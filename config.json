@@ -1,0 +1,24 @@
+{
+  "identity": {
+    "npub": "npub1ws8umyrmzzlwmw2nptk03n0g0vn5ah28qm40ecgg4f8mk3wd9c5suds6x6",
+    "secret_file": "/home/ubuntu/.marmot-agents/hermes/accounts/hermes-agent/secret.json"
+  },
+  "relays": {
+    "publish": [
+      "wss://relay.day.ag/chat",
+      "wss://relay.day.ag/inbox"
+    ],
+    "read": [
+      "wss://relay.day.ag/chat",
+      "wss://relay.day.ag/inbox"
+    ]
+  },
+  "dm_policy": "allowlist",
+  "allow_from": [
+    "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+  ],
+  "allow_from_pending": [
+    "Sam \u2014 need his npub, then add the hex here"
+  ],
+  "lookback_seconds": 259200
+}
