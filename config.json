@@ -15,10 +15,8 @@
   },
   "dm_policy": "allowlist",
   "allow_from": [
-    "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
-  ],
-  "allow_from_pending": [
-    "Sam \u2014 need his npub, then add the hex here"
+    "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7",
+    "93afa609d45882ebe91e2efca40c5dcd2f0614a9898ac8fe34e70d5f7b7afd8b"
   ],
   "lookback_seconds": 259200
 }
