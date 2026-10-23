@@ -21,13 +21,18 @@ class RelayWorker:
     """A `nak req` subscription for one relay, restarted with backoff if it dies."""
 
     def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
-                 authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True):
+                 authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
+                 secret: str | None = None):
         self.relay = relay
         self.me = me
         self.kinds = kinds
         self.authors = authors
         self.p_tag = p_tag
         self.auth = auth
+        # NIP-42 auth must sign as OUR identity. Without this the relay authenticates us
+        # as nak's machine-default key, which is not in the web of trust, and closes the
+        # subscription with "restricted".
+        self.secret = secret
         if not me:
             raise ValueError("RelayWorker needs an identity; refusing an unfiltered subscription")
         self.nak = shutil.which("nak") or "nak"
@@ -53,10 +58,15 @@ class RelayWorker:
         log = logging.getLogger("hng.relay")
         while not self._stop.is_set():
             try:
+                env = None
+                if self.secret:
+                    import os as _os
+                    env = dict(_os.environ, NOSTR_SECRET_KEY=self.secret)
                 proc = await asyncio.create_subprocess_exec(
                     *self._args(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
             except Exception as exc:  # noqa: BLE001 - log, back off, retry
                 self.last_error = f"spawn failed: {exc}"
@@ -86,7 +96,15 @@ class RelayWorker:
                     await proc.wait()
             if self._stop.is_set():
                 break
-            await asyncio.sleep(backoff)
+            # A relay that answered 429 is rate-limiting us: backing off politely is the
+            # fix, not retrying faster. Start at a minute and cap at ten.
+            rate_limited = "429" in (self.last_error or "")
+            if rate_limited:
+                delay = min(max(backoff, 60) * 2, 600)
+            else:
+                delay = backoff
+            import random
+            await asyncio.sleep(delay * (0.8 + random.random() * 0.4))
             backoff = min(backoff * 2, 60)
 
     def stop(self) -> None:

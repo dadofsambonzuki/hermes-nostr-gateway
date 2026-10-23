@@ -33,7 +33,8 @@ class Gateway:
         from .cli import normalise_groups, secret_from
 
         self.cfg = cfg
-        self.crypto = SdkCrypto(secret_from(cfg))
+        self._secret = secret_from(cfg)
+        self.crypto = SdkCrypto(self._secret)
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,21 +60,20 @@ class Gateway:
     async def start(self) -> None:
         await self.server.start()
         for relay in self.relays_read:
-            # DMs: gift wraps addressed to us.
-            worker = RelayWorker(relay, self.me, kinds=(1059,), p_tag=self.me)
+            # ONE subscription per relay for every inbound kind we care about.
+            # One connection per plane is what tripped our own relay's limiter (429)
+            # and multiplies reconnects across every relay.
+            # Per-relay kind sets: our chat relay restricts reads to chat kinds and
+            # closes the subscription if we ask for public notes there.
+            kinds = (1059, 4) if relay.rstrip("/").endswith("/chat") else (1059, 4, 1)
+            worker = RelayWorker(relay, self.me, kinds=kinds, p_tag=self.me,
+                                 secret=self._secret)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
-            # Legacy NIP-04 DMs: kind 4 that p-tag us.
-            legacy = RelayWorker(relay, self.me, kinds=(4,), p_tag=self.me)
-            self.workers.append(legacy)
-            self._tasks.append(asyncio.create_task(self._guarded(legacy)))
-            # Mentions: kind 1 events that p-tag us.
-            mention = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me)
-            self.workers.append(mention)
-            self._tasks.append(asyncio.create_task(self._guarded(mention)))
-            # Watched feeds: kind 1 from configured authors, if any.
+            # Watched feeds need a different filter (authors, no p tag).
             if self.nip01.authors:
-                feed = RelayWorker(relay, self.me, kinds=(1,), authors=tuple(self.nip01.authors))
+                feed = RelayWorker(relay, self.me, kinds=(1,), authors=tuple(self.nip01.authors),
+                                   secret=self._secret)
                 self.workers.append(feed)
                 self._tasks.append(asyncio.create_task(self._guarded(feed)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
