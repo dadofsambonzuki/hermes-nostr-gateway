@@ -54,11 +54,18 @@ expected.
 
 ## 3. Relay policy
 
-- **Read** hinges on the identity's `kind 10050` (DM relay list). Senders deliver wraps to
-  those relays; the gateway streams `{kinds:[1059], "#p":[me], since: now-3d, until: now+5m}`
-  there, plus `{kinds:[4], "#p":[me]}` for the legacy plane.
+- **Read** hinges on the identity's `kind 10050` (DM relay list) **and the sender's app-relay set**.
+  Measured on BitFest (Hal, 23 Oct): 2 of 4 real DMs existed *only* on `relay.ditto.pub`,
+  `relay.dreamith.to` and `relay.eu.whitenoise.chat` — none of which the adapter read — so they
+  were missed with no error and no log line. Stream `{kinds:[1059], "#p":[me], since: now-3d,
+  until: now+5m}` over 10050 **plus** the app-relay defaults (ditto, dreamith, eu/us
+  whitenoise), all configurable.
+- A relay being down or empty is invisible: `relay.damus.io` answered 503 for a whole day
+  (0 events) and the operator's own relay held **zero** wrappers. Log **per-relay event counts**
+  and surface a relay that has delivered nothing while others have.
 - The 3-day `since` is not slack, it is a correctness requirement: NIP-59 randomises gift-wrap
-  `created_at` up to two days into the past.
+  `created_at` up to two days into the past. Watermark on the **inner rumor** time, not the
+  wrapper's.
 - **Write** uses the *recipient's* 10050 when known (cache it; refresh on miss), else the
   identity's own 10050, else `default_write_relays` from config. Never fan out to a long tail.
 - **NIP-42**: relays that require auth (our own `relay.day.ag/chat` and `/inbox`) must be
@@ -296,3 +303,54 @@ fetching — if it needs to, the gateway is missing an operation.
     to an unknown rumor is stored unresolved rather than dropped.
 15. NIP-04 in and out with an allowlisted peer, and no duplicate when that peer also has
     NIP-17.
+
+---
+
+## 14. Live-testing corrections (Hal, BitFest, 23 Oct 2026)
+
+Measured against real relays while debugging Armada→bot DMs; full note in
+`docs/prior-art/hal-whitenoise-dm-handover.md`.
+
+1. **Dedupe on the inner rumor, not the wrapper.** The same message arrives once per relay
+   with a *different* wrapper id each time, so wrapper-level dedupe cannot work across relays.
+   Key on `rumor.pubkey + rumor.created_at + rumor.content` (the rumor id is the natural key),
+   and keep wrapper ids only to avoid reprocessing the same event twice.
+2. **Inner kind filtering is mandatory.** Kind 1059 also carries Concord invites (inner kind
+   `3313`, outer `k=3313`). Anything whose inner kind is not `14` (DM) or `7` (reaction) must be
+   routed by kind — invites to the Concord plane — and must never surface as a message or
+   trigger an agent run.
+3. **NIP-04 is legacy-only.** Armada sends NIP-17 only; older clients still send kind 4. Do not
+   dual-send both dialects by default: it doubles cost and duplicates in clients that read both.
+4. **Authorisation drops need a voice.** A DM from a non-allowlisted key is correctly refused,
+   but silently — the sender concludes the bot is broken. Log at INFO with the sender npub, and
+   either send one short refusal or notify the owner.
+5. **Replies:** seal from the real sender key, wrap to the recipient's `p`; never send from the
+   ephemeral wrap key (it is not ours to reuse).
+
+### Extra acceptance criteria (from the same note)
+
+- A DM sent from Armada appears in our own evidence probe on **≥2 relays including one of
+  ditto/dreamith/whitenoise**.
+- The gateway logs an inbound message within ~10 s of send.
+- The reply is visible in Armada.
+- A DM from a non-allowlisted key produces a log line and **no agent run**.
+- An invite (inner kind 3313) produces **no agent run**.
+- A restart does not replay already-answered DMs (persist processed rumor ids).
+
+---
+
+## 15. Prior art and seed code
+
+- **`wn-agent` / mdk** (`github.com/marmot-protocol/mdk`, `wn-agent-v0.10.4`) — the Marmot agent
+  connector, its Unix control socket, and the Hermes integration under
+  `integrations/hermes/marmot`. This repo's socket contract is modelled on it; the Marmot plane
+  proxies it rather than reimplementing MLS.
+- **Armada** (`soapbox.pub`) — reference client for NIP-17 DMs and Concord; its DM planes
+  (`nip17`, `nip04`) and `imeta` handling informed §4b.
+- **Hal, the BitFest bot** (`npub19etsn3sn…`) — the live-testing corrections in §14 and the
+  relay-coverage finding in §3.
+- **BitFest's existing Hermes `nostr` plugin** (`~/.hermes/plugins/nostr` on bitfest.uk: 
+  `adapter.py`, `nostr_crypto.py`, `concord_write.py`, ~1,419 lines, with a `platforms/nostr/
+  seen-ids.json` state file). This is prior art of our own and the intended **seed** for the
+  daemon: lift the crypto and Concord write paths out of the adapter rather than rewrite them.
+  Ownership/licence to be confirmed before it goes into a public repo.
