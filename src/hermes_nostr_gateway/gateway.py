@@ -163,6 +163,15 @@ class Gateway:
 
         peer_ok = any(ok for ok, _ in results["peer"].values())
         if peer_ok:
+            # Record what we sent, so history is not one-sided and an answer can be
+            # traced back to the message that prompted it.
+            from .store import Inbound as _Inbound
+            self.store.add(_Inbound(
+                id=rumor["id"], wrapper_id=wraps["peer"]["id"], sender=self.me,
+                kind=int(rumor.get("kind", 14)), created_at=int(rumor.get("created_at", 0)),
+                content=text, conversation=peer, reply_to=reply_to, plane="nip17",
+                reach="sent", authority="self", rule="outbound", why="sent by us",
+            ))
             self.store.mark_delivered([rumor["id"]])
         return {
             "type": "delivery",

@@ -153,6 +153,17 @@ class Store:
 
     # -- rumors (application level) -------------------------------------
     def add(self, msg: Inbound) -> bool:
+        # A sender may write the same text over NIP-17 and NIP-04; ids differ per plane,
+        # so also dedupe on (sender, created_at, content). Without this the agent sees
+        # the same message twice.
+        if msg.authority != "self":
+            row = self.db.execute(
+                "SELECT id FROM rumors WHERE sender = ? AND created_at BETWEEN ? AND ? "
+                "AND content = ? LIMIT 1",
+                (msg.sender, msg.created_at - 2, msg.created_at + 2, msg.content),
+            ).fetchone()
+            if row is not None:
+                return False
         try:
             self.db.execute(
                 "INSERT INTO rumors (id, wrapper_id, sender, kind, created_at, conversation,"
