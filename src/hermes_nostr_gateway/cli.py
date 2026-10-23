@@ -1,0 +1,271 @@
+"""`hng` — the dogfood CLI. Same core the socket server will expose."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .crypto import NakCrypto
+from .planes.nip17 import Nip17Plane
+from .policy import Policy
+from .relay import OneShot, RelayWorker
+from .store import Store
+
+DEFAULT_CONFIG = Path("config.yaml")
+
+
+def load_config(path: str | None = None) -> dict[str, Any]:
+    candidates = [path, os.environ.get("HNG_CONFIG"), str(DEFAULT_CONFIG),
+                  str(Path.home() / ".config/hermes-nostr-gateway/config.yaml")]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            with open(candidate) as fh:
+                return yaml.safe_load(fh) or {}
+    raise SystemExit("no config found: pass --config or create config.yaml")
+
+
+def secret_from(cfg: dict[str, Any]) -> str:
+    if cfg.get("identity", {}).get("secret_env"):
+        return os.environ[cfg["identity"]["secret_env"]]
+    path = Path(os.path.expanduser(cfg["identity"]["secret_file"]))
+    data = json.loads(path.read_text())
+    return data.get("secret_key_hex") or data["secret_key"]
+
+
+def _decode_npub(npub: str) -> str:
+    import subprocess
+    out = subprocess.run(["nak", "decode", npub], capture_output=True, text=True).stdout.strip()
+    return out or npub
+
+
+def normalise_groups(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Groups are authored as npubs but events carry hex, so normalise once, here.
+
+    Keeping this in the CLI (not in Policy) leaves the policy engine dependency-free
+    and unit-testable without nak.
+    """
+    groups = cfg.get("groups") or {}
+    return {name: [_decode_npub(m) if str(m).startswith("npub") else m for m in members]
+            for name, members in groups.items()}
+
+def build(cfg: dict[str, Any]) -> tuple[NakCrypto, Store, Policy, Nip17Plane]:
+    crypto = NakCrypto(secret_from(cfg))
+    store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store = Store(store_path)
+    policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
+                     "defaults": cfg.get("defaults")})
+    return crypto, store, policy, Nip17Plane(crypto, store, policy)
+
+
+def to_hex(who: str) -> str:
+    if who.startswith("npub"):
+        import subprocess
+        return subprocess.run(["nak", "decode", who], capture_output=True, text=True).stdout.strip()
+    return who
+
+
+def print_message(msg, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(msg.to_frame(), separators=(",", ":")))
+        return
+    import datetime
+    when = datetime.datetime.fromtimestamp(msg.created_at, datetime.UTC).strftime("%d %b %H:%M")
+    print(f"[{when}] {msg.sender[:12]}… ({msg.reach}/{msg.authority}) {msg.content}")
+
+
+async def found(plane: Nip17Plane, relay: str, event: dict, args) -> None:
+    msg = plane.handle(relay, event)
+    if not msg:
+        return
+    print_message(msg, args.json)
+    if args.mark_read:
+        plane.store.mark_delivered([msg.id])
+
+
+def cmd_listen(args) -> int:
+    cfg = load_config(args.config)
+    crypto, store, policy, plane = build(cfg)
+    relays = [r for r in cfg["relays"]["read"]]
+
+    if args.once:
+        since = None
+        import time
+        if args.since_hours:
+            since = int(time.time()) - args.since_hours * 3600
+
+        async def run_once() -> int:
+            fetch = OneShot(plane.me, limit=args.limit, since=since)
+            total = 0
+            for relay in relays:
+                try:
+                    events = await fetch.fetch(relay)
+                except Exception as exc:  # noqa: BLE001 - report, do not crash
+                    store.note_relay(relay, error=str(exc)[:200])
+                    continue
+                store.note_relay(relay, events=len(events))
+                for event in events:
+                    msg = plane.handle(relay, event)
+                    if msg:
+                        print_message(msg, args.json)
+                        total += 1
+            return total
+
+        count = asyncio.run(run_once())
+        print(f"-- {count} new message(s) across {len(relays)} relays", file=sys.stderr)
+        return 0
+
+    async def stream() -> None:
+        workers = [RelayWorker(r, plane.me) for r in relays]
+        tasks = [asyncio.create_task(w.run(lambda relay, event: found(plane, relay, event, args)))
+                 for w in workers]
+        try:
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            for w in workers:
+                w.stop()
+            for t in tasks:
+                t.cancel()
+
+    try:
+        asyncio.run(stream())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def recipient_relays(cfg: dict[str, Any], peer: str) -> list[str]:
+    import subprocess
+    relays = list(cfg["relays"].get("publish", []))
+    try:
+        out = subprocess.run(
+            ["nak", "req", "-k", "10050", "-a", peer, "-l", "1", *relays[:2]],
+            capture_output=True, text=True, timeout=25,
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            event = json.loads(line)
+            for tag in event.get("tags", []):
+                if tag and tag[0] == "relay" and tag[1] not in relays:
+                    relays.append(tag[1])
+            break
+    except Exception:  # noqa: BLE001 - absence of 10050 is not fatal
+        pass
+    return relays[:6]
+
+
+def cmd_send(args) -> int:
+    import subprocess
+    cfg = load_config(args.config)
+    crypto, store, policy, plane = build(cfg)
+    peer = to_hex(args.to)
+    rumor = crypto.build_rumor(args.text, peer, reply_to=args.reply_to)
+    wraps = {"peer": crypto.wrap(rumor, peer), "self": crypto.wrap(rumor, plane.me)}
+    relays = recipient_relays(cfg, peer)
+    ok_peer = False
+    for label, wrap in wraps.items():
+        results = {}
+        for relay in relays:
+            proc = subprocess.run(
+                ["nak", "event", "--auth", relay], input=json.dumps(wrap),
+                capture_output=True, text=True,
+            )
+            results[relay] = "success" in (proc.stdout + proc.stderr).lower()
+        published = [r for r, v in results.items() if v]
+        print(f"  {label:5} {wrap['id'][:12]}… -> {', '.join(published) or 'FAILED'}")
+        if label == "peer":
+            ok_peer = bool(published)
+    if ok_peer:
+        from .store import Inbound
+        store.add(Inbound(
+            id=rumor["id"], wrapper_id=wraps["peer"]["id"], sender=plane.me,
+            kind=rumor.get("kind", 14), created_at=int(rumor["created_at"]),
+            content=args.text, conversation=peer, reply_to=args.reply_to,
+            reach="sent", authority="self", rule="outbound", why="sent by us",
+        ))
+        store.mark_delivered([rumor["id"]])
+    return 0 if ok_peer else 1
+
+
+def cmd_status(args) -> int:
+    cfg = load_config(args.config)
+    crypto, store, policy, plane = build(cfg)
+    print(f"identity: {plane.me}")
+    print(f"store:    {store.path}")
+    stats = store.stats()
+    print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery)")
+    print("relays:")
+    for row in stats["relays"]:
+        print(f"  {row['relay']:<38} events={row['events']:<5} last={row['last_event'] or '-'} "
+              f"err={row['last_error'] or '-'}")
+    return 0
+
+
+def cmd_recent(args) -> int:
+    cfg = load_config(args.config)
+    crypto, store, policy, plane = build(cfg)
+    for row in reversed(store.recent(args.number)):
+        direction = "out" if row["authority"] == "self" else "in "
+        print(f"[{row['created_at']}] {direction} {row['sender'][:10]}… {row['reach']:<9} "
+              f"{(row['content'] or '')[:90]}")
+    return 0
+
+
+def cmd_policy_test(args) -> int:
+    cfg = load_config(args.config)
+    policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
+                     "defaults": cfg.get("defaults")})
+    d = policy.decide(sender=to_hex(args.sender), kind=args.kind,
+                      mention=args.mention, dm=args.dm, event_id=args.event_id)
+    print(json.dumps(d.to_frame(), indent=2))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="hng", description="Hermes Nostr Gateway")
+    parser.add_argument("--config", help="path to config.yaml")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_listen = sub.add_parser("listen", help="stream inbound DMs")
+    p_listen.add_argument("--once", action="store_true", help="one-shot fetch, then exit")
+    p_listen.add_argument("--limit", type=int, default=50)
+    p_listen.add_argument("--since-hours", type=int, default=None)
+    p_listen.add_argument("--json", action="store_true")
+    p_listen.add_argument("--mark-read", action="store_true")
+    p_listen.set_defaults(func=cmd_listen)
+
+    p_send = sub.add_parser("send", help="send a NIP-17 DM")
+    p_send.add_argument("--to", required=True)
+    p_send.add_argument("--text", required=True)
+    p_send.add_argument("--reply-to", default=None)
+    p_send.set_defaults(func=cmd_send)
+
+    sub.add_parser("status", help="identity, store and relay health").set_defaults(func=cmd_status)
+
+    p_recent = sub.add_parser("recent", help="recent messages")
+    p_recent.add_argument("-n", "--number", type=int, default=20)
+    p_recent.set_defaults(func=cmd_recent)
+
+    p_policy = sub.add_parser("policy-test", help="ask the policy engine what it would do")
+    p_policy.add_argument("--sender", required=True)
+    p_policy.add_argument("--kind", type=int, default=14)
+    p_policy.add_argument("--mention", action="store_true")
+    p_policy.add_argument("--dm", action="store_true")
+    p_policy.add_argument("--event-id", default=None)
+    p_policy.set_defaults(func=cmd_policy_test)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
