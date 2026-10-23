@@ -1,6 +1,7 @@
 # nostr-dm-gateway — socket API and trust model (v1)
 
-Status: **approved for build** (decisions §11 resolved 2026-10-23). Supersedes the phase-0
+Status: **approved for build** — v2 2026-10-23: planes and attention policy added, seed code
+identified. Repo: `nostr://npub1cn67…/relay.ngit.dev/hermes-nostr-gateway`. Supersedes the phase-0
 wrapper as the design target; the wrapper stays as the protocol conformance reference (its
 four traps are encoded in §4 and §7 below).
 
@@ -354,3 +355,89 @@ Measured against real relays while debugging Armada→bot DMs; full note in
   seen-ids.json` state file). This is prior art of our own and the intended **seed** for the
   daemon: lift the crypto and Concord write paths out of the adapter rather than rewrite them.
   Ownership/licence to be confirmed before it goes into a public repo.
+
+---
+
+## 16. Planes (v2)
+
+One socket, one normalised event, N planes behind it:
+
+| plane | reads | writes | notes |
+|---|---|---|---|
+| `nip01` | kinds 1, 6, 16, 1111; NIP-50 search where the relay offers it | kind 1, 7, 1111 — **config-gated off by default** | feeds and mentions; attention policy §17 |
+| `nip17` | 1059 → inner 14 / 7 / 15 | 14, 7, 15 inside 1059 | primary DM plane |
+| `nip04` | kind 4 | kind 4 | legacy, allowlist-gated, never dual-sent by default |
+| `concord` | 1059 with inner 3313 (invites) + Concord control/chat kinds | invites, chat, rekey | serverless E2EE communities; own control plane |
+| `marmot` | via the wn-agent socket | via the wn-agent socket | **proxy**, not an implementation — MLS stays theirs |
+
+Normalised event on the wire:
+
+```
+{plane, conversation, author, content, media[], reply_to, why, authority, cursor}
+```
+
+Adding a plane must not require touching the socket schema: `plane` is a string and
+`conversation` is opaque to the client (channel id, DM peer, group id).
+
+---
+
+## 17. Attention policy (feeds and mentions)
+
+Two **independent** dimensions per sender group. Keeping them separate is the whole point: a
+public bot can *hear* strangers without letting them *instruct* it.
+
+- **reach:** `immediate | digest(interval) | drop`
+- **authority:** `instructions | none`
+
+Built-in groups: `any` (everyone matched), `unknown` (not in any named group). Named groups are
+lists of npubs in config. Rules are ordered, first match wins, and anything unmatched falls to
+`defaults`.
+
+```yaml
+groups:
+  family: [npub1cn67…, npub1jwh6…]
+  team:   [npub1…]
+  hal:    [npub19etsn3sn…]
+policies:
+  - match: {group: family, kinds: [1], mention: true}    -> {reach: immediate, authority: instructions}
+  - match: {group: any,    kinds: [1], mention: true}    -> {reach: digest(15m), authority: none}
+  - match: {group: hal,    kinds: [1]}                   -> {reach: digest(60m), authority: instructions}
+  - match: {group: unknown, kinds: [4, 1059]}            -> {reach: digest(60m), authority: none}
+defaults: {reach: digest(15m), authority: none, quota: 60/h}
+```
+
+Rules:
+- `mention: true` means a `p` tag naming the identity (and, for `nip01`, replies via `e`).
+- **Digest** batches over the configured interval: one message carrying a count, the top N items
+  (author, time, snippet) and the `why` for each, plus the count of items dropped by quota. A
+  digest with nothing in it is not sent — silence is the "nothing happened" signal.
+- **Quota** is per rule per hour; a global floor (default 60 deliveries/hour overall) stops a
+  misconfiguration from spinning the agent.
+- **Dedupe across rules** by event id, so one post matching two rules arrives once, attributed to
+  the highest-priority rule.
+- **Authority is not reach.** `authority: none` means the text reaches the agent as *data*; the
+  agent must not act on instructions in it, and the adapter marks it as untrusted in the turn.
+  This is what makes a public bot safe: strangers can talk, nobody can instruct.
+- The policy engine also decides DM delivery (§10 item 1) — one mechanism, not a separate feed
+  allowlist bolted on.
+
+---
+
+## 18. Seed from the BitFest plugin
+
+The extraction target, in review order:
+
+1. `nostr_crypto.py` (392 lines) → `src/planes/crypto.py` — NIP-44/NIP-59 primitives, key handling.
+   Review for: key in argv/env, temporary files, error paths that log secrets.
+2. `concord_write.py` (120 lines) → `src/planes/concord/write.py` — invite/control writes.
+   Review for: replay/rekey edge cases, state handling.
+3. `adapter.py` (19 KB) → **split**, not moved: the relay/subscription logic becomes
+   `src/planes/nip17.py` + `src/relay/pool.py`; the Hermes-specific parts become the thin adapter
+   (§11). Anything in the adapter that allowlists, retries or picks relays is a bug to delete, not
+   port.
+4. `~/.hermes/platforms/nostr/seen-ids.json` → seed data for `wraps_seen`, migrated once at first
+   start, then owned by SQLite.
+
+The PR is Hal's (authorship stays with him); it lands on a `pr/extract-biffest-plugin` branch and
+is reviewed against the checklist in §10 plus: no key material in logs, no network writes outside
+configured relays, no `eval`/`exec`/shell, dependencies pinned.
