@@ -1,4 +1,4 @@
-# nostr-dm-gateway — socket API and trust model (v1)
+# hermes-nostr-gateway — planes, socket API and trust model (v2)
 
 Status: **approved for build** — v2 2026-10-23: planes and attention policy added, seed code
 identified. Repo: `nostr://npub1cn67…/relay.ngit.dev/hermes-nostr-gateway`. Supersedes the phase-0
@@ -291,7 +291,7 @@ fetching — if it needs to, the gateway is missing an operation.
 | # | Decision | Outcome |
 |---|---|---|
 | A | Key ownership | **Share Holly's npub with wn-agent**, disjoint-kind table enforced at startup |
-| B | Language | **Rust + `nostr-sdk`** |
+| B | Language | **Python on `nostr-sdk` bindings** (decided; §8) |
 | C | NIP-04 in v1 | **Yes**, same process, allowlist-gated |
 | D | Allowlist authority | **Gateway-side**, mirrored read-only in the adapter |
 | E | v1 scope | Text 1:1 + both planes **+ media + reactions**; docs/container/CI before publishing |
