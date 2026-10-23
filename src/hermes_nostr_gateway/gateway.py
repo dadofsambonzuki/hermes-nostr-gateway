@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .crypto import NakCrypto
+from .crypto import SdkCrypto
+from .planes import nip04
 from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
@@ -32,7 +33,7 @@ class Gateway:
         from .cli import normalise_groups, secret_from
 
         self.cfg = cfg
-        self.crypto = NakCrypto(secret_from(cfg))
+        self.crypto = SdkCrypto(secret_from(cfg))
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +63,10 @@ class Gateway:
             worker = RelayWorker(relay, self.me, kinds=(1059,), p_tag=self.me)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
+            # Legacy NIP-04 DMs: kind 4 that p-tag us.
+            legacy = RelayWorker(relay, self.me, kinds=(4,), p_tag=self.me)
+            self.workers.append(legacy)
+            self._tasks.append(asyncio.create_task(self._guarded(legacy)))
             # Mentions: kind 1 events that p-tag us.
             mention = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me)
             self.workers.append(mention)
@@ -100,14 +105,42 @@ class Gateway:
 
     # -- inbound --------------------------------------------------------
     def _on_event(self, relay: str, event: dict) -> None:
-        if event.get("kind") == 1059:
+        kind = event.get("kind")
+        if kind == 1059:
             msg = self.plane.handle(relay, event)
+        elif kind == 4:
+            msg = self._handle_nip04(relay, event)
         else:
             msg = self.nip01.handle(relay, event)
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
         asyncio.create_task(self.server.broadcast(msg.to_frame()))
+
+
+    def _handle_nip04(self, relay: str, event: dict) -> Any:
+        """Legacy kind-4 DM: decrypt with the binding, then the same policy path."""
+        from .store import Inbound
+
+        sender = str(event.get("pubkey") or "")
+        if not sender or sender == self.me:
+            return None
+        try:
+            _, text = nip04.open_event(self.crypto.keys, event)
+        except Exception:  # noqa: BLE001 - undecryptable is not fatal
+            return None
+        decision = self.policy.decide(sender=sender, kind=4, dm=True,
+                                      event_id=str(event.get("id") or ""))
+        if decision.duplicate:
+            return None
+        msg = Inbound(
+            id=str(event.get("id") or ""), wrapper_id=str(event.get("id") or ""),
+            sender=sender, kind=4, created_at=int(event.get("created_at") or 0),
+            content=text, conversation=sender, reply_to=None, plane="nip04",
+            reach=decision.reach, authority=decision.authority,
+            rule=decision.rule, why=decision.why,
+        )
+        return msg if self.store.add(msg) else None
 
     # -- outbound -------------------------------------------------------
     async def send(self, *, to: str, text: str, reply_to: str | None = None,
@@ -212,7 +245,7 @@ class Gateway:
             "identity": self.me,
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
-            "planes": ["nip17", "nip01"],
+            "planes": ["nip17", "nip01", "nip04"],
             "relays_publish": self.relays_publish,
             "rumors": stats["total"],
             "pending": stats["pending"],

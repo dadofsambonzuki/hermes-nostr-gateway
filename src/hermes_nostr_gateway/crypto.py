@@ -1,23 +1,22 @@
-"""Crypto backend seam.
+"""Crypto: everything delegates to rust-nostr through the official bindings.
 
-The bindings give us NIP-44 (`Keys.nip44_encrypt/decrypt`) and gift-wrap *unwrapping*
-(`UnwrappedGift.from_gift_wrap`) but no wrap builder, so M1 shells out to `nak` for the
-two operations it lacks. `NakCrypto` is therefore an interim backend, not the design:
-`NativeCrypto` (seal/wrap built on the binding's NIP-44) replaces it without touching
-callers. The trap this encodes, learned the hard way:
+There is deliberately **no hand-rolled cryptography in this module**. NIP-44, NIP-59,
+NIP-04, event ids and signing all come from `nostr-sdk`, so we inherit the upstream
+implementation and its review. If something cannot be expressed through the bindings,
+it does not go in this file — it goes upstream as a binding gap.
 
-  * `--use-our-identity-key --use-their-identity-key` is mandatory — without it nak may
-    encrypt to a NIP-4E decoupled key, the wrap's `p` tag stops being the recipient's
-    identity pubkey, and standard NIP-17 clients never see the message.
+NIP-59 detail this wraps: the gift wrap's `p` tag must be the recipient's *identity*
+key, and its `created_at` is randomised into the past (the binding does that), which is
+why inbound reads need a multi-day `since` window.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import subprocess
-from typing import Any, Protocol
+import time
+from typing import Any, Optional, Protocol
+
+import nostr_sdk as sdk
 
 
 class CryptoError(RuntimeError):
@@ -31,82 +30,169 @@ class CryptoBackend(Protocol):
     def unwrap(self, wrap: dict) -> dict | None: ...
 
 
-class NakCrypto:
-    """Interim backend: the proven `nak` calls, behind the interface the daemon wants."""
+# ── keys and npubs (bindings only) ───────────────────────────────────────────
 
-    def __init__(self, secret_hex: str, nak: str | None = None):
-        self._secret = secret_hex
-        self._nak = nak or shutil.which("nak") or ""
-        if not self._nak:
-            raise CryptoError("nak not found on PATH")
-        self._pubkey: str | None = None
+def normalize_pubkey(value: str) -> str:
+    """npub / nprofile / 64-hex -> 64-hex, via the binding's NIP-19 decoder."""
+    value = (value or "").strip()
+    if not value:
+        raise CryptoError("empty pubkey")
+    if value.startswith("npub") or value.startswith("nprofile"):
+        try:
+            return sdk.PublicKey.parse(value).to_hex()
+        except Exception as exc:  # noqa: BLE001
+            raise CryptoError(f"invalid npub: {value[:12]}…") from exc
+    if len(value) != 64:
+        raise CryptoError("pubkey must be npub or 64-char hex")
+    return value.lower()
 
-    # -- plumbing -------------------------------------------------------
-    def _run(self, args: list[str], stdin: Any = None) -> str:
-        env = dict(os.environ, NOSTR_SECRET_KEY=self._secret)
-        proc = subprocess.run(
-            [self._nak, *args], input=stdin, capture_output=True, text=True, env=env
-        )
-        if proc.returncode != 0:
-            raise CryptoError(f"nak {' '.join(args)} failed: {proc.stderr.strip()[:300]}")
-        return proc.stdout
 
-    @staticmethod
-    def _last_json(text: str) -> dict:
-        for line in reversed(text.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                return json.loads(line)
-        raise CryptoError(f"no event in nak output: {text[:200]}")
+def npub_encode(hex_pubkey: str) -> str:
+    return sdk.PublicKey.parse(hex_pubkey).to_bech32()
 
-    # -- interface ------------------------------------------------------
+
+def npub_decode(value: str) -> str:
+    return normalize_pubkey(value)
+
+
+def parse_secret(value: str) -> str:
+    """Accept nsec or 64-char hex; never echo the value back in an error."""
+    value = (value or "").strip()
+    if value.startswith("nsec"):
+        try:
+            return sdk.SecretKey.parse(value).to_hex()
+        except Exception as exc:  # noqa: BLE001
+            raise CryptoError("invalid nsec") from exc
+    if len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return value.lower()
+    raise CryptoError("secret key must be nsec or 64-char hex")
+
+
+def pubkey_from_secret(hex_secret: str) -> str:
+    try:
+        return sdk.Keys.parse(hex_secret).public_key().to_hex()
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError("invalid secret key") from exc
+
+
+# ── events (ids and signatures from the binding) ────────────────────────────
+
+def sign_event(event: dict[str, Any], keys: sdk.Keys) -> dict[str, Any]:
+    payload = {
+        "kind": int(event["kind"]),
+        "content": event.get("content", ""),
+        "tags": event.get("tags", []),
+        "created_at": int(event.get("created_at") or time.time()),
+    }
+    unsigned = unsigned_event(payload, keys.public_key().to_hex())
+    return json.loads(keys.sign_event(unsigned).as_json())
+
+
+def unsigned_event(event: dict[str, Any], author_hex: str) -> sdk.UnsignedEvent:
+    builder = sdk.EventBuilder(sdk.Kind(int(event["kind"])), event.get("content", ""))
+    if event.get("tags"):
+        builder = builder.tags([sdk.Tag.parse([str(p) for p in tag]) for tag in event["tags"]])
+    if event.get("created_at"):
+        builder = builder.custom_created_at(sdk.Timestamp.from_secs(int(event["created_at"])))
+    unsigned = builder.finalize_unsigned(sdk.PublicKey.parse(author_hex))
+    # ensure_id returns the instance with the id populated; the original stays None.
+    return unsigned.ensure_id()
+
+
+def verify_event(event: dict[str, Any]) -> bool:
+    try:
+        return sdk.Event.from_json(json.dumps(event)).verify()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_rumor(author_hex: str, recipient_hex: str, text: str, kind: int = 14,
+                tags: Optional[list[list[str]]] = None,
+                created_at: Optional[int] = None) -> dict[str, Any]:
+    """An unsigned NIP-17 rumor, id from the binding (the dedupe key)."""
+    payload = {
+        "kind": int(kind),
+        "content": text,
+        "tags": [["p", recipient_hex], *(tags or [])],
+        "created_at": int(created_at or time.time()),
+        "pubkey": author_hex,
+    }
+    unsigned = unsigned_event(payload, author_hex)
+    rumor = json.loads(unsigned.as_json())
+    rumor.setdefault("pubkey", author_hex)
+    # The id comes from the binding, so dedupe keys always match what the seal reports.
+    rumor.setdefault("id", unsigned.id().to_hex())
+    return rumor
+
+
+# ── NIP-04 (legacy DMs) ──────────────────────────────────────────────────────
+
+def nip04_encrypt(keys: sdk.Keys, peer: str, plaintext: str) -> str:
+    return sdk.nip04_encrypt(keys.secret_key(), sdk.PublicKey.parse(normalize_pubkey(peer)), plaintext)
+
+
+def nip04_decrypt(keys: sdk.Keys, peer: str, payload: str) -> str:
+    return sdk.nip04_decrypt(keys.secret_key(), sdk.PublicKey.parse(normalize_pubkey(peer)), payload)
+
+
+# ── NIP-17 / NIP-59 ──────────────────────────────────────────────────────────
+
+def unwrap_gift(keys: sdk.Keys, wrap: dict[str, Any]) -> dict[str, Any]:
+    """kind 1059 -> seal -> rumor. Raises on integrity problems."""
+    try:
+        event = sdk.Event.from_json(json.dumps(wrap))
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError("malformed gift wrap") from exc
+    if int(event.kind().as_u16()) != 1059:
+        raise CryptoError("not a gift wrap event")
+    try:
+        unwrapped = sdk.UnwrappedGift.from_gift_wrap(keys, event)
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError(f"cannot unwrap gift: {exc}") from exc
+    rumor = json.loads(unwrapped.rumor().as_json())
+    if rumor.get("pubkey") != unwrapped.sender().to_hex():
+        raise CryptoError("rumor author does not match seal author")
+    return rumor
+
+
+class SdkCrypto:
+    """NIP-17 send/receive through rust-nostr. No subprocess, no local primitives."""
+
+    def __init__(self, secret_hex: str):
+        try:
+            self.keys = sdk.Keys.parse(parse_secret(secret_hex))
+        except Exception as exc:  # noqa: BLE001
+            raise CryptoError("invalid identity secret") from exc
+        self._pubkey = self.keys.public_key().to_hex()
+        if len(self._pubkey) != 64:
+            raise CryptoError("cannot derive our pubkey from the configured secret")
+
     def our_pubkey(self) -> str:
-        if self._pubkey is None:
-            # Prefer the bindings: nak's `key public` returned empty stdout under some
-            # environments, and an empty identity silently widens every relay filter.
-            try:
-                import nostr_sdk
-
-                self._pubkey = nostr_sdk.Keys.parse(self._secret).public_key().to_hex()
-            except Exception:  # noqa: BLE001 - fall back to nak
-                self._pubkey = self._run(["key", "public"]).strip()
-            if not self._pubkey or len(self._pubkey) != 64:
-                raise CryptoError(
-                    f"cannot derive a pubkey from the configured secret (got {self._pubkey!r})"
-                )
         return self._pubkey
 
     def build_rumor(self, content: str, peer: str, reply_to: str | None = None) -> dict:
-        args = ["event", "-k", "14", "-c", content, "-p", peer]
-        if reply_to:
-            args += ["-e", reply_to]
-        return self._last_json(self._run(args))
+        peer_hex = normalize_pubkey(peer)
+        tags = [["e", reply_to]] if reply_to else []
+        return build_rumor(self._pubkey, peer_hex, content, kind=14, tags=tags)
 
     def wrap(self, rumor: dict, recipient: str) -> dict:
-        out = self._run(
-            [
-                "gift",
-                "wrap",
-                "-p",
-                recipient,
-                "--use-our-identity-key",
-                "--use-their-identity-key",
-            ],
-            stdin=json.dumps(rumor),
-        )
-        event = self._last_json(out)
-        addressed = [t[1] for t in event.get("tags", []) if t and t[0] == "p"]
-        if addressed != [recipient]:
+        recipient_hex = normalize_pubkey(recipient)
+        unsigned = unsigned_event(rumor, self._pubkey)
+        try:
+            event = json.loads(
+                sdk.nip59_make_gift_wrap(self.keys, sdk.PublicKey.parse(recipient_hex),
+                                         unsigned).as_json())
+        except Exception as exc:  # noqa: BLE001
+            raise CryptoError(f"cannot build gift wrap: {exc}") from exc
+        addressed = [tag[1] for tag in event.get("tags", [])
+                     if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p"]
+        if addressed != [recipient_hex]:
             raise CryptoError(
-                f"wrap addressed to {addressed} not {[recipient]} — refusing to publish"
-            )
+                f"wrap addressed to {addressed} not {[recipient_hex]} — refusing to publish")
         return event
 
     def unwrap(self, wrap: dict) -> dict | None:
         try:
-            out = self._run(["gift", "unwrap"], stdin=json.dumps(wrap))
-        except CryptoError:
+            return unwrap_gift(self.keys, wrap)
+        except Exception:  # noqa: BLE001 - unreadable wrap is not fatal
             return None
-        if not out.strip():
-            return None
-        return self._last_json(out)
