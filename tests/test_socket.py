@@ -21,8 +21,11 @@ class FakeHandler:
     def peers(self):
         return {"peers": []}
 
-    def ack(self, ids):
-        return {"acked": ids}
+    def ack(self, ids=None, *, rule=None, frame=None):
+        return {"acked": ids or []}
+
+    def replay_digests(self, since_frame=0):
+        return []
 
     def mark_read(self, ids):
         return {"acked": ids}
@@ -32,6 +35,15 @@ class FakeHandler:
 
     def replay_skip(self):
         return {"skipped": 3, "replay_floor": 1234}
+
+
+class DigestHandler(FakeHandler):
+    def replay_digests(self, since_frame=0):
+        return [{"type": "digest", "frame": 2, "rule": "unknown-dms",
+                 "items": [{"rumor_id": "r1"}]}]
+
+    def ack(self, ids=None, *, rule=None, frame=None):
+        return {"rule": rule, "frame": frame, "acked": 1}
 
 
 async def call(path, *frames):
@@ -102,3 +114,23 @@ async def test_replay_skip_records_a_handover(server, tmp_path):
     (frame,) = await call(tmp_path / "s.sock", {"op": "replay.skip"})
     assert frame["type"] == "ok"
     assert frame["skipped"] == 3 and frame["replay_floor"] == 1234
+
+async def test_subscribe_replays_digest_and_ack_uses_frame(tmp_path):
+    srv = SocketServer(tmp_path / "d.sock", DigestHandler())
+    await srv.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "d.sock"))
+        writer.write(b'{"op":"subscribe","since":1}\n')
+        await writer.drain()
+        assert json.loads(await asyncio.wait_for(reader.readline(), 2))["type"] == "subscribed"
+        digest = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        assert digest["type"] == "digest" and digest["frame"] == 2
+
+        writer.write(b'{"op":"ack","rule":"unknown-dms","frame":2}\n')
+        await writer.drain()
+        ack = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        assert ack == {"type": "ok", "rule": "unknown-dms", "frame": 2, "acked": 1}
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await srv.stop()

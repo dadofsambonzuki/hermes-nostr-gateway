@@ -52,7 +52,9 @@ class Handler(Protocol):
     async def send(self, *, to: str, text: str, reply_to: str | None, cid: str | None) -> dict[str, Any]: ...
     def history(self, limit: int) -> dict[str, Any]: ...
     def peers(self) -> dict[str, Any]: ...
-    def ack(self, ids: list[str]) -> dict[str, Any]: ...
+    def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
+            frame: int | None = None) -> dict[str, Any]: ...
+    def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]: ...
     def mark_read(self, ids: list[str]) -> dict[str, Any]: ...
     def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]: ...
     def replay_skip(self) -> dict[str, Any]: ...
@@ -123,9 +125,15 @@ class SocketServer:
                         await self._send(writer, {"type": "subscribed",
                                                   "since": req.get("since")})
                         # Re-offer anything accepted but never acknowledged, so a
-                        # reconnect (or a crash mid-delivery) cannot lose it.
+                        # reconnect (or a crash mid-delivery) cannot lose it. Immediate
+                        # frames replay by id; digest frames replay whole, by frame
+                        # sequence, until the batch itself is acked.
                         for frame in self.handler.replay_pending():
                             await self._send(writer, frame)
+                        replay = getattr(self.handler, "replay_digests", None)
+                        if replay is not None:
+                            for frame in replay(int(req.get("since") or 0)):
+                                await self._send(writer, frame)
                     elif op == "status":
                         await self._send(writer, {"type": "status", **(await self.handler.status())})
                     elif op == "send":
@@ -140,7 +148,13 @@ class SocketServer:
                     elif op == "peers":
                         await self._send(writer, {"type": "peers", **self.handler.peers()})
                     elif op == "ack":
-                        await self._send(writer, {"type": "ok", **self.handler.ack(req.get("ids", []))})
+                        if "rule" in req or "frame" in req:
+                            result = self.handler.ack(
+                                rule=req.get("rule"), frame=req.get("frame")
+                            )
+                        else:
+                            result = self.handler.ack(req.get("ids", []))
+                        await self._send(writer, {"type": "ok", **result})
                     elif op == "mark_read":
                         await self._send(writer, {"type": "ok",
                                                   **self.handler.mark_read(req.get("ids", []))})

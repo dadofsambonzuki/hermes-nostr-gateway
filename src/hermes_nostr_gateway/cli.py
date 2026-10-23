@@ -70,7 +70,7 @@ def build(cfg: dict[str, Any]) -> tuple[SdkCrypto, Store, Policy, Nip17Plane]:
     crypto = SdkCrypto(secret_from(cfg))
     store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
     store_path.parent.mkdir(parents=True, exist_ok=True)
-    store = Store(store_path)
+    store = Store(store_path, identity=crypto.our_pubkey())
     policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
                      "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit")})
     return crypto, store, policy, Nip17Plane(crypto, store, policy)

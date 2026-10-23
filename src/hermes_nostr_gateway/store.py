@@ -3,6 +3,10 @@
 Dedupe keys on the *rumor* id, not the wrapper: the same message arrives once per relay
 with a different wrapper id each time, so wrapper-level dedupe misses duplicates across
 relays (Hal's finding, spec §14).
+
+v1 is one identity per process. ``rumors`` therefore carries no identity column; the
+``delivery_cursor`` row is keyed by the local npub so digest tables remain ready for a
+multi-identity daemon later. See ``docs/digest-cursor.md``.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,7 +82,51 @@ CREATE TABLE IF NOT EXISTS concord_invites (
     bundle       TEXT NOT NULL,
     received_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS delivery_cursor (
+    identity   TEXT PRIMARY KEY,
+    next_rumor INTEGER NOT NULL DEFAULT 1,
+    next_frame INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS digest_rules (
+    identity      TEXT NOT NULL,
+    rule          TEXT NOT NULL,
+    interval_s    INTEGER NOT NULL,
+    window_start  INTEGER NOT NULL,
+    last_batch_at INTEGER,
+    acked_frame   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (identity, rule)
+);
+
+CREATE TABLE IF NOT EXISTS digests (
+    id            TEXT PRIMARY KEY,
+    identity      TEXT NOT NULL,
+    frame_seq     INTEGER NOT NULL,
+    rule          TEXT NOT NULL,
+    plane         TEXT NOT NULL,
+    window_start  INTEGER NOT NULL,
+    window_end    INTEGER NOT NULL,
+    cursor_start  INTEGER NOT NULL,
+    cursor_end    INTEGER NOT NULL,
+    item_count    INTEGER NOT NULL,
+    delivered_count INTEGER NOT NULL,
+    dropped_count INTEGER NOT NULL,
+    top_ids       TEXT NOT NULL DEFAULT '[]',
+    created_at    INTEGER NOT NULL,
+    acked_at      INTEGER,
+    UNIQUE(identity, rule, window_start),
+    UNIQUE(identity, frame_seq)
+);
+CREATE INDEX IF NOT EXISTS digests_replay ON digests (identity, frame_seq);
 """
+
+_RUMOR_COLUMNS = {
+    "cursor": "INTEGER",
+    "digest_rule": "TEXT",
+    "digest_state": "TEXT",
+    "digest_batch": "TEXT",
+}
 
 
 @dataclass
@@ -96,6 +145,11 @@ class Inbound:
     rule: str = ""
     why: str = ""
     blocked_reason: str | None = None
+    interval_s: int | None = None
+    cursor: int | None = None
+    digest_rule: str | None = None
+    digest_state: str | None = None
+    digest_batch: str | None = None
 
     def to_frame(self) -> dict[str, Any]:
         frame = {
@@ -114,11 +168,13 @@ class Inbound:
         }
         if self.blocked_reason:
             frame["blocked_reason"] = self.blocked_reason
+        if self.cursor is not None:
+            frame["cursor"] = self.cursor
         return frame
 
 
 class Store:
-    def __init__(self, path: str | Path = "gateway.db"):
+    def __init__(self, path: str | Path = "gateway.db", *, identity: str = ""):
         self.path = str(path)
         # A store that did not exist a moment ago owns no undelivered history: any
         # pending rows it is given were answered by whoever held the messages before
@@ -126,6 +182,7 @@ class Store:
         # restart of an existing store must still replay a message that crashed
         # mid-delivery.
         fresh = not Path(self.path).exists()
+        self.identity = identity
         self.db = sqlite3.connect(self.path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -134,11 +191,46 @@ class Store:
         if fresh:
             self.set_replay_floor()
 
+    # -- schema migration -----------------------------------------------
     def _migrate(self) -> None:
-        """Add columns a live store predates; `CREATE TABLE IF NOT EXISTS` won't."""
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(rumors)")}
-        if "blocked_reason" not in columns:
+        cols = {row["name"] for row in self.db.execute("PRAGMA table_info(rumors)")}
+        if "blocked_reason" not in cols:
             self.db.execute("ALTER TABLE rumors ADD COLUMN blocked_reason TEXT")
+        for name, kind in _RUMOR_COLUMNS.items():
+            if name not in cols:
+                self.db.execute(f"ALTER TABLE rumors ADD COLUMN {name} {kind}")
+
+        self.db.execute(
+            "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
+        )
+        row = self.db.execute(
+            "SELECT next_rumor, next_frame FROM delivery_cursor WHERE identity = ?",
+            (self.identity,),
+        ).fetchone()
+        max_row = self.db.execute(
+            "SELECT COALESCE(MAX(cursor), 0) AS m FROM rumors"
+        ).fetchone()
+        next_rumor = max(int(row["next_rumor"]), int(max_row["m"]) + 1)
+
+        rows = self.db.execute(
+            "SELECT id FROM rumors WHERE cursor IS NULL ORDER BY received_at, id"
+        ).fetchall()
+        for item in rows:
+            self.db.execute(
+                "UPDATE rumors SET cursor = ? WHERE id = ?", (next_rumor, item["id"])
+            )
+            next_rumor += 1
+        if rows or int(row["next_rumor"]) != next_rumor:
+            self.db.execute(
+                "UPDATE delivery_cursor SET next_rumor = ? WHERE identity = ?",
+                (next_rumor, self.identity),
+            )
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS rumors_cursor ON rumors (cursor)")
+
+    def _ensure_cursor(self) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
+        )
 
     # -- wrappers (transport level) -------------------------------------
     def wrapper_seen(self, wrapper_id: str, relay: str = "") -> bool:
@@ -187,34 +279,78 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- rumors (application level) -------------------------------------
-    def add(self, msg: Inbound) -> bool:
-        # A sender may write the same text over NIP-17 and NIP-04; ids differ per plane,
-        # so also dedupe on (sender, created_at, content). Without this the agent sees
-        # the same message twice.
-        if msg.authority != "self":
-            row = self.db.execute(
-                "SELECT id FROM rumors WHERE sender = ? AND created_at BETWEEN ? AND ? "
-                "AND content = ? LIMIT 1",
-                (msg.sender, msg.created_at - 2, msg.created_at + 2, msg.content),
-            ).fetchone()
-            if row is not None:
-                return False
+    def add(self, msg: Inbound, *, now: int | None = None) -> bool:
+        """Insert a rumor and assign its cursor in one transaction.
+
+        A sender may write the same text over NIP-17 and NIP-04; ids differ per plane,
+        so also dedupe on (sender, created_at, content). A duplicate rolls the cursor
+        allocation back, so the sequence stays contiguous.
+        """
+        stamp = int(time.time()) if now is None else int(now)
+        digest_rule = msg.rule if msg.reach in ("digest", "drop") and msg.rule else None
+        digest_state = None
+        if msg.reach == "digest":
+            digest_state = "queued"
+        elif msg.reach == "drop" and msg.interval_s is not None:
+            digest_state = "dropped"
+
+        self.db.execute("BEGIN IMMEDIATE")
         try:
+            if msg.authority != "self":
+                row = self.db.execute(
+                    "SELECT id FROM rumors WHERE sender = ? AND created_at BETWEEN ? AND ? "
+                    "AND content = ? LIMIT 1",
+                    (msg.sender, msg.created_at - 2, msg.created_at + 2, msg.content),
+                ).fetchone()
+                if row is not None:
+                    self.db.execute("ROLLBACK")
+                    return False
+            self._ensure_cursor()
+            row = self.db.execute(
+                "SELECT next_rumor FROM delivery_cursor WHERE identity = ?",
+                (self.identity,),
+            ).fetchone()
+            cursor = int(row["next_rumor"])
             self.db.execute(
                 "INSERT INTO rumors (id, wrapper_id, sender, kind, created_at, conversation,"
                 " content, reply_to, plane, reach, authority, rule, why, received_at,"
-                " blocked_reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cursor, digest_rule, digest_state, digest_batch, blocked_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
                     msg.conversation, msg.content, msg.reply_to, msg.plane,
-                    msg.reach, msg.authority, msg.rule, msg.why, int(time.time()),
-                    msg.blocked_reason,
+                    msg.reach, msg.authority, msg.rule, msg.why, stamp,
+                    cursor, digest_rule, digest_state, None, msg.blocked_reason,
                 ),
             )
-            return True
+            self.db.execute(
+                "UPDATE delivery_cursor SET next_rumor = ? WHERE identity = ?",
+                (cursor + 1, self.identity),
+            )
+            if digest_rule and (msg.reach == "digest" or digest_state == "dropped"):
+                self._ensure_digest_rule(digest_rule, int(msg.interval_s or 900), stamp)
+            self.db.execute("COMMIT")
         except sqlite3.IntegrityError:
+            self.db.execute("ROLLBACK")
             return False
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+        msg.cursor = cursor
+        msg.digest_rule = digest_rule
+        msg.digest_state = digest_state
+        return True
+
+    def _ensure_digest_rule(self, rule: str, interval_s: int, now: int) -> None:
+        interval_s = max(1, int(interval_s))
+        window_start = (now // interval_s) * interval_s
+        self.db.execute(
+            "INSERT INTO digest_rules (identity, rule, interval_s, window_start)"
+            " VALUES (?,?,?,?) ON CONFLICT(identity, rule) DO UPDATE SET"
+            " interval_s = excluded.interval_s",
+            (self.identity, rule, interval_s, window_start),
+        )
 
     def mark_delivered(self, ids: list[str]) -> None:
         self.db.executemany(
@@ -341,6 +477,191 @@ class Store:
         return {"total": row["total"], "pending": row["pending"] or 0,
                 "blocked": row["blocked"] or 0,
                 "invites": invites["n"], "relays": self.relay_report()}
+
+    # -- digests --------------------------------------------------------
+    def seal_digests(self, now: int | float | None = None, *, top_n: int = 5) -> list[dict[str, Any]]:
+        """Seal every due rule window, oldest first, and return the digest frames."""
+        stamp = int(time.time()) if now is None else int(now)
+        due = self.db.execute(
+            "SELECT * FROM digest_rules WHERE identity = ? AND window_start + interval_s <= ?"
+            " ORDER BY window_start ASC, rule ASC",
+            (self.identity, stamp),
+        ).fetchall()
+        frames: list[dict[str, Any]] = []
+        for rule_row in due:
+            rule = str(rule_row["rule"])
+            interval = max(1, int(rule_row["interval_s"]))
+            window_start = int(rule_row["window_start"])
+            guard = 0
+            while window_start + interval <= stamp and guard < 1000:
+                window_end = window_start + interval
+                rows = self.db.execute(
+                    "SELECT * FROM rumors WHERE digest_rule = ? AND digest_state IN"
+                    " ('queued','dropped') AND received_at >= ? AND received_at < ?"
+                    " ORDER BY cursor ASC",
+                    (rule, window_start, window_end),
+                ).fetchall()
+                queued = [r for r in rows if r["digest_state"] == "queued"]
+                dropped = [r for r in rows if r["digest_state"] == "dropped"]
+
+                if queued:
+                    digest_id = uuid.uuid4().hex
+                    frame_seq = self._next_frame()
+                    ordered = sorted(
+                        queued, key=lambda r: (int(r["created_at"]), int(r["cursor"])),
+                        reverse=True,
+                    )
+                    top_ids = [str(r["id"]) for r in ordered[:top_n]]
+                    planes = {str(r["plane"]) for r in queued}
+                    plane = planes.pop() if len(planes) == 1 else "mixed"
+                    cursor_start = int(rows[0]["cursor"])
+                    cursor_end = int(rows[-1]["cursor"])
+                    self.db.execute(
+                        "INSERT INTO digests (id, identity, frame_seq, rule, plane,"
+                        " window_start, window_end, cursor_start, cursor_end, item_count,"
+                        " delivered_count, dropped_count, top_ids, created_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            digest_id, self.identity, frame_seq, rule, plane,
+                            window_start, window_end, cursor_start, cursor_end,
+                            len(rows), len(top_ids), len(dropped),
+                            json.dumps(top_ids), stamp,
+                        ),
+                    )
+                    self.db.execute(
+                        "UPDATE rumors SET digest_state = 'batched', digest_batch = ?"
+                        " WHERE digest_rule = ? AND digest_state = 'queued'"
+                        " AND received_at >= ? AND received_at < ?",
+                        (digest_id, rule, window_start, window_end),
+                    )
+                    # Dropped rows share the batch id so the cursor range stays auditable,
+                    # but keep their state: they were never delivered.
+                    self.db.execute(
+                        "UPDATE rumors SET digest_batch = ? WHERE digest_rule = ?"
+                        " AND digest_state = 'dropped' AND received_at >= ? AND received_at < ?",
+                        (digest_id, rule, window_start, window_end),
+                    )
+                    frames.append(self.digest_frame(digest_id))
+                elif dropped:
+                    # Nothing to send; leave dropped rows without a batch. Cursor range
+                    # remains contiguous on the next real batch.
+                    pass
+
+                self.db.execute(
+                    "UPDATE digest_rules SET window_start = ?, last_batch_at = ?"
+                    " WHERE identity = ? AND rule = ?",
+                    (window_end, stamp, self.identity, rule),
+                )
+                window_start = window_end
+                guard += 1
+
+                if not rows:
+                    pending = self.db.execute(
+                        "SELECT MIN(received_at) AS first FROM rumors WHERE digest_rule = ?"
+                        " AND digest_state IN ('queued','dropped')",
+                        (rule,),
+                    ).fetchone()
+                    if pending and pending["first"] is not None:
+                        first = int(pending["first"])
+                        candidate = (first // interval) * interval
+                        if candidate > window_start:
+                            self.db.execute(
+                                "UPDATE digest_rules SET window_start = ?"
+                                " WHERE identity = ? AND rule = ?",
+                                (candidate, self.identity, rule),
+                            )
+                            window_start = candidate
+                    else:
+                        candidate = (stamp // interval) * interval
+                        if candidate > window_start:
+                            self.db.execute(
+                                "UPDATE digest_rules SET window_start = ?"
+                                " WHERE identity = ? AND rule = ?",
+                                (candidate, self.identity, rule),
+                            )
+                        break
+        return frames
+
+    def _next_frame(self) -> int:
+        self._ensure_cursor()
+        row = self.db.execute(
+            "SELECT next_frame FROM delivery_cursor WHERE identity = ?", (self.identity,)
+        ).fetchone()
+        frame = int(row["next_frame"])
+        self.db.execute(
+            "UPDATE delivery_cursor SET next_frame = ? WHERE identity = ?",
+            (frame + 1, self.identity),
+        )
+        return frame
+
+    def digest_frame(self, digest_id: str) -> dict[str, Any]:
+        row = self.db.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+        if row is None:
+            raise KeyError(digest_id)
+        items = self.db.execute(
+            "SELECT * FROM rumors WHERE digest_batch = ? ORDER BY cursor ASC", (digest_id,)
+        ).fetchall()
+        by_id = {str(r["id"]): r for r in items}
+        top_ids = json.loads(row["top_ids"])
+        return {
+            "type": "digest",
+            "frame": int(row["frame_seq"]),
+            "identity": row["identity"],
+            "rule": row["rule"],
+            "plane": row["plane"],
+            "window_start": int(row["window_start"]),
+            "window_end": int(row["window_end"]),
+            "count": int(row["item_count"]),
+            "delivered": int(row["delivered_count"]),
+            "dropped": int(row["dropped_count"]),
+            "cursor_start": int(row["cursor_start"]),
+            "cursor_end": int(row["cursor_end"]),
+            "items": [
+                {
+                    "rumor_id": str(r["id"]),
+                    "from": r["sender"],
+                    "created_at": int(r["created_at"]),
+                    "authority": r["authority"],
+                    "why": r["why"],
+                    "snippet": (r["content"] or "")[:256],
+                }
+                for r in (by_id.get(i) for i in top_ids) if r is not None
+            ],
+            "truncated": int(row["delivered_count"]) < int(row["item_count"]),
+        }
+
+    def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT id FROM digests WHERE identity = ? AND frame_seq > ? AND acked_at IS NULL"
+            " ORDER BY frame_seq ASC",
+            (self.identity, int(since_frame)),
+        ).fetchall()
+        return [self.digest_frame(r["id"]) for r in rows]
+
+    def ack_digest(self, rule: str, frame: int) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM digests WHERE identity = ? AND rule = ? AND frame_seq <= ?"
+            " ORDER BY frame_seq DESC LIMIT 1",
+            (self.identity, rule, int(frame)),
+        ).fetchone()
+        if row is None:
+            return {"rule": rule, "frame": frame, "acked": 0}
+        now = int(time.time())
+        self.db.execute(
+            "UPDATE digest_rules SET acked_frame = MAX(acked_frame, ?)"
+            " WHERE identity = ? AND rule = ?",
+            (int(frame), self.identity, rule),
+        )
+        cur = self.db.execute(
+            "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?) WHERE digest_batch = ?",
+            (now, row["id"]),
+        )
+        self.db.execute(
+            "UPDATE digests SET acked_at = COALESCE(acked_at, ?)"
+            " WHERE identity = ? AND rule = ? AND frame_seq <= ?",
+            (now, self.identity, rule, int(frame)),
+        )
+        return {"rule": rule, "frame": int(frame), "acked": cur.rowcount}
 
     def close(self) -> None:
         self.db.close()
