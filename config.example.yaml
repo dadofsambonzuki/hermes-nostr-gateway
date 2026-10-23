@@ -23,6 +23,13 @@ relays:
 
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
 
+# Public feeds. Without rules, kind-1 events other than mentions are ignored.
+feeds:
+  - name: example-watch
+    authors: []          # hex pubkeys to follow
+    keywords: []         # case-insensitive substrings
+    hashtags: []         # without the leading '#'
+
 groups:
   family: []
   team: []
@@ -31,6 +38,10 @@ groups:
 policies:
   - name: family-dms
     match: {group: family, kinds: [14, 1059], dm: true}
+    reach: immediate
+    authority: instructions
+  - name: family-mentions
+    match: {group: family, kinds: [1], mention: true}
     reach: immediate
     authority: instructions
   - name: hal-dms

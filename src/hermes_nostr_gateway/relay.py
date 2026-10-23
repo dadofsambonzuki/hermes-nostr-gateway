@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 from typing import Awaitable, Callable
 
@@ -19,11 +20,16 @@ Handler = Callable[[str, dict], Awaitable[None] | None]
 class RelayWorker:
     """A `nak req` subscription for one relay, restarted with backoff if it dies."""
 
-    def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,), auth: bool = True):
+    def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
+                 authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True):
         self.relay = relay
         self.me = me
         self.kinds = kinds
+        self.authors = authors
+        self.p_tag = p_tag
         self.auth = auth
+        if not me:
+            raise ValueError("RelayWorker needs an identity; refusing an unfiltered subscription")
         self.nak = shutil.which("nak") or "nak"
         self.events = 0
         self.last_error: str | None = None
@@ -35,17 +41,29 @@ class RelayWorker:
             args.append("--auth")
         for kind in self.kinds:
             args += ["-k", str(kind)]
-        args += ["-p", self.me, self.relay]
+        if self.p_tag:
+            args += ["-p", self.p_tag]
+        for author in self.authors:
+            args += ["-a", author]
+        args.append(self.relay)
         return args
 
     async def run(self, on_event: Handler) -> None:
         backoff = 2
+        log = logging.getLogger("hng.relay")
         while not self._stop.is_set():
-            proc = await asyncio.create_subprocess_exec(
-                *self._args(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *self._args(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except Exception as exc:  # noqa: BLE001 - log, back off, retry
+                self.last_error = f"spawn failed: {exc}"
+                log.exception("cannot spawn nak for %s", self.relay)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
             try:
                 assert proc.stdout is not None
                 async for raw in proc.stdout:

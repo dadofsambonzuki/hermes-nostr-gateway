@@ -62,7 +62,18 @@ class NakCrypto:
     # -- interface ------------------------------------------------------
     def our_pubkey(self) -> str:
         if self._pubkey is None:
-            self._pubkey = self._run(["key", "public"]).strip()
+            # Prefer the bindings: nak's `key public` returned empty stdout under some
+            # environments, and an empty identity silently widens every relay filter.
+            try:
+                import nostr_sdk
+
+                self._pubkey = nostr_sdk.Keys.parse(self._secret).public_key().to_hex()
+            except Exception:  # noqa: BLE001 - fall back to nak
+                self._pubkey = self._run(["key", "public"]).strip()
+            if not self._pubkey or len(self._pubkey) != 64:
+                raise CryptoError(
+                    f"cannot derive a pubkey from the configured secret (got {self._pubkey!r})"
+                )
         return self._pubkey
 
     def build_rumor(self, content: str, peer: str, reply_to: str | None = None) -> dict:

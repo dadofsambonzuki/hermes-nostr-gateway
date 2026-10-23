@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .crypto import NakCrypto
+from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .publisher import publish
@@ -42,6 +43,7 @@ class Gateway:
             "defaults": cfg.get("defaults"),
         })
         self.plane = Nip17Plane(self.crypto, self.store, self.policy)
+        self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
         self.relays_read = list(cfg["relays"]["read"])
         self.relays_publish = list(cfg["relays"].get("publish", []))
         self.socket_path = Path(socket_path) if socket_path else Path(
@@ -56,15 +58,29 @@ class Gateway:
     async def start(self) -> None:
         await self.server.start()
         for relay in self.relays_read:
-            worker = RelayWorker(relay, self.me)
+            # DMs: gift wraps addressed to us.
+            worker = RelayWorker(relay, self.me, kinds=(1059,), p_tag=self.me)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
+            # Mentions: kind 1 events that p-tag us.
+            mention = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me)
+            self.workers.append(mention)
+            self._tasks.append(asyncio.create_task(self._guarded(mention)))
+            # Watched feeds: kind 1 from configured authors, if any.
+            if self.nip01.authors:
+                feed = RelayWorker(relay, self.me, kinds=(1,), authors=tuple(self.nip01.authors))
+                self.workers.append(feed)
+                self._tasks.append(asyncio.create_task(self._guarded(feed)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
 
     async def _guarded(self, worker: RelayWorker) -> None:
         try:
             await worker.run(self._on_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one relay must not take the daemon down
+            log.exception("relay worker %s died", worker.relay)
         finally:
             self.store.note_relay(worker.relay, error=worker.last_error)
 
@@ -84,7 +100,10 @@ class Gateway:
 
     # -- inbound --------------------------------------------------------
     def _on_event(self, relay: str, event: dict) -> None:
-        msg = self.plane.handle(relay, event)
+        if event.get("kind") == 1059:
+            msg = self.plane.handle(relay, event)
+        else:
+            msg = self.nip01.handle(relay, event)
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
@@ -193,10 +212,16 @@ class Gateway:
             "identity": self.me,
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
+            "planes": ["nip17", "nip01"],
             "relays_publish": self.relays_publish,
             "rumors": stats["total"],
             "pending": stats["pending"],
             "relay_stats": stats["relays"],
+            "workers": [
+                {"relay": w.relay, "kinds": list(w.kinds), "p_tag": bool(w.p_tag),
+                 "authors": len(w.authors), "events": w.events, "last_error": w.last_error}
+                for w in self.workers
+            ],
             "uptime_s": None,
         }
 
