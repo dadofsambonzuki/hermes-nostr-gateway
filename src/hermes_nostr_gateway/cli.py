@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from .crypto import NakCrypto
+from .crypto import SdkCrypto
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .relay import OneShot, RelayWorker
@@ -56,7 +56,7 @@ def normalise_groups(cfg: dict[str, Any]) -> dict[str, Any]:
             for name, members in groups.items()}
 
 def build(cfg: dict[str, Any]) -> tuple[NakCrypto, Store, Policy, Nip17Plane]:
-    crypto = NakCrypto(secret_from(cfg))
+    crypto = SdkCrypto(secret_from(cfg))
     store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store = Store(store_path)
