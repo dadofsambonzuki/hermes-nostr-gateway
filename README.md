@@ -65,3 +65,10 @@ needs his client pointed at these relays (kind 10050) and is the phase 0 accepta
 
 Same npub as Holly's White Noise identity (one Holly); our own relays
 (`wss://relay.day.ag/chat`, `/inbox`); allowlist = Nathan, plus Sam once we have his npub.
+
+## Design target
+
+The v1 gateway shape — local socket API, relay policy, trust model, acceptance tests — is
+specified in [`docs/gateway-spec.md`](docs/gateway-spec.md). The phase-0 wrapper here is the
+protocol conformance reference (its recorded traps are encoded in §4/§9 of the spec); phase 1
+is the daemon described there, not an extension of this script.
