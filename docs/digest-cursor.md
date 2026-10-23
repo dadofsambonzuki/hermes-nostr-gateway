@@ -1,6 +1,6 @@
-# Digest batching: cursor schema (design only, rev 2)
+# Digest batching: cursor schema (rev 2)
 
-Status: proposal for review. No code in this PR.
+Status: approved schema; implementation is in this PR (commit `8279285`).
 
 Scope: §17 `reach: digest(interval)` for `nip01` and `nip17`, and the §5 `ack` /
 `subscribe(since_frame)` contract. Immediate messages keep their existing id-based ack.
