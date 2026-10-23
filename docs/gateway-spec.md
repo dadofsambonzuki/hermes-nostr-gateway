@@ -191,25 +191,41 @@ and risk a duplicate in the peer's client.
 
 ---
 
-## 8. Rust implementation map
+## 8. Python implementation map
 
-| Concern | Crate |
+**Language decision (2026-10-23): Python 3.11+ on rust-nostr's official bindings**, not a Rust
+core. `nostr-sdk` 0.45.1 ships wheels for py>=3.9, so the Rust implementation's protocol coverage
+(NIP-44, NIP-59, NIP-42, subscriptions, signing) is available behind a Python API, and Hermes
+contributors need one toolchain rather than two. `pynostr` (0.7.0, one wheel, unmaintained) is
+not a candidate.
+
+Consequence for the seed: the BitFest plugin is Python, so §18 is a **Python extraction, not a
+port**. Anything in this table that reads Rust-is, read it as "the binding does this for us".
+
+| Concern | Choice |
 |---|---|
-| Relays, signing, NIP-44/59, NIP-92 | `nostr-sdk` (`nostr` re-exports nip59) |
-| Runtime | `tokio` (multi-thread; `UnixListener` for the socket) |
-| Storage | `rusqlite` (bundled) |
-| Socket codec | `serde` / `serde_json`, newline framing |
-| Blossom | `reqwest` (rustls), `sha2` |
-| MIME sniffing | `infer` |
-| CLI / logging | `clap`, `tracing` + `tracing-subscriber` |
-| Config | `serde` + `figment` (file + env precedence) |
+| Relays, signing, NIP-44/59, NIP-42, subscriptions | `nostr-sdk` 0.45.1 (official rust-nostr bindings) |
+| Runtime | `asyncio`; `asyncio.start_unix_server` for the socket |
+| Storage | `sqlite3` (stdlib), WAL, one writer task — no ORM |
+| Socket codec | `json` stdlib, newline framing (NDJSON) |
+| Blossom | `httpx` + `hashlib` |
+| MIME sniffing | `puremagic` |
+| CLI / logging | `argparse`; `structlog` (JSON lines) |
+| Config / validation | `PyYAML` + `pydantic` |
+| Tests | `pytest` + `pytest-asyncio`; probes as fixtures |
+| Packaging | `pyproject.toml` (hatchling), `uv` for dev, one console script |
 
-Modules: `identity/`, `transport/{nip17,nip04}.rs`, `relay/` (pool, auth, discovery),
-`store/`, `media/`, `api/` (socket), `policy/` (allowlist, rate limits, dedupe), `bin/`.
-One crate, one binary, no network listener — wn-agent's operational shape.
+Modules mirror §18: `src/planes/{crypto,nip17,nip04,nip01,concord,marmot}.py`,
+`src/relay/pool.py`, `src/store/`, `src/media/`, `src/api/socket.py`, `src/policy/`,
+`src/adapter/` (the thin Hermes-facing part). One package, one process, no network listener —
+wn-agent's operational shape.
 
-**Milestones:** M1 identity + NIP-17 text + allowlist + socket (the family case); M2 NIP-04;
-M3 media; M4 reactions; M5 docs, container, CI, conformance suite.
+If a real binding gap appears (not a hypothetical one — no spike first), the fallback is a thin
+Rust helper crate for exactly those calls, not a rewrite of the daemon.
+
+**Milestones:** M1 identity + NIP-17 text + policy/allowlist + socket (the family case);
+M2 NIP-04; M3 media + reactions; M4 Concord; M5 Marmot proxy; M6 kind-1 feeds and mentions
+(policy engine already in M1); M7 docs, container, CI, conformance suite.
 
 ---
 

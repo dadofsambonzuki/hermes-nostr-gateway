@@ -6,7 +6,10 @@
   "relays": {
     "publish": [
       "wss://relay.day.ag/chat",
-      "wss://relay.day.ag/inbox"
+      "wss://relay.day.ag/inbox",
+      "wss://nos.lol",
+      "wss://relay.damus.io",
+      "wss://relay.primal.net"
     ],
     "read": [
       "wss://relay.day.ag/chat",
