@@ -230,6 +230,33 @@ def cmd_policy_test(args) -> int:
     return 0
 
 
+
+def cmd_serve(args) -> int:
+    import logging
+    import signal
+
+    from .gateway import Gateway
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    cfg = load_config(args.config)
+    gw = Gateway(cfg, socket_path=args.socket)
+
+    async def run() -> None:
+        await gw.start()
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:  # pragma: no cover
+                pass
+        await stop.wait()
+        await gw.stop()
+
+    asyncio.run(run())
+    return 0
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hng", description="Hermes Nostr Gateway")
     parser.add_argument("--config", help="path to config.yaml")
@@ -250,6 +277,10 @@ def main(argv: list[str] | None = None) -> int:
     p_send.set_defaults(func=cmd_send)
 
     sub.add_parser("status", help="identity, store and relay health").set_defaults(func=cmd_status)
+
+    p_serve = sub.add_parser("serve", help="run the gateway daemon (socket + relays)")
+    p_serve.add_argument("--socket", default=None, help="socket path override")
+    p_serve.set_defaults(func=cmd_serve)
 
     p_recent = sub.add_parser("recent", help="recent messages")
     p_recent.add_argument("-n", "--number", type=int, default=20)

@@ -1,0 +1,28 @@
+[Unit]
+Description=Hermes Nostr Gateway (NIP-17 plane)
+Documentation=https://github.com/nostr-protocol/nips
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/hermes-nostr-gateway
+Environment=HOME=/home/ubuntu
+Environment=PYTHONPATH=/home/ubuntu/Projects/hermes-nostr-gateway/src
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng serve
+Restart=always
+RestartSec=5
+# The socket is 0600 and local-only; there is no network listener.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.local/state/hermes-nostr-gateway
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

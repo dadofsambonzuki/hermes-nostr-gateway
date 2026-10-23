@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS wrappers (
     seen_at    INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS outbound_wraps (
+    id          TEXT NOT NULL,
+    relay       TEXT NOT NULL,
+    event       TEXT NOT NULL,
+    rumor_id    TEXT NOT NULL,
+    recipient   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    last_attempt INTEGER,
+    PRIMARY KEY (id, relay)
+);
+CREATE INDEX IF NOT EXISTS wraps_pending ON outbound_wraps (status);
+
 CREATE TABLE IF NOT EXISTS relay_stats (
     relay      TEXT PRIMARY KEY,
     events     INTEGER NOT NULL DEFAULT 0,
@@ -111,6 +125,30 @@ class Store:
 
     def relay_report(self) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM relay_stats ORDER BY relay").fetchall()
+        return [dict(r) for r in rows]
+
+    # -- outbound wraps (retry uses the same signed event) ---------------
+    def record_wrap(self, event: dict, rumor_id: str, recipient: str, relays: list[str]) -> None:
+        for relay in relays:
+            self.db.execute(
+                "INSERT INTO outbound_wraps (id, relay, event, rumor_id, recipient) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(id, relay) DO NOTHING",
+                (event["id"], relay, json.dumps(event), rumor_id, recipient),
+            )
+
+    def mark_wrap(self, wrap_id: str, relay: str, *, ok: bool, error: str | None = None) -> None:
+        self.db.execute(
+            "UPDATE outbound_wraps SET status = ?, attempts = attempts + 1, last_attempt = ?,"
+            " last_error = ? WHERE id = ? AND relay = ?",
+            ("sent" if ok else "failed", int(time.time()), error, wrap_id, relay),
+        )
+
+    def pending_wraps(self, max_attempts: int = 6) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM outbound_wraps WHERE status != 'sent' AND attempts < ? "
+            "ORDER BY attempts, last_attempt IS NULL DESC",
+            (max_attempts,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     # -- rumors (application level) -------------------------------------
