@@ -11,8 +11,11 @@ which — it reads one normalised event stream.
 ## Status
 
 - **Design: approved.** The authoritative spec is [`docs/gateway-spec.md`](docs/gateway-spec.md).
-- **Code: M1 starting.** Seed material is BitFest's existing Hermes `nostr` plugin, being extracted
-  rather than rewritten (see spec §18).
+- **M1 running**: the gateway is a systemd service (`deploy/`), speaking NDJSON over a 0600 Unix
+  socket, with the policy engine, rumor store, relay workers and NIP-17 plane in place.
+- **Hermes plugin**: `integrations/hermes-plugin/` — a platform adapter that turns socket frames
+  into MessageEvents and replies into `send` ops. It maps the gateway's `authority` onto
+  `source.role_authorized`, so untrusted senders reach the agent as data, never as instructions.
 - Prior art and the live-testing handover this design leans on: [`docs/prior-art/`](docs/prior-art/).
 
 ## Shape

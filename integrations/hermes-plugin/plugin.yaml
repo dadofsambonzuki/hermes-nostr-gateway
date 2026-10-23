@@ -1,0 +1,36 @@
+manifest_version: 1
+name: nostr
+label: Nostr
+kind: platform
+version: 0.1.0
+description: Nostr DM platform adapter backed by the local Hermes Nostr Gateway socket
+author: day.ag
+api_version: 1
+requires_env: []
+optional_env:
+  - name: NOSTR_GATEWAY_SOCKET
+    description: "Unix socket exposed by hermes-nostr-gateway (defaults to ~/.local/state/hermes-nostr-gateway/gateway.sock)"
+    password: false
+  - name: NOSTR_HOME_CHANNEL
+    description: "Default Nostr peer pubkey (hex) for Hermes home and cron delivery"
+    password: false
+  - name: NOSTR_ALLOWED_USERS
+    description: "Comma-separated pubkeys allowed to message Hermes (advisory; the gateway policy is authoritative)"
+    password: false
+  - name: NOSTR_ALLOW_ALL_USERS
+    description: "When true, accept Nostr messages from any sender; the gateway still applies its own policy"
+    password: false
+license: MIT
+tags:
+  - nostr
+  - messaging
+  - dm
+config_schema:
+  socket_path:
+    type: string
+    default: ""
+    description: Unix socket exposed by hermes-nostr-gateway
+  home_channel:
+    type: string
+    default: ""
+    description: Default Nostr peer pubkey for home and cron delivery
