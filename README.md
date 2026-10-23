@@ -1,74 +1,52 @@
-# hermes-nostr-nip17 — phase 0 spike
+# Hermes Nostr Gateway
 
-A NIP-17 (private DM) wrapper for the Hermes gateway, built as leverage rather than a
-from-scratch gateway: `nak` (already installed) supplies NIP-44 + NIP-59 + relay I/O, and the
-Hermes side will be the catalog `bridge-adapter` plugin, which exchanges JSON files with a
-wrapper. This directory is the wrapper plus its tests.
+A Nostr transport hub for Hermes agents: one local socket, several protocol *planes*, and an
+attention policy that decides what is worth waking an agent for.
 
-## What exists now (phase 0)
+Hermes has no Nostr platform surface of its own. This project gives it one without pretending
+Nostr is a single protocol: DMs arrive over NIP-17 or legacy NIP-04, community traffic over
+Concord, group chat over Marmot, and public life over kind 1. The agent should not have to care
+which — it reads one normalised event stream.
 
-| Piece | State |
-|---|---|
-| `nip17_wrapper.py send <text> --to <hex>` | Works. Kind 14 rumor → kind 13 seal → kind 1059 wrap to the peer **and** to ourselves (NIP-17 self-copy), published per relay with per-relay results. |
-| `nip17_wrapper.py listen` | Works. Long-lived `nak req --stream` subscription for wraps addressed to our npub, unwrap, allowlist check, dedupe by rumor id, catch-up cursor, one JSON file per accepted message in `--inbox`. |
-| `spike_sim.py` | Throwaway-identity inbound simulator (tests the receive path without a second human). |
-| `spike_inbound_test.py` | End-to-end receive test: blocked branch and allowed branch, against a local `nak serve` relay. |
-| Gateway integration | **Not done** — that is phase 1 (`bridge-adapter` + registry manifest + systemd unit). |
+## Status
 
-## Run it
+- **Design: approved.** The authoritative spec is [`docs/gateway-spec.md`](docs/gateway-spec.md).
+- **Code: M1 starting.** Seed material is BitFest's existing Hermes `nostr` plugin, being extracted
+  rather than rewritten (see spec §18).
+- Prior art and the live-testing handover this design leans on: [`docs/prior-art/`](docs/prior-art/).
 
-```bash
-# outbound
-python3 nip17_wrapper.py send "hello" --to <peer hex pubkey>
+## Shape
 
-# inbound (long-running; writes inbox/<timestamp>-<id>.json)
-python3 nip17_wrapper.py listen --state ~/.nip17-wrapper/state.json --inbox ~/.nip17-wrapper/inbox
-
-# tests
-python3 spike_inbound_test.py          # starts its own local relay on :8777
+```
+agent runtime (Hermes plugin)
+        │  NDJSON over a Unix socket, 0600
+        ▼
+   hermes-nostr-gateway
+        ├── nip17   DMs: 1059 giftwrap → 13 seal → 14 rumor, media, reactions
+        ├── nip04   legacy DMs
+        ├── concord serverless E2EE communities (invites, chat, rekey)
+        ├── nip01   feeds and mentions, digested by policy
+        └── marmot  proxied to wn-agent — MLS stays theirs
 ```
 
-Config: `config.json` (identity + relays + `dm_policy` + `allow_from`). `--config` must precede
-the subcommand; `NIP17_CONFIG` overrides the path for a service unit. State defaults to
-`~/.nip17-wrapper/`.
+- **Split by protocol, never by app.** Armada, Amethyst, Damus and 0xChat all speak the NIPs; a
+  gateway written to one client bakes in its quirks.
+- **Reach and authority are separate.** A public bot can hear strangers without letting them
+  instruct it; see spec §17.
+- **Relay coverage is a correctness property.** Reading only the identity's `10050` misses DMs
+  that exist only on the sender's app relays — measured, not theorised (spec §3).
+- **The gateway never interprets content.** No fetching beyond configured Blossom servers, no
+  command parsing, no reply policy, no read receipts.
 
-## Pitfalls found the hard way (all four cost real debugging time)
+## Credits
 
-1. **`nak` writes status lines to stderr, only the event JSON to stdout.** Checking
-   `"success" in stdout` reports every successful publish as a failure. Ask for both streams.
-2. **`nak gift wrap` silently uses a NIP-4E decoupled key when it has one stored.** The wrap's
-   `p` tag then stops being the recipient's identity pubkey, and a standard NIP-17 client
-   (which subscribes on `#p = <their identity key>`) never sees the message. Always pass
-   `--use-our-identity-key --use-their-identity-key`, and assert the `p` tag before publishing.
-3. **Wrap timestamps are randomised up to two days into the past** (NIP-59, anti-timing). A
-   tight `since` filter — even 120 seconds — hides messages published seconds ago. Any
-   subscription window must exceed two days; the wrapper defaults to three.
-4. **`nak dekey list` is not read-only.** It generated and stored a decoupled key for our
-   identity and tried to publish a kind 10044 (the White Noise relays reject that kind). Do not
-   run it casually.
+- **Marmot / `wn-agent`** (`github.com/marmot-protocol/mdk`) — the agent-connector shape this
+  follows, and the Marmot plane itself.
+- **Armada** (soapbox.pub) — reference client for NIP-17 and Concord.
+- **Hal**, the BitFest bot (`npub19etsn3sn…`) — the relay-coverage finding and testing discipline
+  in [`docs/prior-art/hal-whitenoise-dm-handover.md`](docs/prior-art/hal-whitenoise-dm-handover.md).
+- The NIP authors, obviously.
 
-Also: our relay refuses writes from unlisted keys (`blocked: you must be in the web of trust`,
-`restricted: you must be whitelisted`), which is why the inbound tests use a local `nak serve`
-relay instead of a public one — testing our code, not a relay's spam policy.
+## Licence
 
-## What is proven, and what is not
-
-Proven: outbound wraps publish to both `relay.day.ag` paths with correct `p` tags and unwrap
-back to the original text; the live subscription catches a wrap within seconds of publication;
-history catch-up replays older wraps; own self-copies are recognised and not delivered; a
-non-allowlisted sender is blocked and an allowlisted one produces a well-formed inbox JSON.
-
-Not proven: a real message from Nathan's client in, and a reply landing in his client. That
-needs his client pointed at these relays (kind 10050) and is the phase 0 acceptance test.
-
-## Decisions locked in
-
-Same npub as Holly's White Noise identity (one Holly); our own relays
-(`wss://relay.day.ag/chat`, `/inbox`); allowlist = Nathan, plus Sam once we have his npub.
-
-## Design target
-
-The v1 gateway shape — local socket API, relay policy, trust model, acceptance tests — is
-specified in [`docs/gateway-spec.md`](docs/gateway-spec.md). The phase-0 wrapper here is the
-protocol conformance reference (its recorded traps are encoded in §4/§9 of the spec); phase 1
-is the daemon described there, not an extension of this script.
+MIT — see [`LICENSE`](LICENSE).
