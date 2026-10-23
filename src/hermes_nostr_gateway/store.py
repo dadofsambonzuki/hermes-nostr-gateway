@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -480,7 +479,13 @@ class Store:
 
     # -- digests --------------------------------------------------------
     def seal_digests(self, now: int | float | None = None, *, top_n: int = 5) -> list[dict[str, Any]]:
-        """Seal every due rule window, oldest first, and return the digest frames."""
+        """Seal every due rule window, oldest first, and return the digest frames.
+
+        Each window is one transaction. The digest id is deterministic for
+        ``(identity, rule, window_start)``, so a crash after the digest insert and before the
+        rumor update leaves a retry that completes the same batch instead of hitting the
+        unique constraint and wedging the rule forever.
+        """
         stamp = int(time.time()) if now is None else int(now)
         due = self.db.execute(
             "SELECT * FROM digest_rules WHERE identity = ? AND window_start + interval_s <= ?"
@@ -495,63 +500,77 @@ class Store:
             guard = 0
             while window_start + interval <= stamp and guard < 1000:
                 window_end = window_start + interval
-                rows = self.db.execute(
-                    "SELECT * FROM rumors WHERE digest_rule = ? AND digest_state IN"
-                    " ('queued','dropped') AND received_at >= ? AND received_at < ?"
-                    " ORDER BY cursor ASC",
-                    (rule, window_start, window_end),
-                ).fetchall()
-                queued = [r for r in rows if r["digest_state"] == "queued"]
-                dropped = [r for r in rows if r["digest_state"] == "dropped"]
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    rows = self.db.execute(
+                        "SELECT * FROM rumors WHERE digest_rule = ? AND digest_state IN"
+                        " ('queued','dropped') AND received_at >= ? AND received_at < ?"
+                        " ORDER BY cursor ASC",
+                        (rule, window_start, window_end),
+                    ).fetchall()
+                    queued = [r for r in rows if r["digest_state"] == "queued"]
+                    dropped = [r for r in rows if r["digest_state"] == "dropped"]
 
-                if queued:
-                    digest_id = uuid.uuid4().hex
-                    frame_seq = self._next_frame()
-                    ordered = sorted(
-                        queued, key=lambda r: (int(r["created_at"]), int(r["cursor"])),
-                        reverse=True,
-                    )
-                    top_ids = [str(r["id"]) for r in ordered[:top_n]]
-                    planes = {str(r["plane"]) for r in queued}
-                    plane = planes.pop() if len(planes) == 1 else "mixed"
-                    cursor_start = int(rows[0]["cursor"])
-                    cursor_end = int(rows[-1]["cursor"])
+                    digest_id: str | None = None
+                    if queued:
+                        existing = self.db.execute(
+                            "SELECT * FROM digests WHERE identity = ? AND rule = ?"
+                            " AND window_start = ?",
+                            (self.identity, rule, window_start),
+                        ).fetchone()
+                        if existing is not None:
+                            digest_id = str(existing["id"])
+                        else:
+                            digest_id = f"d:{self.identity}:{rule}:{window_start}"
+                            frame_seq = self._next_frame()
+                            ordered = sorted(
+                                queued, key=lambda r: (int(r["created_at"]), int(r["cursor"])),
+                                reverse=True,
+                            )
+                            top_ids = [str(r["id"]) for r in ordered[:top_n]]
+                            planes = {str(r["plane"]) for r in queued}
+                            plane = planes.pop() if len(planes) == 1 else "mixed"
+                            cursor_start = int(rows[0]["cursor"])
+                            cursor_end = int(rows[-1]["cursor"])
+                            self.db.execute(
+                                "INSERT INTO digests (id, identity, frame_seq, rule, plane,"
+                                " window_start, window_end, cursor_start, cursor_end, item_count,"
+                                " delivered_count, dropped_count, top_ids, created_at)"
+                                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    digest_id, self.identity, frame_seq, rule, plane,
+                                    window_start, window_end, cursor_start, cursor_end,
+                                    len(rows), len(top_ids), len(dropped),
+                                    json.dumps(top_ids), stamp,
+                                ),
+                            )
+                        self.db.execute(
+                            "UPDATE rumors SET digest_state = 'batched', digest_batch = ?"
+                            " WHERE digest_rule = ? AND digest_state = 'queued'"
+                            " AND received_at >= ? AND received_at < ?",
+                            (digest_id, rule, window_start, window_end),
+                        )
+                        # Dropped rows share the batch id so the cursor range stays auditable,
+                        # but keep their state: they were never delivered.
+                        self.db.execute(
+                            "UPDATE rumors SET digest_batch = ? WHERE digest_rule = ?"
+                            " AND digest_state = 'dropped' AND received_at >= ?"
+                            " AND received_at < ?",
+                            (digest_id, rule, window_start, window_end),
+                        )
+
                     self.db.execute(
-                        "INSERT INTO digests (id, identity, frame_seq, rule, plane,"
-                        " window_start, window_end, cursor_start, cursor_end, item_count,"
-                        " delivered_count, dropped_count, top_ids, created_at)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            digest_id, self.identity, frame_seq, rule, plane,
-                            window_start, window_end, cursor_start, cursor_end,
-                            len(rows), len(top_ids), len(dropped),
-                            json.dumps(top_ids), stamp,
-                        ),
+                        "UPDATE digest_rules SET window_start = ?, last_batch_at = ?"
+                        " WHERE identity = ? AND rule = ?",
+                        (window_end, stamp, self.identity, rule),
                     )
-                    self.db.execute(
-                        "UPDATE rumors SET digest_state = 'batched', digest_batch = ?"
-                        " WHERE digest_rule = ? AND digest_state = 'queued'"
-                        " AND received_at >= ? AND received_at < ?",
-                        (digest_id, rule, window_start, window_end),
-                    )
-                    # Dropped rows share the batch id so the cursor range stays auditable,
-                    # but keep their state: they were never delivered.
-                    self.db.execute(
-                        "UPDATE rumors SET digest_batch = ? WHERE digest_rule = ?"
-                        " AND digest_state = 'dropped' AND received_at >= ? AND received_at < ?",
-                        (digest_id, rule, window_start, window_end),
-                    )
+                    self.db.execute("COMMIT")
+                except Exception:
+                    self.db.execute("ROLLBACK")
+                    raise
+
+                if digest_id is not None:
                     frames.append(self.digest_frame(digest_id))
-                elif dropped:
-                    # Nothing to send; leave dropped rows without a batch. Cursor range
-                    # remains contiguous on the next real batch.
-                    pass
-
-                self.db.execute(
-                    "UPDATE digest_rules SET window_start = ?, last_batch_at = ?"
-                    " WHERE identity = ? AND rule = ?",
-                    (window_end, stamp, self.identity, rule),
-                )
                 window_start = window_end
                 guard += 1
 
@@ -627,7 +646,8 @@ class Store:
                 }
                 for r in (by_id.get(i) for i in top_ids) if r is not None
             ],
-            "truncated": int(row["delivered_count"]) < int(row["item_count"]),
+            "truncated": int(row["delivered_count"])
+            < int(row["item_count"]) - int(row["dropped_count"]),
         }
 
     def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]:
@@ -653,8 +673,10 @@ class Store:
             (int(frame), self.identity, rule),
         )
         cur = self.db.execute(
-            "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?) WHERE digest_batch = ?",
-            (now, row["id"]),
+            "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?)"
+            " WHERE digest_state = 'batched' AND digest_batch IN ("
+            " SELECT id FROM digests WHERE identity = ? AND rule = ? AND frame_seq <= ?)",
+            (now, self.identity, rule, int(frame)),
         )
         self.db.execute(
             "UPDATE digests SET acked_at = COALESCE(acked_at, ?)"
