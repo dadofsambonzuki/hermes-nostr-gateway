@@ -4,6 +4,11 @@ Reading [kinds: 1059, #p: me] from the identity's 10050 alone is not enough: DMs
 only on the sender's app relays (ditto, dreamith, whitenoise) and the gap is silent.
 So: N workers, per-relay counters, and a relay that stops delivering is reported rather
 than assumed healthy.
+
+A filter is all-or-nothing at the relay: a REQ naming a kind the relay refuses is closed
+whole (`kind not allowed: 4`), so one refused kind used to take a relay's 1059 DMs with
+it. One connection per relay is still right (connection limits), so the kind set is
+negotiated instead: read the refusal, drop that kind, resubscribe at once.
 """
 
 from __future__ import annotations
@@ -11,11 +16,34 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
 from typing import Awaitable, Callable
 
 Handler = Callable[[str, dict], Awaitable[None] | None]
+#: Called when a relay refuses a kind: (relay, dropped, what we now ask for, raw error).
+RefusalHandler = Callable[[str, "set[int]", tuple[int, ...], str | None], None]
+
+#: `CLOSED: ... kind not allowed: 4` (whitenoise), `kind 4 not allowed`, and the plural
+#: form. Only kind-specific refusals are acted on: dropping a kind changes what we read,
+#: so nothing else about a CLOSED frame is guessed at.
+_KIND_REFUSED = re.compile(
+    r"kinds?\s+(?:not\s+allowed\s*:\s*([0-9][0-9, ]*)|([0-9]+)\s+not\s+allowed)",
+    re.IGNORECASE,
+)
+
+
+def refused_kinds(text: str | None) -> set[int]:
+    """The kinds a relay's CLOSED/NOTICE named as not allowed."""
+    if not text:
+        return set()
+    found: set[int] = set()
+    for match in _KIND_REFUSED.finditer(text):
+        chunk = match.group(1) or match.group(2) or ""
+        found.update(int(number) for number in re.findall(r"\d+", chunk))
+    return found
+
 
 
 class RelayWorker:
@@ -23,9 +51,16 @@ class RelayWorker:
 
     def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
                  authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
-                 secret: str | None = None, since_days: int = 3):
+                 secret: str | None = None, since_days: int = 3, nak: str | None = None,
+                 on_refusal: RefusalHandler | None = None):
         self.relay = relay
-        self.kinds = kinds
+        # Requested vs refused vs active: config (or the caller) says what we want,
+        # the relay says what it accepts, and `kinds` is what the next REQ carries.
+        self.requested_kinds = tuple(dict.fromkeys(int(kind) for kind in kinds))
+        if not self.requested_kinds:
+            raise ValueError("RelayWorker needs at least one kind: an empty filter is a firehose")
+        self.refused: set[int] = set()
+        self.on_refusal = on_refusal
         self.authors = authors
         self.p_tag = p_tag
         self.auth = auth
@@ -40,17 +75,45 @@ class RelayWorker:
         if len(self.me) != 64:
             raise ValueError(
                 "RelayWorker needs a 64-hex identity; refusing an unfiltered subscription")
-        self.nak = shutil.which("nak") or "nak"
+        self.nak = nak or shutil.which("nak") or "nak"
         self.events = 0
         self.last_error: str | None = None
         self._stop = asyncio.Event()
 
+    @property
+    def kinds(self) -> tuple[int, ...]:
+        """What the subscription asks for now: requested minus what the relay refused."""
+        return tuple(kind for kind in self.requested_kinds if kind not in self.refused)
+
+    def note_refusals(self, text: str | None) -> set[int]:
+        """Learn from a relay's CLOSED text. Returns the kinds newly dropped.
+
+        Only kinds we actually asked for count: a relay complaining about some other
+        filter must not quietly narrow ours. The caller decides whether to resubscribe
+        or give up when nothing is left.
+        """
+        dropped = refused_kinds(text) & set(self.requested_kinds) - self.refused
+        if dropped:
+            self.refused |= dropped
+            logging.getLogger("hng.relay").warning(
+                "%s refuses kind(s) %s; resubscribing for %s",
+                self.relay, sorted(dropped), list(self.kinds) or "nothing")
+            if self.on_refusal is not None:
+                self.on_refusal(self.relay, dropped, self.kinds, self.last_error)
+        return dropped
+
     def _args(self) -> list[str]:
+        if not self.kinds:
+            # Belt and braces: run() stops before this, but a filters-less REQ is a
+            # firehose and must be impossible to construct by any path.
+            raise ValueError(
+                f"refusing to subscribe to {self.relay} with no kinds: that is a firehose")
         args = [self.nak, "req"]
         if self.auth:
             args.append("--auth")
         for kind in self.kinds:
             args += ["-k", str(kind)]
+
         if self.p_tag:
             args += ["-p", self.p_tag]
         # Only the recent window: without this every reconnect replays the relay's
@@ -85,6 +148,7 @@ class RelayWorker:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
+            err = ""
             try:
                 assert proc.stdout is not None
                 async for raw in proc.stdout:
@@ -107,6 +171,19 @@ class RelayWorker:
                     await proc.wait()
             if self._stop.is_set():
                 break
+            if self.note_refusals(err):
+                # A refused kind is a filter problem, not a transport problem: the REQ
+                # can never succeed as written, so resubscribe at once with what is
+                # left rather than backing off into a loop that always fails. Bounded
+                # by the number of kinds, so this cannot spin.
+                if not self.kinds:
+                    self.last_error = (
+                        f"relay refuses every kind we subscribed to "
+                        f"({list(self.requested_kinds)}): {err}"[:300])
+                    log.error("%s: %s", self.relay, self.last_error)
+                    break
+                backoff = 2
+                continue
             # A relay that answered 429 is rate-limiting us: backing off politely is the
             # fix, not retrying faster. Start at a minute and cap at ten.
             rate_limited = "429" in (self.last_error or "")

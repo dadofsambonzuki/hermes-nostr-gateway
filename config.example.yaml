@@ -7,6 +7,9 @@ identity:
 relays:
   # Read set = our 10050 inbox relays PLUS the sender's app relays. Reading only the
   # first list misses DMs that exist nowhere else, silently (spec §3).
+  # An entry is a URL, or {url, kinds} when that relay's filter must be narrower than
+  # the default (1059 + legacy 4). whitenoise refuses kind 4 and closes the whole
+  # subscription when it appears in the same REQ — its wraps would go with it.
   read:
     - wss://relay.day.ag/chat
     - wss://relay.day.ag/inbox
@@ -14,7 +17,8 @@ relays:
     - wss://relay.primal.net
     - wss://relay.ditto.pub
     - wss://relay.dreamith.to
-    - wss://relay.eu.whitenoise.chat
+    - url: wss://relay.eu.whitenoise.chat
+      kinds: [1059]
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
     - wss://relay.day.ag/chat

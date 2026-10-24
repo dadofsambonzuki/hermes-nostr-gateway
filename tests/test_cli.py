@@ -53,6 +53,33 @@ def test_listen_is_scoped_to_our_inbox_and_signed_as_us(tmp_path, monkeypatch):
         assert worker["secret"] == secret, "worker would authenticate as nak's machine key"
 
 
+def test_listen_understands_a_pinned_relay_kind_set(tmp_path, monkeypatch):
+    path, _ = make_config(tmp_path)
+    cfg = yaml.safe_load(open(path))
+    cfg["relays"]["read"] = ["wss://relay.example",
+                             {"url": "wss://relay.eu.whitenoise.chat", "kinds": [1059]}]
+    open(path, "w").write(yaml.safe_dump(cfg))
+
+    captured = []
+
+    class FakeWorker:
+        def __init__(self, relay, me, **kwargs):
+            captured.append({"relay": relay, **kwargs})
+
+        async def run(self, handler):
+            return None
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(cli, "RelayWorker", FakeWorker)
+    assert cli.main(["--config", path, "listen"]) == 0
+
+    assert [worker["relay"] for worker in captured] == [
+        "wss://relay.example", "wss://relay.eu.whitenoise.chat"]
+    assert captured[1]["kinds"] == (1059,), "a pinned kind set reached the worker as a dict"
+
+
 def test_send_publishes_with_the_identity_secret(tmp_path, monkeypatch):
     path, secret = make_config(tmp_path)
     peer = sdk.Keys.generate().public_key().to_hex()

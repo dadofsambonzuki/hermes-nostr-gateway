@@ -86,11 +86,15 @@ worker reads.
 - **Event limiter** is separate and per IP: `/chat` 50 events/s (burst 100), `/inbox` 10/s
   (burst 20), the outbox 10 per minute (burst 100). A publish burst from one address hits this
   before it hits the connection limiter.
-- **`kind not allowed` is the filter, not the key.** Every DM worker asks for `1059` *and*
-  legacy `4` in one REQ; a relay that refuses kind 4 refuses the whole subscription, so its
-  1059 DMs go with it. `/chat` tolerates the pair; `relay.eu.whitenoise.chat` does not
+- **`kind not allowed` is the filter, not the key.** A DM subscription asks for `1059` *and*
+  legacy `4` in one REQ; a relay that refuses kind 4 closes the whole subscription, so its
+  1059 DMs went with it. `/chat` tolerates the pair; `relay.eu.whitenoise.chat` does not
   (`CLOSED: ERROR: bad req: filter validation failed: kind not allowed: 4`, seen 2026-10-24),
-  which leaves that relay with no DM subscription at all.
+  which left that relay with no DM subscription at all. The kind set is now per relay:
+  `relays.read` pins whitenoise to `[1059]`, a worker refused a kind drops it and
+  resubscribes on the rest at once, and a relay that refuses every kind stops with an error
+  rather than ever sending a filterless REQ. `hng status` records both the refusal and what
+  is still being read.
 - **`CHAT_RELAY_MINIMUM_FOLLOWERS=3` is set but not what runs.** The boot log reports
   `minFollowers=0`; the depth-3 WoT is what is enforced. Re-check the log after a restart
   before relying on the follower floor.

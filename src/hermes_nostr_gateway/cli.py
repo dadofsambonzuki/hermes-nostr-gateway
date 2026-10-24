@@ -92,9 +92,13 @@ async def found(plane: Nip17Plane, relay: str, event: dict, args) -> None:
 
 
 def cmd_listen(args) -> int:
+    from .gateway import relay_read_plan
+
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
-    relays = [r for r in cfg["relays"]["read"]]
+    # `relays.read` may pin a per-relay kind set ({url, kinds}); listen only speaks
+    # NIP-17, so the pin is respected but legacy kind 4 is not a listen default.
+    relays, relay_kinds = relay_read_plan(cfg)
 
     if args.once:
         since = None
@@ -128,7 +132,8 @@ def cmd_listen(args) -> int:
         # `-p me` is not optional: a kind-1059 subscription without it is a firehose of
         # every wrap on the relay, and the identity secret must reach the child so NIP-42
         # authenticates as us rather than as nak's machine key.
-        workers = [RelayWorker(r, plane.me, p_tag=plane.me, secret=secret) for r in relays]
+        workers = [RelayWorker(r, plane.me, kinds=relay_kinds.get(r) or (1059,),
+                               p_tag=plane.me, secret=secret) for r in relays]
         tasks = [asyncio.create_task(w.run(lambda relay, event: found(plane, relay, event, args)))
                  for w in workers]
         try:

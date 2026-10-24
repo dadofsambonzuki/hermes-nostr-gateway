@@ -29,6 +29,47 @@ from .store import Store
 
 log = logging.getLogger("hng.gateway")
 
+#: The DM subscription asks for NIP-17 wraps and legacy NIP-04 in one REQ. A relay
+#: that refuses one kind closes the whole filter, so this is only the default:
+#: `relays.read` can pin a narrower set per relay, and a refusal is negotiated at
+#: runtime (RelayWorker.note_refusals) rather than costing the relay entirely.
+DM_KINDS: tuple[int, ...] = (1059, 4)
+
+
+def restricted_relay(relay: str) -> bool:
+    """Relays that carry only the private path, never public feeds."""
+    return relay.rstrip("/").endswith("/chat") or "whitenoise" in relay
+
+
+def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int, ...]]]:
+    """The read set, plus any per-relay kind set the config pins.
+
+    Each `relays.read` entry is a URL, or `{url, kinds}` when that relay's filter has
+    to differ from `DM_KINDS`. `wss://relay.eu.whitenoise.chat` refuses kind 4 and
+    closes the whole subscription when it appears in the same REQ, so its 1059 DMs
+    would otherwise go down with it (spec §3: those relays carry DMs that exist
+    nowhere else).
+    """
+    urls: list[str] = []
+    declared: dict[str, tuple[int, ...]] = {}
+    for entry in (cfg.get("relays") or {}).get("read") or []:
+        if isinstance(entry, str):
+            urls.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"relays.read entry must be a URL or a mapping: {entry!r}")
+        url = str(entry.get("url") or entry.get("relay") or "").strip()
+        if not url:
+            raise ValueError(f"relays.read entry has no url: {entry!r}")
+        urls.append(url)
+        if entry.get("kinds") is not None:
+            kinds = tuple(dict.fromkeys(int(kind) for kind in entry["kinds"]))
+            if not kinds:
+                raise ValueError(f"relays.read entry has an empty kind set: {entry!r}")
+            declared[url] = kinds
+    return urls, declared
+
+
 
 def default_marmot_home() -> Path:
     return Path(os.environ.get("MARMOT_HOME") or Path.home() / ".marmot-agents/hermes")
@@ -69,7 +110,7 @@ class Gateway:
         self.marmot_error: str | None = None
         self._setup_marmot(cfg.get("marmot") or {})
         self.follows: tuple[str, ...] = self._load_follows()
-        self.relays_read = list(cfg["relays"]["read"])
+        self.relays_read, self.relay_kinds = relay_read_plan(cfg)
         self.relays_publish = list(cfg["relays"].get("publish", []))
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
@@ -122,10 +163,12 @@ class Gateway:
             # and multiplies reconnects across every relay.
             # DMs and mentions: wraps/notes addressed to us. Restricted relays
             # (our chat path, whitenoise) refuse public kinds outright.
-            restricted = relay.rstrip("/").endswith("/chat") or "whitenoise" in relay
-            kinds = (1059, 4) if restricted else (1059, 4)
+            restricted = restricted_relay(relay)
+            # Per relay, not per gateway: a relay that refuses one kind closes the
+            # whole REQ, so `kinds` is config-pinnable and then negotiated at runtime.
+            kinds = self.relay_kinds.get(relay) or DM_KINDS
             worker = RelayWorker(relay, self.me, kinds=kinds, p_tag=self.me,
-                                 secret=self._secret)
+                                 secret=self._secret, on_refusal=self._note_refusal)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
             # Feeds: kind 1 from people WE FOLLOW, never the global firehose.
@@ -165,6 +208,20 @@ class Gateway:
         except Exception:  # noqa: BLE001 - no contact list means no feed workers
             pass
         return ()
+
+    def _note_refusal(self, relay: str, dropped: set[int],
+                      remaining: tuple[int, ...], error: str | None) -> None:
+        """Persist the kind negotiation, so `hng status` shows recovery, not a dead relay.
+
+        Without this the store's last error stays the raw CLOSED frame while the
+        subscription is in fact healthy again on the kinds the relay does accept.
+        """
+        detail = f"relay refuses kind(s) {', '.join(str(k) for k in sorted(dropped))}"
+        detail += (f"; reading {', '.join(str(k) for k in remaining)}" if remaining
+                   else "; no kinds left")
+        if error:
+            detail += f" ({error})"
+        self.store.note_relay(relay, error=detail[:300])
 
     async def _guarded(self, worker: RelayWorker) -> None:
         try:
@@ -474,8 +531,11 @@ class Gateway:
                 else {"enabled": False, "error": self.marmot_error}
             ),
             "workers": [
-                {"relay": w.relay, "kinds": list(w.kinds), "p_tag": bool(w.p_tag),
-                 "authors": len(w.authors), "events": w.events, "last_error": w.last_error}
+                {"relay": w.relay, "kinds": list(w.kinds),
+                 "requested_kinds": list(w.requested_kinds),
+                 "refused_kinds": sorted(w.refused),
+                 "p_tag": bool(w.p_tag), "authors": len(w.authors), "events": w.events,
+                 "last_error": w.last_error}
                 for w in self.workers
             ],
             "uptime_s": None,

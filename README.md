@@ -64,6 +64,20 @@ is not silent at runtime either — the first Concord derivation raises `CryptoE
 patched wheel, and `tests/test_concord.py` checks the derivation against a NIP-44 vector. If you
 rebuild from the fork branch, update the URL and the hash in `requirements.txt` together.
 
+## Relays and kinds
+
+One subscription per relay, because each extra connection counts against the relay's
+limiter. A Nostr filter is all-or-nothing at the relay, though: a REQ naming a kind the
+relay refuses is closed whole (`kind not allowed: 4`), so a relay that rejects legacy
+kind 4 used to lose its kind-1059 DMs with it — including `relay.eu.whitenoise.chat`,
+which carries DMs that exist nowhere else. Hence a kind set per relay:
+
+- the default DM subscription is `1059` + legacy `4`;
+- `relays.read` can pin a relay's set — `- {url: wss://relay.eu.whitenoise.chat, kinds: [1059]}`;
+- if a relay still refuses a kind at runtime, the worker drops that kind and resubscribes
+  immediately on the rest — never a kind-less filter, and never a reconnect loop that
+  cannot succeed. `hng status` records what was dropped and what is still being read.
+
 ## Shape
 
 ```
