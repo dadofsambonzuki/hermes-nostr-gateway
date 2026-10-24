@@ -30,7 +30,7 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       — landed c51ac1c: `requirements.txt` pins the `wheel-0.45.1-nip44` release asset by URL +
       sha256 (wrong hash refused), pyproject points at the same wheel for `pip install -e .`,
       README names fork `eddb08d` / upstream PR #96; installed on clean uv and pip venvs, 91 tests green.
-- [ ] **Rebase the digest PR onto master** — branch `pr/digest-cursor-schema` (`7cc77b5`,
+- [x] **Rebase the digest PR onto master** — branch `pr/digest-cursor-schema` (`7cc77b5`,
       base `272f9cb`) is four-plus commits behind. Rebase onto current master, then delete
       master's `pending_digest()` / `_digest_loop()` in favour of `seal_digests()` so there
       is exactly one batching path. Keep the socket frame shape additive: `type: "message"`,
@@ -42,6 +42,11 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       transaction as individual id marks, so a second ack is a no-op. Done when: a legacy
       adapter that knows only `type: message` receives the digest, acks the frame id, and a
       reconnect replays nothing; with the ack withheld the identical frame replays; suite green.
+      — landed f60d795 (branch `pr/digest-cursor-schema`, 5 commits on 43b8452): one path via
+      `seal_digests`, message-shaped digest frames with rendered `content`, `ack(ids)` closes a
+      whole batch by `digests.id`; 106 tests green, including the legacy-adapter socket replay;
+      live-DB copy migrated 713 rows with contiguous cursors. Pushed; PR to 3/4 relays
+      (grasp.day.ag 404).
 - [ ] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
       conformance probes under `scripts/`.
 - [ ] **Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
