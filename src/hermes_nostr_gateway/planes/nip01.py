@@ -107,5 +107,6 @@ class Nip01Plane:
             authority=decision.authority,
             rule=decision.rule,
             why=f"{decision.why}; {reason}",
+            blocked_reason=decision.blocked_reason,
         )
         return msg if self.store.add(msg) else None

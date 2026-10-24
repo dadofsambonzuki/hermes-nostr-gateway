@@ -43,3 +43,47 @@ def test_pending_immediate_is_replayed_but_old_or_sent_is_not(tmp_path):
                       plane="nip01", reach="digest", **base))
         ids = [r["id"] for r in s.pending_immediate()]
         assert ids == ["fresh"]
+
+
+def test_blocked_rows_are_stored_but_never_replayed_or_counted_pending(tmp_path):
+    import time
+    from hermes_nostr_gateway.store import Inbound, Store
+
+    with Store(tmp_path / "b.db") as s:
+        now = int(time.time())
+        s.add(Inbound(id="ok", wrapper_id="w1", sender="dd" * 32, kind=14, created_at=now,
+                      content="hello", conversation="dd" * 32, reply_to=None,
+                      plane="nip17", reach="immediate", authority="instructions",
+                      rule="family", why="matched"))
+        s.add(Inbound(id="spam", wrapper_id="w2", sender="dd" * 32, kind=14, created_at=now,
+                      content="spam", conversation="dd" * 32, reply_to=None,
+                      plane="nip17", reach="drop", authority="none",
+                      rule="family", why="rate limited",
+                      blocked_reason="rate_limited"))
+        assert [r["id"] for r in s.pending_immediate()] == ["ok"]
+        assert s.stats()["pending"] == 1
+        assert s.stats()["blocked"] == 1
+        rows = {r["id"]: r for r in s.recent(5)}
+        assert rows["spam"]["blocked_reason"] == "rate_limited"  # still on the record
+
+
+def test_live_store_gains_the_blocked_reason_column(tmp_path):
+    """A DB created before blocked frames existed must migrate on open, not fail."""
+    import sqlite3
+
+    from hermes_nostr_gateway.store import Store
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE rumors (id TEXT PRIMARY KEY, wrapper_id TEXT NOT NULL,"
+        " sender TEXT NOT NULL, kind INTEGER NOT NULL, created_at INTEGER NOT NULL,"
+        " conversation TEXT, content TEXT, reply_to TEXT, plane TEXT NOT NULL,"
+        " reach TEXT, authority TEXT, rule TEXT, why TEXT, received_at INTEGER NOT NULL,"
+        " delivered_at INTEGER)"
+    )
+    old.commit()
+    old.close()
+    with Store(path) as s:
+        columns = {row["name"] for row in s.db.execute("PRAGMA table_info(rumors)")}
+        assert "blocked_reason" in columns

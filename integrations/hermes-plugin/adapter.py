@@ -116,6 +116,12 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                         continue
                     if frame.get("type") == "message":
                         await self._deliver(frame)
+                    elif frame.get("type") == "blocked":
+                        # Warnings, never user-visible chat (spec §11.6). A blocked
+                        # frame has no content and must never become an agent run.
+                        logger.warning("nostr blocked %s… (%s)",
+                                       (frame.get("from") or "")[:12],
+                                       frame.get("reason") or "unknown")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform

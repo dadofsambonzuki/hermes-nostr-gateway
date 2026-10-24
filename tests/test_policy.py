@@ -90,9 +90,38 @@ def test_quota_exceeded_drops_rather_than_floods(clock):
     assert p.decide(sender="npub1loud", kind=1).reach == "immediate"
     third = p.decide(sender="npub1loud", kind=1)
     assert third.reach == "drop"
+    assert third.blocked_reason == "rate_limited"
     assert "quota" in third.why
     clock.t += 3601  # window rolls
     assert p.decide(sender="npub1loud", kind=1).reach == "immediate"
+
+
+def test_per_sender_bucket_degrades_to_blocked(clock):
+    cfg = {"groups": {"loud": ["npub1loud"]},
+           "policies": [{"name": "loud", "match": {"group": "loud"}, "reach": "immediate"}],
+           "defaults": {"reach": "immediate"},
+           "rate_limit": {"burst": 10, "per_hour": 30}}
+    p = Policy(cfg, clock=clock)
+    decisions = [p.decide(sender="npub1loud", kind=1, event_id=f"e{i}") for i in range(11)]
+    assert [d.reach for d in decisions[:10]] == ["immediate"] * 10
+    assert decisions[10].reach == "drop"
+    assert decisions[10].blocked_reason == "rate_limited"
+    # The bucket refills continuously: a full hour later the same sender is welcome.
+    clock.t += 3600
+    assert p.decide(sender="npub1loud", kind=1, event_id="later").reach == "immediate"
+
+
+def test_bucket_is_per_sender_and_duplicates_do_not_burn_tokens(clock):
+    cfg = {"policies": [], "defaults": {"reach": "immediate"},
+           "rate_limit": {"burst": 2, "per_hour": 30}}
+    p = Policy(cfg, clock=clock)
+    # One event seen three times (three relays) is one delivery, not three tokens.
+    for _ in range(3):
+        assert p.decide(sender=STRANGER, kind=1, event_id="evt").reach == "immediate"
+    assert p.decide(sender=STRANGER, kind=1, event_id="e2").reach == "immediate"
+    assert p.decide(sender=STRANGER, kind=1, event_id="e3").reach == "drop"
+    # A different sender has their own bucket.
+    assert p.decide(sender=FAM, kind=1, event_id="f1").reach == "immediate"
 
 
 def test_duplicate_event_is_delivered_once_and_upgrades_to_best_rule(policy):

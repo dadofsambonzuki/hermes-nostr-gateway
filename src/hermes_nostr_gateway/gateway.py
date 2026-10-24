@@ -97,6 +97,7 @@ class Gateway:
             "groups": normalise_groups(cfg),
             "policies": cfg.get("policies"),
             "defaults": cfg.get("defaults"),
+            "rate_limit": cfg.get("rate_limit"),
         })
         self.concord = ConcordPlane(self.store)
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
@@ -258,6 +259,24 @@ class Gateway:
         await self._stopping.wait()
 
     # -- inbound --------------------------------------------------------
+    @staticmethod
+    def frame_for(msg: Any) -> dict[str, Any]:
+        """A message frame, or a `blocked` frame when policy refused it.
+
+        A blocked message is still stored (see §13.3) but must never look like chat:
+        the adapter turns `type: message` into an agent run, and a `drop` reach used
+        to ride that path silently. `blocked` carries the reason and no content.
+        """
+        if msg.reach == "drop" or msg.blocked_reason:
+            return {
+                "type": "blocked",
+                "plane": msg.plane,
+                "from": msg.sender,
+                "reason": msg.blocked_reason or "not_allowlisted",
+                "rumor_id": msg.id,
+            }
+        return msg.to_frame()
+
     def _on_event(self, relay: str, event: dict) -> None:
         kind = event.get("kind")
         if kind == 1059:
@@ -269,7 +288,7 @@ class Gateway:
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
-        asyncio.create_task(self.server.broadcast(msg.to_frame()))
+        asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
 
     def _on_marmot(self, event: dict) -> None:
         """A control event from wn-agent. Same normalised frame as any other plane."""
@@ -282,7 +301,7 @@ class Gateway:
             return
         if msg is None:
             return
-        asyncio.create_task(self.server.broadcast(msg.to_frame()))
+        asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
 
 
     def _handle_nip04(self, relay: str, event: dict) -> Any:
@@ -520,6 +539,7 @@ class Gateway:
             "relays_publish": self.relays_publish,
             "rumors": stats["total"],
             "pending": stats["pending"],
+            "blocked": stats["blocked"],
             "invites": stats["invites"],
             "relay_stats": stats["relays"],
             # Instrument the plane rather than inferring it from `ps`: a worker that

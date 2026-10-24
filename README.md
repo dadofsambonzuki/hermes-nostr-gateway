@@ -79,6 +79,23 @@ which carries DMs that exist nowhere else. Hence a kind set per relay:
   immediately on the rest — never a kind-less filter, and never a reconnect loop that
   cannot succeed. `hng status` records what was dropped and what is still being read.
 
+## Rate limits and blocked frames
+
+One token bucket per sender, shared by every plane (NIP-17, NIP-04, Marmot), so
+switching transport cannot earn a fresh burst: 10 messages at once by default, then
+30/hour. Over the bucket the message is still stored — the record matters — but it is
+never delivered to the adapter. The socket emits a `blocked` frame instead of a
+`message`:
+
+```json
+{"type":"blocked","plane":"nip17","from":"<hex>","reason":"rate_limited","rumor_id":"<id>"}
+```
+
+The same frame shape carries policy drops (`reason: "not_allowlisted"`), so a flooding
+peer degrades to blocked rather than a queue that grows, and no blocked message can
+look like chat to a consumer. `rate_limit: {burst: 10, per_hour: 30}` in the config
+overrides the defaults; `enabled: false` turns it off.
+
 ## Shape
 
 ```

@@ -62,7 +62,7 @@ def build(cfg: dict[str, Any]) -> tuple[NakCrypto, Store, Policy, Nip17Plane]:
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store = Store(store_path)
     policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
-                     "defaults": cfg.get("defaults")})
+                     "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit")})
     return crypto, store, policy, Nip17Plane(crypto, store, policy)
 
 
@@ -85,6 +85,11 @@ def print_message(msg, as_json: bool) -> None:
 async def found(plane: Nip17Plane, relay: str, event: dict, args) -> None:
     msg = plane.handle(relay, event)
     if not msg:
+        return
+    if msg.reach == "drop":
+        # A blocked message has no business looking like chat in a dogfood CLI.
+        print(f"[blocked] {msg.sender[:12]}… reason={msg.blocked_reason or 'not_allowlisted'}",
+              file=sys.stderr)
         return
     print_message(msg, args.json)
     if args.mark_read:
@@ -215,7 +220,8 @@ def cmd_status(args) -> int:
     print(f"identity: {plane.me}")
     print(f"store:    {store.path}")
     stats = store.stats()
-    print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery)")
+    print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery, "
+          f"{stats['blocked']} blocked)")
     print(f"invites:  {stats['invites']} concord invite(s)")
     print("relays:")
     for row in stats["relays"]:
@@ -237,7 +243,7 @@ def cmd_recent(args) -> int:
 def cmd_policy_test(args) -> int:
     cfg = load_config(args.config)
     policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
-                     "defaults": cfg.get("defaults")})
+                     "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit")})
     d = policy.decide(sender=to_hex(args.sender), kind=args.kind,
                       mention=args.mention, dm=args.dm, event_id=args.event_id)
     print(json.dumps(d.to_frame(), indent=2))
