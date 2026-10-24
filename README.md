@@ -8,28 +8,49 @@ Nostr is a single protocol: DMs arrive over NIP-17 or legacy NIP-04, community t
 Concord, group chat over Marmot, and public life over kind 1. The agent should not have to care
 which — it reads one normalised event stream.
 
-## Status
+## Target state
 
-- **Design: approved.** The authoritative spec is [`docs/gateway-spec.md`](docs/gateway-spec.md).
-- **M1 running**: the gateway is a systemd service (`deploy/`), speaking NDJSON over a 0600 Unix
-  socket, with the policy engine, rumor store, relay workers and NIP-17 plane in place.
-- **Marmot plane**: a proxy over `wn-agent`'s control socket — group messages arrive as ordinary
-  frames (`plane: "marmot"`), `send` reaches them with `to: "marmot:<group id>"`, and
-  `marmot.group` / `marmot.timeline` read through the same socket. MLS stays wn-agent's; the
-  plane attaches only when that daemon's socket exists.
-- **Operating notes**: [`docs/ops-notes.md`](docs/ops-notes.md) — the service, its socket, and
-  the host-side gates (`relay.day.ag`'s WoT and rate limits) that explain its refusals. Mirrored
-  for the host at `~/Projects/infra/ops/hermes-nostr-gateway.md`.
-- **Conformance probes**: `scripts/probe_nip17_conformance.py` — the NIP-17 traps the retired
-  phase-0 wrapper pinned down (wrap `p` is the recipient's identity key, wraps backdated up to
-  two days against a three-day read window, watermark on the inner rumor, NIP-42 as the
-  identity, self-copy never surfaced), executable and exercised by `tests/test_conformance.py`.
-  `--live` adds the spec §13.1 wire probe: a throwaway recipient, a real relay, read back and
-  decrypted — no message reaches the household inbox.
-- **Hermes plugin**: `integrations/hermes-plugin/` — a platform adapter that turns socket frames
-  into MessageEvents and replies into `send` ops. It maps the gateway's `authority` onto
-  `source.role_authorized`, so untrusted senders reach the agent as data, never as instructions.
-- Prior art and the live-testing handover this design leans on: [`docs/prior-art/`](docs/prior-art/).
+One long-running service per identity, one local socket, one adapter — and an agent that never
+has to know which protocol a message arrived on. When it is finished, this is what runs:
+
+- **One socket.** NDJSON over a 0600 Unix socket, no network listener, carrying every plane:
+  DMs (NIP-17, legacy NIP-04), public feeds and mentions (NIP-01), Concord communities, and
+  Marmot groups proxied to `wn-agent`.
+- **One policy.** Every message, whatever the plane, is classified for *reach* — wake the agent
+  now, or fold it into a digest — and for *authority* — instructions, or data it may read but
+  not obey. Sender trust is decided once, centrally, not per transport.
+- **One adapter.** `integrations/hermes-plugin/` maps frames onto Hermes' platform contract and
+  maps `authority` onto `source.role_authorized`, so an untrusted sender can reach the agent as
+  text and never as a command.
+- **Durability by default.** A message is stored before it is delivered, re-offered if the
+  adapter never acknowledged it, and retried per relay by republishing the *same* signed event —
+  re-wrapping would change its id and show the peer a duplicate.
+- **Coverage that is measured, not assumed.** Reads span the identity's follows, its NIP-65
+  write relays and the sender app-relay defaults; per-relay event counts and last errors are in
+  `hng status`, because "we read all relays" is a claim a status line should be able to prove.
+- **Marmot stays Marmot.** MLS is `wn-agent`'s job; the gateway speaks its control socket as a
+  proxy plane rather than reimplementing a protocol it does not own. The gateway is the single
+  entry point, and `wn-agent` remains the transport underneath.
+
+The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md); host-side operations
+are in [`docs/ops-notes.md`](docs/ops-notes.md). Where the current build differs from this
+target is tracked in [`QUEUE.md`](QUEUE.md), not here — a README that doubles as a progress log
+goes stale between commits.
+
+## Pieces
+
+- **Operating notes** — [`docs/ops-notes.md`](docs/ops-notes.md): the service, its socket and the
+  host-side gates (`relay.day.ag`'s web-of-trust depth and rate limits) that explain its
+  refusals. Mirrored for the host at `~/Projects/infra/ops/hermes-nostr-gateway.md`.
+- **Conformance probes** — `scripts/probe_nip17_conformance.py` executes the NIP-17 traps this
+  design has to respect: a wrap's `p` tag is the recipient identity key, wraps are backdated up
+  to two days against a three-day read window, the watermark belongs on the inner rumor, NIP-42
+  must sign as the identity, and the self-copy is never surfaced. `--live` adds the spec §13.1
+  wire probe: a throwaway recipient, a real relay, read back and decrypted, so no probe message
+  reaches the household inbox. `tests/test_conformance.py` exercises it.
+- **Hermes plugin** — `integrations/hermes-plugin/` (manifest, adapter, `register(ctx)` shim), kept
+  in step with the live copy under `~/.hermes/plugins/nostr/`.
+- **Prior art** — [`docs/prior-art/`](docs/prior-art/) holds the handover this design leans on.
 
 ## Quick start (five minutes)
 
@@ -55,7 +76,7 @@ the template.
 Tests and lint need no relay and no secret:
 
 ```sh
-.venv/bin/python -m pytest -q            # 129 tests, ~4 s
+.venv/bin/python -m pytest -q            # full suite, ~4 s
 .venv/bin/ruff check src tests scripts
 ```
 
@@ -120,7 +141,7 @@ daemon's journal; `docker run --rm` with the same mounts replaces the default `s
 pytest and ruff are the two gates:
 
 ```sh
-python -m pytest -q                       # 129 tests
+python -m pytest -q                       # full suite
 ruff check src tests scripts
 ```
 
@@ -134,16 +155,24 @@ instead of Concord at runtime. The repository's canonical home is Nostr, so ther
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's
-limiter. A Nostr filter is all-or-nothing at the relay, though: a REQ naming a kind the
-relay refuses is closed whole (`kind not allowed: 4`), so a relay that rejects legacy
-kind 4 used to lose its kind-1059 DMs with it — including `relay.eu.whitenoise.chat`,
-which carries DMs that exist nowhere else. Hence a kind set per relay:
+connection limiter. A Nostr filter is all-or-nothing at the relay, though: a REQ naming a kind
+the relay refuses is closed whole (`filter validation failed: kind not allowed: 4`), so a relay
+that rejects legacy kind 4 would otherwise lose its kind-1059 DMs along with it. Hence a kind
+set per relay:
 
 - the default DM subscription is `1059` + legacy `4`;
-- `relays.read` can pin a relay's set — `- {url: wss://relay.eu.whitenoise.chat, kinds: [1059]}`;
+- `relays.read` may pin a relay's set — `- {url: wss://relay.example, kinds: [1059]}` — for a
+  relay that refuses a kind rather than for one that simply has less traffic;
 - if a relay still refuses a kind at runtime, the worker drops that kind and resubscribes
-  immediately on the rest — never a kind-less filter, and never a reconnect loop that
-  cannot succeed. `hng status` records what was dropped and what is still being read.
+  immediately on the rest: never a kind-less filter, never a reconnect loop that cannot succeed.
+  `hng status` records what was dropped and what is still being read.
+
+**White Noise relays belong to the Marmot plane.** `relay.eu.whitenoise.chat` and
+`relay.us.whitenoise.chat` exist to carry White Noise's own groups, which `wn-agent` speaks for
+us; they are not a general NIP-17 inbox, they refuse public kinds, and the gateway does not put
+them in the DM or feed read set. They are named under `relays.whitenoise` for the Marmot plane
+to use through `wn-agent`. The trade is deliberate: a DM that exists *only* there is not fetched
+by the DM workers, and if one ever goes missing this is the first thing to check.
 
 ## Rate limits and blocked frames
 
