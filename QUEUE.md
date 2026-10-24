@@ -4,10 +4,12 @@ The 20-minute cron takes the first unchecked item, does it, runs the tests, comm
 pushes, then ticks the box with a one-line note. If an item needs a decision it is marked
 BLOCKED and a DM is sent; the cron moves to the next item and leaves that one alone.
 
-- [ ] **Concord plane** — restore `derive`/`read`/`write` from Hal's PR, replace the
+- [x] **Concord plane** — restore `derive`/`read`/`write` from Hal's PR, replace the
       hand-rolled ECDH with `sdk.nip44_conversation_key`, tests against a known vector,
       route kind-1059/inner-3313 invites to it. Done when: invite parses, a message is
       read and one written, tests green.
+      — landed 222bdbc: binding-derived stream keys (vector-tested), channel/guestbook
+      read+write, invites verified into `concord_invites` and never delivered; 65 tests green.
 - [ ] **Marmot proxy plane** — speak wn-agent's control socket as a plane (`marmot`),
       add a `marmot` worker/resolver, expose it over the same socket frames. Done when:
       Hermes reads a Marmot group through the gateway, wn-agent unchanged.
