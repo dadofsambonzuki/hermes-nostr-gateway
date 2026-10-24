@@ -19,9 +19,12 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       subscription on a scratch socket, wn-agent unrestarted, 91 tests green. Inbound push
       proven against a protocol-faithful fake, not yet by a live peer message. Not enabled
       in the live config: attaching it beside the marmot plugin double-delivers.
-- [ ] **Hal upgrade note** — DM Hal the exact steps: pull master, install the plugin,
+- [x] **Hal upgrade note** — DM Hal the exact steps: pull master, install the plugin,
       set `NOSTR_GATEWAY_SOCKET`, install the patched `nostr-sdk` wheel, close his PR
       `a3631dbe`. Done when: sent, with the wheel provenance included.
+      — sent (giftwrap `1965d0936a67`, read back from nos.lol + primal): five steps, wheel
+      provenance (fork `eddb08d`, upstream PR #96) and a sha256-checked download at
+      `relay.day.ag/2a7287…`; also records the Marmot-plane double-delivery trap.
 - [ ] **Pin the patched wheel** — requirements entry + README section naming the source
       commit and the upstream PR, so a reinstall cannot silently revert it.
 - [ ] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
