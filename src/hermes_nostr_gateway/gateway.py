@@ -46,6 +46,7 @@ class Gateway:
         })
         self.plane = Nip17Plane(self.crypto, self.store, self.policy)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
+        self.follows: tuple[str, ...] = self._load_follows()
         self.relays_read = list(cfg["relays"]["read"])
         self.relays_publish = list(cfg["relays"].get("publish", []))
         self.socket_path = Path(socket_path) if socket_path else Path(
@@ -63,21 +64,48 @@ class Gateway:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
             # and multiplies reconnects across every relay.
-            # Per-relay kind sets: our chat relay restricts reads to chat kinds and
-            # closes the subscription if we ask for public notes there.
-            kinds = (1059, 4) if relay.rstrip("/").endswith("/chat") else (1059, 4, 1)
+            # DMs and mentions: wraps/notes addressed to us. Restricted relays
+            # (our chat path, whitenoise) refuse public kinds outright.
+            restricted = relay.rstrip("/").endswith("/chat") or "whitenoise" in relay
+            kinds = (1059, 4) if restricted else (1059, 4)
             worker = RelayWorker(relay, self.me, kinds=kinds, p_tag=self.me,
                                  secret=self._secret)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
-            # Watched feeds need a different filter (authors, no p tag).
-            if self.nip01.authors:
-                feed = RelayWorker(relay, self.me, kinds=(1,), authors=tuple(self.nip01.authors),
+            # Feeds: kind 1 from people WE FOLLOW, never the global firehose.
+            authors = tuple(sorted(set(self.follows) | set(self.nip01.authors)))
+            if authors and not restricted:
+                feed = RelayWorker(relay, self.me, kinds=(1,), authors=authors,
                                    secret=self._secret)
                 self.workers.append(feed)
                 self._tasks.append(asyncio.create_task(self._guarded(feed)))
+            # Mentions of us by strangers: a small #p filter, separate from follows.
+            if not restricted:
+                mentions = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me,
+                                       secret=self._secret)
+                self.workers.append(mentions)
+                self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
+
+    def _load_follows(self) -> tuple[str, ...]:
+        """Our kind-3 contact list: what 'feeds' means, as opposed to the firehose."""
+        import json as _json
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["nak", "req", "-k", "3", "-a", self.me, "-l", "1", *self.relays_publish[:2]],
+                capture_output=True, text=True, timeout=20,
+            ).stdout
+            for line in out.splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                tags = _json.loads(line).get("tags", [])
+                return tuple(sorted({t[1] for t in tags if t and t[0] == "p"}))
+        except Exception:  # noqa: BLE001 - no contact list means no feed workers
+            pass
+        return ()
 
     async def _guarded(self, worker: RelayWorker) -> None:
         try:
@@ -187,7 +215,8 @@ class Gateway:
         return rumor, {"peer": self.crypto.wrap(rumor, peer), "self": self.crypto.wrap(rumor, self.me)}
 
     def _publish_all(self, wraps: dict, relays: list[str]) -> dict:
-        return {label: publish(event, relays) for label, event in wraps.items()}
+        return {label: publish(event, relays, secret=self._secret)
+                for label, event in wraps.items()}
 
     def _recipient_relays(self, peer: str) -> list[str]:
         import json as _json
@@ -231,7 +260,9 @@ class Gateway:
 
     async def retry_failed(self) -> int:
         import json as _json
-        pending = self.store.pending_wraps()
+        # Retry a few at a time: a burst of replays trips our own relay's connection
+        # limiter and turns one failure into a hundred.
+        pending = self.store.pending_wraps()[:5]
         if not pending:
             return 0
         loop = asyncio.get_running_loop()
@@ -239,10 +270,12 @@ class Gateway:
         for row in pending:
             event = _json.loads(row["event"])
             ok, error = await loop.run_in_executor(
-                None, lambda: list(publish(event, [row["relay"]]).values())[0]
+                None, lambda: list(publish(event, [row["relay"]], secret=self._secret).values())[0]
             )
             self.store.mark_wrap(row["id"], row["relay"], ok=ok, error=error)
             sent += int(ok)
+            import asyncio as _asyncio
+            await _asyncio.sleep(1.5)  # stay under the relay's connection limiter
         if sent:
             log.info("retried %d wrap(s)", sent)
         return sent

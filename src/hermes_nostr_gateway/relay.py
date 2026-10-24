@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from typing import Awaitable, Callable
 
 Handler = Callable[[str, dict], Awaitable[None] | None]
@@ -22,7 +23,7 @@ class RelayWorker:
 
     def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
                  authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
-                 secret: str | None = None):
+                 secret: str | None = None, since_days: int = 3):
         self.relay = relay
         self.me = me
         self.kinds = kinds
@@ -33,6 +34,7 @@ class RelayWorker:
         # as nak's machine-default key, which is not in the web of trust, and closes the
         # subscription with "restricted".
         self.secret = secret
+        self.since_days = since_days
         if not me:
             raise ValueError("RelayWorker needs an identity; refusing an unfiltered subscription")
         self.nak = shutil.which("nak") or "nak"
@@ -48,6 +50,12 @@ class RelayWorker:
             args += ["-k", str(kind)]
         if self.p_tag:
             args += ["-p", self.p_tag]
+        # Only the recent window: without this every reconnect replays the relay's
+        # entire history (NIP-59 backdates wraps up to 2 days, so 3 days is the floor).
+        if self.since_days:
+            args += ["-s", str(int(time.time()) - self.since_days * 86400)]
+        # Keep the subscription open instead of exiting at EOSE and re-fetching.
+        args.append("--stream")
         for author in self.authors:
             args += ["-a", author]
         args.append(self.relay)

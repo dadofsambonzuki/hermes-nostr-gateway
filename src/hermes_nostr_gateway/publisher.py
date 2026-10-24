@@ -13,13 +13,16 @@ import subprocess
 from typing import Iterable
 
 
-def publish(event: dict, relays: Iterable[str]) -> dict[str, tuple[bool, str | None]]:
+def publish(event: dict, relays: Iterable[str], secret: str | None = None) -> dict[str, tuple[bool, str | None]]:
     nak = shutil.which("nak") or "nak"
     out: dict[str, tuple[bool, str | None]] = {}
+    import os
     payload = json.dumps(event)
+    env = dict(os.environ, **({"NOSTR_SECRET_KEY": secret} if secret else {}))
     for relay in relays:
         proc = subprocess.run(
-            [nak, "event", "--auth", relay], input=payload, capture_output=True, text=True
+            [nak, "event", "--auth", relay], input=payload, capture_output=True, text=True,
+            env=env,
         )
         text = (proc.stdout + proc.stderr).lower()
         ok = "success" in text
