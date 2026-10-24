@@ -54,12 +54,18 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       `hng send` publishes through `publisher.publish` with the secret and records the wrap
       for retry; the six §4/§7 traps live on as `scripts/probe_nip17_conformance.py`
       (`--live` §13.1 round trip run on nos.lol), 101 tests green.
-- [ ] **Ops notes** — write them to `~/Projects/infra/ops/hermes-nostr-gateway.md`
+- [x] **Ops notes** — write them to `~/Projects/infra/ops/hermes-nostr-gateway.md`
       (Nathan's call, 2026-10-24: a separate file rather than `infra/AGENTS.md`, which
       needs his approval per write). Source copy already committed at
       `docs/ops-notes.md` (`00dc164`). Also leave a one-line pointer comment in the
       queue for the eventual AGENTS.md entry. Done when: the file exists with the
       notes and the `docs/ops-notes.md` copy is referenced from it.
+      — landed 572241a: `~/Projects/infra/ops/hermes-nostr-gateway.md` exists, body identical
+      to `docs/ops-notes.md` (which now names the mirror as its ops copy and stays the source),
+      README points at it; unit, 15 s drop-in, 0600 socket and WAL db re-checked on the host
+      before writing. Pointer line below. 123 tests green.
+      <!-- AGENTS.md pointer: hermes-nostr-gateway — ops notes at ops/hermes-nostr-gateway.md
+           (socket/XDG trap, systemd sandbox, relay.day.ag WoT + rate limits + per-relay kinds). -->
 
 - [x] **A relay that refuses kind 4 loses kind 1059 too** — `gateway.py` builds
       `kinds = (1059, 4) if restricted else (1059, 4)`, so the restricted branch is a no-op.
