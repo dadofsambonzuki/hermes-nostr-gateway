@@ -61,8 +61,9 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       `security.protected_instruction_files`, and turning it off weakens the
       prompt-injection guard for every project). Question for Nathan: paste the prepared
       section into `~/Projects/infra/AGENTS.md` yourself, re-scope this item to a
-      non-`AGENTS.md` path, or keep the copy now committed at `docs/ops-notes.md` as the
-      ops record? The research is done and lives in that file; only the infra edit is left.
+      non-`AGENTS.md` path, or keep the copy now committed at `docs/ops-notes.md`
+      (`00dc164`) as the ops record? The research is done and lives in that file; only the
+      infra edit is left.
 - [ ] **A relay that refuses kind 4 loses kind 1059 too** — `gateway.py` builds
       `kinds = (1059, 4) if restricted else (1059, 4)`, so the restricted branch is a no-op.
       `relay.eu.whitenoise.chat` answers the combined REQ with
