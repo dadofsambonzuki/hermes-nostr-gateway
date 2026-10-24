@@ -10,9 +10,15 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       read and one written, tests green.
       — landed 222bdbc: binding-derived stream keys (vector-tested), channel/guestbook
       read+write, invites verified into `concord_invites` and never delivered; 65 tests green.
-- [ ] **Marmot proxy plane** — speak wn-agent's control socket as a plane (`marmot`),
+- [x] **Marmot proxy plane** — speak wn-agent's control socket as a plane (`marmot`),
       add a `marmot` worker/resolver, expose it over the same socket frames. Done when:
       Hermes reads a Marmot group through the gateway, wn-agent unchanged.
+      — landed 35ad31f: control-socket client (protocol + id correlation), worker with
+      reconnect/counters, resolver (32-hex group vs 64-hex pubkey, `group_info`-verified),
+      `marmot.group`/`marmot.timeline` reads; live read of the home group + established
+      subscription on a scratch socket, wn-agent unrestarted, 91 tests green. Inbound push
+      proven against a protocol-faithful fake, not yet by a live peer message. Not enabled
+      in the live config: attaching it beside the marmot plugin double-delivers.
 - [ ] **Hal upgrade note** — DM Hal the exact steps: pull master, install the plugin,
       set `NOSTR_GATEWAY_SOCKET`, install the patched `nostr-sdk` wheel, close his PR
       `a3631dbe`. Done when: sent, with the wheel provenance included.
