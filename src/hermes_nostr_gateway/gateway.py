@@ -10,6 +10,7 @@ from typing import Any
 
 from .crypto import SdkCrypto
 from .planes import nip04
+from .planes.concord.plane import ConcordPlane
 from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
@@ -44,7 +45,9 @@ class Gateway:
             "policies": cfg.get("policies"),
             "defaults": cfg.get("defaults"),
         })
-        self.plane = Nip17Plane(self.crypto, self.store, self.policy)
+        self.concord = ConcordPlane(self.store)
+        self.plane = Nip17Plane(self.crypto, self.store, self.policy,
+                                on_invite=self.concord.handle_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
         self.follows: tuple[str, ...] = self._load_follows()
         self.relays_read = list(cfg["relays"]["read"])
@@ -340,10 +343,11 @@ class Gateway:
             "identity": self.me,
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
-            "planes": ["nip17", "nip01", "nip04"],
+            "planes": ["nip17", "nip01", "nip04", "concord"],
             "relays_publish": self.relays_publish,
             "rumors": stats["total"],
             "pending": stats["pending"],
+            "invites": stats["invites"],
             "relay_stats": stats["relays"],
             "workers": [
                 {"relay": w.relay, "kinds": list(w.kinds), "p_tag": bool(w.p_tag),

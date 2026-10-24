@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS relay_stats (
     last_event INTEGER,
     last_error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS concord_invites (
+    id           TEXT PRIMARY KEY,
+    inviter      TEXT NOT NULL,
+    community_id TEXT NOT NULL,
+    name         TEXT,
+    relays       TEXT,
+    bundle       TEXT NOT NULL,
+    received_at  INTEGER NOT NULL
+);
 """
 
 
@@ -222,11 +232,36 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # -- Concord invites (verified, never delivered as messages) ---------
+    def record_invite(self, *, id: str, inviter: str, community_id: str, name: str,
+                      relays: list[str], bundle: dict[str, Any]) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO concord_invites (id, inviter, community_id, name,"
+            " relays, bundle, received_at) VALUES (?,?,?,?,?,?,?)",
+            (id, inviter, community_id, name, json.dumps(relays), json.dumps(bundle),
+             int(time.time())),
+        )
+        return cur.rowcount > 0
+
+    def concord_invites(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM concord_invites ORDER BY received_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["bundle"] = json.loads(item.get("bundle") or "{}")
+            item["relays"] = json.loads(item.get("relays") or "[]")
+            out.append(item)
+        return out
+
     def stats(self) -> dict[str, Any]:
         row = self.db.execute(
             "SELECT COUNT(*) AS total, SUM(delivered_at IS NULL) AS pending FROM rumors"
         ).fetchone()
-        return {"total": row["total"], "pending": row["pending"] or 0, "relays": self.relay_report()}
+        invites = self.db.execute("SELECT COUNT(*) AS n FROM concord_invites").fetchone()
+        return {"total": row["total"], "pending": row["pending"] or 0,
+                "invites": invites["n"], "relays": self.relay_report()}
 
     def close(self) -> None:
         self.db.close()

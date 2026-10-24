@@ -203,6 +203,7 @@ def cmd_status(args) -> int:
     print(f"store:    {store.path}")
     stats = store.stats()
     print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery)")
+    print(f"invites:  {stats['invites']} concord invite(s)")
     print("relays:")
     for row in stats["relays"]:
         print(f"  {row['relay']:<38} events={row['events']:<5} last={row['last_event'] or '-'} "

@@ -7,14 +7,20 @@ to the agent.
 
 from __future__ import annotations
 
-from typing import Protocol
+import logging
+from typing import Callable, Protocol
 
 from ..policy import Policy
 from ..store import Inbound, Store
 
+log = logging.getLogger("hng.plane.nip17")
+
 DM_KINDS = {14, 7}
 INVITE_KINDS = {3313}
 ROUTED_KINDS = DM_KINDS | INVITE_KINDS
+
+# An unwrapped invite rumor goes here; the Concord plane owns parsing and storage.
+InviteSink = Callable[[str, dict], object]
 
 
 class Crypto(Protocol):
@@ -23,10 +29,12 @@ class Crypto(Protocol):
 
 
 class Nip17Plane:
-    def __init__(self, crypto: Crypto, store: Store, policy: Policy):
+    def __init__(self, crypto: Crypto, store: Store, policy: Policy,
+                 on_invite: InviteSink | None = None):
         self.crypto = crypto
         self.store = store
         self.policy = policy
+        self.on_invite = on_invite
         self.me = crypto.our_pubkey()
 
     def handle(self, relay: str, wrap: dict) -> Inbound | None:
@@ -48,7 +56,15 @@ class Nip17Plane:
         if kind not in ROUTED_KINDS:
             return None  # unknown payload in a wrapper: not ours to interpret
         if kind in INVITE_KINDS:
-            return None  # Concord invite: handled by the concord plane, never a DM
+            # A Concord invite shares the 1059 wrapper with DMs; it is never chat and
+            # must never reach the agent as a message (spec §14). Hand it to the
+            # Concord plane, which verifies and records it.
+            if self.on_invite is not None:
+                try:
+                    self.on_invite(relay, rumor)
+                except Exception:  # noqa: BLE001 - a bad invite must not kill the relay
+                    log.exception("concord invite sink failed")
+            return None
 
         tags = rumor.get("tags", [])
         reply_to = next((t[1] for t in tags if t and t[0] == "e"), None)

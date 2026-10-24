@@ -135,6 +135,60 @@ def nip04_decrypt(keys: sdk.Keys, peer: str, payload: str) -> str:
     return sdk.nip04_decrypt(keys.secret_key(), sdk.PublicKey.parse(normalize_pubkey(peer)), payload)
 
 
+# ── NIP-44 with an arbitrary key pair (Concord's stream keys, not just identities) ──
+
+def _secret_key(hex_secret: str) -> sdk.SecretKey:
+    return sdk.SecretKey.parse(parse_secret(hex_secret))
+
+
+def nip44_conversation_key(secret_hex: str, peer_hex: str) -> bytes:
+    """NIP-44 v2 conversation key for *any* pair, derived by the binding.
+
+    Concord derives its stream keys from this value, so it has to come from
+    `nostr-sdk` rather than a local ECDH: an unreviewed second implementation of
+    the curve maths is exactly what this project refuses to ship. The released
+    0.45.1 wheel does not expose the call, so an unpatched wheel fails loudly here
+    instead of silently falling back.
+    """
+    derive = getattr(sdk, "nip44_conversation_key", None)
+    if derive is None:
+        raise CryptoError(
+            "this nostr-sdk wheel does not expose nip44_conversation_key — the Concord "
+            "plane needs the patched wheel (see README); do not derive ECDH locally")
+    try:
+        return bytes(derive(_secret_key(secret_hex),
+                            sdk.PublicKey.parse(normalize_pubkey(peer_hex))))
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError(f"cannot derive NIP-44 conversation key: {exc}") from exc
+
+
+def nip44_encrypt(secret_hex: str, peer_hex: str, plaintext: str) -> str:
+    """NIP-44 encrypt for any pair. For a stream key's own pair this is its conv key."""
+    try:
+        return sdk.nip44_encrypt(_secret_key(secret_hex),
+                                 sdk.PublicKey.parse(normalize_pubkey(peer_hex)),
+                                 plaintext, sdk.Nip44Version.V2)
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError(f"cannot NIP-44 encrypt: {exc}") from exc
+
+
+def nip44_decrypt(secret_hex: str, peer_hex: str, payload: str) -> str:
+    try:
+        return sdk.nip44_decrypt(_secret_key(secret_hex),
+                                 sdk.PublicKey.parse(normalize_pubkey(peer_hex)),
+                                 payload)
+    except Exception as exc:  # noqa: BLE001
+        raise CryptoError(f"cannot NIP-44 decrypt: {exc}") from exc
+
+
+def event_id(event: dict[str, Any]) -> str:
+    """NIP-01 id from the binding (never a local hash: dedupe keys must match the seal)."""
+    author = str(event.get("pubkey") or "")
+    if not author:
+        raise CryptoError("event has no pubkey; cannot compute its id")
+    return unsigned_event(event, author).id().to_hex()
+
+
 # ── NIP-17 / NIP-59 ──────────────────────────────────────────────────────────
 
 def unwrap_gift(keys: sdk.Keys, wrap: dict[str, Any]) -> dict[str, Any]:
