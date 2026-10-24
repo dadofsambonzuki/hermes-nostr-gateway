@@ -1,8 +1,10 @@
 """Unix-socket API: NDJSON in, NDJSON out, 0600, local only.
 
-Seven ops, one connection may both subscribe and request. No TCP, no HTTP in v1 —
-there is no auth surface to get wrong, and the adapter is a local process by design.
-See docs/gateway-spec.md §5.
+One connection may both subscribe and request. Ops: subscribe, status, send, history,
+peers, ack, mark_read, ping, plus the Marmot reads (`marmot.group`, `marmot.timeline`)
+that only exist when that plane is attached. No TCP, no HTTP in v1 — there is no auth
+surface to get wrong, and the adapter is a local process by design. See
+docs/gateway-spec.md §5.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ class Handler(Protocol):
     def ack(self, ids: list[str]) -> dict[str, Any]: ...
     def mark_read(self, ids: list[str]) -> dict[str, Any]: ...
     def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]: ...
+    async def marmot_group(self, group: str) -> dict[str, Any]: ...
+    async def marmot_timeline(self, group: str, limit: int = 20) -> dict[str, Any]: ...
 
 
 class SocketServer:
@@ -111,6 +115,21 @@ class SocketServer:
                     elif op == "mark_read":
                         await self._send(writer, {"type": "ok",
                                                   **self.handler.mark_read(req.get("ids", []))})
+                    elif op == "marmot.group":
+                        handler = getattr(self.handler, "marmot_group", None)
+                        if handler is None:
+                            await self._send(writer, {"type": "error", "op": op,
+                                                      "error": "marmot plane not enabled"})
+                        else:
+                            await self._send(writer, await handler(req.get("group") or ""))
+                    elif op == "marmot.timeline":
+                        handler = getattr(self.handler, "marmot_timeline", None)
+                        if handler is None:
+                            await self._send(writer, {"type": "error", "op": op,
+                                                      "error": "marmot plane not enabled"})
+                        else:
+                            await self._send(writer, await handler(
+                                req.get("group") or "", int(req.get("limit", 20))))
                     elif op == "ping":
                         await self._send(writer, {"type": "pong"})
                     else:

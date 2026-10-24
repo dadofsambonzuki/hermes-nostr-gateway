@@ -13,6 +13,10 @@ which — it reads one normalised event stream.
 - **Design: approved.** The authoritative spec is [`docs/gateway-spec.md`](docs/gateway-spec.md).
 - **M1 running**: the gateway is a systemd service (`deploy/`), speaking NDJSON over a 0600 Unix
   socket, with the policy engine, rumor store, relay workers and NIP-17 plane in place.
+- **Marmot plane**: a proxy over `wn-agent`'s control socket — group messages arrive as ordinary
+  frames (`plane: "marmot"`), `send` reaches them with `to: "marmot:<group id>"`, and
+  `marmot.group` / `marmot.timeline` read through the same socket. MLS stays wn-agent's; the
+  plane attaches only when that daemon's socket exists.
 - **Hermes plugin**: `integrations/hermes-plugin/` — a platform adapter that turns socket frames
   into MessageEvents and replies into `send` ops. It maps the gateway's `authority` onto
   `source.role_authorized`, so untrusted senders reach the agent as data, never as instructions.

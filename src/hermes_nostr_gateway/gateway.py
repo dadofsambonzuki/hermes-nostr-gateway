@@ -11,6 +11,14 @@ from typing import Any
 from .crypto import SdkCrypto
 from .planes import nip04
 from .planes.concord.plane import ConcordPlane
+from .planes.marmot import (
+    MarmotControl,
+    MarmotError,
+    MarmotPlane,
+    MarmotResolver,
+    MarmotWorker,
+    resolve_account_id,
+)
 from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
@@ -20,6 +28,10 @@ from .server import SocketServer
 from .store import Store
 
 log = logging.getLogger("hng.gateway")
+
+
+def default_marmot_home() -> Path:
+    return Path(os.environ.get("MARMOT_HOME") or Path.home() / ".marmot-agents/hermes")
 
 
 def default_socket_path() -> Path:
@@ -49,6 +61,13 @@ class Gateway:
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
                                 on_invite=self.concord.handle_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
+        # The Marmot plane proxies wn-agent rather than speaking MLS, so it is
+        # attached only when that daemon is actually reachable (see _setup_marmot).
+        self.marmot: MarmotPlane | None = None
+        self.marmot_resolver: MarmotResolver | None = None
+        self.marmot_worker: MarmotWorker | None = None
+        self.marmot_error: str | None = None
+        self._setup_marmot(cfg.get("marmot") or {})
         self.follows: tuple[str, ...] = self._load_follows()
         self.relays_read = list(cfg["relays"]["read"])
         self.relays_publish = list(cfg["relays"].get("publish", []))
@@ -59,6 +78,40 @@ class Gateway:
         self.workers: list[RelayWorker] = []
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
+
+    def _setup_marmot(self, cfg: dict[str, Any]) -> None:
+        """Attach the Marmot proxy iff wn-agent's control socket is actually there.
+
+        A missing socket is "not configured" and stays quiet. A socket that exists
+        but cannot be used (no account file, two of them) disables only this plane
+        and records why in `marmot_error` — the NIP-17 planes must not go down
+        because a second daemon is mid-install, and a silent disable would look
+        exactly like a working plane with nothing to say.
+        """
+        if cfg.get("enabled") is False:
+            log.info("marmot plane disabled by config")
+            return
+        home = Path(os.path.expanduser(str(cfg.get("home") or default_marmot_home())))
+        socket = Path(os.path.expanduser(str(
+            cfg.get("socket") or cfg.get("socket_path") or home / "dev/wn-agent.sock"
+        )))
+        if not socket.exists():
+            log.info("marmot plane idle: no control socket at %s", socket)
+            return
+        try:
+            account = str(cfg.get("account_id_hex") or "").strip() or resolve_account_id(
+                home, cfg.get("label")
+            )
+            control = MarmotControl(socket, request_timeout=float(cfg.get("request_timeout", 30)))
+            plane = MarmotPlane(self.store, self.policy, control=control, account_id_hex=account)
+        except MarmotError as exc:
+            self.marmot_error = str(exc)
+            log.error("marmot plane disabled: %s", exc)
+            return
+        self.marmot = plane
+        self.marmot_resolver = MarmotResolver(plane)
+        self.marmot_worker = MarmotWorker(plane, group_id_hex=cfg.get("group"))
+        log.info("marmot plane via %s (account %s…)", socket, account[:12])
 
     # -- lifecycle ------------------------------------------------------
     async def start(self) -> None:
@@ -90,6 +143,8 @@ class Gateway:
                 self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
         self._tasks.append(asyncio.create_task(self._digest_loop()))
+        if self.marmot_worker is not None:
+            self._tasks.append(asyncio.create_task(self._guard_marmot(self.marmot_worker)))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
 
     def _load_follows(self) -> tuple[str, ...]:
@@ -121,6 +176,16 @@ class Gateway:
         finally:
             self.store.note_relay(worker.relay, error=worker.last_error)
 
+    async def _guard_marmot(self, worker: MarmotWorker) -> None:
+        """Kept separate from _guarded: the Marmot worker is a socket peer, not a
+        relay, and must not appear in the per-relay counters."""
+        try:
+            await worker.run(self._on_marmot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the proxy must not take the daemon down
+            log.exception("marmot worker died")
+
     async def stop(self) -> None:
         self._stopping.set()
         for worker in self.workers:
@@ -147,6 +212,19 @@ class Gateway:
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
+        asyncio.create_task(self.server.broadcast(msg.to_frame()))
+
+    def _on_marmot(self, event: dict) -> None:
+        """A control event from wn-agent. Same normalised frame as any other plane."""
+        if self.marmot is None:
+            return
+        try:
+            msg = self.marmot.handle(event)
+        except Exception:  # noqa: BLE001 - one bad event must not drop the subscription
+            log.exception("marmot event rejected")
+            return
+        if msg is None:
+            return
         asyncio.create_task(self.server.broadcast(msg.to_frame()))
 
 
@@ -177,6 +255,20 @@ class Gateway:
     # -- outbound -------------------------------------------------------
     async def send(self, *, to: str, text: str, reply_to: str | None = None,
                    cid: str | None = None) -> dict[str, Any]:
+        target = str(to or "").strip()
+        explicit_marmot = target.lower().startswith("marmot:")
+        if self.marmot_resolver is None:
+            # An explicit Marmot target with no plane attached must say so: falling
+            # through to NIP-17 would fail as "bad pubkey", which sends the caller
+            # looking in the wrong place.
+            if explicit_marmot:
+                detail = f": {self.marmot_error}" if self.marmot_error else ""
+                return {"type": "delivery", "id": cid, "ok": False,
+                        "error": f"marmot plane is not enabled{detail}"}
+        else:
+            group = self.marmot_resolver.parse(target)
+            if group is not None:
+                return await self._send_marmot(group, text, reply_to, cid)
         peer = self._hex(to)
         loop = asyncio.get_running_loop()
         try:
@@ -213,6 +305,28 @@ class Gateway:
             "relays": {label: {r: ok for r, (ok, _) in v.items()} for label, v in results.items()},
             "errors": {r: e for label, v in results.items() for r, (ok, e) in v.items() if not ok},
         }
+
+    async def _send_marmot(self, group: str, text: str, reply_to: str | None,
+                           cid: str | None) -> dict[str, Any]:
+        """Send into a Marmot group through wn-agent, with the group proven first.
+
+        A bad target must fail as a delivery error the caller can read, not as a
+        dead socket or a message that silently went nowhere.
+        """
+        assert self.marmot is not None and self.marmot_resolver is not None
+        try:
+            await self.marmot_resolver.resolve(group)
+            result = await self.marmot.send(
+                group, text, reply_to=reply_to, idempotency_key=cid or None
+            )
+        except MarmotError as exc:
+            return {"type": "delivery", "id": cid, "ok": False,
+                    "error": f"{exc.code}: {exc}"[:300], "conversation": group}
+        except Exception as exc:  # noqa: BLE001 - report, do not kill the socket
+            return {"type": "delivery", "id": cid, "ok": False, "error": str(exc)[:300]}
+        return {"type": "delivery", "id": cid, "ok": True, "plane": "marmot",
+                "conversation": group, "message_id": result["message_id"],
+                "message_ids": result["message_ids"], "relays": {}}
 
     def _build_wraps(self, text: str, peer: str, reply_to: str | None) -> tuple[dict, dict]:
         rumor = self.crypto.build_rumor(text, peer, reply_to=reply_to)
@@ -343,12 +457,22 @@ class Gateway:
             "identity": self.me,
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
-            "planes": ["nip17", "nip01", "nip04", "concord"],
+            "planes": ["nip17", "nip01", "nip04", "concord"]
+                      + (["marmot"] if self.marmot else []),
             "relays_publish": self.relays_publish,
             "rumors": stats["total"],
             "pending": stats["pending"],
             "invites": stats["invites"],
             "relay_stats": stats["relays"],
+            # Instrument the plane rather than inferring it from `ps`: a worker that
+            # reconnects every 60s and one that died at startup look identical from
+            # outside, and only the counters tell them apart.
+            "marmot": (
+                {"worker": self.marmot_worker.stats(),
+                 "conversations": self.marmot_resolver.conversations()}
+                if self.marmot and self.marmot_worker and self.marmot_resolver
+                else {"enabled": False, "error": self.marmot_error}
+            ),
             "workers": [
                 {"relay": w.relay, "kinds": list(w.kinds), "p_tag": bool(w.p_tag),
                  "authors": len(w.authors), "events": w.events, "last_error": w.last_error}
@@ -383,6 +507,30 @@ class Gateway:
     def ack(self, ids: list[str]) -> dict[str, Any]:
         self.store.mark_delivered(ids)
         return {"acked": ids}
+
+    # -- Marmot reads (over the same socket, same normalised shapes) ------
+    async def marmot_group(self, group: str) -> dict[str, Any]:
+        if self.marmot is None or self.marmot_resolver is None:
+            return {"type": "error", "op": "marmot.group",
+                    "error": self.marmot_error or "marmot plane not enabled"}
+        try:
+            info = await self.marmot_resolver.resolve(group)
+        except MarmotError as exc:
+            return {"type": "error", "op": "marmot.group", "code": exc.code,
+                    "error": str(exc)[:300]}
+        return {"type": "marmot_group", **info}
+
+    async def marmot_timeline(self, group: str, limit: int = 20) -> dict[str, Any]:
+        if self.marmot is None or self.marmot_resolver is None:
+            return {"type": "error", "op": "marmot.timeline",
+                    "error": self.marmot_error or "marmot plane not enabled"}
+        try:
+            await self.marmot_resolver.resolve(group)
+            page = await self.marmot.timeline(group, limit=limit)
+        except MarmotError as exc:
+            return {"type": "error", "op": "marmot.timeline", "code": exc.code,
+                    "error": str(exc)[:300]}
+        return {"type": "marmot_timeline", **page}
 
     def mark_read(self, ids: list[str]) -> dict[str, Any]:
         return self.ack(ids)
