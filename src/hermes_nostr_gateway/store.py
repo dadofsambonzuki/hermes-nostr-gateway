@@ -352,26 +352,68 @@ class Store:
         )
 
     def mark_delivered(self, ids: list[str]) -> None:
-        self.db.executemany(
-            "UPDATE rumors SET delivered_at = ? WHERE id = ?",
-            [(int(time.time()), i) for i in ids],
-        )
+        """Mark individual rumors delivered, and whole digest batches when the id is one.
+
+        A legacy adapter knows only ``type: message`` and acks ``id``; for a digest frame
+        that id is ``digests.id``, so the batch is the unit of delivery. The batch row is
+        closed only once every ``batched`` rumor in it is delivered — a partial id-level
+        ack leaves it open, so replay can still offer what is left. A second ack is a
+        no-op: ``COALESCE`` keeps the first timestamp.
+        """
+        ids = [i for i in ids if i]
+        if not ids:
+            return
+        now = int(time.time())
+        whole: set[str] = set()
+        touched: set[str] = set()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.executemany(
+                "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?) WHERE id = ?",
+                [(now, i) for i in ids],
+            )
+            for start in range(0, len(ids), 200):
+                chunk = ids[start:start + 200]
+                placeholders = ",".join("?" * len(chunk))
+                whole.update(
+                    str(row["id"]) for row in self.db.execute(
+                        f"SELECT id FROM digests WHERE id IN ({placeholders})", chunk
+                    ).fetchall()
+                )
+                touched.update(
+                    str(row["digest_batch"]) for row in self.db.execute(
+                        f"SELECT DISTINCT digest_batch FROM rumors WHERE id IN ({placeholders})"
+                        " AND digest_batch IS NOT NULL", chunk
+                    ).fetchall()
+                )
+            for batch_id in whole | touched:
+                if batch_id in whole:
+                    # The frame id is the batch: one ack covers every batched rumor in it.
+                    self.db.execute(
+                        "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?)"
+                        " WHERE digest_batch = ? AND digest_state = 'batched'",
+                        (now, batch_id),
+                    )
+                remaining = self.db.execute(
+                    "SELECT COUNT(*) AS n FROM rumors WHERE digest_batch = ?"
+                    " AND digest_state = 'batched' AND delivered_at IS NULL",
+                    (batch_id,),
+                ).fetchone()["n"]
+                if remaining == 0:
+                    self.db.execute(
+                        "UPDATE digests SET acked_at = COALESCE(acked_at, ?) WHERE id = ?",
+                        (now, batch_id),
+                    )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     def pending(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM rumors WHERE delivered_at IS NULL AND blocked_reason IS NULL"
             " ORDER BY received_at, rowid LIMIT ?",
             (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def pending_digest(self, older_than_s: int, limit: int = 20) -> list[dict[str, Any]]:
-        """Digest-class messages that have waited out the window and not been sent."""
-        cutoff = int(time.time()) - older_than_s
-        rows = self.db.execute(
-            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'digest'"
-            " AND blocked_reason IS NULL AND received_at <= ? ORDER BY received_at, rowid LIMIT ?",
-            (cutoff, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -614,6 +656,12 @@ class Store:
         return frame
 
     def digest_frame(self, digest_id: str) -> dict[str, Any]:
+        """One digest as an ordinary message frame, rebuilt from the joined rumors.
+
+        ``digests`` stores ids only; `content` is rendered here, at delivery and again at
+        replay, so the same row always yields the same frame and no plaintext is copied
+        into the digest record.
+        """
         row = self.db.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
         if row is None:
             raise KeyError(digest_id)
@@ -622,17 +670,40 @@ class Store:
         ).fetchall()
         by_id = {str(r["id"]): r for r in items}
         top_ids = json.loads(row["top_ids"])
+        top = [by_id[i] for i in top_ids if i in by_id]
+        lines = []
+        for r in top:
+            who = str(r["sender"] or "")[:10]
+            text = (r["content"] or "").replace("\n", " ")[:140]
+            lines.append(f"- {who}… ({r['rule'] or row['rule']}): {text}")
+        delivered = int(row["delivered_count"])
+        dropped = int(row["dropped_count"])
+        header = f"{delivered} item(s) in the {row['rule']} digest"
+        if dropped:
+            header += f" ({dropped} dropped by quota)"
         return {
-            "type": "digest",
+            "type": "message",
+            "plane": "digest",
+            "id": str(row["id"]),
+            "sender": "digest",
+            "conversation": "digest",
+            "kind": 1,
+            "created_at": int(row["created_at"]),
+            "reply_to": None,
+            "reach": "digest",
+            "authority": "none",
+            "why": f"{int(row['item_count'])} item(s) awaited the "
+                   f"{row['rule']} digest window",
+            "content": header + ":\n" + "\n".join(lines),
             "frame": int(row["frame_seq"]),
+            "rule": str(row["rule"]),
+            "source_plane": str(row["plane"]),
             "identity": row["identity"],
-            "rule": row["rule"],
-            "plane": row["plane"],
             "window_start": int(row["window_start"]),
             "window_end": int(row["window_end"]),
             "count": int(row["item_count"]),
-            "delivered": int(row["delivered_count"]),
-            "dropped": int(row["dropped_count"]),
+            "delivered": delivered,
+            "dropped": dropped,
             "cursor_start": int(row["cursor_start"]),
             "cursor_end": int(row["cursor_end"]),
             "items": [
@@ -644,10 +715,9 @@ class Store:
                     "why": r["why"],
                     "snippet": (r["content"] or "")[:256],
                 }
-                for r in (by_id.get(i) for i in top_ids) if r is not None
+                for r in top
             ],
-            "truncated": int(row["delivered_count"])
-            < int(row["item_count"]) - int(row["dropped_count"]),
+            "truncated": delivered < int(row["item_count"]) - dropped,
         }
 
     def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]:

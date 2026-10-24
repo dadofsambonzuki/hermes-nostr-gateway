@@ -1,6 +1,6 @@
 # Digest batching: cursor schema (rev 2)
 
-Status: approved schema; implementation is in this PR (commit `8279285`).
+Status: implemented on `pr/digest-cursor-schema`, rebased onto master.
 
 Scope: §17 `reach: digest(interval)` for `nip01` and `nip17`, and the §5 `ack` /
 `subscribe(since_frame)` contract. Immediate messages keep their existing id-based ack.
@@ -148,7 +148,7 @@ is not a valid state; the insert path always assigns one.
 
 ## Ack
 
-Digest frame:
+Digest frame, rule-scoped form:
 
 ```json
 {"op": "ack", "rule": "unknown-dms", "frame": 42}
@@ -160,23 +160,52 @@ Digest frame:
 - Mark `rumors.delivered_at` for every rumor in that `digests` row.
 - `UPDATE digests SET acked_at = ... WHERE identity=? AND rule=? AND frame_seq<=?`.
 
-Immediate frames keep `{"op":"ack","ids":["…"]}`; that path does not touch
-`digest_rules.acked_frame`. `ack(ids)` remains the compatibility shim for old adapters.
+Legacy form — and the one an adapter that only knows `type: message` uses:
+
+```json
+{"op": "ack", "ids": ["d:<identity>:unknown-dms:1790000000"]}
+```
+
+- An id matching `digests.id` is a **whole-batch** ack: every `batched` rumor in that digest
+  is marked delivered in the same transaction as any individual rumor ids in the same call.
+- The `digests` row is closed (`acked_at`) only when no `batched` rumor in it remains
+  undelivered; an id-level ack of part of a batch leaves it open for replay. A second ack is
+  a no-op — `COALESCE` keeps the first timestamps.
+- The same applies to `mark_read`, which is an alias for `ack`.
+
+Immediate frames keep `{"op":"ack","ids":["…"]}` and never touch `digest_rules.acked_frame`.
 
 ## Frame
 
+A digest is delivered as an ordinary `type: message` frame with `plane: "digest"`, so every
+adapter that already handles messages receives it without a protocol change. The extra keys
+are additive:
+
 ```json
 {
-  "type": "digest",
+  "type": "message",
+  "plane": "digest",
+  "id": "d:<identity>:unknown-dms:1790000000",
+  "sender": "digest",
+  "conversation": "digest",
+  "kind": 1,
+  "created_at": 1790003601,
+  "reply_to": null,
+  "reach": "digest",
+  "authority": "none",
+  "why": "12 item(s) awaited the unknown-dms digest window",
+  "content": "5 item(s) in the unknown-dms digest (7 dropped by quota):\n- npub1abc… (unknown-dms): first 140 bytes…",
   "frame": 42,
-  "identity": "npub1…",
   "rule": "unknown-dms",
-  "plane": "nip17",
+  "source_plane": "nip17",
+  "identity": "npub1…",
   "window_start": 1790000000,
   "window_end": 1790003600,
   "count": 12,
   "delivered": 5,
   "dropped": 7,
+  "cursor_start": 1180,
+  "cursor_end": 1191,
   "items": [
     {"rumor_id": "…", "from": "npub1…", "created_at": 1790000123,
      "authority": "none", "why": "matched unknown-dms (group unknown)",
@@ -186,8 +215,11 @@ Immediate frames keep `{"op":"ack","ids":["…"]}`; that path does not touch
 }
 ```
 
+`id` is `digests.id`, so an adapter can ack the whole frame with the legacy `ack(ids)` form.
 `delivered` is `len(items)` capped at `top_n` (default 5); `count` is `item_count`;
-`truncated` means `delivered < count`. `dropped` is `dropped_count`.
+`truncated` means `delivered < count - dropped`. `content` is rendered at delivery and again
+at replay by joining the rumors named in `top_ids` — `digests` itself stores ids only, never
+plaintext.
 
 ## Decisions confirmed
 

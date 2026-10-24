@@ -123,12 +123,8 @@ class Gateway:
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
-<<<<<<< HEAD
-        self.store = Store(store_path)
-        groups = normalise_groups(cfg)
-=======
         self.store = Store(store_path, identity=self.me)
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
+        groups = normalise_groups(cfg)
         self.policy = Policy({
             "groups": groups,
             "policies": cfg.get("policies"),
@@ -468,14 +464,11 @@ class Gateway:
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
-<<<<<<< HEAD
-        asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
-=======
-        # Immediate is the only reach that becomes a socket frame now. Digest rows wait
-        # for their window; drop rows are stored only so quota accounting stays honest.
-        if msg.reach == "immediate":
-            asyncio.create_task(self.server.broadcast(msg.to_frame()))
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
+        # Immediate is the only reach that becomes a socket frame now: digest rows wait
+        # for their window. A drop or a rate-limited row still has to emit its `blocked`
+        # frame, or a refusal reaches the agent as silence.
+        if msg.reach == "immediate" or msg.reach == "drop" or getattr(msg, "blocked_reason", None):
+            asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
 
     def _on_marmot(self, event: dict) -> None:
         """A control event from wn-agent. Same normalised frame as any other plane."""
@@ -511,12 +504,8 @@ class Gateway:
             sender=sender, kind=4, created_at=int(event.get("created_at") or 0),
             content=text, conversation=sender, reply_to=None, plane="nip04",
             reach=decision.reach, authority=decision.authority,
-<<<<<<< HEAD
-            rule=decision.rule, why=decision.why,
-            blocked_reason=decision.blocked_reason,
-=======
             rule=decision.rule, why=decision.why, interval_s=decision.interval_s,
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
+            blocked_reason=decision.blocked_reason,
         )
         return msg if self.store.add(msg) else None
 
@@ -674,6 +663,12 @@ class Gateway:
 
     # -- digest batching -------------------------------------------------
     async def _digest_loop(self, every: int = 30) -> None:
+        """Seal due rule windows and broadcast each batch as one message frame.
+
+        Sealing is durable before the broadcast: a frame nobody receives (no
+        subscribers) stays unacked and replays on the next subscribe, so silence is
+        never mistaken for delivery.
+        """
         while not self._stopping.is_set():
             try:
                 for frame in self.store.seal_digests():
@@ -777,7 +772,6 @@ class Gateway:
             })
         return frames
 
-<<<<<<< HEAD
     def replay_skip(self) -> dict[str, Any]:
         """Record a handover: the current backlog was answered by the previous adapter."""
         skipped = self.store.skip_pending()
@@ -785,17 +779,12 @@ class Gateway:
                  self.store.replay_floor(), skipped)
         return {"skipped": skipped, "replay_floor": self.store.replay_floor()}
 
-    def ack(self, ids: list[str]) -> dict[str, Any]:
-        self.store.mark_delivered(ids)
-        return {"acked": ids}
-=======
     def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
             frame: int | None = None) -> dict[str, Any]:
         if rule is not None and frame is not None:
             return self.store.ack_digest(rule, int(frame))
         self.store.mark_delivered(ids or [])
         return {"acked": ids or []}
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
 
     # -- Marmot reads (over the same socket, same normalised shapes) ------
     def _marmot_unavailable(self) -> str:

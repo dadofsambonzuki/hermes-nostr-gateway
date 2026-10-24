@@ -11,10 +11,10 @@ PEER = "bb" * 32
 
 
 def inbound(rid, *, reach="digest", rule="unknown-dms", interval=60, now=1000,
-            plane="nip17", content="hello"):
+            plane="nip17", content=None):
     return Inbound(
         id=rid, wrapper_id=f"w-{rid}", sender=PEER, kind=14, created_at=now,
-        content=content, conversation=PEER, reply_to=None, plane=plane,
+        content=content or f"hello {rid}", conversation=PEER, reply_to=None, plane=plane,
         reach=reach, authority="none", rule=rule, why="test", interval_s=interval,
     )
 
@@ -26,9 +26,63 @@ def test_digest_waits_for_its_window_then_emits_one_frame(tmp_path):
     frames = store.seal_digests(now=1060)
     assert len(frames) == 1
     frame = frames[0]
-    assert frame["type"] == "digest" and frame["frame"] == 1
+    assert frame["type"] == "message" and frame["plane"] == "digest"
+    assert frame["frame"] == 1
     assert frame["count"] == 1 and frame["delivered"] == 1
     assert frame["items"][0]["rumor_id"] == "r1"
+
+
+def test_frame_carries_the_additive_contract_and_rendered_content(tmp_path):
+    store = Store(tmp_path / "d.db", identity=ME)
+    assert store.add(inbound("r1", rule="r", now=100, content="first line"), now=100)
+    assert store.add(inbound("r2", rule="r", now=101, content="second line"), now=101)
+    frame = store.seal_digests(now=160)[0]
+    assert frame["type"] == "message" and frame["plane"] == "digest"
+    assert frame["id"] == f"d:{ME}:r:60"
+    for key in ("frame", "rule", "cursor_start", "cursor_end", "count", "delivered",
+                "dropped", "truncated", "items", "content", "sender", "conversation",
+                "created_at", "reach", "authority", "why"):
+        assert key in frame, key
+    assert frame["count"] == 2 and frame["delivered"] == 2 and frame["truncated"] is False
+    # Newest first, in the frame and in the rendered text the adapter shows the agent.
+    assert [i["rumor_id"] for i in frame["items"]] == ["r2", "r1"]
+    assert frame["content"].startswith("2 item(s) in the r digest:")
+    assert "second line" in frame["content"] and "first line" in frame["content"]
+
+
+def test_ack_of_frame_id_closes_the_batch_and_a_second_ack_is_noop(tmp_path):
+    store = Store(tmp_path / "d.db", identity=ME)
+    assert store.add(inbound("r1", rule="r", now=100), now=100)
+    assert store.add(inbound("r2", rule="r", now=101), now=101)
+    frame = store.seal_digests(now=160)[0]
+    store.mark_delivered([frame["id"]])
+    rows = store.db.execute("SELECT delivered_at FROM rumors").fetchall()
+    assert all(r["delivered_at"] is not None for r in rows)
+    acked = store.db.execute("SELECT acked_at FROM digests").fetchone()["acked_at"]
+    assert acked is not None
+    assert store.replay_digests() == []
+    store.mark_delivered([frame["id"]])
+    assert store.db.execute("SELECT acked_at FROM digests").fetchone()["acked_at"] == acked
+
+
+def test_individual_acks_keep_the_batch_open_until_every_item_is_delivered(tmp_path):
+    store = Store(tmp_path / "d.db", identity=ME)
+    assert store.add(inbound("r1", rule="r", now=100), now=100)
+    assert store.add(inbound("r2", rule="r", now=101), now=101)
+    frame = store.seal_digests(now=160)[0]
+    store.mark_delivered(["r1"])
+    assert store.db.execute("SELECT acked_at FROM digests").fetchone()["acked_at"] is None
+    assert [f["id"] for f in store.replay_digests()] == [frame["id"]]
+    store.mark_delivered(["r2"])
+    assert store.db.execute("SELECT acked_at FROM digests").fetchone()["acked_at"] is not None
+    assert store.replay_digests() == []
+
+
+def test_withheld_ack_replays_the_identical_frame(tmp_path):
+    store = Store(tmp_path / "d.db", identity=ME)
+    assert store.add(inbound("r1", rule="r", now=100), now=100)
+    frame = store.seal_digests(now=160)[0]
+    assert store.replay_digests() == [frame]
 
 
 def test_one_rule_ack_does_not_cover_another_rules_queued_item(tmp_path):

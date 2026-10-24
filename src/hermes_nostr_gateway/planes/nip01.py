@@ -107,10 +107,7 @@ class Nip01Plane:
             authority=decision.authority,
             rule=decision.rule,
             why=f"{decision.why}; {reason}",
-<<<<<<< HEAD
             blocked_reason=decision.blocked_reason,
-=======
             interval_s=decision.interval_s,
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
         )
         return msg if self.store.add(msg) else None

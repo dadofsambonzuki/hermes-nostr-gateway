@@ -15,11 +15,7 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
-<<<<<<< HEAD
 from dataclasses import dataclass, field, replace
-=======
-from dataclasses import dataclass, field
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
 from typing import Any, Callable
 
 REACH_PRIORITY = {"drop": 0, "digest": 1, "immediate": 2}
@@ -232,7 +228,6 @@ class Policy:
             None,
         )
 
-<<<<<<< HEAD
         # Dedupe first: the same event arriving on a second relay or a second plane
         # is one delivery, and must not burn a rate token or turn into a blocked replay.
         if event_id is not None:
@@ -270,23 +265,6 @@ class Policy:
             base = self.default
         else:
             base = Decision(
-=======
-        chosen: Decision | None = None
-        for rule in self._rules:
-            if not rule.matches(group=group, kind=kind, mention=mention, dm=dm):
-                continue
-            if rule.over_quota(now):
-                chosen = Decision(
-                    reach="drop",
-                    interval_s=rule.interval_s,
-                    authority="none",
-                    rule=rule.name,
-                    why=f"quota {rule.limit}/h exceeded",
-                )
-                break
-            rule.hit(now)
-            chosen = Decision(
->>>>>>> 9c1a51b (feat: digest batching with per-rule cursors and ack)
                 reach=rule.reach,
                 interval_s=rule.interval_s,
                 authority=rule.authority,

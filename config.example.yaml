@@ -59,9 +59,8 @@ feeds:
     keywords: []         # case-insensitive substrings
     hashtags: []         # without the leading '#'
 
-digest:
-  interval_minutes: 15   # one batched message per window
-  max_items: 20
+# Digest windows come from each policy rule's `reach: digest(15m)`; there is no
+# global digest interval. See docs/digest-cursor.md.
 
 # Replay on subscribe is for "crashed mid-delivery", not history: a reconnect or an
 # adapter restart. The window is minutes and nothing older than the store's replay
