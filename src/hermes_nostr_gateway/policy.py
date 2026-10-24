@@ -15,8 +15,8 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
 
 REACH_PRIORITY = {"drop": 0, "digest": 1, "immediate": 2}
 _INTERVAL = re.compile(r"^\s*(\d+)\s*([smh]?)\s*$", re.I)
@@ -61,6 +61,7 @@ class Decision:
     rule: str
     why: str
     duplicate: bool = False
+    blocked_reason: str | None = None
 
     @property
     def deliverable(self) -> bool:
@@ -74,7 +75,39 @@ class Decision:
             "rule": self.rule,
             "why": self.why,
             "duplicate": self.duplicate,
+            "blocked_reason": self.blocked_reason,
         }
+
+
+@dataclass
+class _TokenBucket:
+    """Per-sender token bucket: burst at once, then refill at `per_hour`.
+
+    Per *sender*, not per rule: a peer must not earn a fresh burst by tripping a
+    different rule, and an allowlisted contact that starts flooding has to degrade
+    to `blocked` frames rather than a queue that grows (spec §10.4). In-memory on
+    purpose — a restart forgiving a flood is preferable to a durable table nobody
+    reads, and the durable record is the blocked rows themselves.
+    """
+
+    burst: float
+    per_hour: float
+    clock: Callable[[], float]
+    _tokens: dict[str, float] = field(default_factory=dict)
+    _stamp: dict[str, float] = field(default_factory=dict)
+
+    def allow(self, sender: str) -> bool:
+        now = self.clock()
+        tokens = self._tokens.get(sender, self.burst)
+        last = self._stamp.get(sender, now)
+        if self.per_hour > 0:
+            tokens = min(self.burst, tokens + (now - last) * (self.per_hour / 3600))
+        self._stamp[sender] = now
+        if tokens < 1:
+            self._tokens[sender] = tokens
+            return False
+        self._tokens[sender] = tokens - 1
+        return True
 
 
 @dataclass
@@ -156,6 +189,14 @@ class Policy:
             rule="defaults",
             why="no rule matched",
         )
+        limits = config.get("rate_limit") or {}
+        self.limiter: _TokenBucket | None = None
+        if limits.get("enabled", True):
+            burst = int(limits.get("burst", 10))
+            per_hour = int(limits.get("per_hour", 30))
+            if burst < 1 or per_hour < 0:
+                raise ValueError(f"bad rate_limit: burst={burst}, per_hour={per_hour}")
+            self.limiter = _TokenBucket(burst=burst, per_hour=per_hour, clock=clock)
         self._seen: dict[str, Decision] = {}
 
     # -- groups ---------------------------------------------------------
@@ -181,43 +222,68 @@ class Policy:
     ) -> Decision:
         now = self._clock()
         group = self.group_of(sender)
+        matched = next(
+            (rule for rule in self._rules
+             if rule.matches(group=group, kind=kind, mention=mention, dm=dm)),
+            None,
+        )
 
-        chosen: Decision | None = None
-        for rule in self._rules:
-            if not rule.matches(group=group, kind=kind, mention=mention, dm=dm):
-                continue
-            if rule.over_quota(now):
-                chosen = Decision(
-                    reach="drop",
-                    interval_s=None,
-                    authority="none",
-                    rule=rule.name,
-                    why=f"quota {rule.limit}/h exceeded",
-                )
-                break
-            rule.hit(now)
-            chosen = Decision(
+        # Dedupe first: the same event arriving on a second relay or a second plane
+        # is one delivery, and must not burn a rate token or turn into a blocked replay.
+        if event_id is not None:
+            prior = self._seen.get(event_id)
+            if prior is not None:
+                candidate = self._decide(matched, sender, group, now, consume=False)
+                if REACH_PRIORITY[candidate.reach] > REACH_PRIORITY[prior.reach]:
+                    self._seen[event_id] = candidate
+                    return replace(candidate, duplicate=True)
+                return replace(prior, duplicate=True)
+
+        chosen = self._decide(matched, sender, group, now, consume=True)
+        if event_id is not None:
+            self._seen[event_id] = chosen
+        return chosen
+
+    def _decide(self, rule: "_Rule | None", sender: str, group: str, now: float,
+                *, consume: bool) -> Decision:
+        """Turn a matched rule (or the default) into a decision, consuming quota once.
+
+        A sender over its bucket loses the message to a `blocked` frame with
+        `reason: rate_limited`; it never sits in a queue waiting for the window to
+        roll, because a flood that is retried later is still a flood (spec §10.4).
+        """
+        if rule is not None and rule.over_quota(now):
+            return Decision(
+                reach="drop",
+                interval_s=None,
+                authority="none",
+                rule=rule.name,
+                why=f"quota {rule.limit}/h exceeded",
+                blocked_reason="rate_limited",
+            )
+        if rule is None:
+            base = self.default
+        else:
+            base = Decision(
                 reach=rule.reach,
                 interval_s=rule.interval_s,
                 authority=rule.authority,
                 rule=rule.name,
                 why=f"matched {rule.name} (group {group})",
             )
-            break
-
-        if chosen is None:
-            chosen = self.default
-
-        # Dedupe across rules: one event, one delivery, best rule wins.
-        if event_id is not None:
-            prior = self._seen.get(event_id)
-            if prior is not None:
-                if REACH_PRIORITY[chosen.reach] > REACH_PRIORITY[prior.reach]:
-                    self._seen[event_id] = chosen
-                    return Decision(**{**chosen.__dict__, "duplicate": True})
-                return Decision(**{**prior.__dict__, "duplicate": True})
-            self._seen[event_id] = chosen
-        return chosen
+        if consume:
+            if self.limiter is not None and not self.limiter.allow(sender):
+                return Decision(
+                    reach="drop",
+                    interval_s=None,
+                    authority="none",
+                    rule=base.rule,
+                    why=f"per-sender rate limit exceeded ({base.rule})",
+                    blocked_reason="rate_limited",
+                )
+            if rule is not None:
+                rule.hit(now)
+        return base
 
     def digest_due(self, interval_s: int | None, last_sent: float | None, now: float | None = None) -> bool:
         """Whether a digest window has closed. Callers own the batching; this owns the clock."""

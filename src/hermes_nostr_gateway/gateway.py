@@ -306,6 +306,7 @@ class Gateway:
             content=text, conversation=sender, reply_to=None, plane="nip04",
             reach=decision.reach, authority=decision.authority,
             rule=decision.rule, why=decision.why,
+            blocked_reason=decision.blocked_reason,
         )
         return msg if self.store.add(msg) else None
 

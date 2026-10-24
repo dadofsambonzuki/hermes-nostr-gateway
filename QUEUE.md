@@ -88,3 +88,10 @@ service's config without recording why in the commit; if tests fail and the fix 
 obvious in the same run, mark BLOCKED with the failure in the note. To DM Nathan, write the
 text to a file and send it with `hermes send --to marmot --file <path>` (`hermes send` takes
 a positional body, not `--text`).
+
+## Decisions (do not re-litigate)
+
+- **White Noise relays are Marmot-only.** `relay.eu/us.whitenoise.chat` serve the White
+  Noise plane via wn-agent; they are not part of the gateway's NIP-17/feed read set and
+  must not be re-added there. If the Marmot plane needs them, it reads them through
+  wn-agent, not through a DM worker.

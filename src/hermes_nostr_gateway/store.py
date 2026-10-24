@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS rumors (
     rule          TEXT,
     why           TEXT,
     received_at   INTEGER NOT NULL,
-    delivered_at  INTEGER
+    delivered_at  INTEGER,
+    blocked_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS rumors_pending ON rumors (delivered_at, received_at);
 CREATE INDEX IF NOT EXISTS rumors_sender ON rumors (sender, created_at);
@@ -89,9 +90,10 @@ class Inbound:
     authority: str = "none"
     rule: str = ""
     why: str = ""
+    blocked_reason: str | None = None
 
     def to_frame(self) -> dict[str, Any]:
-        return {
+        frame = {
             "type": "message",
             "plane": self.plane,
             "id": self.id,
@@ -105,6 +107,9 @@ class Inbound:
             "authority": self.authority,
             "why": self.why,
         }
+        if self.blocked_reason:
+            frame["blocked_reason"] = self.blocked_reason
+        return frame
 
 
 class Store:
@@ -114,6 +119,13 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns a live store predates; `CREATE TABLE IF NOT EXISTS` won't."""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(rumors)")}
+        if "blocked_reason" not in columns:
+            self.db.execute("ALTER TABLE rumors ADD COLUMN blocked_reason TEXT")
 
     # -- wrappers (transport level) -------------------------------------
     def wrapper_seen(self, wrapper_id: str, relay: str = "") -> bool:
@@ -177,12 +189,14 @@ class Store:
         try:
             self.db.execute(
                 "INSERT INTO rumors (id, wrapper_id, sender, kind, created_at, conversation,"
-                " content, reply_to, plane, reach, authority, rule, why, received_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " content, reply_to, plane, reach, authority, rule, why, received_at,"
+                " blocked_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
                     msg.conversation, msg.content, msg.reply_to, msg.plane,
                     msg.reach, msg.authority, msg.rule, msg.why, int(time.time()),
+                    msg.blocked_reason,
                 ),
             )
             return True
@@ -197,7 +211,8 @@ class Store:
 
     def pending(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT * FROM rumors WHERE delivered_at IS NULL ORDER BY received_at LIMIT ?",
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND blocked_reason IS NULL"
+            " ORDER BY received_at, rowid LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -206,8 +221,8 @@ class Store:
         """Digest-class messages that have waited out the window and not been sent."""
         cutoff = int(time.time()) - older_than_s
         rows = self.db.execute(
-            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'digest' "
-            "AND received_at <= ? ORDER BY received_at LIMIT ?",
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'digest'"
+            " AND blocked_reason IS NULL AND received_at <= ? ORDER BY received_at, rowid LIMIT ?",
             (cutoff, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -216,12 +231,15 @@ class Store:
         """Messages that never reached an adapter (refused, or crashed mid-delivery).
 
         Replayed on subscribe so a reconnect cannot lose a message that was accepted
-        but never handed over.
+        but never handed over. Ordering is by arrival and then insertion: `received_at`
+        has second resolution, and a replay has to keep the order the frames first
+        appeared in or a cursor-taking consumer would see it jump backwards.
         """
         cutoff = int(time.time()) - max_age_days * 86400
         rows = self.db.execute(
-            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate' "
-            "AND authority != 'self' AND received_at >= ? ORDER BY received_at LIMIT ?",
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate'"
+            " AND authority != 'self' AND blocked_reason IS NULL AND received_at >= ?"
+            " ORDER BY received_at, rowid LIMIT ?",
             (cutoff, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -257,10 +275,13 @@ class Store:
 
     def stats(self) -> dict[str, Any]:
         row = self.db.execute(
-            "SELECT COUNT(*) AS total, SUM(delivered_at IS NULL) AS pending FROM rumors"
+            "SELECT COUNT(*) AS total,"
+            " SUM(delivered_at IS NULL AND blocked_reason IS NULL) AS pending,"
+            " SUM(blocked_reason IS NOT NULL) AS blocked FROM rumors"
         ).fetchone()
         invites = self.db.execute("SELECT COUNT(*) AS n FROM concord_invites").fetchone()
         return {"total": row["total"], "pending": row["pending"] or 0,
+                "blocked": row["blocked"] or 0,
                 "invites": invites["n"], "relays": self.relay_report()}
 
     def close(self) -> None:
