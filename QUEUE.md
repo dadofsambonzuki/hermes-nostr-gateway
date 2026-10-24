@@ -61,13 +61,18 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       queue for the eventual AGENTS.md entry. Done when: the file exists with the
       notes and the `docs/ops-notes.md` copy is referenced from it.
 
-- [ ] **A relay that refuses kind 4 loses kind 1059 too** — `gateway.py` builds
+- [x] **A relay that refuses kind 4 loses kind 1059 too** — `gateway.py` builds
       `kinds = (1059, 4) if restricted else (1059, 4)`, so the restricted branch is a no-op.
       `relay.eu.whitenoise.chat` answers the combined REQ with
       `CLOSED: ERROR: bad req: filter validation failed: kind not allowed: 4`, which drops its
       DM subscription entirely (seen in `hng status`, 2026-10-24). Give each relay a kind set it
       accepts — at minimum drop kind 4 where it is refused while keeping 1059 — and add a test
       for a relay that rejects kind 4 but accepts 1059. Found while writing the ops notes.
+      — landed c2dfbf8: `relays.read` entries may be `{url, kinds}` (whitenoise pinned to
+      `[1059]`), and a worker refused a kind drops it and resubscribes at once, stopping with
+      an error rather than ever building a filterless REQ; `hng status` records the negotiation.
+      Live: 126 wraps after dropping kind 4. 123 tests green. The daemon still runs the old
+      code (editable install) until someone bounces the unit — unattended runs may not.
 - [ ] **Acceptance tests from spec §13** — crash-between-insert-and-ack replays;
       rate-limited peer degrades to blocked.
 - [ ] **Packaging** — container image, CI (pytest + ruff), README "run it in five minutes".
