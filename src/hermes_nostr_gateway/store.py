@@ -202,6 +202,20 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def pending_immediate(self, limit: int = 20, max_age_days: int = 2) -> list[dict[str, Any]]:
+        """Messages that never reached an adapter (refused, or crashed mid-delivery).
+
+        Replayed on subscribe so a reconnect cannot lose a message that was accepted
+        but never handed over.
+        """
+        cutoff = int(time.time()) - max_age_days * 86400
+        rows = self.db.execute(
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate' "
+            "AND authority != 'self' AND received_at >= ? ORDER BY received_at LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM rumors ORDER BY created_at DESC LIMIT ?", (limit,)

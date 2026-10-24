@@ -24,6 +24,7 @@ class Handler(Protocol):
     def peers(self) -> dict[str, Any]: ...
     def ack(self, ids: list[str]) -> dict[str, Any]: ...
     def mark_read(self, ids: list[str]) -> dict[str, Any]: ...
+    def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]: ...
 
 
 class SocketServer:
@@ -45,8 +46,11 @@ class SocketServer:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Do not await client shutdown here: a half-open test connection would make
+        # stop() hang forever.
         for writer in list(self._clients):
             writer.close()
+        self._clients.clear()
         if self.path.exists():
             self.path.unlink()
 
@@ -85,6 +89,10 @@ class SocketServer:
                         self._clients.add(writer)
                         await self._send(writer, {"type": "subscribed",
                                                   "since": req.get("since")})
+                        # Re-offer anything accepted but never acknowledged, so a
+                        # reconnect (or a crash mid-delivery) cannot lose it.
+                        for frame in self.handler.replay_pending():
+                            await self._send(writer, frame)
                     elif op == "status":
                         await self._send(writer, {"type": "status", **(await self.handler.status())})
                     elif op == "send":

@@ -23,3 +23,23 @@ def test_distinct_messages_from_same_sender_both_stored(tmp_path):
                     authority="instructions", rule="t", why="t")
         assert s.add(Inbound(id="a", wrapper_id="a", content="one", plane="nip17", **base))
         assert s.add(Inbound(id="b", wrapper_id="b", content="two", plane="nip17", **base))
+
+
+def test_pending_immediate_is_replayed_but_old_or_sent_is_not(tmp_path):
+    import time
+    from hermes_nostr_gateway.store import Inbound, Store
+
+    with Store(tmp_path / "p.db") as s:
+        now = int(time.time())
+        base = dict(sender="cc" * 32, kind=14, conversation="cc" * 32, reply_to=None,
+                    authority="instructions", rule="t", why="t")
+        s.add(Inbound(id="fresh", wrapper_id="w1", created_at=now, content="new",
+                      plane="nip17", reach="immediate", **base))
+        s.add(Inbound(id="old", wrapper_id="w2", created_at=now - 3 * 86400, content="old",
+                      plane="nip17", reach="immediate", **base))
+        # received_at is what the replay window uses; backdate it for the stale row
+        s.db.execute("UPDATE rumors SET received_at = ? WHERE id = 'old'", (now - 3 * 86400,))
+        s.add(Inbound(id="digestish", wrapper_id="w3", created_at=now, content="later",
+                      plane="nip01", reach="digest", **base))
+        ids = [r["id"] for r in s.pending_immediate()]
+        assert ids == ["fresh"]

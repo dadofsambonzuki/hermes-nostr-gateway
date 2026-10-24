@@ -28,6 +28,9 @@ class FakeHandler:
     def mark_read(self, ids):
         return {"acked": ids}
 
+    def replay_pending(self, limit=20):
+        return []
+
 
 async def call(path, *frames):
     reader, writer = await asyncio.open_unix_connection(str(path))

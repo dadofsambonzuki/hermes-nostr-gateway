@@ -364,6 +364,18 @@ class Gateway:
         return {"peers": [{"pubkey": k, "last_seen": v} for k, v in
                           sorted(seen.items(), key=lambda kv: kv[1], reverse=True)]}
 
+    def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]:
+        frames = []
+        for row in self.store.pending_immediate(limit):
+            frames.append({
+                "type": "message", "plane": row["plane"], "id": row["id"],
+                "sender": row["sender"], "conversation": row["conversation"],
+                "kind": row["kind"], "created_at": row["created_at"],
+                "content": row["content"], "reply_to": row["reply_to"],
+                "reach": row["reach"], "authority": row["authority"], "why": row["why"],
+            })
+        return frames
+
     def ack(self, ids: list[str]) -> dict[str, Any]:
         self.store.mark_delivered(ids)
         return {"acked": ids}
