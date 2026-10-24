@@ -3,9 +3,10 @@
 What the daemon is, where its socket lives, and the two host-side gates that make
 `relay.day.ag` look like it is refusing us. Checked against the live host on 2026-10-24.
 
-This was written for `~/Projects/infra/AGENTS.md`; it lives here because a scheduled run
-cannot write a file named `AGENTS.md` (protected instruction file, human approval only).
-Copy the "Service and socket" and "Why `relay.day.ag` says no" sections across unchanged.
+This is the source copy. The ops-side mirror lives at
+`~/Projects/infra/ops/hermes-nostr-gateway.md` (the file Nathan chose on 2026-10-24 instead of
+an `infra/AGENTS.md` entry): change this copy, commit it, then re-copy the body across so the
+two differ only in their headers.
 
 ## Service and socket
 

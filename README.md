@@ -18,7 +18,8 @@ which — it reads one normalised event stream.
   `marmot.group` / `marmot.timeline` read through the same socket. MLS stays wn-agent's; the
   plane attaches only when that daemon's socket exists.
 - **Operating notes**: [`docs/ops-notes.md`](docs/ops-notes.md) — the service, its socket, and
-  the host-side gates (`relay.day.ag`'s WoT and rate limits) that explain its refusals.
+  the host-side gates (`relay.day.ag`'s WoT and rate limits) that explain its refusals. Mirrored
+  for the host at `~/Projects/infra/ops/hermes-nostr-gateway.md`.
 - **Conformance probes**: `scripts/probe_nip17_conformance.py` — the NIP-17 traps the retired
   phase-0 wrapper pinned down (wrap `p` is the recipient's identity key, wraps backdated up to
   two days against a three-day read window, watermark on the inner rumor, NIP-42 as the
