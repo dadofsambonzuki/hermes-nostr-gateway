@@ -79,8 +79,15 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       an error rather than ever building a filterless REQ; `hng status` records the negotiation.
       Live: 126 wraps after dropping kind 4. 123 tests green. The daemon still runs the old
       code (editable install) until someone bounces the unit — unattended runs may not.
-- [ ] **Acceptance tests from spec §13** — crash-between-insert-and-ack replays;
+- [x] **Acceptance tests from spec §13** — crash-between-insert-and-ack replays;
       rate-limited peer degrades to blocked.
+      — landed 0ffbb33: a real-Gateway socket test acks one of two frames, drops the
+      connection before the second ack, and gets exactly the unacked frame back once,
+      then nothing after it is acked; the per-sender bucket (10 burst, 30/h, all planes)
+      stores over-limit messages but emits `blocked`/`rate_limited` with no content, and
+      policy drops use the same frame (`not_allowlisted`). 129 tests green; live-DB copy
+      migrated 1,693 rows. The policy/store half was swept into 81bae9e by a concurrent
+      commit; 0ffbb33 is the frame mapping, CLI/plugin treatment, docs and tests.
 - [ ] **Packaging** — container image, CI (pytest + ruff), README "run it in five minutes".
 
 Rules for the cron: one item per run; never amend pushed history; never touch a running
