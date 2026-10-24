@@ -2,8 +2,9 @@
 
 Status: **approved for build** — v2 2026-10-23: planes and attention policy added, seed code
 identified. Repo: `nostr://npub1cn67…/relay.ngit.dev/hermes-nostr-gateway`. Supersedes the phase-0
-wrapper as the design target; the wrapper stays as the protocol conformance reference (its
-four traps are encoded in §4 and §7 below).
+wrapper as the design target; that wrapper is now retired (`nip17_wrapper.py` deleted — `hng
+send` / `hng listen` and the daemon cover it), and its four traps are encoded in §4 and §7 and
+checked executably by `scripts/probe_nip17_conformance.py`.
 
 Name is deliberately protocol-first. There is **no "Armada gateway"**: Armada is a client
 that speaks NIP-17 with a legacy NIP-04 plane. Serving the NIPs serves every client at once.

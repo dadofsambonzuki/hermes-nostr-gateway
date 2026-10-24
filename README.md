@@ -17,6 +17,12 @@ which — it reads one normalised event stream.
   frames (`plane: "marmot"`), `send` reaches them with `to: "marmot:<group id>"`, and
   `marmot.group` / `marmot.timeline` read through the same socket. MLS stays wn-agent's; the
   plane attaches only when that daemon's socket exists.
+- **Conformance probes**: `scripts/probe_nip17_conformance.py` — the NIP-17 traps the retired
+  phase-0 wrapper pinned down (wrap `p` is the recipient's identity key, wraps backdated up to
+  two days against a three-day read window, watermark on the inner rumor, NIP-42 as the
+  identity, self-copy never surfaced), executable and exercised by `tests/test_conformance.py`.
+  `--live` adds the spec §13.1 wire probe: a throwaway recipient, a real relay, read back and
+  decrypted — no message reaches the household inbox.
 - **Hermes plugin**: `integrations/hermes-plugin/` — a platform adapter that turns socket frames
   into MessageEvents and replies into `send` ops. It maps the gateway's `authority` onto
   `source.role_authorized`, so untrusted senders reach the agent as data, never as instructions.

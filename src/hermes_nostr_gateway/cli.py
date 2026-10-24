@@ -15,6 +15,7 @@ import yaml
 from .crypto import SdkCrypto
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
+from .publisher import publish
 from .relay import OneShot, RelayWorker
 from .store import Store
 
@@ -123,7 +124,11 @@ def cmd_listen(args) -> int:
         return 0
 
     async def stream() -> None:
-        workers = [RelayWorker(r, plane.me) for r in relays]
+        secret = secret_from(cfg)
+        # `-p me` is not optional: a kind-1059 subscription without it is a firehose of
+        # every wrap on the relay, and the identity secret must reach the child so NIP-42
+        # authenticates as us rather than as nak's machine key.
+        workers = [RelayWorker(r, plane.me, p_tag=plane.me, secret=secret) for r in relays]
         tasks = [asyncio.create_task(w.run(lambda relay, event: found(plane, relay, event, args)))
                  for w in workers]
         try:
@@ -164,23 +169,26 @@ def recipient_relays(cfg: dict[str, Any], peer: str) -> list[str]:
 
 
 def cmd_send(args) -> int:
-    import subprocess
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
+    secret = secret_from(cfg)
     peer = to_hex(args.to)
     rumor = crypto.build_rumor(args.text, peer, reply_to=args.reply_to)
     wraps = {"peer": crypto.wrap(rumor, peer), "self": crypto.wrap(rumor, plane.me)}
     relays = recipient_relays(cfg, peer)
     ok_peer = False
     for label, wrap in wraps.items():
-        results = {}
-        for relay in relays:
-            proc = subprocess.run(
-                ["nak", "event", "--auth", relay], input=json.dumps(wrap),
-                capture_output=True, text=True,
-            )
-            results[relay] = "success" in (proc.stdout + proc.stderr).lower()
-        published = [r for r, v in results.items() if v]
+        # Durable before attempted, retried from the stored event rather than re-wrapped,
+        # and published through the same function the daemon uses so NIP-42 signs as us
+        # instead of as nak's machine-default key (spec §3, §7).
+        recipient = peer if label == "peer" else plane.me
+        store.record_wrap(wrap, rumor["id"], recipient, relays)
+        results = publish(wrap, relays, secret=secret)
+        for relay, (ok, error) in results.items():
+            store.mark_wrap(wrap["id"], relay, ok=ok, error=error)
+            if not ok:
+                print(f"    {relay}: {error}", file=sys.stderr)
+        published = [relay for relay, (ok, _) in results.items() if ok]
         print(f"  {label:5} {wrap['id'][:12]}… -> {', '.join(published) or 'FAILED'}")
         if label == "peer":
             ok_peer = bool(published)

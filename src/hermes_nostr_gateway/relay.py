@@ -25,7 +25,6 @@ class RelayWorker:
                  authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
                  secret: str | None = None, since_days: int = 3):
         self.relay = relay
-        self.me = me
         self.kinds = kinds
         self.authors = authors
         self.p_tag = p_tag
@@ -35,8 +34,12 @@ class RelayWorker:
         # subscription with "restricted".
         self.secret = secret
         self.since_days = since_days
-        if not me:
-            raise ValueError("RelayWorker needs an identity; refusing an unfiltered subscription")
+        self.me = (me or "").strip()
+        # An empty identity must be a hard error, never an empty filter: with no `-p`
+        # value the subscription silently becomes a firehose of every wrap on the relay.
+        if len(self.me) != 64:
+            raise ValueError(
+                "RelayWorker needs a 64-hex identity; refusing an unfiltered subscription")
         self.nak = shutil.which("nak") or "nak"
         self.events = 0
         self.last_error: str | None = None
