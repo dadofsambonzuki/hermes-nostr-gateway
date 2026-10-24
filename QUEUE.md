@@ -54,8 +54,22 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       `hng send` publishes through `publisher.publish` with the secret and records the wrap
       for retry; the six §4/§7 traps live on as `scripts/probe_nip17_conformance.py`
       (`--live` §13.1 round trip run on nos.lol), 101 tests green.
-- [ ] **Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
+- [ ] **BLOCKED — Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
       and connection limiter, the nak machine-key trap, `TimeoutStopSec`.
+      — **BLOCKED 2026-10-24**: `AGENTS.md` is a protected agent-instruction file and an
+      unattended run cannot write it (approval requires a human; the only switch is
+      `security.protected_instruction_files`, and turning it off weakens the
+      prompt-injection guard for every project). Question for Nathan: paste the prepared
+      section into `~/Projects/infra/AGENTS.md` yourself, re-scope this item to a
+      non-`AGENTS.md` path, or keep the copy now committed at `docs/ops-notes.md` as the
+      ops record? The research is done and lives in that file; only the infra edit is left.
+- [ ] **A relay that refuses kind 4 loses kind 1059 too** — `gateway.py` builds
+      `kinds = (1059, 4) if restricted else (1059, 4)`, so the restricted branch is a no-op.
+      `relay.eu.whitenoise.chat` answers the combined REQ with
+      `CLOSED: ERROR: bad req: filter validation failed: kind not allowed: 4`, which drops its
+      DM subscription entirely (seen in `hng status`, 2026-10-24). Give each relay a kind set it
+      accepts — at minimum drop kind 4 where it is refused while keeping 1059 — and add a test
+      for a relay that rejects kind 4 but accepts 1059. Found while writing the ops notes.
 - [ ] **Acceptance tests from spec §13** — crash-between-insert-and-ack replays;
       rate-limited peer degrades to blocked.
 - [ ] **Packaging** — container image, CI (pytest + ruff), README "run it in five minutes".
