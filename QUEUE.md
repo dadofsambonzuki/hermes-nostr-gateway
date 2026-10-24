@@ -25,8 +25,11 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       — sent (giftwrap `1965d0936a67`, read back from nos.lol + primal): five steps, wheel
       provenance (fork `eddb08d`, upstream PR #96) and a sha256-checked download at
       `relay.day.ag/2a7287…`; also records the Marmot-plane double-delivery trap.
-- [ ] **Pin the patched wheel** — requirements entry + README section naming the source
+- [x] **Pin the patched wheel** — requirements entry + README section naming the source
       commit and the upstream PR, so a reinstall cannot silently revert it.
+      — landed c51ac1c: `requirements.txt` pins the `wheel-0.45.1-nip44` release asset by URL +
+      sha256 (wrong hash refused), pyproject points at the same wheel for `pip install -e .`,
+      README names fork `eddb08d` / upstream PR #96; installed on clean uv and pip venvs, 91 tests green.
 - [ ] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
       conformance probes under `scripts/`.
 - [ ] **Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
