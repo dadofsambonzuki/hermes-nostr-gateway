@@ -30,6 +30,10 @@ feeds:
     keywords: []         # case-insensitive substrings
     hashtags: []         # without the leading '#'
 
+digest:
+  interval_minutes: 15   # one batched message per window
+  max_items: 20
+
 groups:
   family: []
   team: []

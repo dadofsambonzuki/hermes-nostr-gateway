@@ -50,6 +50,10 @@ class SocketServer:
         if self.path.exists():
             self.path.unlink()
 
+    @property
+    def has_subscribers(self) -> bool:
+        return bool(self._clients)
+
     async def broadcast(self, frame: dict[str, Any]) -> None:
         if not self._clients:
             return

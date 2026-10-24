@@ -86,6 +86,7 @@ class Gateway:
                 self.workers.append(mentions)
                 self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
+        self._tasks.append(asyncio.create_task(self._digest_loop()))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
 
     def _load_follows(self) -> tuple[str, ...]:
@@ -279,6 +280,58 @@ class Gateway:
         if sent:
             log.info("retried %d wrap(s)", sent)
         return sent
+
+
+    # -- digests --------------------------------------------------------
+    async def _digest_loop(self) -> None:
+        """Batch digest-class messages into one frame instead of trickling them.
+
+        Emitted as an ordinary message frame (plane 'digest'), so every adapter that
+        already handles messages gets digests without a protocol change.
+        """
+        cfg = self.cfg.get("digest") or {}
+        interval = int(cfg.get("interval_minutes", 15)) * 60
+        max_items = int(cfg.get("max_items", 20))
+        while not self._stopping.is_set():
+            try:
+                rows = self.store.pending_digest(interval, max_items)
+                # Never mark a digest delivered when nobody is listening: that would
+                # silently discard the batch.
+                if rows and self.server.has_subscribers:
+                    frame = self._digest_frame(rows)
+                    await self.server.broadcast(frame)
+                    self.store.mark_delivered([r["id"] for r in rows])
+            except Exception:  # noqa: BLE001 - a bad batch must not kill the loop
+                log.exception("digest pass failed")
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                continue
+
+    def _digest_frame(self, rows: list[dict]) -> dict:
+        import hashlib as _hash
+        import time as _time
+        lines = []
+        for row in rows[:20]:
+            who = (row.get("sender") or "")[:10]
+            text = (row.get("content") or "").replace("\n", " ")[:140]
+            lines.append(f"- {who}… ({row.get('rule') or 'feed'}): {text}")
+        stamp = int(_time.time())
+        digest_id = "digest-" + _hash.sha256(f"{stamp}:{len(rows)}".encode()).hexdigest()[:16]
+        return {
+            "type": "message",
+            "plane": "digest",
+            "id": digest_id,
+            "sender": "digest",
+            "conversation": "digest",
+            "kind": 1,
+            "created_at": stamp,
+            "reply_to": None,
+            "reach": "digest",
+            "authority": "none",
+            "why": f"{len(rows)} items awaited the digest window",
+            "content": (f"{len(rows)} item(s) since the last digest:\n" + "\n".join(lines)),
+        }
 
     # -- socket ops -----------------------------------------------------
     async def status(self) -> dict[str, Any]:

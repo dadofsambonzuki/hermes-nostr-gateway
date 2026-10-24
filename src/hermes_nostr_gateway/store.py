@@ -192,6 +192,16 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def pending_digest(self, older_than_s: int, limit: int = 20) -> list[dict[str, Any]]:
+        """Digest-class messages that have waited out the window and not been sent."""
+        cutoff = int(time.time()) - older_than_s
+        rows = self.db.execute(
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'digest' "
+            "AND received_at <= ? ORDER BY received_at LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM rumors ORDER BY created_at DESC LIMIT ?", (limit,)
