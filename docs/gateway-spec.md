@@ -199,12 +199,16 @@ core. `nostr-sdk` 0.45.1 ships wheels for py>=3.9, so the Rust implementation's 
 contributors need one toolchain rather than two. `pynostr` (0.7.0, one wheel, unmaintained) is
 not a candidate.
 
+The one deliberate exception to "official": the installed 0.45.1 binding is our fork build that
+exposes `nip44_conversation_key` (Concord derives stream keys from it). `requirements.txt` pins
+it by URL and hash — see README, "The patched `nostr-sdk` wheel".
+
 Consequence for the seed: the BitFest plugin is Python, so §18 is a **Python extraction, not a
 port**. Anything in this table that reads Rust-is, read it as "the binding does this for us".
 
 | Concern | Choice |
 |---|---|
-| Relays, signing, NIP-44/59, NIP-42, subscriptions | `nostr-sdk` 0.45.1 (official rust-nostr bindings) |
+| Relays, signing, NIP-44/59, NIP-42, subscriptions | `nostr-sdk` 0.45.1 (official rust-nostr bindings, patched for `nip44_conversation_key`) |
 | Runtime | `asyncio`; `asyncio.start_unix_server` for the socket |
 | Storage | `sqlite3` (stdlib), WAL, one writer task — no ORM |
 | Socket codec | `json` stdlib, newline framing (NDJSON) |

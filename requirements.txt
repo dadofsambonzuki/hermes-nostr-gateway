@@ -1,0 +1,10 @@
+# The pin that matters: nostr-sdk is our patched build, not the PyPI release. The
+# released 0.45.1 wheel does not expose nip44_conversation_key, which the Concord plane
+# needs, but carries the same version number — so an install that resolves it by name
+# would silently swap the patch away. --hash makes pip/uv verify the exact bytes;
+# everything else comes from pyproject.toml. See README, "The patched nostr-sdk wheel".
+#
+#   uv venv .venv
+#   uv pip install --python .venv/bin/python -r requirements.txt
+#   uv pip install --python .venv/bin/python -e '.[media]'
+nostr-sdk @ https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl --hash=sha256:2a728769109d4d2f42cf3de37c591e2f24487471f0e5971ddefa5b638d261de6

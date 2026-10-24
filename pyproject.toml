@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  "nostr-sdk==0.45.1",
+  # Patched build, not the PyPI release — see README, "The patched nostr-sdk wheel".
+  # `nostr-sdk==0.45.1` would install the release wheel on a clean venv and leave the
+  # Concord plane without nip44_conversation_key.
+  "nostr-sdk @ https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl",
   "websockets>=12",
   "PyYAML>=6.0",
   "pydantic>=2.6",
@@ -26,6 +29,10 @@ hng = "hermes_nostr_gateway.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_nostr_gateway"]
+
+# nostr-sdk is a direct URL (patched wheel); the package is not published to PyPI.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
