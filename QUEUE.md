@@ -47,8 +47,13 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       whole batch by `digests.id`; 106 tests green, including the legacy-adapter socket replay;
       live-DB copy migrated 713 rows with contiguous cursors. Pushed; PR to 3/4 relays
       (grasp.day.ag 404).
-- [ ] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
+- [x] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
       conformance probes under `scripts/`.
+      — landed f9f3029: wrapper, both spikes and `config.json` deleted; `hng listen` now
+      `#p`-scoped and NIP-42-signed as the identity (was a firehose on nak's machine key),
+      `hng send` publishes through `publisher.publish` with the secret and records the wrap
+      for retry; the six §4/§7 traps live on as `scripts/probe_nip17_conformance.py`
+      (`--live` §13.1 round trip run on nos.lol), 101 tests green.
 - [ ] **Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
       and connection limiter, the nak machine-key trap, `TimeoutStopSec`.
 - [ ] **Acceptance tests from spec §13** — crash-between-insert-and-ack replays;
