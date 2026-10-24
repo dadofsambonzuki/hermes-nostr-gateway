@@ -88,7 +88,14 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       policy drops use the same frame (`not_allowlisted`). 129 tests green; live-DB copy
       migrated 1,693 rows. The policy/store half was swept into 81bae9e by a concurrent
       commit; 0ffbb33 is the frame mapping, CLI/plugin treatment, docs and tests.
-- [ ] **Packaging** — container image, CI (pytest + ruff), README "run it in five minutes".
+- [x] **Packaging** — container image, CI (pytest + ruff), README "run it in five minutes".
+      — landed 6689a56: `Dockerfile` (uid-1000 runtime, state volume for socket+store, `nak`
+      v0.20.6 pinned by sha256, wheel assertion at build), `.ngit/act/workflows/test.yml`
+      (ruff + pytest as separate gates, requirements-first install, `nip44_conversation_key`
+      assertion) run green by the coordinator after adding `…/hermes-nostr-gateway` to
+      `NGIT_CI_REPOS` and publishing a maintainer service request; README quick start,
+      container recipe and CI section; ruff's E4/E7/E9+F/I/B gate fixed seven pre-existing
+      findings (wrong annotation name, unused imports, a loop lambda capture); 129 tests green.
 
 Rules for the cron: one item per run; never amend pushed history; never touch a running
 service's config without recording why in the commit; if tests fail and the fix is not
