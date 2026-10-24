@@ -30,6 +30,18 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
       — landed c51ac1c: `requirements.txt` pins the `wheel-0.45.1-nip44` release asset by URL +
       sha256 (wrong hash refused), pyproject points at the same wheel for `pip install -e .`,
       README names fork `eddb08d` / upstream PR #96; installed on clean uv and pip venvs, 91 tests green.
+- [ ] **Rebase the digest PR onto master** — branch `pr/digest-cursor-schema` (`7cc77b5`,
+      base `272f9cb`) is four-plus commits behind. Rebase onto current master, then delete
+      master's `pending_digest()` / `_digest_loop()` in favour of `seal_digests()` so there
+      is exactly one batching path. Keep the socket frame shape additive: `type: "message"`,
+      `plane: "digest"`, plus `frame`, `rule`, `cursor_start`, `cursor_end`, `count`,
+      `delivered`, `dropped`, `truncated`, `items`, and **rendered `content`** built from the
+      joined rumors at delivery/replay time (`digests` keeps `top_ids` only, no plaintext
+      copy). `ack(ids)` must treat an id matching `digests.id` as a whole-batch ack: mark
+      every `batched` rumor delivered, close the row when none remain, in the same
+      transaction as individual id marks, so a second ack is a no-op. Done when: a legacy
+      adapter that knows only `type: message` receives the digest, acks the frame id, and a
+      reconnect replays nothing; with the ack withheld the identical frame replays; suite green.
 - [ ] **Retire `nip17_wrapper.py`** — the CLI covers send/listen now; keep only the
       conformance probes under `scripts/`.
 - [ ] **Ops notes in `~/Projects/infra/AGENTS.md`** — service, socket, haven's WoT gate
