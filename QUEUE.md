@@ -37,4 +37,6 @@ BLOCKED and a DM is sent; the cron moves to the next item and leaves that one al
 
 Rules for the cron: one item per run; never amend pushed history; never touch a running
 service's config without recording why in the commit; if tests fail and the fix is not
-obvious in the same run, mark BLOCKED with the failure in the note.
+obvious in the same run, mark BLOCKED with the failure in the note. To DM Nathan, write the
+text to a file and send it with `hermes send --to marmot --file <path>` (`hermes send` takes
+a positional body, not `--text`).
