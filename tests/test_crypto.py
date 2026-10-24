@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 import nostr_sdk as sdk
-import pytest
 
 from hermes_nostr_gateway import crypto
 from hermes_nostr_gateway.crypto import SdkCrypto

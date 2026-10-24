@@ -56,7 +56,7 @@ def normalise_groups(cfg: dict[str, Any]) -> dict[str, Any]:
     return {name: [_decode_npub(m) if str(m).startswith("npub") else m for m in members]
             for name, members in groups.items()}
 
-def build(cfg: dict[str, Any]) -> tuple[NakCrypto, Store, Policy, Nip17Plane]:
+def build(cfg: dict[str, Any]) -> tuple[SdkCrypto, Store, Policy, Nip17Plane]:
     crypto = SdkCrypto(secret_from(cfg))
     store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
     store_path.parent.mkdir(parents=True, exist_ok=True)

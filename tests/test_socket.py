@@ -3,7 +3,6 @@
 import asyncio
 import json
 
-import pytest
 import pytest_asyncio
 
 from hermes_nostr_gateway.server import SocketServer

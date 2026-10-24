@@ -9,7 +9,7 @@ policy, which decides immediate, digest or drop (spec §17).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable
 
 from ..policy import Policy
 from ..store import Inbound, Store

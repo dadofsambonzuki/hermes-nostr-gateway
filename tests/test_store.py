@@ -27,6 +27,7 @@ def test_distinct_messages_from_same_sender_both_stored(tmp_path):
 
 def test_pending_immediate_is_replayed_but_old_or_sent_is_not(tmp_path):
     import time
+
     from hermes_nostr_gateway.store import Inbound, Store
 
     with Store(tmp_path / "p.db") as s:
@@ -47,6 +48,7 @@ def test_pending_immediate_is_replayed_but_old_or_sent_is_not(tmp_path):
 
 def test_blocked_rows_are_stored_but_never_replayed_or_counted_pending(tmp_path):
     import time
+
     from hermes_nostr_gateway.store import Inbound, Store
 
     with Store(tmp_path / "b.db") as s:

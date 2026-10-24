@@ -31,16 +31,32 @@ which — it reads one normalised event stream.
   `source.role_authorized`, so untrusted senders reach the agent as data, never as instructions.
 - Prior art and the live-testing handover this design leans on: [`docs/prior-art/`](docs/prior-art/).
 
-## Install
+## Quick start (five minutes)
 
-Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). One process, one identity; the systemd unit
-is `deploy/hermes-nostr-gateway.service`.
+Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). One process, one identity; the systemd
+unit is `deploy/hermes-nostr-gateway.service`. From a checkout:
 
 ```sh
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
-uv pip install --python .venv/bin/python -e '.[media]'
-.venv/bin/hng --help
+uv pip install --python .venv/bin/python -e '.[media,dev]'
+cp config.example.yaml config.yaml
+$EDITOR config.yaml                      # point identity.secret_file at a 0600 JSON file
+.venv/bin/hng --config config.yaml status
+.venv/bin/hng --config config.yaml serve
+```
+
+`hng status` is the five-second check: it names the identity and the store and prints
+one line per relay. `serve` then holds the socket and the relay workers; the agent side
+reads the same socket (`NOSTR_GATEWAY_SOCKET` overrides its path). `config.yaml` is
+gitignored, so a local edit cannot be committed by accident — `config.example.yaml` is
+the template.
+
+Tests and lint need no relay and no secret:
+
+```sh
+.venv/bin/python -m pytest -q            # 129 tests, ~4 s
+.venv/bin/ruff check src tests scripts
 ```
 
 ### The patched `nostr-sdk` wheel
@@ -64,6 +80,56 @@ dependency is a direct URL with a hash: a clean venv cannot silently lose the pa
 is not silent at runtime either — the first Concord derivation raises `CryptoError` naming the
 patched wheel, and `tests/test_concord.py` checks the derivation against a NIP-44 vector. If you
 rebuild from the fork branch, update the URL and the hash in `requirements.txt` together.
+
+## Container
+
+`Dockerfile` builds the same package with a pinned `nak` (the relay transport is a `nak`
+child per relay, so it is part of the image). The image runs as `gateway`, UID/GID 1000 by
+default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)` when the host user
+that owns the mounted files is not 1000.
+
+There is no network listener, so the socket is published through a volume, not a port:
+
+```sh
+docker build -t hermes-nostr-gateway .
+
+mkdir -p state
+cat > state/config.yaml <<'YAML'
+identity:
+  secret_file: /run/secrets/nostr-secret.json
+store: /var/lib/hermes-nostr-gateway/gateway.db
+socket: /var/lib/hermes-nostr-gateway/gateway.sock
+relays:
+  read: [wss://relay.day.ag/chat, wss://nos.lol]
+  publish: [wss://relay.day.ag/chat, wss://nos.lol]
+YAML
+
+docker run -d --name hermes-nostr-gateway --restart unless-stopped \
+  -v "$PWD/state:/var/lib/hermes-nostr-gateway" \
+  -v "$PWD/state/config.yaml:/etc/hermes-nostr-gateway/config.yaml:ro" \
+  -v "$HOME/.marmot-agents/hermes/accounts/hermes-agent/secret.json:/run/secrets/nostr-secret.json:ro" \
+  hermes-nostr-gateway
+```
+
+Point the adapter at `NOSTR_GATEWAY_SOCKET=$PWD/state/gateway.sock`. `docker logs` is the
+daemon's journal; `docker run --rm` with the same mounts replaces the default `serve` with
+`status` for a one-off check (the entrypoint is `hng`, so the argument is the subcommand).
+
+## Tests and CI
+
+pytest and ruff are the two gates:
+
+```sh
+python -m pytest -q                       # 129 tests
+ruff check src tests scripts
+```
+
+`.ngit/act/workflows/test.yml` runs both on every push to `master` and every Nostr pull
+request through the ngit-ci coordinator. It installs `requirements.txt` first and then
+asserts that the installed `nostr-sdk` really exposes `nip44_conversation_key`, so a
+resolver that quietly swaps in the PyPI release of the same version fails a named step
+instead of Concord at runtime. The repository's canonical home is Nostr, so there is no
+`.github/workflows` copy for a mirror to drift from.
 
 ## Relays and kinds
 

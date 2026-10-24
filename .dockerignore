@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+config.yaml
+config.local.yaml
+tests
+docs
+scripts
+integrations

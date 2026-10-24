@@ -1,4 +1,5 @@
 import pytest
+
 from hermes_nostr_gateway.policy import Policy, parse_interval
 
 FAM = "npub1family"

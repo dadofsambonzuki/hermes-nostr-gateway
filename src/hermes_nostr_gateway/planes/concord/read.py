@@ -22,8 +22,15 @@ import nostr_sdk as sdk
 from websockets.asyncio.client import connect as ws_connect
 
 from ... import crypto
-from .derive import (CURVE_ORDER, DEFAULT_COMMUNITY_RELAYS, ConcordError,
-                     GroupKey, group_key, hkdf, scalar_normalize)
+from .derive import (
+    CURVE_ORDER,
+    DEFAULT_COMMUNITY_RELAYS,
+    ConcordError,
+    GroupKey,
+    group_key,
+    hkdf,
+    scalar_normalize,
+)
 
 __all__ = [
     "CURVE_ORDER", "DEFAULT_COMMUNITY_RELAYS", "ConcordError", "GroupKey", "group_key",

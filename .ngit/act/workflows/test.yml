@@ -1,0 +1,58 @@
+name: Test
+
+# The project's gates, run on every push and pull request by an ngit-ci
+# coordinator through act. This is the canonical repository, so the workflow
+# lives under .ngit/act/workflows/; there is no GitHub mirror to keep in step.
+#
+# The install order is deliberate. requirements.txt is the only install path
+# that carries the patched nostr-sdk wheel's URL and hash, so it goes first;
+# `.[dev]` then sees 0.45.1 already satisfied instead of resolving the PyPI
+# release of the same version, which would silently drop
+# `nip44_conversation_key` and fail Concord only at runtime. The assertion step
+# turns that silent swap into a named CI failure.
+#
+# pytest and ruff are separate steps so a failure names its gate, and neither
+# step needs a GITHUB_TOKEN.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the hash-pinned wheel, the package, and the dev tools
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m pip install --disable-pip-version-check -e '.[dev]'
+
+      - name: Assert the patched nostr-sdk is the one installed
+        run: |
+          python - <<'PY'
+          import nostr_sdk as sdk
+
+          assert callable(getattr(sdk, "nip44_conversation_key", None)), (
+              "the PyPI nostr-sdk is installed: nip44_conversation_key is missing; "
+              "install from requirements.txt so the patched wheel is used"
+          )
+          PY
+
+      - name: Lint (ruff)
+        run: ruff check src tests scripts
+
+      - name: Tests (pytest)
+        run: python -m pytest -q

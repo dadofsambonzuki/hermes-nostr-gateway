@@ -17,12 +17,12 @@ import pytest
 
 from hermes_nostr_gateway.planes.marmot import (
     APP_MESSAGE_KIND,
+    PROTOCOL,
     MarmotControl,
     MarmotError,
     MarmotPlane,
     MarmotResolver,
     MarmotWorker,
-    PROTOCOL,
     resolve_account_id,
 )
 from hermes_nostr_gateway.policy import Policy

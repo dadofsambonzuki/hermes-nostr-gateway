@@ -354,7 +354,7 @@ class Gateway:
             return {"type": "delivery", "id": cid, "ok": False, "error": str(exc)[:300]}
 
         relays = self._recipient_relays(peer)
-        for label, event in wraps.items():
+        for event in wraps.values():
             self.store.record_wrap(event, rumor["id"], peer, relays)
 
         results = await loop.run_in_executor(None, self._publish_all, wraps, relays)
@@ -464,8 +464,13 @@ class Gateway:
         sent = 0
         for row in pending:
             event = _json.loads(row["event"])
+            # Bind both loop variables as defaults: run_in_executor schedules the
+            # callable, and a late lambda would otherwise publish a later row.
             ok, error = await loop.run_in_executor(
-                None, lambda: list(publish(event, [row["relay"]], secret=self._secret).values())[0]
+                None,
+                lambda event=event, row=row: list(
+                    publish(event, [row["relay"]], secret=self._secret).values()
+                )[0],
             )
             self.store.mark_wrap(row["id"], row["relay"], ok=ok, error=error)
             sent += int(ok)
