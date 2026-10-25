@@ -52,8 +52,12 @@ class RelayWorker:
     def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
                  authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
                  secret: str | None = None, since_days: int = 3, nak: str | None = None,
-                 on_refusal: RefusalHandler | None = None):
+                 on_refusal: RefusalHandler | None = None, purpose: str = "dm"):
         self.relay = relay
+        # Why this relay is in the read set (`dm`, `feed`, `mentions`, `peer-inbox`).
+        # `hng status` shows it, so an extra connection can be traced to a decision
+        # rather than to drift.
+        self.purpose = purpose
         # Requested vs refused vs active: config (or the caller) says what we want,
         # the relay says what it accepts, and `kinds` is what the next REQ carries.
         self.requested_kinds = tuple(dict.fromkeys(int(kind) for kind in kinds))

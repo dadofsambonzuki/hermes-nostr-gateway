@@ -84,6 +84,12 @@ worker reads.
   a 9-token burst. Starting a dozen workers at once fits; replaying a failed batch does not.
   Retry passes send at most 5 wraps 1.5 s apart, and a `429` backs off from 60 s to 600 s with
   jitter. Do not "speed up" reconnects — the relay answers by refusing connections.
+- **Peer inbox coverage spends connections deliberately.** Each relay resolved from a peer's
+  kind-10050 list gets one DM worker and no feed/mention subscription; `max_extra` (default 4)
+  bounds the total for the process lifetime, and lookups run one peer at a time so the lookup
+  itself does not burst a relay's limiter. If a `429` appears shortly after startup, check
+  `status.peer_inbox.added` first: that is the only read-set growth not visible in
+  `config.yaml`.
 - **Event limiter** is separate and per IP: `/chat` 50 events/s (burst 100), `/inbox` 10/s
   (burst 20), the outbox 10 per minute (burst 100). A publish burst from one address hits this
   before it hits the connection limiter.

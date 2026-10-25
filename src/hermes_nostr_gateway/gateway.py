@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from .crypto import SdkCrypto
+from .peer_inbox import (
+    InboxResolver,
+    NakInboxResolver,
+    PeerInboxConfig,
+    inbox_additions,
+    normalise_relay,
+    now_seconds,
+    peer_inbox_config,
+    peer_pubkeys,
+)
 from .planes import nip04
 from .planes.concord.plane import ConcordPlane
 from .planes.marmot import (
@@ -70,6 +80,17 @@ def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int
     return urls, declared
 
 
+def _peer_exclusions(cfg: dict[str, Any]) -> tuple[str, ...]:
+    """Relays a peer must never drag into the DM read set.
+
+    White Noise relays carry the Marmot plane's groups, refuse public kinds and are not
+    a general NIP-17 inbox (README, "Relays and kinds"). A peer listing one is saying
+    where their own inbox is, not asking us to subscribe to a group relay.
+    """
+    relays = cfg.get("relays") or {}
+    values = [*(cfg.get("whitenoise") or []), *(relays.get("whitenoise") or [])]
+    return tuple(str(value) for value in values if str(value).strip())
+
 
 def default_marmot_home() -> Path:
     return Path(os.environ.get("MARMOT_HOME") or Path.home() / ".marmot-agents/hermes")
@@ -83,7 +104,8 @@ def default_socket_path() -> Path:
 
 
 class Gateway:
-    def __init__(self, cfg: dict[str, Any], *, socket_path: str | Path | None = None):
+    def __init__(self, cfg: dict[str, Any], *, socket_path: str | Path | None = None,
+                 peer_resolver: InboxResolver | None = None):
         from .cli import normalise_groups, secret_from
 
         self.cfg = cfg
@@ -93,8 +115,9 @@ class Gateway:
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(store_path)
+        groups = normalise_groups(cfg)
         self.policy = Policy({
-            "groups": normalise_groups(cfg),
+            "groups": groups,
             "policies": cfg.get("policies"),
             "defaults": cfg.get("defaults"),
             "rate_limit": cfg.get("rate_limit"),
@@ -112,7 +135,31 @@ class Gateway:
         self._setup_marmot(cfg.get("marmot") or {})
         self.follows: tuple[str, ...] = self._load_follows()
         self.relays_read, self.relay_kinds = relay_read_plan(cfg)
+        # What config asked for, kept separately: `relays_read` grows with peer inboxes.
+        self.relays_configured = list(self.relays_read)
         self.relays_publish = list(cfg["relays"].get("publish", []))
+        # Read coverage beyond the fixed list (spec §3): the kind-10050 inbox relays of
+        # the people named in `groups`, bounded by a hard cap and refreshed on an
+        # interval. Additive and sticky — see refresh_peer_relays.
+        self.peer_cfg: PeerInboxConfig = peer_inbox_config(cfg)
+        self.peer_resolver: InboxResolver | None = peer_resolver
+        self.peer_pubkeys = peer_pubkeys(groups)
+        self.peer_relays: list[str] = []
+        self.peer_exclusions = _peer_exclusions(cfg)
+        self.peer_errors: dict[str, str] = {}
+        self.peer_last_refresh: int | None = None
+        self._dead_peer_relays: set[str] = set()
+        self._cap_blocked: dict[str, str] = {}
+        if self.peer_cfg.enabled:
+            raw_members = {str(member).strip().lower()
+                           for members in groups.values() for member in (members or [])}
+            if len(self.peer_pubkeys) < len(raw_members):
+                log.warning(
+                    "peer inbox: %d group member(s) are not hex pubkeys and will not be "
+                    "resolved", len(raw_members) - len(self.peer_pubkeys))
+            if not self.peer_cfg.lookup and peer_resolver is None:
+                log.warning("peer inbox enabled but no lookup relays: set "
+                            "relays.peer_inbox.lookup (or relays.read/publish)")
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
@@ -176,17 +223,21 @@ class Gateway:
             authors = tuple(sorted(set(self.follows) | set(self.nip01.authors)))
             if authors and not restricted:
                 feed = RelayWorker(relay, self.me, kinds=(1,), authors=authors,
-                                   secret=self._secret)
+                                   secret=self._secret, purpose="feed")
                 self.workers.append(feed)
                 self._tasks.append(asyncio.create_task(self._guarded(feed)))
             # Mentions of us by strangers: a small #p filter, separate from follows.
             if not restricted:
                 mentions = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me,
-                                       secret=self._secret)
+                                       secret=self._secret, purpose="mentions")
                 self.workers.append(mentions)
                 self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
         self._tasks.append(asyncio.create_task(self._digest_loop()))
+        if self.peer_cfg.enabled:
+            # Background, not a gate on startup: the fixed read set comes up now and
+            # peer inboxes join as they resolve.
+            self._tasks.append(asyncio.create_task(self._peer_relay_loop()))
         if self.marmot_worker is not None:
             self._tasks.append(asyncio.create_task(self._guard_marmot(self.marmot_worker)))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
@@ -224,6 +275,103 @@ class Gateway:
             detail += f" ({error})"
         self.store.note_relay(relay, error=detail[:300])
 
+    # -- peer inbox coverage --------------------------------------------
+    async def _peer_relay_loop(self) -> None:
+        """Resolve peer inboxes at startup, then on the configured interval."""
+        while not self._stopping.is_set():
+            try:
+                await self.refresh_peer_relays()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - coverage must not take the daemon down
+                log.exception("peer inbox refresh failed")
+            every = self.peer_cfg.refresh_seconds
+            if every <= 0:
+                return  # startup-only mode: one pass, then nothing to wait for
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=every)
+            except asyncio.TimeoutError:
+                continue
+
+    def _inbox_resolver(self) -> InboxResolver | None:
+        if self.peer_resolver is not None:
+            return self.peer_resolver
+        if not self.peer_cfg.lookup:
+            return None
+        self.peer_resolver = NakInboxResolver(self.peer_cfg.lookup, secret=self._secret)
+        return self.peer_resolver
+
+    def _add_peer_relay(self, relay: str) -> RelayWorker:
+        """One DM worker for a peer's inbox — deliberately not a feed/mention pair.
+
+        The configured read set costs up to three connections per relay (DM, feeds,
+        mentions). A peer's inbox is a DM path only, so `max_extra` is the real bound
+        on new connections rather than three times it.
+        """
+        worker = RelayWorker(relay, self.me, kinds=self.relay_kinds.get(relay) or DM_KINDS,
+                             p_tag=self.me, secret=self._secret,
+                             on_refusal=self._note_refusal, purpose="peer-inbox")
+        self.relays_read.append(relay)
+        self.peer_relays.append(relay)
+        self.workers.append(worker)
+        self._tasks.append(asyncio.create_task(self._guarded(worker)))
+        return worker
+
+    async def refresh_peer_relays(self) -> list[str]:
+        """Resolve configured peers' 10050 inboxes and add new relays, up to the cap.
+
+        Additive and sticky: a relay, once added, stays for the process lifetime. A
+        lookup that times out or a peer that rotates their list must not remove a relay
+        that may still hold an unread wrap, and re-adding a working relay would cost a
+        reconnect for nothing. The cap is on total additions, so sticky cannot grow
+        without bound; refresh only picks up relays newly advertised by a peer.
+        """
+        if not self.peer_cfg.enabled:
+            return []
+        remaining = self.peer_cfg.max_extra - len(self.peer_relays)
+        if remaining <= 0 or not self.peer_pubkeys:
+            return []
+        resolver = self._inbox_resolver()
+        if resolver is None:
+            return []
+        loop = asyncio.get_running_loop()
+        candidates: list[str] = []
+        # One peer at a time: each lookup opens a connection to every lookup relay, and
+        # a burst is exactly what trips a relay's connection limiter.
+        for pubkey in self.peer_pubkeys:
+            try:
+                found = await loop.run_in_executor(None, resolver.inbox_relays, pubkey)
+            except Exception as exc:  # noqa: BLE001 - one peer must not stop the rest
+                self.peer_errors[pubkey] = str(exc)[:200]
+                log.warning("peer inbox lookup failed for %s…: %s", pubkey[:12], exc)
+                continue
+            self.peer_errors.pop(pubkey, None)
+            candidates.extend(found or [])
+
+        additions = inbox_additions(base=self.relays_read, candidates=candidates,
+                                    cap=remaining, exclude=self.peer_exclusions)
+        if self._stopping.is_set():
+            return []
+        for relay in additions:
+            self._add_peer_relay(relay)
+        self.peer_last_refresh = now_seconds()
+        if additions:
+            log.info("peer inbox: +%d relay(s) %s (%d/%d extra in the read set)",
+                     len(additions), ", ".join(additions), len(self.peer_relays),
+                     self.peer_cfg.max_extra)
+        # A relay a peer advertises but the cap will not admit is a known blind spot:
+        # say so once, and show it in the socket `status` op, instead of silently not
+        # reading it.
+        blocked = inbox_additions(base=self.relays_read, candidates=candidates,
+                                  cap=max(len(candidates), 1), exclude=self.peer_exclusions)
+        for url in blocked:
+            key = normalise_relay(url)
+            if key not in self._cap_blocked:
+                self._cap_blocked[key] = url
+                log.warning("peer inbox: cap of %d extra relay(s) reached; not reading %s",
+                            self.peer_cfg.max_extra, url)
+        return additions
+
     async def _guarded(self, worker: RelayWorker) -> None:
         try:
             await worker.run(self._on_event)
@@ -233,6 +381,11 @@ class Gateway:
             log.exception("relay worker %s died", worker.relay)
         finally:
             self.store.note_relay(worker.relay, error=worker.last_error)
+            if getattr(worker, "purpose", "dm") == "peer-inbox" and not worker.kinds:
+                # It refused every kind, so it can never deliver and its worker has
+                # stopped. It stays in the read set (no reconnect, and refresh will not
+                # add it twice); status names it as a dead inbox rather than a quiet one.
+                self._dead_peer_relays.add(worker.relay)
 
     async def _guard_marmot(self, worker: MarmotWorker) -> None:
         """Kept separate from _guarded: the Marmot worker is a socket peer, not a
@@ -539,9 +692,21 @@ class Gateway:
             "identity": self.me,
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
+            "relays_configured": self.relays_configured,
             "planes": ["nip17", "nip01", "nip04", "concord"]
                       + (["marmot"] if self.marmot else []),
             "relays_publish": self.relays_publish,
+            "peer_inbox": {
+                "enabled": self.peer_cfg.enabled,
+                "max_extra": self.peer_cfg.max_extra,
+                "refresh_minutes": self.peer_cfg.refresh_minutes,
+                "peers": len(self.peer_pubkeys),
+                "added": list(self.peer_relays),
+                "dead": sorted(self._dead_peer_relays),
+                "skipped_by_cap": sorted(self._cap_blocked.values()),
+                "errors": dict(self.peer_errors),
+                "last_refresh": self.peer_last_refresh,
+            },
             "rumors": stats["total"],
             "pending": stats["pending"],
             "blocked": stats["blocked"],
@@ -557,7 +722,8 @@ class Gateway:
                 else {"enabled": False, "error": self.marmot_error}
             ),
             "workers": [
-                {"relay": w.relay, "kinds": list(w.kinds),
+                {"relay": w.relay, "purpose": getattr(w, "purpose", "dm"),
+                 "kinds": list(w.kinds),
                  "requested_kinds": list(w.requested_kinds),
                  "refused_kinds": sorted(w.refused),
                  "p_tag": bool(w.p_tag), "authors": len(w.authors), "events": w.events,
