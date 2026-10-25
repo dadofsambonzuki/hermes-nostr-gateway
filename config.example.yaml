@@ -15,8 +15,7 @@ relays:
     - wss://nos.lol
     - wss://relay.primal.net
     - wss://relay.ditto.pub
-    - wss://relay.dreamith.to
-      kinds: [1059]
+    - {url: wss://relay.dreamith.to, kinds: [1059]}
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
     - wss://relay.day.ag/chat
@@ -50,6 +49,14 @@ feeds:
 digest:
   interval_minutes: 15   # one batched message per window
   max_items: 20
+
+# Replay on subscribe is for "crashed mid-delivery", not history: a reconnect or an
+# adapter restart. The window is minutes and nothing older than the store's replay
+# floor is offered (stamped when the store is created, or by `hng replay-skip` when an
+# adapter handover means the backlog was already answered).
+replay:
+  limit: 20
+  max_age_minutes: 120
 
 groups:
   family: []
