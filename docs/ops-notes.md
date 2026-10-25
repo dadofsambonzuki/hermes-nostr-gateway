@@ -118,9 +118,12 @@ worker reads.
   identity secret in the child's **environment** (never argv); `hng listen`/`hng send` were
   fixed to match in `f9f3029`. Any new `nak` invocation in this repo needs the same treatment.
 - **Connection rate limiter** — a token bucket per relay group on *new connections*:
-  `/chat` 3 tokens per 3 s, `/private` 3 per 5 s, `/inbox` and the outbox 3 per 1 s, all with
-  a 9-token burst. Starting a dozen workers at once fits; replaying a failed batch does not.
-  Retry passes send at most 5 wraps 1.5 s apart, and a `429` backs off from 60 s to 600 s with
+  `/chat` 3 tokens per interval, `/private` 3 per 5, `/inbox` and the outbox 3 per 1, all with
+  a 9-token burst. Do **not** read a bare `3` as three seconds: where haven applies these
+  counters it multiplies the interval by `time.Minute` (the event IP limiter does exactly that
+  in `init.go`), and the agent that measured this hit `429`s consistent with minutes, not
+  seconds. Starting a dozen workers at once fits; replaying a failed batch does not. Retry
+  passes send at most 5 wraps 1.5 s apart, and a `429` backs off from 60 s to 600 s with
   jitter. Do not "speed up" reconnects — the relay answers by refusing connections.
 - **Peer inbox coverage spends connections deliberately.** Each relay resolved from a peer's
   kind-10050 list gets one DM worker and no feed/mention subscription; `max_extra` (default 4)
