@@ -105,9 +105,9 @@ worker reads.
 
 ## What the web of trust actually gates
 
-Checked on 2026-10-25 against haven `v1.2.2` (`github.com/barrydeen/haven`, tag `v1.2.2` =
-`45d835f`) and against the running relay. Each claim is marked **[source]** (read from that
-tag) or **[measured]** (this box's log or a probe); nothing here is inferred from `.env`.
+Checked on 2026-10-25 against haven `v1.2.2` (`github.com/barrydeen/haven`, tag `v1.2.2`,
+commit `45d835f`) and against the running relay. Each claim is marked **[source]** (read from
+that tag) or **[measured]** (this box's log or a probe); nothing here is inferred from `.env`.
 The deployed binary is a local build of that tag with a patched khatru 0.19.1, sha256
 `a3cc6ef9…` — NIP-11 says `version: (devel)`, so identify the release by hash, not that field.
 
@@ -200,5 +200,5 @@ the same data. `git ls-remote` also 404s on the coordinate ngit builds for that 
 `https://grasp.day.ag/npub19ets…/hermes-nostr-gateway.git`, which decodes to `2e5709c6…`, one
 of the announced maintainers, not the repo owner `npub1cn670…`. The push itself succeeded:
 the branch and its PR event published (4 relays) and `git ls-remote` resolves the branch tip
-from the other three servers. Treat a grasp.day.ag 404 as a missing or mis-scoped coordinate
+from the other servers. Treat a grasp.day.ag 404 as a missing or mis-scoped coordinate
 on that one cache, not a failed push; the exact cause is **unconfirmed**.
