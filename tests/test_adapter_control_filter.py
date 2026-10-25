@@ -185,3 +185,21 @@ def test_a_nominated_control_channel_receives_control_text(monkeypatch):
     result = asyncio.run(inst.send("f" * 64, "[interrupt: no assistant output for this turn]"))
     assert [p.get("to") for p in sent] == ["f" * 64]
     assert result.success is True
+
+
+def test_the_home_channel_gets_chat_not_status(monkeypatch):
+    """Home is for conversation: even as home, it must never receive a control notice."""
+    monkeypatch.setenv("NOSTR_HOME_CHANNEL", "9" * 64)
+    monkeypatch.delenv("NOSTR_CONTROL_CHANNEL", raising=False)
+    inst = _bare_adapter()
+    sent = []
+
+    async def _request(payload, timeout=30.0):
+        sent.append(payload)
+        return {"type": "delivery", "ok": True, "message_id": "x"}
+
+    inst._request = _request
+    import asyncio
+    result = asyncio.run(inst.send("9" * 64, "\u26a0\ufe0f Hermes is shutting down"))
+    assert sent == []
+    assert (result.raw_response or {}).get("skipped") == "control_notice"
