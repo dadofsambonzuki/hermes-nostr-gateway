@@ -230,6 +230,16 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_replay_skip(args) -> int:
+    """Record a handover: the pending backlog was answered by the previous adapter."""
+    cfg = load_config(args.config)
+    _crypto, store, _policy, _plane = build(cfg)
+    skipped = store.skip_pending()
+    print(f"replay floor: {store.replay_floor()} "
+          f"({skipped} pending message(s) marked delivered)")
+    return 0
+
+
 def cmd_recent(args) -> int:
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
@@ -305,6 +315,10 @@ def main(argv: list[str] | None = None) -> int:
     p_recent = sub.add_parser("recent", help="recent messages")
     p_recent.add_argument("-n", "--number", type=int, default=20)
     p_recent.set_defaults(func=cmd_recent)
+
+    sub.add_parser("replay-skip",
+                   help="record a handover: the pending backlog is already answered"
+                   ).set_defaults(func=cmd_replay_skip)
 
     p_policy = sub.add_parser("policy-test", help="ask the policy engine what it would do")
     p_policy.add_argument("--sender", required=True)
