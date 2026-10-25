@@ -54,7 +54,7 @@ Day-to-day:
 ```bash
 systemctl status hermes-nostr-gateway
 journalctl -u hermes-nostr-gateway -n 50
-cd ~/Projects/hermes-nostr-gateway && .venv/bin/hng status      # per-relay counters
+cd ~/Projects/hermes-nostr-gateway && .venv/bin/hng status      # live per-relay verdicts
 printf '{"op":"ping"}\n' | nc -U ~/.local/state/hermes-nostr-gateway/gateway.sock
 ```
 
@@ -74,8 +74,7 @@ then.
   flag chooses the transport; it does not add a second, harmless reader.
 - **An idle plane says why.** The start log carries `marmot plane idle: opt-in only: set
   marmot.enabled: true …`, and the socket's `status` op reports `marmot.enabled: false` with
-  that sentence in `marmot.reason`. `hng status` prints relay counters only, so read the
-  plane state with
+  that sentence in `marmot.reason`. `hng status --json` also carries it; the raw form is
   `printf '{"op":"status"}\n' | nc -U ~/.local/state/hermes-nostr-gateway/gateway.sock`.
 - **Turning it on means turning the other one off first.** Disable `platforms.marmot` (and
   the `marmot` plugin entry) in Hermes, restart Hermes, then set `marmot.enabled: true` in
@@ -86,6 +85,18 @@ then.
   section with `enabled: true` was added while the Hermes plugin is still enabled.
 - **`no wn-agent control socket at <path>`** means the opt-in is right but nothing is
   listening: wn-agent is down, or `home:`/`socket:` point at another account's directory.
+
+**Reading `hng status`.** The verdict per relay comes from the running daemon's worker state
+(`connected`, `authenticating`, `no events for Nm`, `refusing`, `down`, `no worker`), not from
+`relay_stats.last_error`. That column used to be the last stderr line of a `nak` child, so a
+healthy relay showed `connecting to nos.lol... ok.` and a healthy gated one showed
+`authenticating to relay.day.ag/chat as …`; neither is a fault, and a relay removed from the
+config kept its row. Those rows now appear only under `not in config (history only, not read)`.
+If the daemon is not running the relays read `unknown` and the store's row is printed as
+`history:` — a stored counter is not a health check. `--check` exits 1 for a bad verdict or no
+daemon, `--json` is machine-readable, `-v` adds each child's last stderr line as diagnostics.
+A daemon built before per-worker timestamps cannot answer "when", so the command says so
+rather than borrowing the store's age; restart the service once to get the age column.
 
 ## Why `relay.day.ag` says no
 
@@ -121,8 +132,8 @@ worker reads.
   which left that relay with no DM subscription at all. The kind set is now per relay:
   `relays.read` pins whitenoise to `[1059]`, a worker refused a kind drops it and
   resubscribes on the rest at once, and a relay that refuses every kind stops with an error
-  rather than ever sending a filterless REQ. `hng status` records both the refusal and what
-  is still being read.
+  rather than ever sending a filterless REQ. `hng status` reports the surviving kind set in the
+  relay's detail and `refusing` when nothing is left to read.
 - **`CHAT_RELAY_MINIMUM_FOLLOWERS=3` is not a knob haven 1.2.2 reads.** The name in this
   build is `WOT_MINIMUM_FOLLOWERS`, and it is unset here, so the boot log reports
   `minFollowers=0`; the depth-3 graph is what is enforced. Do not edit the `CHAT_RELAY_*`

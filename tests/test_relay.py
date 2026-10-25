@@ -51,11 +51,22 @@ class _Stdout:
 
 
 class _Stderr:
+    """A `StreamReader`-shaped stderr: iterable by line, as the worker reads it live."""
+
     def __init__(self, payload: bytes):
-        self._payload = payload
+        self._lines = [line + b"\n" for line in payload.splitlines()]
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
 
     async def read(self) -> bytes:
-        return self._payload
+        payload, self._lines = b"".join(self._lines), []
+        return payload
 
 
 class FakeProc:
@@ -277,3 +288,72 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
                          ("wss://relay.eu.whitenoise.chat", (1059,))]
     finally:
         await gateway.stop()
+
+
+# -- what `hng status` reads from a worker -----------------------------------
+
+async def test_worker_records_connect_auth_and_event_times_while_the_child_runs(monkeypatch):
+    """The facts a verdict needs must exist *during* the run, not only after it dies."""
+    delivered = event_id()
+    install_fake_nak(monkeypatch, [{
+        "stderr": "connecting to relay.day.ag... ok.\n"
+                  "authenticating to relay.day.ag/chat as 740fcd907b10beed…",
+        "lines": [(json.dumps(delivered) + "\n").encode()],
+    }])
+    worker = RelayWorker("wss://relay.day.ag/chat", ME, kinds=(1059,), secret="00" * 32)
+
+    def handler(_relay: str, _event: dict) -> None:
+        worker.stop()
+
+    await asyncio.wait_for(worker.run(handler), timeout=5)
+
+    assert worker.connected_at is not None, "the connect notice was not recorded"
+    assert worker.auth_at is not None, "the auth notice was not recorded"
+    assert worker.events == 1 and worker.last_event_at is not None
+    assert (worker.last_stderr or "").startswith("authenticating to")
+    state = worker.live_state()
+    assert state["alive"] is False, "a stopped child must not report as alive"
+    assert state["attempts"] == 1
+    assert state["last_event_at"] == worker.last_event_at
+
+
+def test_a_connect_notice_is_not_an_auth_notice():
+    worker = RelayWorker("wss://nos.lol", ME, kinds=(1059,))
+    worker._note_stderr("connecting to nos.lol... ok.")
+
+    assert worker.connected_at is not None
+    assert worker.auth_at is None, "a healthy connect was mistaken for an auth in progress"
+
+
+def test_live_state_starts_unknown_rather_than_healthy():
+    state = RelayWorker("wss://nos.lol", ME, kinds=(1059,)).live_state()
+
+    assert state["alive"] is False
+    assert state["attempts"] == 0
+    assert state["connected_at"] is None and state["last_event_at"] is None
+    assert state["last_error"] is None
+
+
+async def test_gateway_status_frame_carries_the_live_worker_fields(tmp_path, monkeypatch):
+    secret = sdk.Keys.generate().secret_key().to_hex()
+    (tmp_path / "secret.json").write_text(json.dumps({"secret_key_hex": secret}))
+    cfg = {
+        "identity": {"secret_file": str(tmp_path / "secret.json")},
+        "relays": {"read": ["wss://nos.lol"], "publish": ["wss://nos.lol"]},
+        "store": str(tmp_path / "gw.db"),
+        "groups": {}, "policies": [], "defaults": {},
+    }
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    monkeypatch.setattr(Gateway, "_setup_marmot", lambda self, _cfg: None)
+
+    gateway = Gateway(cfg, socket_path=tmp_path / "gw.sock")
+    gateway.workers = [RelayWorker("wss://nos.lol", "a" * 64, kinds=(1059,))]
+    try:
+        frame = await gateway.status()
+    finally:
+        gateway.store.close()
+
+    (entry,) = frame["workers"]
+    for field in ("alive", "last_event_at", "connected_at", "auth_at",
+                  "attempts", "last_stderr", "refused_kinds"):
+        assert field in entry, f"status frame cannot answer health without {field}"

@@ -69,11 +69,19 @@ $EDITOR config.yaml                      # point identity.secret_file at a 0600 
 .venv/bin/hng --config config.yaml serve
 ```
 
-`hng status` is the five-second check: it names the identity and the store and prints
-one line per relay. `serve` then holds the socket and the relay workers; the agent side
-reads the same socket (`NOSTR_GATEWAY_SOCKET` overrides its path). `config.yaml` is
-gitignored, so a local edit cannot be committed by accident — `config.example.yaml` is
-the template.
+`hng status` is the five-second check, and it answers a live question: for each relay
+in `relays.read` it asks the running daemon what that relay's workers are doing right
+now (`{"op":"status"}` on the socket) and prints one verdict — `connected`,
+`authenticating`, `no events for 47m`, `refusing`, `down`, `no worker`, or `unknown`
+when the daemon is not running. The child process's stderr is not a verdict and is no
+longer shown as one; `-v` prints it under a heading that calls it diagnostics. Store
+rows for relays the config no longer lists appear under `not in config (history only,
+not read)`. `--json` gives the same facts machine-readable and `--check` exits non-zero
+when the daemon is unreachable or a relay is unhealthy; `--quiet-minutes N` sets the
+silence window (default 30, 0 disables it). `serve` then holds the socket and the relay
+workers; the agent side reads the same socket (`NOSTR_GATEWAY_SOCKET` overrides its
+path). `config.yaml` is gitignored, so a local edit cannot be committed by accident —
+`config.example.yaml` is the template.
 
 Tests and lint need no relay and no secret:
 
@@ -167,7 +175,8 @@ set per relay:
   relay that refuses a kind rather than for one that simply has less traffic;
 - if a relay still refuses a kind at runtime, the worker drops that kind and resubscribes
   immediately on the rest: never a kind-less filter, never a reconnect loop that cannot succeed.
-  `hng status` records what was dropped and what is still being read.
+  `hng status` shows the narrowed set in that relay's detail, and reports `refusing` when
+  nothing is left to read.
 
 **White Noise relays belong to the Marmot plane.** `relay.eu.whitenoise.chat` and
 `relay.us.whitenoise.chat` exist to carry White Noise's own groups, which `wn-agent` speaks for

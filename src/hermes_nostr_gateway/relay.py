@@ -19,7 +19,7 @@ import logging
 import re
 import shutil
 import time
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 Handler = Callable[[str, dict], Awaitable[None] | None]
 #: Called when a relay refuses a kind: (relay, dropped, what we now ask for, raw error).
@@ -43,6 +43,14 @@ def refused_kinds(text: str | None) -> set[int]:
         chunk = match.group(1) or match.group(2) or ""
         found.update(int(number) for number in re.findall(r"\d+", chunk))
     return found
+
+
+#: nak's stderr, which is where its liveness facts live. Both are notices, not errors:
+#: a healthy relay says `connecting to <host>... ok.` and then, when the relay requires
+#: NIP-42, `authenticating to <relay> as <pubkey>…`. Reading only the *last* line after
+#: the child died made both look like a diagnosis of a relay that was fine.
+_CONNECTED_LINE = re.compile(r"connecting to\s+\S+\.\.\.\s*ok", re.IGNORECASE)
+_AUTH_LINE = re.compile(r"authenticating to\s+\S+", re.IGNORECASE)
 
 
 
@@ -78,6 +86,17 @@ class RelayWorker:
         self.nak = nak or shutil.which("nak") or "nak"
         self.events = 0
         self.last_error: str | None = None
+        # Live facts for `hng status`. None means "not observed", never "fine":
+        # a worker that has not connected yet must not read like a healthy one.
+        self.started_at: float | None = None
+        self.attempt_started_at: float | None = None
+        self.attempts = 0
+        self.connected_at: float | None = None
+        self.auth_at: float | None = None
+        self.last_event_at: float | None = None
+        self.last_stderr: str | None = None
+        self._alive = False
+        self._attempt_lines: list[str] = []
         self._stop = asyncio.Event()
 
     @property
@@ -127,10 +146,72 @@ class RelayWorker:
         args.append(self.relay)
         return args
 
+    @property
+    def alive(self) -> bool:
+        """True while a `nak` child for this subscription is running."""
+        return self._alive
+
+    def live_state(self) -> dict[str, Any]:
+        """What this worker is doing now: the only honest input to a health verdict.
+
+        `last_error` is kept for diagnostics, but it is the last stderr line of a child
+        that may have exited hours ago; callers must not read it as the current state.
+        """
+        return {
+            "relay": self.relay,
+            "kinds": list(self.kinds),
+            "requested_kinds": list(self.requested_kinds),
+            "refused_kinds": sorted(self.refused),
+            "p_tag": bool(self.p_tag),
+            "authors": len(self.authors),
+            "events": self.events,
+            "alive": self._alive,
+            "attempts": self.attempts,
+            "started_at": self.started_at,
+            "attempt_started_at": self.attempt_started_at,
+            "connected_at": self.connected_at,
+            "auth_at": self.auth_at,
+            "last_event_at": self.last_event_at,
+            "last_stderr": self.last_stderr,
+            "last_error": self.last_error,
+        }
+
+    async def _drain_stderr(self, stderr: Any) -> None:
+        """Keep reading the child's stderr so its live notices are not lost."""
+        if stderr is None:
+            return
+        async for raw in stderr:
+            line = raw.decode(errors="replace").strip()
+            if line:
+                self._note_stderr(line)
+
+    async def _settle(self, task: "asyncio.Task[Any]") -> None:
+        """Give a finished child's stderr a moment to land, never forever."""
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except TimeoutError:
+            task.cancel()
+        except Exception:  # noqa: BLE001 - a broken pipe must not kill the worker
+            logging.getLogger("hng.relay").debug(
+                "stderr pump for %s ended badly", self.relay)
+
+    def _note_stderr(self, line: str) -> None:
+        """Record a liveness fact from nak's stderr; do not diagnose from it."""
+        self.last_stderr = line[:200]
+        self._attempt_lines.append(line)
+        now = time.time()
+        if _AUTH_LINE.search(line):
+            self.auth_at = now
+        elif _CONNECTED_LINE.search(line):
+            self.connected_at = now
+
     async def run(self, on_event: Handler) -> None:
         backoff = 2
         log = logging.getLogger("hng.relay")
         while not self._stop.is_set():
+            self.attempts += 1
+            self.attempt_started_at = time.time()
+            self._attempt_lines = []
             try:
                 env = None
                 if self.secret:
@@ -148,6 +229,13 @@ class RelayWorker:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
+            if self.started_at is None:
+                self.started_at = self.attempt_started_at
+            self._alive = True
+            # Read stderr *while* the child runs. It used to be read only after stdout
+            # closed, which hid the connect/auth notices for exactly as long as they
+            # were true and left only a dead attempt's last line on the record.
+            stderr_task = asyncio.create_task(self._drain_stderr(proc.stderr))
             err = ""
             try:
                 assert proc.stdout is not None
@@ -160,15 +248,26 @@ class RelayWorker:
                     except json.JSONDecodeError:
                         continue
                     self.events += 1
+                    self.last_event_at = time.time()
                     result = on_event(self.relay, event)
                     if asyncio.iscoroutine(result):
                         await result
-                err = (await proc.stderr.read()).decode().strip() if proc.stderr else ""
+                await self._settle(stderr_task)
+                err = "\n".join(self._attempt_lines).strip()
                 self.last_error = err.splitlines()[-1][:200] if err else None
             finally:
+                self._alive = False
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                try:
+                    await stderr_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - never let a pipe end the worker
+                    pass
             if self._stop.is_set():
                 break
             if self.note_refusals(err):
