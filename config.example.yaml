@@ -15,7 +15,7 @@ relays:
     - wss://nos.lol
     - wss://relay.primal.net
     - wss://relay.ditto.pub
-    - wss://relay.dreamith.to
+    - url: wss://relay.dreamith.to
       kinds: [1059]
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
