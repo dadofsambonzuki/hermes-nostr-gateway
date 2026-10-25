@@ -28,9 +28,11 @@ has to know which protocol a message arrived on. When it is finished, this is wh
 - **Coverage that is measured, not assumed.** Reads span the identity's follows, its NIP-65
   write relays and the sender app-relay defaults; per-relay event counts and last errors are in
   `hng status`, because "we read all relays" is a claim a status line should be able to prove.
-- **Marmot stays Marmot.** MLS is `wn-agent`'s job; the gateway speaks its control socket as a
-  proxy plane rather than reimplementing a protocol it does not own. The gateway is the single
-  entry point, and `wn-agent` remains the transport underneath.
+- **Marmot stays Marmot — and is opt-in.** MLS is `wn-agent`'s job; the gateway speaks its
+  control socket as a proxy plane rather than reimplementing a protocol it does not own. The
+  plane attaches only when `marmot.enabled: true`, because Hermes' own Marmot plugin can be
+  subscribed to the same socket and two subscribers mean two agent runs per message (below).
+  `wn-agent` remains the transport underneath either way.
 
 The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md); host-side operations
 are in [`docs/ops-notes.md`](docs/ops-notes.md). Where the current build differs from this
@@ -173,6 +175,27 @@ us; they are not a general NIP-17 inbox, they refuse public kinds, and the gatew
 them in the DM or feed read set. They are named under `relays.whitenoise` for the Marmot plane
 to use through `wn-agent`. The trade is deliberate: a DM that exists *only* there is not fetched
 by the DM workers, and if one ever goes missing this is the first thing to check.
+
+## Marmot is opt-in
+
+The `marmot` plane is a proxy to `wn-agent`'s control socket, and it does **not** attach unless
+the config says `marmot.enabled: true`. The default is off for a specific reason: Hermes ships
+its own Marmot platform plugin, usually configured against the same account and the same socket,
+and two subscribers on one control socket deliver the same group message to the agent twice — two
+runs, two replies, duplicate side effects. Setting the flag is the operator choosing which
+process is the transport; it is not a way to get Marmot *and* keep the plugin.
+
+An idle plane is not a silent one: startup logs
+
+```
+marmot plane idle: opt-in only: set marmot.enabled: true to attach it. …
+```
+
+and the socket's `status` op carries the same text under `marmot.reason` with
+`marmot.enabled: false`. An explicit `marmot:<group>` send fails with that explanation rather
+than looking like a bad target. If the flag *is* set and the plane is still absent, the reason
+changes to `no wn-agent control socket at <path>` — that is a daemon or `home:` problem, not an
+opt-in one.
 
 ## Rate limits and blocked frames
 

@@ -15,8 +15,7 @@ relays:
     - wss://nos.lol
     - wss://relay.primal.net
     - wss://relay.ditto.pub
-    - wss://relay.dreamith.to
-      kinds: [1059]
+    - {url: wss://relay.dreamith.to, kinds: [1059]}
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
     - wss://relay.day.ag/chat
@@ -32,9 +31,12 @@ whitenoise:
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
 
 # Marmot: proxied to wn-agent, never reimplemented — MLS stays theirs (spec §16).
-# Leave the section out (or point it at a missing socket) and the other planes still run;
-# the plane only attaches when wn-agent's control socket is actually there.
+# OPT-IN, and off by default on purpose. Hermes' own Marmot platform plugin reads the
+# same wn-agent socket; with both attached the agent receives every group message
+# twice. Set `enabled: true` only in the process meant to be the transport — i.e.
+# after disabling the Hermes Marmot plugin — and leave it false otherwise.
 marmot:
+  enabled: false                   # true = this gateway is the Marmot transport
   socket: ~/.marmot-agents/hermes/dev/wn-agent.sock
   home: ~/.marmot-agents/hermes     # account_id_hex is read from accounts/*/account.json
   # label: hermes-agent             # only needed when that home holds more than one account
