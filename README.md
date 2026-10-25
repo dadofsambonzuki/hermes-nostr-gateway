@@ -178,6 +178,40 @@ set per relay:
   `hng status` shows the narrowed set in that relay's detail, and reports `refusing` when
   nothing is left to read.
 
+**Peer inbox coverage.** A fixed read list cannot see a peer who publishes only into their own
+kind-10050 inbox relays, and the miss is silent (spec §3). So the gateway also resolves the
+10050 list of every pubkey named in `groups` — at startup, then every
+`relays.peer_inbox.refresh_minutes` — and adds those relays to the DM read set:
+
+```yaml
+relays:
+  peer_inbox:
+    enabled: true          # the gate; on by default because coverage is correctness
+    max_extra: 4           # hard cap on relays added, for the process lifetime
+    refresh_minutes: 60    # 0 = resolve once at startup
+    # lookup: [wss://relay.day.ag/chat, wss://nos.lol]   # default: first 4 of read + publish
+```
+
+The bounds matter as much as the lookup:
+
+- additions are deduplicated against `relays.read` on a normalised URL, so a relay already
+  read costs nothing;
+- `max_extra` caps the total for the life of the process. A relay is added once and never
+  re-added; a relay the cap refused is named in the socket `status` op
+  (`peer_inbox.skipped_by_cap`) rather than silently dropped;
+- each added relay gets **one** DM worker, not the DM/feed/mention trio the configured read
+  set uses, so the cap really is the connection bound;
+- only `wss://` URLs are accepted, and the White Noise relays below are never added;
+- a lookup that fails is recorded (`peer_inbox.errors`) and changes nothing: coverage never
+  shrinks because a relay was slow or a peer rotated their list;
+- a peer relay that refuses a kind negotiates exactly like any other relay: the kind is
+  dropped and the subscription continues on the rest. A relay that refuses every kind is
+  reported as a dead inbox and is not resubscribed.
+
+`status` reports `peer_inbox.added`, `.dead`, `.skipped_by_cap`, `.errors` and `.last_refresh`,
+and each worker carries a `purpose` (`dm`, `feed`, `mentions`, `peer-inbox`) so an extra
+connection can be traced to a decision.
+
 **White Noise relays belong to the Marmot plane.** `relay.eu.whitenoise.chat` and
 `relay.us.whitenoise.chat` exist to carry White Noise's own groups, which `wn-agent` speaks for
 us; they are not a general NIP-17 inbox, they refuse public kinds, and the gateway does not put

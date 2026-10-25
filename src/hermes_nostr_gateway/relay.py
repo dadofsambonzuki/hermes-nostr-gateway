@@ -60,8 +60,12 @@ class RelayWorker:
     def __init__(self, relay: str, me: str, *, kinds: tuple[int, ...] = (1059,),
                  authors: tuple[str, ...] = (), p_tag: str | None = None, auth: bool = True,
                  secret: str | None = None, since_days: int = 3, nak: str | None = None,
-                 on_refusal: RefusalHandler | None = None):
+                 on_refusal: RefusalHandler | None = None, purpose: str = "dm"):
         self.relay = relay
+        # Why this relay is in the read set (`dm`, `feed`, `mentions`, `peer-inbox`).
+        # `hng status` shows it, so an extra connection can be traced to a decision
+        # rather than to drift.
+        self.purpose = purpose
         # Requested vs refused vs active: config (or the caller) says what we want,
         # the relay says what it accepts, and `kinds` is what the next REQ carries.
         self.requested_kinds = tuple(dict.fromkeys(int(kind) for kind in kinds))
@@ -159,6 +163,7 @@ class RelayWorker:
         """
         return {
             "relay": self.relay,
+            "purpose": getattr(self, "purpose", "dm"),
             "kinds": list(self.kinds),
             "requested_kinds": list(self.requested_kinds),
             "refused_kinds": sorted(self.refused),
@@ -180,10 +185,19 @@ class RelayWorker:
         """Keep reading the child's stderr so its live notices are not lost."""
         if stderr is None:
             return
-        async for raw in stderr:
-            line = raw.decode(errors="replace").strip()
-            if line:
-                self._note_stderr(line)
+        if hasattr(stderr, "__aiter__"):
+            async for raw in stderr:
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    self._note_stderr(line)
+            return
+        # A stream that only offers read() — a test double, or a pipe wrapped by a
+        # caller — still has to be read, or its CLOSED/auth notices are lost and a
+        # refused kind never gets dropped.
+        raw = await stderr.read()
+        for line in (raw or b"").decode(errors="replace").splitlines():
+            if line.strip():
+                self._note_stderr(line.strip())
 
     async def _settle(self, task: "asyncio.Task[Any]") -> None:
         """Give a finished child's stderr a moment to land, never forever."""

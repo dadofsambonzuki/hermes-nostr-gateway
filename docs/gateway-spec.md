@@ -62,6 +62,13 @@ expected.
   were missed with no error and no log line. Stream `{kinds:[1059], "#p":[me], since: now-3d,
   until: now+5m}` over 10050 **plus** the app-relay defaults (ditto, dreamith, eu/us
   whitenoise), all configurable.
+- **Peer coverage closes the fixed-list gap.** At startup and on
+  `relays.peer_inbox.refresh_minutes` (default 60; `0` = once), resolve the kind-10050 list of
+  every pubkey named in `groups` and add those relays to the DM read set: deduplicated against
+  `relays.read` on a normalised URL, capped by `relays.peer_inbox.max_extra` (default 4, hard,
+  for the process lifetime), one DM subscription each. `enabled: false` turns it off. A failed
+  or slow lookup must never remove a relay already being read, and an added relay that refuses
+  a kind is negotiated exactly like any other relay.
 - A relay being down or empty is invisible: `relay.damus.io` answered 503 for a whole day
   (0 events) and the operator's own relay held **zero** wrappers. Log **per-relay event counts**
   and surface a relay that has delivered nothing while others have.

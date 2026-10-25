@@ -16,6 +16,16 @@ relays:
     - wss://relay.primal.net
     - wss://relay.ditto.pub
     - {url: wss://relay.dreamith.to, kinds: [1059]}
+  # Read coverage beyond that list (spec §3). A peer who publishes only into their own
+  # kind-10050 inbox relays is invisible to a fixed read list, silently. So the inbox
+  # relays of every pubkey in `groups` are resolved at startup and on a refresh, then
+  # added to the DM read set. `max_extra` is a hard cap on additions for the life of the
+  # process; each addition is one DM subscription, never a feed/mention pair.
+  peer_inbox:
+    enabled: true            # the gate; on by default because coverage is correctness
+    max_extra: 4             # hard cap, deduplicated against relays.read
+    refresh_minutes: 60      # 0 = resolve once at startup
+    # lookup: [wss://relay.day.ag/chat, wss://nos.lol]   # default: first 4 of read+publish
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
     - wss://relay.day.ag/chat
