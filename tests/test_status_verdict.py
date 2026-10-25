@@ -341,3 +341,14 @@ def test_status_json_carries_the_verdicts_and_the_stale_rows(tmp_path, capsys):
     assert payload["daemon"] is True and payload["event_times"] is True
     assert [row["state"] for row in payload["relays"]] == ["connected"]
     assert [row["relay"] for row in payload["not_in_config"]] == [REMOVED]
+
+
+def test_peer_inbox_additions_are_not_reported_as_config_drift():
+    """A relay discovered from a peer's 10050 is an addition, not a stale config entry."""
+    frame = {"workers": [
+        {"relay": "wss://relay.day.ag/chat", "purpose": "dm"},
+        {"relay": "wss://relay.damus.io", "purpose": "peer-inbox"},
+        {"relay": "wss://stale.example", "purpose": "dm"},
+    ]}
+    extra = running_but_unconfigured(frame, {"wss://relay.day.ag/chat"})
+    assert extra == ["wss://stale.example"]
