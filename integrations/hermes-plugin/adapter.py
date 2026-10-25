@@ -54,6 +54,29 @@ def _short(pubkey: str) -> str:
     return f"{pubkey[:12]}…" if pubkey else "nostr"
 
 
+# Hermes emits turn-control notices through the platform send path: an empty turn's
+# placeholder, interrupt notices, provider-retry notices, the home-channel prompt, the
+# shutdown warning. They are not conversation, and two agents that forward them echo each
+# other without end (measured: 3,370 relay-publishes of "—" and "[interrupt: …]" between
+# two Hermes bots). They must never leave the box over a Nostr plane, and a control notice
+# arriving from a peer must never wake an agent either.
+_CONTROL_PREFIXES = (
+    "[interrupt",
+    "\u21aa Redirected",
+    "\u23f3 Provider temporarily unavailable",
+    "\U0001f4ec No home channel is set",
+    "\u26a0\ufe0f Hermes is shutting down",
+    "\u26a0\ufe0f Hermes is restarting",
+)
+_CONTROL_EXACT = {"", "\u2014", "-", "\u2013"}
+
+
+def is_control_text(text: str) -> bool:
+    """True when a send is a Hermes control notice rather than a message to a person."""
+    stripped = (text or "").strip()
+    return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
+
+
 class NostrGatewayAdapter(BasePlatformAdapter):
     """One reader connection (subscribe) and a short-lived connection per send."""
 
@@ -64,9 +87,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(PLATFORM_NAME))
         self._socket = socket_path(config)
+        self._config = config
         self._reader_task: Optional[asyncio.Task] = None
         self._closing = False
         self._connected = asyncio.Event()
+        # Destinations this adapter has actually heard from. A reply may go to one of
+        # these (or the configured home channel) and nowhere else: a notice that falls
+        # back to "whatever peer Hermes last spoke to" is how the Hal echo loop started.
+        self._peers: set[str] = set()
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -94,6 +122,34 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"chat_id": chat_id, "name": _short(chat_id), "type": "dm",
                 "platform": PLATFORM_NAME}
+
+    # -- destinations ---------------------------------------------------
+    def _home_chat(self) -> str:
+        """The one destination a notice may always use, as hex when it is configured."""
+        raw = (os.environ.get("NOSTR_HOME_CHANNEL")
+               or _extra(getattr(self, "_config", None)).get("home_channel") or "").strip()
+        if not raw:
+            return ""
+        if not raw.startswith("npub"):
+            return raw.lower()
+        cached = getattr(self, "_home_hex", "")
+        if cached:
+            return cached
+        try:  # a bad home channel must not fail a send that would otherwise work
+            import subprocess
+            out = subprocess.run(["nak", "decode", raw], capture_output=True, text=True,
+                                 timeout=10)
+            self._home_hex = (out.stdout or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            self._home_hex = ""
+        return self._home_hex
+
+    def _may_address(self, chat_id: str) -> bool:
+        """Only the home channel and peers that have written here may be addressed."""
+        target = (chat_id or "").strip().lower()
+        if not target:
+            return False
+        return target == self._home_chat() or target in self._peers
 
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
@@ -137,6 +193,16 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         sender = frame.get("sender") or ""
         message_id = frame.get("id") or ""
         conversation = frame.get("conversation") or sender
+        if sender:
+            self._peers.add(sender.lower())
+        if conversation:
+            self._peers.add(str(conversation).lower())
+        if is_control_text(frame.get("content") or ""):
+            # The peer's own turn-control notice is not chat: ack it so the gateway does
+            # not replay it, but never turn it into an agent run.
+            logger.debug("nostr inbound skipped: control notice from %s", _short(sender))
+            await self._request({"op": "ack", "ids": [message_id]})
+            return
         authoritative = frame.get("authority") == "instructions"
         source = SessionSource(
             platform=self.platform,
@@ -161,32 +227,18 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Ack only once Hermes has taken the message; a crash before this replays it.
         await self._request({"op": "ack", "ids": [message_id]})
 
-
-# Hermes emits turn-control notices through the platform send path: an empty turn's
-# placeholder, interrupt notices, provider-retry notices, the home-channel prompt. They
-# are not conversation, and two agents that forward them echo each other without end
-# (measured: 3,370 relay-publishes of "—" and "[interrupt: …]" between two Hermes bots).
-# They must never leave the box over a Nostr plane.
-_CONTROL_PREFIXES = (
-    "[interrupt",
-    "\u21aa Redirected",
-    "\u23f3 Provider temporarily unavailable",
-    "\U0001f4ec No home channel is set",
-)
-_CONTROL_EXACT = {"", "\u2014", "-", "\u2013"}
-
-
-def is_control_text(text: str) -> bool:
-    """True when a send is a Hermes control notice rather than a message to a person."""
-    stripped = (text or "").strip()
-    return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
-
     # -- outbound -------------------------------------------------------
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if is_control_text(content):
             logger.debug("nostr send skipped: Hermes control notice, not a message")
             return SendResult(success=True, raw_response={"skipped": "control_notice"})
+        if not self._may_address(chat_id):
+            # A misdirected notice is as bad as a control string: never invent a
+            # destination. Report success so Hermes does not retry it forever.
+            logger.warning("nostr send refused: %s is neither the home channel nor a peer "
+                           "that has written here", _short(str(chat_id or "")))
+            return SendResult(success=True, raw_response={"skipped": "unknown_destination"})
         try:
             frame = await self._request(
                 {"op": "send", "to": chat_id, "text": content, "reply_to": reply_to},
