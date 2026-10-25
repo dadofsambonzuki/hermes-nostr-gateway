@@ -389,7 +389,7 @@ One socket, one normalised event, N planes behind it:
 | `nip17` | 1059 → inner 14 / 7 / 15 | 14, 7, 15 inside 1059 | primary DM plane |
 | `nip04` | kind 4 | kind 4 | legacy, allowlist-gated, never dual-sent by default |
 | `concord` | 1059 with inner 3313 (invites) + Concord control/chat kinds | invites, chat, rekey | serverless E2EE communities; own control plane |
-| `marmot` | via the wn-agent socket | via the wn-agent socket | **proxy**, not an implementation — MLS stays theirs |
+| `marmot` | via the wn-agent socket | via the wn-agent socket | **proxy**, not an implementation — MLS stays theirs; **config opt-in** (see below) |
 
 Normalised event on the wire:
 
@@ -399,6 +399,12 @@ Normalised event on the wire:
 
 Adding a plane must not require touching the socket schema: `plane` is a string and
 `conversation` is opaque to the client (channel id, DM peer, group id).
+
+`marmot` is the one plane that is **off unless asked for** (`marmot.enabled: true`). Hermes'
+own Marmot platform plugin can subscribe to the same `wn-agent` socket; a gateway plane
+attached alongside it would hand the agent every group message twice, so presence of the
+socket is not consent. An idle plane logs why at startup and reports
+`marmot: {enabled: false, reason: …}` on the `status` op.
 
 ---
 

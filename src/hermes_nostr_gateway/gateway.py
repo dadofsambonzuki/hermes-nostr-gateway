@@ -83,6 +83,15 @@ def default_socket_path() -> Path:
 
 
 class Gateway:
+    #: Logged and reported whenever the plane is not attached for want of an opt-in.
+    #: Kept as one string so the log line, `hng status` and a refused send all tell
+    #: the operator the same thing.
+    MARMOT_OPT_IN_REASON = (
+        "opt-in only: set marmot.enabled: true to attach it. It is idle by default "
+        "because Hermes' own Marmot platform plugin reads the same wn-agent socket, "
+        "so both attached deliver every group message to the agent twice"
+    )
+
     def __init__(self, cfg: dict[str, Any], *, socket_path: str | Path | None = None):
         from .cli import normalise_groups, secret_from
 
@@ -103,12 +112,15 @@ class Gateway:
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
                                 on_invite=self.concord.handle_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
-        # The Marmot plane proxies wn-agent rather than speaking MLS, so it is
-        # attached only when that daemon is actually reachable (see _setup_marmot).
+        # The Marmot plane proxies wn-agent rather than speaking MLS: it attaches
+        # only when opted in *and* that daemon is reachable (see _setup_marmot).
         self.marmot: MarmotPlane | None = None
         self.marmot_resolver: MarmotResolver | None = None
         self.marmot_worker: MarmotWorker | None = None
         self.marmot_error: str | None = None
+        #: Why the plane is attached to nothing, when it is idle by choice or by a
+        #: missing socket. `marmot_error` is for failures; this is for "not asked".
+        self.marmot_idle: str | None = None
         self._setup_marmot(cfg.get("marmot") or {})
         self.follows: tuple[str, ...] = self._load_follows()
         self.relays_read, self.relay_kinds = relay_read_plan(cfg)
@@ -122,23 +134,30 @@ class Gateway:
         self._stopping = asyncio.Event()
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
-        """Attach the Marmot proxy iff wn-agent's control socket is actually there.
+        """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
 
-        A missing socket is "not configured" and stays quiet. A socket that exists
-        but cannot be used (no account file, two of them) disables only this plane
-        and records why in `marmot_error` — the NIP-17 planes must not go down
-        because a second daemon is mid-install, and a silent disable would look
-        exactly like a working plane with nothing to say.
+        Opt-in, not opt-out. The gateway is not the only reader of wn-agent's
+        control socket: Hermes' Marmot platform plugin subscribes to the same
+        account, so a gateway plane attached by default hands the agent a second
+        copy of every group message. `marmot.enabled: true` is the operator saying
+        this process is the transport. Once opted in, a missing socket still means
+        "nothing to attach to" and stays quiet; a socket that exists but cannot be
+        used (no account file, two of them) disables only this plane and records why
+        in `marmot_error` — the NIP-17 planes must not go down because a second
+        daemon is mid-install, and a silent disable would look exactly like a
+        working plane with nothing to say.
         """
-        if cfg.get("enabled") is False:
-            log.info("marmot plane disabled by config")
+        if cfg.get("enabled") is not True:
+            self.marmot_idle = self.MARMOT_OPT_IN_REASON
+            log.info("marmot plane idle: %s", self.marmot_idle)
             return
         home = Path(os.path.expanduser(str(cfg.get("home") or default_marmot_home())))
         socket = Path(os.path.expanduser(str(
             cfg.get("socket") or cfg.get("socket_path") or home / "dev/wn-agent.sock"
         )))
         if not socket.exists():
-            log.info("marmot plane idle: no control socket at %s", socket)
+            self.marmot_idle = f"no wn-agent control socket at {socket}"
+            log.info("marmot plane idle: %s", self.marmot_idle)
             return
         try:
             account = str(cfg.get("account_id_hex") or "").strip() or resolve_account_id(
@@ -339,9 +358,10 @@ class Gateway:
             # through to NIP-17 would fail as "bad pubkey", which sends the caller
             # looking in the wrong place.
             if explicit_marmot:
-                detail = f": {self.marmot_error}" if self.marmot_error else ""
+                detail = self.marmot_error or self.marmot_idle
+                suffix = f": {detail}" if detail else ""
                 return {"type": "delivery", "id": cid, "ok": False,
-                        "error": f"marmot plane is not enabled{detail}"}
+                        "error": f"marmot plane is not enabled{suffix}"}
         else:
             group = self.marmot_resolver.parse(target)
             if group is not None:
@@ -554,7 +574,8 @@ class Gateway:
                 {"worker": self.marmot_worker.stats(),
                  "conversations": self.marmot_resolver.conversations()}
                 if self.marmot and self.marmot_worker and self.marmot_resolver
-                else {"enabled": False, "error": self.marmot_error}
+                else {"enabled": False, "error": self.marmot_error,
+                      "reason": self.marmot_idle}
             ),
             "workers": [
                 {"relay": w.relay, "kinds": list(w.kinds),
@@ -595,10 +616,13 @@ class Gateway:
         return {"acked": ids}
 
     # -- Marmot reads (over the same socket, same normalised shapes) ------
+    def _marmot_unavailable(self) -> str:
+        return self.marmot_error or self.marmot_idle or "marmot plane not enabled"
+
     async def marmot_group(self, group: str) -> dict[str, Any]:
         if self.marmot is None or self.marmot_resolver is None:
             return {"type": "error", "op": "marmot.group",
-                    "error": self.marmot_error or "marmot plane not enabled"}
+                    "error": self._marmot_unavailable()}
         try:
             info = await self.marmot_resolver.resolve(group)
         except MarmotError as exc:
@@ -609,7 +633,7 @@ class Gateway:
     async def marmot_timeline(self, group: str, limit: int = 20) -> dict[str, Any]:
         if self.marmot is None or self.marmot_resolver is None:
             return {"type": "error", "op": "marmot.timeline",
-                    "error": self.marmot_error or "marmot plane not enabled"}
+                    "error": self._marmot_unavailable()}
         try:
             await self.marmot_resolver.resolve(group)
             page = await self.marmot.timeline(group, limit=limit)
