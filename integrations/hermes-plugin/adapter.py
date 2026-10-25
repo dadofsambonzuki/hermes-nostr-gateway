@@ -161,9 +161,32 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Ack only once Hermes has taken the message; a crash before this replays it.
         await self._request({"op": "ack", "ids": [message_id]})
 
+
+# Hermes emits turn-control notices through the platform send path: an empty turn's
+# placeholder, interrupt notices, provider-retry notices, the home-channel prompt. They
+# are not conversation, and two agents that forward them echo each other without end
+# (measured: 3,370 relay-publishes of "—" and "[interrupt: …]" between two Hermes bots).
+# They must never leave the box over a Nostr plane.
+_CONTROL_PREFIXES = (
+    "[interrupt",
+    "\u21aa Redirected",
+    "\u23f3 Provider temporarily unavailable",
+    "\U0001f4ec No home channel is set",
+)
+_CONTROL_EXACT = {"", "\u2014", "-", "\u2013"}
+
+
+def is_control_text(text: str) -> bool:
+    """True when a send is a Hermes control notice rather than a message to a person."""
+    stripped = (text or "").strip()
+    return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
+
     # -- outbound -------------------------------------------------------
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        if is_control_text(content):
+            logger.debug("nostr send skipped: Hermes control notice, not a message")
+            return SendResult(success=True, raw_response={"skipped": "control_notice"})
         try:
             frame = await self._request(
                 {"op": "send", "to": chat_id, "text": content, "reply_to": reply_to},
