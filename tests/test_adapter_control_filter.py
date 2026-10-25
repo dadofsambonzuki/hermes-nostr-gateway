@@ -151,3 +151,37 @@ def test_send_allows_the_home_channel(monkeypatch):
     result = asyncio.run(inst.send("d" * 64, "real message"))
     assert [p.get("to") for p in sent] == ["d" * 64]
     assert result.success is True
+
+
+def test_control_text_is_still_dropped_for_an_ordinary_peer(monkeypatch):
+    monkeypatch.delenv("NOSTR_CONTROL_CHANNEL", raising=False)
+    inst = _bare_adapter()
+    inst._peers.add("e" * 64)
+    sent = []
+
+    async def _request(payload, timeout=30.0):
+        sent.append(payload)
+        return {"type": "delivery", "ok": True, "message_id": "x"}
+
+    inst._request = _request
+    import asyncio
+    result = asyncio.run(inst.send("E" * 64, "[interrupt: no assistant output for this turn]"))
+    assert sent == []
+    assert (result.raw_response or {}).get("skipped") == "control_notice"
+
+
+def test_a_nominated_control_channel_receives_control_text(monkeypatch):
+    """Deliberate control plane: naming the npub is the exception to the drop rule."""
+    monkeypatch.setenv("NOSTR_CONTROL_CHANNEL", "f" * 64)
+    inst = _bare_adapter()
+    sent = []
+
+    async def _request(payload, timeout=30.0):
+        sent.append(payload)
+        return {"type": "delivery", "ok": True, "message_id": "x"}
+
+    inst._request = _request
+    import asyncio
+    result = asyncio.run(inst.send("f" * 64, "[interrupt: no assistant output for this turn]"))
+    assert [p.get("to") for p in sent] == ["f" * 64]
+    assert result.success is True

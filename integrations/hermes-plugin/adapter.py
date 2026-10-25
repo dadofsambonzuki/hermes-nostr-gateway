@@ -149,7 +149,42 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         target = (chat_id or "").strip().lower()
         if not target:
             return False
-        return target == self._home_chat() or target in self._peers
+        return (target == self._home_chat() or target == self._control_chat()
+                or target in self._peers)
+
+    def _control_chat(self) -> str:
+        """An npub explicitly nominated to receive control notices (a control plane).
+
+        Empty by default: control text is dropped everywhere, which is what stops two
+        agents echoing their status lines at each other. Naming a destination here is
+        the deliberate exception — a control plane you asked for, not an accident.
+        """
+        raw = (os.environ.get("NOSTR_CONTROL_CHANNEL")
+               or _extra(getattr(self, "_config", None)).get("control_channel") or "").strip()
+        if not raw:
+            return ""
+        first = raw.split(",")[0].strip()
+        if not first.startswith("npub"):
+            return first.lower()
+        cached = getattr(self, "_control_hex", "")
+        if cached:
+            return cached
+        try:
+            import subprocess
+            out = subprocess.run(["nak", "decode", first], capture_output=True, text=True,
+                                 timeout=10)
+            self._control_hex = (out.stdout or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            self._control_hex = ""
+        return self._control_hex
+
+    def _control_allowed(self, chat_id: str) -> bool:
+        target = (chat_id or "").strip().lower()
+        allowed = {p.strip().lower() for p in
+                   (os.environ.get("NOSTR_CONTROL_CHANNEL")
+                    or _extra(getattr(self, "_config", None)).get("control_channel") or "").split(",")
+                   if p.strip()}
+        return bool(target) and target in allowed | {self._control_chat()}
 
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
@@ -230,7 +265,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     # -- outbound -------------------------------------------------------
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        if is_control_text(content):
+        if is_control_text(content) and not self._control_allowed(chat_id):
             logger.debug("nostr send skipped: Hermes control notice, not a message")
             return SendResult(success=True, raw_response={"skipped": "control_notice"})
         if not self._may_address(chat_id):
