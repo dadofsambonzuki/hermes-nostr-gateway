@@ -77,6 +77,18 @@ def is_control_text(text: str) -> bool:
     return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
 
 
+# A digest is the gateway batching many low-priority items into one frame. It has no human
+# author, so the frame carries the literal `sender`/`conversation` "digest" — not a pubkey.
+# Hermes admits an inbound by sender identity (`NOSTR_ALLOWED_USERS`), so a frame signed
+# "digest" is rejected before the agent ever sees it: the live log shows one
+# `Unauthorized user: digest (digest…) on nostr` per digest window, and the gateway has
+# already marked that batch delivered. The adapter therefore re-addresses the batch to the
+# owner's home session — the conversation a digest belongs to — while keeping it data.
+def is_digest_frame(frame: dict[str, Any]) -> bool:
+    """True when *frame* is a gateway digest batch rather than a person's message."""
+    return frame.get("plane") == "digest" or frame.get("sender") == "digest"
+
+
 class NostrGatewayAdapter(BasePlatformAdapter):
     """One reader connection (subscribe) and a short-lived connection per send."""
 
@@ -225,8 +237,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             backoff = min(backoff * 2, 30.0)
 
     async def _deliver(self, frame: dict[str, Any]) -> None:
-        sender = frame.get("sender") or ""
         message_id = frame.get("id") or ""
+        if is_digest_frame(frame):
+            await self._deliver_digest(frame, message_id)
+            return
+        sender = frame.get("sender") or ""
         conversation = frame.get("conversation") or sender
         if sender:
             self._peers.add(sender.lower())
@@ -260,6 +275,44 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
         # Ack only once Hermes has taken the message; a crash before this replays it.
+        await self._request({"op": "ack", "ids": [message_id]})
+
+    async def _deliver_digest(self, frame: dict[str, Any], message_id: str) -> None:
+        """Deliver one digest batch into the owner's session, as data.
+
+        A digest has no sender Hermes could authorise, so it is presented in the home
+        channel's DM — the conversation it is addressed to — and never as a peer: nothing
+        may be sent to "digest". `role_authorized` is False unconditionally: batching
+        drops per-item provenance, so no batch may carry instructions, whatever the frame
+        claims. The gateway still owns the ack contract, so ack only after Hermes took it.
+        """
+        owner = self._home_chat()
+        if not owner:
+            # No home channel, no authorised destination. Warn and leave it unacked: an ack
+            # claims Hermes took the batch, and nothing did.
+            logger.warning(
+                "nostr digest %s not delivered: no home channel is configured",
+                message_id or "(no id)")
+            return
+        event = MessageEvent(
+            text=frame.get("content") or "",
+            message_type=MessageType.TEXT,
+            user_id=owner,
+            user_name="digest",
+            source=SessionSource(
+                platform=self.platform,
+                chat_id=owner,
+                chat_name=_short(owner),
+                chat_type="dm",
+                user_id=owner,
+                user_name="digest",
+                role_authorized=False,
+                message_id=message_id,
+            ),
+            raw_message=frame,
+            message_id=message_id,
+        )
+        await self.handle_message(event)
         await self._request({"op": "ack", "ids": [message_id]})
 
     # -- outbound -------------------------------------------------------
