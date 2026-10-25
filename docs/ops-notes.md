@@ -1,7 +1,8 @@
 # Operating notes
 
 What the daemon is, where its socket lives, and the two host-side gates that make
-`relay.day.ag` look like it is refusing us. Checked against the live host on 2026-10-24.
+`relay.day.ag` look like it is refusing us. Checked against the live host and against
+haven `v1.2.2` on 2026-10-25.
 
 This is the source copy. The ops-side mirror lives at
 `~/Projects/infra/ops/hermes-nostr-gateway.md` (the file Nathan chose on 2026-10-24 instead of
@@ -67,12 +68,13 @@ into a delivery stream.
 `/private`, `/chat` and `/inbox` to it. `/chat` is gated, and it is the one the gateway's DM
 worker reads.
 
-- **Web-of-trust gate, depth 3** — owner → follows → their follows
-  (`CHAT_RELAY_WOT_DEPTH=3`), refreshed every 24 hours
-  (`CHAT_RELAY_WOT_REFRESH_INTERVAL_HOURS=24`). The model is in memory and rebuilt from
-  `relays_import.json` at boot (about 4 s; 36k pubkeys from 534 relays on the last start).
-  NIP-42 auth is checked **against the WoT**; `/opt/haven/whitelisted_npubs.json` is a
-  separate list and is not a substitute. A rejected subscription closes with **`restricted`**.
+- **Web-of-trust gate, depth 3** — the graph is seeded from `OWNER_NPUB` plus every npub in
+  `/opt/haven/whitelisted_npubs.json`, walked to depth 3, held in memory and rebuilt at boot
+  (about 4 s; 36k pubkeys from 534 import relays on the last start). NIP-42 auth is checked
+  **against that graph** on reads and writes. Depth, follower floor and refresh are sized by
+  `WOT_DEPTH` / `WOT_MINIMUM_FOLLOWERS` / `WOT_REFRESH_INTERVAL` — **not** by the
+  `CHAT_RELAY_*` names. Read *What the web of trust actually gates* below before changing
+  anything here.
 - **The `nak` machine-key trap.** `nak` with no key material signs NIP-42 as its machine
   default — `nak key default` → `3429e7d6…`, a key nobody follows and that is not whitelisted.
   So `nak req --auth` without `NOSTR_SECRET_KEY` is closed `restricted`, and `nak event`
@@ -96,6 +98,96 @@ worker reads.
   resubscribes on the rest at once, and a relay that refuses every kind stops with an error
   rather than ever sending a filterless REQ. `hng status` records both the refusal and what
   is still being read.
-- **`CHAT_RELAY_MINIMUM_FOLLOWERS=3` is set but not what runs.** The boot log reports
-  `minFollowers=0`; the depth-3 WoT is what is enforced. Re-check the log after a restart
-  before relying on the follower floor.
+- **`CHAT_RELAY_MINIMUM_FOLLOWERS=3` is not a knob haven 1.2.2 reads.** The name in this
+  build is `WOT_MINIMUM_FOLLOWERS`, and it is unset here, so the boot log reports
+  `minFollowers=0`; the depth-3 graph is what is enforced. Do not edit the `CHAT_RELAY_*`
+  WoT names and restart expecting a change — see below.
+
+## What the web of trust actually gates
+
+Checked on 2026-10-25 against haven `v1.2.2` (`github.com/barrydeen/haven`, tag `v1.2.2` =
+`45d835f`) and against the running relay. Each claim is marked **[source]** (read from that
+tag) or **[measured]** (this box's log or a probe); nothing here is inferred from `.env`.
+The deployed binary is a local build of that tag with a patched khatru 0.19.1, sha256
+`a3cc6ef9…` — NIP-11 says `version: (devel)`, so identify the release by hash, not that field.
+
+- **The roots are the relay's owner plus its whitelist, not the connecting client's follows.**
+  `loadConfig` inserts `OWNER_NPUB` into the whitelist map itself (`config.go:125`), and at
+  depth 3 the WoT builder seeds from that whole map: it fetches kind 3 for every key in
+  `WhitelistedPubKeys` (`pkg/wot/simple_in_memory.go:84-100`, wired at `main.go:80-88`).
+  **[source]** On this box the file holds 5 npubs and the boot log says
+  `Number of whitelisted pubkeys: 6` — the owner is the sixth — and Holly's npub is one of
+  the five. Her follows are roots *because she is whitelisted*, not because the gateway is
+  doing the reading. A client's own follow list counts for nothing unless that client is in
+  the seed set. **[measured]**
+- **Depth 3 means seeds + their follows + the follows of those, minus the follower floor.**
+  Membership is a property of a key against the seed set; the direction of some other pair's
+  follow edge is irrelevant unless it leaves a seed. So "A follows B, therefore A can read",
+  "the peer doesn't follow the bot, therefore the bot can't read" and "the two bots follow
+  each other, so they are in the web" are all invalid inferences. The floor counts mentions
+  across the follow lists haven actually fetched (seeds and one-hop), not a global follower
+  count, and it is applied only at depth 3. **[source]**
+- **The WoT names are `WOT_*`; the `CHAT_RELAY_*` WoT names are inert.** The only WoT keys in
+  `config.go:112-115` are `WOT_DEPTH` (default 3), `WOT_MINIMUM_FOLLOWERS` (default **0** in
+  code), `WOT_FETCH_TIMEOUT_SECONDS` (default 30) and `WOT_REFRESH_INTERVAL` (Go duration
+  string, default `24h`). Levels: 0 off, 1 owner + whitelist only, 2 plus their direct
+  follows, 3 plus follows-of-follows. **[source]** `.env` instead carries
+  `CHAT_RELAY_WOT_DEPTH=3`, `CHAT_RELAY_WOT_REFRESH_INTERVAL_HOURS=24` and
+  `CHAT_RELAY_MINIMUM_FOLLOWERS=3`, none of which is read; its only `WOT_*` entry is
+  `WOT_FETCH_TIMEOUT_SECONDS=60`. The running model is therefore the code default: depth 3,
+  floor 0, 24 h refresh. **[measured]**
+- **`CHAT_RELAY_MINIMUM_FOLLOWERS` — and `CHAT_RELAY_WOT_DEPTH` /
+  `CHAT_RELAY_WOT_REFRESH_INTERVAL_HOURS` — are read by nothing in this build.** v1.2.2 never
+  references them (`grep -rn CHAT_RELAY_MINIMUM_FOLLOWERS` over the tag: nothing), and
+  `strings /opt/haven/haven | grep -c CHAT_RELAY_MINIMUM_FOLLOWERS` returns **0** while the
+  same binary contains `WOT_MINIMUM_FOLLOWERS`. **[source + measured]** With
+  `CHAT_RELAY_MINIMUM_FOLLOWERS=3` in `.env` and no `WOT_MINIMUM_FOLLOWERS`, the
+  2026-10-25 15:46:51 start logged
+  `Web of Trust Level 3 -> Connection of Connections (owner, follows, and their follows) with minFollowers=0`
+  and then a pruner line reading `minimum=0 kept=36656 eliminated=0` (the emoji-prefixed
+  fields are `minimum`, `kept`, `eliminated`). Editing those names and restarting changes
+  nothing. **[measured]**
+- **The trap: the defaults happen to match the intent.** `.env` asks for depth 3, three
+  common followers and a 24 h refresh; the code's defaults are 3, 0 and 24 h, so the log
+  agrees with the config on two of three while reading none of it. Upstream's own
+  `docs/wot.md` says `WOT_MINIMUM_FOLLOWERS` defaults to 3, but `config.go:113` defaults it
+  to 0 — the code wins, so an unset key means 0, not 3. Confirm which key drives a value
+  before "fixing" it, and read the model line back after any restart. **[source]**
+- **`/chat` reads require NIP-42 and WoT membership.** The read chain is `MustAuth` then
+  `MustBeInWoTToQuery` (`init.go:185`), with `khatru.RequestAuth` on connect (`init.go:207`);
+  writes add `MustNotBeBlacklistedToPost`, `MustBeInWoTToPost` and `EventMustBeChatRelated`
+  (`init.go:186-195`). A whitelist entry is a write grant on the owner-only paths, but here
+  it also puts that npub's graph into the read model, so the two are not independent.
+  **[source]**
+- **A refused query is a `CLOSED`, never an `EOSE` — and that is the "silent" failure.**
+  Measured against `wss://relay.day.ag/chat` on 2026-10-25:
+  - no auth: `CLOSED: auth-required: all requests must be authenticated`, about 0.3 s
+  - authed as a key outside the web:
+    `CLOSED: restricted: you must be in the web of trust to query this relay`, about 0.3 s
+
+  There is no EOSE on either path, by design: khatru writes `CLOSED` and returns before the
+  EOSE goroutine is reached. A client that waits only for EOSE or events, and does not
+  surface `CLOSED`, sees a subscription that delivers nothing and never reaches EOSE — no
+  error, no EOSE. A hung REQ therefore proves the client ignored a close frame; it does not
+  prove the relay dropped the query, and it says nothing about the write path.
+  **[measured + source]**
+- **NIP-42 auth is validated against the public URL, so loopback probes cannot authenticate.**
+  `chatRelay.ServiceURL` is `https://<RELAY_URL>/chat` (`init.go:177`) and NIP-42 compares
+  scheme, host **and** path. A REQ to `ws://127.0.0.1:3355/chat` signs
+  `relay=ws://127.0.0.1:3355/chat`, fails validation, and comes back `auth-required` even
+  though `nak --auth` printed `authenticating …`. The failed AUTH is not reported as an auth
+  error, which is the other way this looks silent. Probe `wss://relay.day.ag/chat` with the
+  identity you are asking about. **[measured + source]**
+
+Diagnosing "is X in the web?", in order:
+
+1. Read the model the process built, not `.env`:
+   `journalctl -u haven | grep -E 'Web of Trust Level|pruned pubkeys' | tail -2`. The
+   `minFollowers=` and `minimum=` values there are what is enforced.
+2. Enumerate the seeds: `OWNER_NPUB` from `/opt/haven/.env` plus every entry in
+   `whitelisted_npubs.json` (those entries plus the owner are the log's count).
+3. Fetch those seeds' kind 3 from the import relays (`relays_import.json`) — not necessarily
+   from this relay — and check X against the seeds themselves, their follows (level 2 and
+   up), and the follows of those (level 3 only).
+4. A new owner follow or whitelist edit is not live until the graph rebuilds: restart haven,
+   wait for the listener, then re-probe. `is-active` says `active` throughout the rebuild.
