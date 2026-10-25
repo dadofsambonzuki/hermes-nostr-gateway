@@ -7,12 +7,22 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .crypto import SdkCrypto
+from .health import (
+    BAD,
+    human_age,
+    relay_verdicts,
+    render,
+    reports_event_times,
+    running_but_unconfigured,
+    stale_rows,
+)
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .publisher import publish
@@ -215,19 +225,118 @@ def cmd_send(args) -> int:
 
 
 def cmd_status(args) -> int:
+    from dataclasses import replace
+
+    from .gateway import default_socket_path, relay_read_plan
+    from .server import request
+
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
+    stats = store.stats()
+    now = time.time()
+    relays, _ = relay_read_plan(cfg)
+    publish = [str(relay) for relay in (cfg.get("relays") or {}).get("publish") or []]
+    socket_path = Path(os.path.expanduser(
+        args.socket or cfg.get("socket") or str(default_socket_path())))
+
+    # The verdict comes from the running daemon, never from the store: relay_stats rows
+    # are history (see health.py). A daemon that does not answer leaves the relays
+    # "unknown", which is the truth, rather than borrowing the last stderr line of a
+    # child process and calling it an error.
+    frame: dict[str, Any] | None = None
+    problem = "no socket"
+    try:
+        reply = asyncio.run(request(socket_path, {"op": "status"}))
+        if reply.get("type") == "status":
+            frame = reply
+        else:
+            problem = f"unexpected reply {reply.get('type')!r}"
+    except (OSError, TimeoutError, ValueError) as exc:
+        problem = str(exc) or exc.__class__.__name__
+
+    verdicts = relay_verdicts(frame, relays=relays, now=now,
+                              quiet_minutes=args.quiet_minutes)
+    if frame is None:
+        # No daemon, no verdict. The store row is printed as history so the operator
+        # still has the last recorded counters without them pretending to be health.
+        history = {str(row.get("relay")): row for row in stats["relays"]}
+        verdicts = [
+            replace(v, detail=f"{v.detail}; history: "
+                              f"{_history_text(history.get(v.relay), now)}")
+            for v in verdicts
+        ]
+
+    stale = stale_rows({"relay_stats": stats["relays"]}, set(relays) | set(publish))
+
+    if args.json:
+        print(json.dumps({
+            "identity": plane.me,
+            "store": str(store.path),
+            "socket": str(socket_path),
+            "daemon": frame is not None,
+            "event_times": reports_event_times(frame),
+            "rumors": stats["total"],
+            "pending": stats["pending"],
+            "blocked": stats["blocked"],
+            "invites": stats["invites"],
+            "relays": [verdict.as_dict() for verdict in verdicts],
+            "not_in_config": stale,
+        }, indent=2))
+        return _status_exit(frame, verdicts, args)
+
     print(f"identity: {plane.me}")
     print(f"store:    {store.path}")
-    stats = store.stats()
     print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery, "
           f"{stats['blocked']} blocked)")
     print(f"invites:  {stats['invites']} concord invite(s)")
-    print("relays:")
-    for row in stats["relays"]:
-        print(f"  {row['relay']:<38} events={row['events']:<5} last={row['last_event'] or '-'} "
-              f"err={row['last_error'] or '-'}")
-    return 0
+    if frame is None:
+        print(f"daemon:   not running ({socket_path}: {problem})")
+        print("relays:   (no live worker state; the daemon answers this question)")
+    else:
+        print(f"daemon:   up ({socket_path}, {len(frame.get('workers') or [])} worker(s))")
+        print("relays:   (live worker state)")
+    for line in render(verdicts):
+        print(line)
+    if frame is not None and not reports_event_times(frame):
+        print("note:     this daemon reports no per-worker event times "
+              "(restart it for \"no events for Nm\" verdicts)")
+
+    if stale:
+        width = max(len(str(row.get("relay"))) for row in stale)
+        print("not in config (history only, not read):")
+        for row in stale:
+            age = (human_age(now - row["last_event"]) if row.get("last_event") else "-")
+            print(f"  {row['relay']:<{width}}  events={row['events']:<5} "
+                  f"last event {age}{' ago' if age != '-' else ''}")
+
+    extra = running_but_unconfigured(frame, set(relays) | set(publish))
+    if extra:
+        print("daemon still reads relays the config no longer lists (restart to apply):")
+        for relay in extra:
+            print(f"  {relay}")
+
+    if args.verbose and frame is not None:
+        print("diagnostics (child stderr, not a verdict):")
+        for worker in frame.get("workers") or []:
+            said = worker.get("last_stderr") or worker.get("last_error")
+            if said:
+                print(f"  {worker.get('relay')}  {said}")
+
+    return _status_exit(frame, verdicts, args)
+
+
+def _history_text(row: dict[str, Any] | None, now: float) -> str:
+    if not row:
+        return "no row in the store"
+    age = human_age(now - row["last_event"]) if row.get("last_event") else None
+    return (f"events={row.get('events', 0)}, last event {age} ago" if age
+            else f"events={row.get('events', 0)}, no event recorded")
+
+
+def _status_exit(frame: dict[str, Any] | None, verdicts, args) -> int:
+    if not getattr(args, "check", False):
+        return 0
+    return 1 if frame is None or any(v.severity == BAD for v in verdicts) else 0
 
 
 def cmd_recent(args) -> int:
@@ -296,7 +405,17 @@ def main(argv: list[str] | None = None) -> int:
     p_send.add_argument("--reply-to", default=None)
     p_send.set_defaults(func=cmd_send)
 
-    sub.add_parser("status", help="identity, store and relay health").set_defaults(func=cmd_status)
+    p_status = sub.add_parser("status", help="identity, store and live relay health")
+    p_status.add_argument("--socket", default=None, help="daemon socket override")
+    p_status.add_argument("--quiet-minutes", type=int, default=30,
+                          help="report a connected relay with no events for this long "
+                               "(0 disables; default 30)")
+    p_status.add_argument("--json", action="store_true", help="machine-readable verdicts")
+    p_status.add_argument("--check", action="store_true",
+                          help="exit 1 when the daemon is unreachable or a relay is unhealthy")
+    p_status.add_argument("-v", "--verbose", action="store_true",
+                          help="also show each worker's last stderr line (diagnostics)")
+    p_status.set_defaults(func=cmd_status)
 
     p_serve = sub.add_parser("serve", help="run the gateway daemon (socket + relays)")
     p_serve.add_argument("--socket", default=None, help="socket path override")

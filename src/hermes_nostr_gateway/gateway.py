@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .crypto import SdkCrypto
 from .planes import nip04
@@ -556,16 +556,23 @@ class Gateway:
                 if self.marmot and self.marmot_worker and self.marmot_resolver
                 else {"enabled": False, "error": self.marmot_error}
             ),
-            "workers": [
-                {"relay": w.relay, "kinds": list(w.kinds),
-                 "requested_kinds": list(w.requested_kinds),
-                 "refused_kinds": sorted(w.refused),
-                 "p_tag": bool(w.p_tag), "authors": len(w.authors), "events": w.events,
-                 "last_error": w.last_error}
-                for w in self.workers
-            ],
+            "workers": [self._worker_state(w) for w in self.workers],
             "uptime_s": None,
         }
+
+    @staticmethod
+    def _worker_state(worker: Any) -> dict[str, Any]:
+        """Per-worker live state, including the fields a health verdict needs.
+
+        Falls back to the counters for a worker that does not implement `live_state`
+        (a test double, or a plane that is not a `RelayWorker`).
+        """
+        state = getattr(worker, "live_state", None)
+        if callable(state):
+            return dict(cast(dict[str, Any], state()))
+        return {"relay": worker.relay, "kinds": list(worker.kinds),
+                "events": getattr(worker, "events", 0),
+                "last_error": getattr(worker, "last_error", None)}
 
     def history(self, limit: int) -> dict[str, Any]:
         return {"messages": self.store.recent(limit)}

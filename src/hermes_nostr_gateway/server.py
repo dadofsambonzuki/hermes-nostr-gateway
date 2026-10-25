@@ -19,6 +19,34 @@ from typing import Any, Protocol
 log = logging.getLogger("hng.socket")
 
 
+async def request(path: str | Path, frame: dict[str, Any], *,
+                  timeout: float = 3.0) -> dict[str, Any]:
+    """One NDJSON request, one reply, over the local socket.
+
+    `hng status` uses this to ask the running daemon what its workers are doing, so it
+    reports the daemon's live state rather than re-deriving it from the store. Raises
+    OSError when nothing is listening and TimeoutError when the daemon does not answer;
+    callers decide what "no answer" means.
+    """
+    reader, writer = await asyncio.open_unix_connection(str(path), limit=1 << 20)
+    try:
+        writer.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+    if not line:
+        raise ConnectionError(f"{path}: daemon closed the connection without a reply")
+    reply = json.loads(line)
+    if not isinstance(reply, dict):
+        raise ValueError(f"{path}: expected one JSON object, got {type(reply).__name__}")
+    return reply
+
+
 class Handler(Protocol):
     async def status(self) -> dict[str, Any]: ...
     async def send(self, *, to: str, text: str, reply_to: str | None, cid: str | None) -> dict[str, Any]: ...
