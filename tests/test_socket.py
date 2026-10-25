@@ -30,6 +30,9 @@ class FakeHandler:
     def replay_pending(self, limit=20):
         return []
 
+    def replay_skip(self):
+        return {"skipped": 3, "replay_floor": 1234}
+
 
 async def call(path, *frames):
     reader, writer = await asyncio.open_unix_connection(str(path))
@@ -93,3 +96,9 @@ async def test_subscriber_receives_broadcast(server, tmp_path):
     assert frame["type"] == "message" and frame["id"] == "r9"
     writer.close()
     await writer.wait_closed()
+
+
+async def test_replay_skip_records_a_handover(server, tmp_path):
+    (frame,) = await call(tmp_path / "s.sock", {"op": "replay.skip"})
+    assert frame["type"] == "ok"
+    assert frame["skipped"] == 3 and frame["replay_floor"] == 1234

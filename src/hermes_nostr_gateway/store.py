@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS relay_stats (
     last_error TEXT
 );
 
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS concord_invites (
     id           TEXT PRIMARY KEY,
     inviter      TEXT NOT NULL,
@@ -115,11 +120,19 @@ class Inbound:
 class Store:
     def __init__(self, path: str | Path = "gateway.db"):
         self.path = str(path)
+        # A store that did not exist a moment ago owns no undelivered history: any
+        # pending rows it is given were answered by whoever held the messages before
+        # the import copy. Start the replay floor at now for that case only — a normal
+        # restart of an existing store must still replay a message that crashed
+        # mid-delivery.
+        fresh = not Path(self.path).exists()
         self.db = sqlite3.connect(self.path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         self._migrate()
+        if fresh:
+            self.set_replay_floor()
 
     def _migrate(self) -> None:
         """Add columns a live store predates; `CREATE TABLE IF NOT EXISTS` won't."""
@@ -227,22 +240,67 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def pending_immediate(self, limit: int = 20, max_age_days: int = 2) -> list[dict[str, Any]]:
+    def pending_immediate(self, limit: int = 20, max_age_minutes: int = 120) -> list[dict[str, Any]]:
         """Messages that never reached an adapter (refused, or crashed mid-delivery).
 
         Replayed on subscribe so a reconnect cannot lose a message that was accepted
-        but never handed over. Ordering is by arrival and then insertion: `received_at`
-        has second resolution, and a replay has to keep the order the frames first
-        appeared in or a cursor-taking consumer would see it jump backwards.
+        but never handed over. Two bounds stop that being a history lesson: the window
+        is minutes (a reconnect or an adapter restart), not days, and nothing older
+        than the store's replay floor is offered, so a handover or an import cannot
+        resurrect messages the previous adapter already answered. Ordering is by
+        arrival and then insertion: `received_at` has second resolution, and a replay
+        has to keep the order the frames first appeared in or a cursor-taking consumer
+        would see it jump backwards.
         """
-        cutoff = int(time.time()) - max_age_days * 86400
+        cutoff = int(time.time()) - max(int(max_age_minutes), 0) * 60
         rows = self.db.execute(
             "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate'"
-            " AND authority != 'self' AND blocked_reason IS NULL AND received_at >= ?"
+            " AND authority != 'self' AND blocked_reason IS NULL"
+            " AND received_at >= ? AND received_at >= ?"
             " ORDER BY received_at, rowid LIMIT ?",
-            (cutoff, limit),
+            (cutoff, self.replay_floor(), limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def skip_pending(self) -> int:
+        """Declare the current backlog already answered, at a handover or an import.
+
+        The rows were delivered by whoever ran before this store, so marking them
+        delivered records a fact rather than discarding work. Moving the floor with it
+        keeps later arrivals (which are genuinely undelivered) replayable.
+        """
+        now = int(time.time())
+        cur = self.db.execute(
+            "UPDATE rumors SET delivered_at = ? WHERE delivered_at IS NULL"
+            " AND reach = 'immediate' AND authority != 'self' AND blocked_reason IS NULL",
+            (now,),
+        )
+        self.set_replay_floor(now)
+        return cur.rowcount
+
+    # -- replay watermark ------------------------------------------------
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+    def replay_floor(self) -> int:
+        """`received_at` below which nothing is ever replayed (0 = no floor)."""
+        try:
+            return int(self.get_meta("replay_floor") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def set_replay_floor(self, when: int | None = None) -> int:
+        moment = int(time.time()) if when is None else int(when)
+        self.set_meta("replay_floor", str(moment))
+        return moment
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.execute(

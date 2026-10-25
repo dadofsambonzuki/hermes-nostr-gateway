@@ -128,6 +128,10 @@ class Gateway:
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
+        # Replay is for "crashed mid-delivery", not "history": minutes, and a floor.
+        replay = cfg.get("replay") or {}
+        self.replay_limit = int(replay.get("limit", 20))
+        self.replay_max_age_minutes = int(replay.get("max_age_minutes", 120))
         self.server = SocketServer(self.socket_path, self)
         self.workers: list[RelayWorker] = []
         self._tasks: list[asyncio.Task] = []
@@ -566,6 +570,9 @@ class Gateway:
             "pending": stats["pending"],
             "blocked": stats["blocked"],
             "invites": stats["invites"],
+            "replay": {"limit": self.replay_limit,
+                       "max_age_minutes": self.replay_max_age_minutes,
+                       "floor": self.store.replay_floor()},
             "relay_stats": stats["relays"],
             # Instrument the plane rather than inferring it from `ps`: a worker that
             # reconnects every 60s and one that died at startup look identical from
@@ -606,17 +613,32 @@ class Gateway:
         return {"peers": [{"pubkey": k, "last_seen": v} for k, v in
                           sorted(seen.items(), key=lambda kv: kv[1], reverse=True)]}
 
-    def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]:
+    def replay_pending(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Re-offer unacknowledged messages, tagged so a consumer can recognise them.
+
+        `replay: true` is the adapter's cue: a frame it has already handed to the agent
+        (the ack failed, so the row is still pending) must be acknowledged again rather
+        than answered twice. The window and floor live in the store.
+        """
         frames = []
-        for row in self.store.pending_immediate(limit):
+        for row in self.store.pending_immediate(limit or self.replay_limit,
+                                                self.replay_max_age_minutes):
             frames.append({
                 "type": "message", "plane": row["plane"], "id": row["id"],
                 "sender": row["sender"], "conversation": row["conversation"],
                 "kind": row["kind"], "created_at": row["created_at"],
                 "content": row["content"], "reply_to": row["reply_to"],
                 "reach": row["reach"], "authority": row["authority"], "why": row["why"],
+                "replay": True,
             })
         return frames
+
+    def replay_skip(self) -> dict[str, Any]:
+        """Record a handover: the current backlog was answered by the previous adapter."""
+        skipped = self.store.skip_pending()
+        log.info("replay floor set to %s: %d pending message(s) marked delivered",
+                 self.store.replay_floor(), skipped)
+        return {"skipped": skipped, "replay_floor": self.store.replay_floor()}
 
     def ack(self, ids: list[str]) -> dict[str, Any]:
         self.store.mark_delivered(ids)

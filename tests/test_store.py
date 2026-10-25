@@ -89,3 +89,74 @@ def test_live_store_gains_the_blocked_reason_column(tmp_path):
     with Store(path) as s:
         columns = {row["name"] for row in s.db.execute("PRAGMA table_info(rumors)")}
         assert "blocked_reason" in columns
+
+
+def _immediate(store, ident, *, content=None, received_at=None, sender="ff" * 32):
+    """Insert an immediate, replayable row, optionally pretending it arrived earlier."""
+    import time
+
+    from hermes_nostr_gateway.store import Inbound
+
+    now = int(time.time())
+    store.add(Inbound(id=ident, wrapper_id="w-" + ident, sender=sender, kind=14,
+                      created_at=now, content=content or f"message {ident}",
+                      conversation=sender, reply_to=None, plane="nip17",
+                      reach="immediate", authority="instructions", rule="t", why="t"))
+    if received_at is not None:
+        store.db.execute("UPDATE rumors SET received_at = ? WHERE id = ?",
+                         (received_at, ident))
+
+
+def test_replay_window_is_minutes_not_days(tmp_path):
+    import time
+
+    from hermes_nostr_gateway.store import Store
+
+    with Store(tmp_path / "min.db") as s:
+        now = int(time.time())
+        s.set_replay_floor(0)  # no handover to honour: every row is a candidate
+        _immediate(s, "recent", received_at=now - 30)
+        _immediate(s, "hours", content="an hour and more ago", received_at=now - 3 * 3600)
+
+        assert [r["id"] for r in s.pending_immediate()] == ["recent"]
+        # The default is a knob; the point is that two days of history is not the default.
+        assert [r["id"] for r in s.pending_immediate(max_age_minutes=10_000)] == [
+            "hours", "recent"]
+
+
+def test_new_store_floor_stops_inherited_rows_being_replayed(tmp_path):
+    """An import or handover must not re-offer messages the previous adapter answered."""
+    import time
+
+    from hermes_nostr_gateway.store import Store
+
+    with Store(tmp_path / "floor.db") as s:
+        now = int(time.time())
+        assert s.replay_floor() in (now, now - 1)
+        _immediate(s, "inherited", content="answered before the import",
+                   received_at=now - 90)
+        _immediate(s, "fresh", content="crashed mid-delivery")
+
+        assert [r["id"] for r in s.pending_immediate()] == ["fresh"]
+        # Even a window wide enough to cover the inherited row leaves it out.
+        assert [r["id"] for r in s.pending_immediate(max_age_minutes=10_000)] == ["fresh"]
+
+
+def test_skip_pending_records_a_handover(tmp_path):
+    import time
+
+    from hermes_nostr_gateway.store import Store
+
+    with Store(tmp_path / "handover.db") as s:
+        now = int(time.time())
+        _immediate(s, "one")
+        _immediate(s, "two")
+        assert len(s.pending_immediate()) == 2
+
+        assert s.skip_pending() == 2
+        assert s.pending_immediate() == []
+        assert s.replay_floor() >= now
+
+        # A handover answers the backlog, not the future.
+        _immediate(s, "after")
+        assert [r["id"] for r in s.pending_immediate()] == ["after"]
