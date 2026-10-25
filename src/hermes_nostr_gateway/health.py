@@ -267,7 +267,13 @@ def running_but_unconfigured(status: dict[str, Any] | None,
                              configured: Iterable[str]) -> list[str]:
     """Relays the daemon still reads that the config no longer lists (restart needed)."""
     known = {str(relay) for relay in configured}
-    running = {str(worker.get("relay") or "") for worker in (status or {}).get("workers") or []}
+    # Peer-inbox workers are additions discovered from a peer's kind 10050, not config
+    # entries: reporting them as "config no longer lists" would be a false alarm.
+    running = {
+        str(worker.get("relay") or "")
+        for worker in (status or {}).get("workers") or []
+        if str(worker.get("purpose") or "dm") != "peer-inbox"
+    }
     return sorted(relay for relay in running if relay and relay not in known)
 
 
