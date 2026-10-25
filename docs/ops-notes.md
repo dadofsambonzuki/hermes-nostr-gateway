@@ -191,3 +191,14 @@ Diagnosing "is X in the web?", in order:
    up), and the follows of those (level 3 only).
 4. A new owner follow or whitelist edit is not live until the graph rebuilds: restart haven,
    wait for the listener, then re-probe. `is-active` says `active` throughout the rebuild.
+
+## Pushing this repo is not the relay
+
+Observed 2026-10-25 while pushing `pr/haven-wot-notes`: commit data went to `gitnostr.com` and
+`git.shakespeare.diy`, while `grasp.day.ag` answered `unexpected http status code: 404` for
+the same data. `git ls-remote` also 404s on the coordinate ngit builds for that host —
+`https://grasp.day.ag/npub19ets…/hermes-nostr-gateway.git`, which decodes to `2e5709c6…`, one
+of the announced maintainers, not the repo owner `npub1cn670…`. The push itself succeeded:
+the branch and its PR event published (4 relays) and `git ls-remote` resolves the branch tip
+from the other three servers. Treat a grasp.day.ag 404 as a missing or mis-scoped coordinate
+on that one cache, not a failed push; the exact cause is **unconfirmed**.
