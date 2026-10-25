@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -107,6 +108,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # these (or the configured home channel) and nowhere else: a notice that falls
         # back to "whatever peer Hermes last spoke to" is how the Hal echo loop started.
         self._peers: set[str] = set()
+        # Ids already handed to the agent. A replayed frame (ack failed, or the gateway
+        # restarted) must be acknowledged again, never answered twice — the gateway's
+        # replay window is a safety net, and this is the consumer's half of at-least-once.
+        self._delivered_ids: deque[str] = deque(maxlen=512)
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -236,6 +241,30 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
+    async def _ack(self, message_id: str, attempts: int = 3) -> bool:
+        """Acknowledge a delivered message, retrying without killing the subscription.
+
+        The ack is a separate short-lived socket request, so it can fail while the
+        subscription itself is healthy. Letting that exception escape `_deliver` tears
+        down the reader loop, the resubscribe replays the message, and a transient ack
+        failure becomes a duplicate-delivery loop. A failed ack is therefore logged and
+        swallowed: the row stays pending, and the replay path plus `_delivered_ids`
+        make the retry idempotent.
+        """
+        delay = 0.5
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._request({"op": "ack", "ids": [message_id]})
+                return True
+            except Exception as exc:  # noqa: BLE001 - a lost ack must not kill the reader
+                if attempt == attempts:
+                    logger.warning("nostr ack failed for %s after %d attempts (%s); "
+                                   "the gateway will replay it", message_id, attempts, exc)
+                    return False
+                await asyncio.sleep(delay)
+                delay *= 2
+        return False
+
     async def _deliver(self, frame: dict[str, Any]) -> None:
         message_id = frame.get("id") or ""
         if is_digest_frame(frame):
@@ -247,11 +276,16 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             self._peers.add(sender.lower())
         if conversation:
             self._peers.add(str(conversation).lower())
+        if frame.get("replay") and message_id and message_id in self._delivered_ids:
+            # Hermes already has this one; the previous ack is what failed.
+            logger.info("nostr replay skipped: %s was already delivered", message_id[:12])
+            await self._ack(message_id)
+            return
         if is_control_text(frame.get("content") or ""):
             # The peer's own turn-control notice is not chat: ack it so the gateway does
             # not replay it, but never turn it into an agent run.
             logger.debug("nostr inbound skipped: control notice from %s", _short(sender))
-            await self._request({"op": "ack", "ids": [message_id]})
+            await self._ack(message_id)
             return
         authoritative = frame.get("authority") == "instructions"
         source = SessionSource(
@@ -274,8 +308,12 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
         await self.handle_message(event)
+        # Record before the ack: if the ack fails and the gateway replays the frame,
+        # this is what stops the same message becoming a second agent turn.
+        if message_id:
+            self._delivered_ids.append(message_id)
         # Ack only once Hermes has taken the message; a crash before this replays it.
-        await self._request({"op": "ack", "ids": [message_id]})
+        await self._ack(message_id)
 
     async def _deliver_digest(self, frame: dict[str, Any], message_id: str) -> None:
         """Deliver one digest batch into the owner's session, as data.

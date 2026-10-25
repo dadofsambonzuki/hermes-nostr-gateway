@@ -6,6 +6,7 @@ Stub the three modules it needs before loading it: the filter itself is stdlib-o
 import importlib.util
 import sys
 import types
+from collections import deque
 from pathlib import Path
 
 
@@ -81,6 +82,7 @@ def _bare_adapter():
     inst = adapter.NostrGatewayAdapter.__new__(adapter.NostrGatewayAdapter)
     inst.platform = "nostr"
     inst._peers = set()
+    inst._delivered_ids = deque(maxlen=512)
     inst._home_hex = ""
     inst._config = None
     inst.acked = []
