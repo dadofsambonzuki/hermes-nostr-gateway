@@ -123,7 +123,7 @@ class Gateway:
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
-        self.store = Store(store_path)
+        self.store = Store(store_path, identity=self.me)
         groups = normalise_groups(cfg)
         self.policy = Policy({
             "groups": groups,
@@ -464,7 +464,11 @@ class Gateway:
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
-        asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
+        # Immediate is the only reach that becomes a socket frame now: digest rows wait
+        # for their window. A drop or a rate-limited row still has to emit its `blocked`
+        # frame, or a refusal reaches the agent as silence.
+        if msg.reach == "immediate" or msg.reach == "drop" or getattr(msg, "blocked_reason", None):
+            asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
 
     def _on_marmot(self, event: dict) -> None:
         """A control event from wn-agent. Same normalised frame as any other plane."""
@@ -500,7 +504,7 @@ class Gateway:
             sender=sender, kind=4, created_at=int(event.get("created_at") or 0),
             content=text, conversation=sender, reply_to=None, plane="nip04",
             reach=decision.reach, authority=decision.authority,
-            rule=decision.rule, why=decision.why,
+            rule=decision.rule, why=decision.why, interval_s=decision.interval_s,
             blocked_reason=decision.blocked_reason,
         )
         return msg if self.store.add(msg) else None
@@ -657,57 +661,27 @@ class Gateway:
             log.info("retried %d wrap(s)", sent)
         return sent
 
+    # -- digest batching -------------------------------------------------
+    async def _digest_loop(self, every: int = 30) -> None:
+        """Seal due rule windows and broadcast each batch as one message frame.
 
-    # -- digests --------------------------------------------------------
-    async def _digest_loop(self) -> None:
-        """Batch digest-class messages into one frame instead of trickling them.
-
-        Emitted as an ordinary message frame (plane 'digest'), so every adapter that
-        already handles messages gets digests without a protocol change.
+        Sealing is durable before the broadcast: a frame nobody receives (no
+        subscribers) stays unacked and replays on the next subscribe, so silence is
+        never mistaken for delivery.
         """
-        cfg = self.cfg.get("digest") or {}
-        interval = int(cfg.get("interval_minutes", 15)) * 60
-        max_items = int(cfg.get("max_items", 20))
         while not self._stopping.is_set():
             try:
-                rows = self.store.pending_digest(interval, max_items)
-                # Never mark a digest delivered when nobody is listening: that would
-                # silently discard the batch.
-                if rows and self.server.has_subscribers:
-                    frame = self._digest_frame(rows)
+                for frame in self.store.seal_digests():
                     await self.server.broadcast(frame)
-                    self.store.mark_delivered([r["id"] for r in rows])
-            except Exception:  # noqa: BLE001 - a bad batch must not kill the loop
+            except Exception:  # noqa: BLE001 - one bad rule must not kill the daemon
                 log.exception("digest pass failed")
             try:
-                await asyncio.wait_for(self._stopping.wait(), timeout=60)
+                await asyncio.wait_for(self._stopping.wait(), timeout=every)
             except asyncio.TimeoutError:
                 continue
 
-    def _digest_frame(self, rows: list[dict]) -> dict:
-        import hashlib as _hash
-        import time as _time
-        lines = []
-        for row in rows[:20]:
-            who = (row.get("sender") or "")[:10]
-            text = (row.get("content") or "").replace("\n", " ")[:140]
-            lines.append(f"- {who}… ({row.get('rule') or 'feed'}): {text}")
-        stamp = int(_time.time())
-        digest_id = "digest-" + _hash.sha256(f"{stamp}:{len(rows)}".encode()).hexdigest()[:16]
-        return {
-            "type": "message",
-            "plane": "digest",
-            "id": digest_id,
-            "sender": "digest",
-            "conversation": "digest",
-            "kind": 1,
-            "created_at": stamp,
-            "reply_to": None,
-            "reach": "digest",
-            "authority": "none",
-            "why": f"{len(rows)} items awaited the digest window",
-            "content": (f"{len(rows)} item(s) since the last digest:\n" + "\n".join(lines)),
-        }
+    def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]:
+        return self.store.replay_digests(since_frame)
 
     # -- socket ops -----------------------------------------------------
     async def status(self) -> dict[str, Any]:
@@ -805,9 +779,12 @@ class Gateway:
                  self.store.replay_floor(), skipped)
         return {"skipped": skipped, "replay_floor": self.store.replay_floor()}
 
-    def ack(self, ids: list[str]) -> dict[str, Any]:
-        self.store.mark_delivered(ids)
-        return {"acked": ids}
+    def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
+            frame: int | None = None) -> dict[str, Any]:
+        if rule is not None and frame is not None:
+            return self.store.ack_digest(rule, int(frame))
+        self.store.mark_delivered(ids or [])
+        return {"acked": ids or []}
 
     # -- Marmot reads (over the same socket, same normalised shapes) ------
     def _marmot_unavailable(self) -> str:

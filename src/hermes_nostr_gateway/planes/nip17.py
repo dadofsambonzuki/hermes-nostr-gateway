@@ -87,6 +87,7 @@ class Nip17Plane:
             rule=decision.rule,
             why=decision.why,
             blocked_reason=decision.blocked_reason,
+            interval_s=decision.interval_s,
         )
         if decision.duplicate:
             return None

@@ -418,6 +418,7 @@ class MarmotPlane:
             rule=decision.rule,
             why=decision.why,
             blocked_reason=decision.blocked_reason,
+            interval_s=decision.interval_s,
         )
         if not self.store.add(inbound):
             return None
