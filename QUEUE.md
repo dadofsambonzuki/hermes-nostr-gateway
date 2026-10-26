@@ -34,7 +34,8 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
       → PR nevent1qqsvyraaescf2skzzypvtu2arh38847pfnfxh959ff4vv7730n4kqegpz3mhxue69uhhyetvv9ujumn8d96zuer9wc65yaqx (pr/concord-experimental)
 - [x] **P8 — Security hardening** — SO_PEERCRED, LoadCredential, ops notes. See plan P8.
       → PR nevent1qqsyzdqn6hpfrg7unw3q2enm9a4wz49r3krnwtas5362nrq452lenzqpz3mhxue69uhhyetvv9ujumn8d96zuer9wccg7xdz (pr/security-hardening)
-- [ ] **P9 — Attachments reach the agent** — adapter calls `media.get`. See plan P9.
+- [x] **P9 — Attachments reach the agent** — adapter calls `media.get`. See plan P9.
+      → PR nevent1qqsy75h05s0y569nfd0k6ytfy67uwm4y0x8x537lmha03xz6euy6u5spz3mhxue69uhhyetvv9ujumn8d96zuer9wcpzqaq0ekg8ky97aku4xzhvlrx7s7e8fmw5wph2lnss32j0hdzu6t3ffq0e2h (pr/attachment-delivery)
 
 ## Decisions (do not re-litigate)
 
