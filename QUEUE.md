@@ -18,8 +18,9 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
 - [x] **P1 — Read transport on nostr-sdk's relay pool** — replace per-relay `nak` children,
       in-process NIP-42, legacy path behind a flag. See plan P1.
       → PR nevent1qqszukd2xa0mz8zjv3g6va5y7cq8f2qcwsxlqtc844tyf4dd6mfwkzqur5urm (pr/read-transport-pool)
-- [ ] **P2 — Publish through the bindings** — one signed event, per-relay send, same-event
+- [x] **P2 — Publish through the bindings** — one signed event, per-relay send, same-event
       retry, no subprocess. See plan P2.
+      → PR nevent1qqstfl2fujt8t3ftz4yzq2wnqasmnsp8f9w05n33kknknpz5d6nmtxcpz3mhxue69uhhyetvv9ujumn8d96zuer9wcljzvaw (pr/publish-bindings)
 - [ ] **P3 — Drops first-class** — `drops` op, TTL, status count. See plan P3.
 - [ ] **P4 — Bot and echo policy** — kind-0 bot flag, reply cap, echo suppression. See plan P4.
 - [ ] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
