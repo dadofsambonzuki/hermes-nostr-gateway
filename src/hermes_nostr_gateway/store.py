@@ -291,6 +291,49 @@ class Store:
         rows = self.db.execute("SELECT * FROM relay_stats ORDER BY relay").fetchall()
         return [dict(r) for r in rows]
 
+    def plane_report(self) -> list[dict[str, Any]]:
+        """Per-plane counters: what arrived, when, and what is not yet delivered.
+
+        One row per plane that has ever held a rumor, so a plane with no traffic has
+        no row here — `health.plane_health` fills the gap with zeros rather than
+        pretending the plane does not exist. `oldest_pending_at` is the age of the
+        oldest message still waiting for the adapter: that, not the total, is what
+        says whether delivery is running behind.
+        """
+        rows = self.db.execute(
+            "SELECT plane,"
+            " COUNT(*) AS events,"
+            " SUM(delivered_at IS NULL AND blocked_reason IS NULL) AS pending,"
+            " SUM(blocked_reason IS NOT NULL) AS blocked,"
+            " SUM(authority = 'self') AS sent,"
+            " MAX(created_at) AS last_event_at,"
+            " MAX(received_at) AS last_received_at,"
+            " MIN(CASE WHEN delivered_at IS NULL AND blocked_reason IS NULL"
+            "     THEN received_at END) AS oldest_pending_at"
+            " FROM rumors GROUP BY plane ORDER BY plane"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def wrap_report_by_plane(self) -> dict[str, dict[str, int]]:
+        """Outbound-wrap rows per plane, by status: pending, sent, failed, expired.
+
+        Joins the wrap to its rumor because the wrap itself does not record a plane and
+        the rumor always does. A plane whose wraps expired is a plane where we accepted
+        a message and then gave up publishing it, which `health` must be able to say.
+        """
+        rows = self.db.execute(
+            "SELECT r.plane AS plane, w.status AS status, COUNT(*) AS n"
+            " FROM outbound_wraps w JOIN rumors r ON r.id = w.rumor_id"
+            " GROUP BY r.plane, w.status"
+        ).fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            plane = str(row["plane"] or "")
+            if not plane:
+                continue
+            out.setdefault(plane, {})[str(row["status"])] = int(row["n"])
+        return out
+
     # -- outbound wraps (retry uses the same signed event) ---------------
     def record_wrap(self, event: dict, rumor_id: str, recipient: str, relays: list[str],
                     *, now: int | None = None) -> None:

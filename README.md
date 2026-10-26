@@ -103,6 +103,18 @@ workers; the agent side reads the same socket (`NOSTR_GATEWAY_SOCKET` overrides 
 path). `config.yaml` is gitignored, so a local edit cannot be committed by accident —
 `config.example.yaml` is the template.
 
+`hng health` is the one call for anything that *reports* rather than investigates. Per
+plane (`nip17`, `nip04`, `nip01`, `concord`, plus `marmot` when that plane is attached)
+it answers with the last event and its age, the undelivered backlog, the policy blocks,
+and whether the plane is degraded — with the reasons. `status` is about relays; `health`
+is about traffic, and it degrades only on a fault: a backlog older than
+`--pending-stale-minutes` (default 10), an outbound wrap whose retry TTL expired, or
+every read relay down. It does not degrade on a quiet night, and it does not degrade on
+`blocked`, because a blocked message is the policy working. `--json` prints the whole
+frame — that is what the overnight cron narrates from, one call, no log parsing —
+`--check` exits 1 when degraded or when the daemon is not running, and with no daemon the
+counters still come from the store, labelled `down` and `history, not live state`.
+
 Tests and lint need no relay and no secret:
 
 ```sh

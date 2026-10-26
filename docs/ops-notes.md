@@ -100,6 +100,16 @@ daemon, `--json` is machine-readable, `-v` adds each child's last stderr line as
 A daemon built before per-worker timestamps cannot answer "when", so the command says so
 rather than borrowing the store's age; restart the service once to get the age column.
 
+**`hng health` is what the overnight cron reads.** One op (`{"op":"health"}`), one frame:
+per plane the last event and its age, `pending`, `blocked`, and `degraded` with `reasons`,
+plus relay totals and a one-line `summary`. Build the narrative from that frame — never
+from journal lines, where a quiet plane and a broken one look identical. `degraded` fires
+on a stuck backlog (older than `--pending-stale-minutes`, default 10), on an expired
+outbound wrap, or when no read relay is delivering; it does **not** fire on a plane with
+no traffic, and it does not fire on `blocked`, which is the policy doing its job. With the
+daemon down the frame still answers, from the store, with `verdict: "down"`, so a cron
+that wakes to a stopped service says so instead of reporting zeros as health.
+
 ## Why `relay.day.ag` says no
 
 `relay.day.ag` is one HAVEN process on `3355`; Caddy path-routes `/` (outbox + Blossom),
