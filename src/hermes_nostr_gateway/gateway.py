@@ -36,7 +36,7 @@ from .policy import Policy
 from .publisher import publish
 from .relay import RelayWorker
 from .server import SocketServer
-from .store import Store
+from .store import Store, drops_ttl_seconds
 
 log = logging.getLogger("hng.gateway")
 
@@ -198,6 +198,9 @@ class Gateway:
         if ttl_hours <= 0:
             raise ValueError("retry.ttl_hours must be positive")
         self.retry_ttl_seconds = int(ttl_hours * 3600)
+        # Drops TTL: how long a refusal stays "live" in `drops`/`status`. Expired rows are
+        # listed and counted, never deleted — the same rule as an expired wrap.
+        self.drops_ttl_seconds = drops_ttl_seconds(cfg.get("drops"))
         self.server = SocketServer(self.socket_path, self)
         self.workers: list[RelayWorker] = []
         self._tasks: list[asyncio.Task] = []
@@ -741,6 +744,8 @@ class Gateway:
             "rumors": stats["total"],
             "pending": stats["pending"],
             "blocked": stats["blocked"],
+            "drops": {**self.store.drop_counts(self.drops_ttl_seconds),
+                      "ttl_hours": self.drops_ttl_seconds / 3600},
             "invites": stats["invites"],
             "media": {
                 "enabled": self.media_cfg.enabled,
@@ -788,6 +793,12 @@ class Gateway:
 
     def history(self, limit: int) -> dict[str, Any]:
         return {"messages": self.store.recent(limit, with_attachments=True)}
+
+    def drops(self, *, plane: str | None = None, reason: str | None = None,
+              since: int | None = None, limit: int = 100) -> dict[str, Any]:
+        """Refused messages, with why and when, aged by the drops TTL (spec §5)."""
+        return self.store.drops(plane=plane, reason=reason, since=since, limit=limit,
+                                ttl_s=self.drops_ttl_seconds)
 
     def peers(self) -> dict[str, Any]:
         seen: dict[str, int] = {}

@@ -163,6 +163,15 @@ async def test_flooding_sender_degrades_to_blocked_not_a_message(tmp_path, monke
         assert len(gw.store.pending_immediate()) == 10
         assert gw.store.stats()["blocked"] == 1
 
+        # A refusal is now first-class: counted in `status`, listed by `drops`, aged by
+        # the TTL. Before this, a blocked row was only visible by querying sqlite.
+        assert (await gw.status())["drops"] == {
+            "total": 1, "live": 1, "expired": 0, "ttl_hours": 168.0}
+        listed = gw.drops()
+        assert listed["total"] == 1
+        assert listed["drops"][0]["reason"] == "rate_limited"
+        assert listed["drops"][0]["sender"] == sender_hex
+
         writer.close()
         await writer.wait_closed()
     finally:

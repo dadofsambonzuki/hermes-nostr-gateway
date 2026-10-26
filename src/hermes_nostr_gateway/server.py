@@ -51,6 +51,8 @@ class Handler(Protocol):
     async def status(self) -> dict[str, Any]: ...
     async def send(self, *, to: str, text: str, reply_to: str | None, cid: str | None) -> dict[str, Any]: ...
     def history(self, limit: int) -> dict[str, Any]: ...
+    def drops(self, *, plane: str | None, reason: str | None,
+              since: int | None, limit: int) -> dict[str, Any]: ...
     def peers(self) -> dict[str, Any]: ...
     def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
             frame: int | None = None) -> dict[str, Any]: ...
@@ -154,6 +156,14 @@ class SocketServer:
                     elif op == "history":
                         await self._send(writer, {"type": "history",
                                                   **self.handler.history(int(req.get("limit", 20)))})
+                    elif op == "drops":
+                        since = req.get("since")
+                        await self._send(writer, {"type": "drops", **self.handler.drops(
+                            plane=req.get("plane") or None,
+                            reason=req.get("reason") or None,
+                            since=int(since) if since not in (None, "", 0) else None,
+                            limit=int(req.get("limit") or 100),
+                        )})
                     elif op == "peers":
                         await self._send(writer, {"type": "peers", **self.handler.peers()})
                     elif op == "ack":

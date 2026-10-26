@@ -90,6 +90,96 @@ def test_blocked_rows_are_stored_but_never_replayed_or_counted_pending(tmp_path)
         assert rows["spam"]["blocked_reason"] == "rate_limited"  # still on the record
 
 
+def _drop(store, ident: str, *, plane: str, sender: str, why: str,
+          reason: str | None = None, at: int, interval_s: int | None = None) -> None:
+    from hermes_nostr_gateway.store import Inbound
+
+    assert store.add(Inbound(
+        id=ident, wrapper_id="w-" + ident, sender=sender, kind=14, created_at=at,
+        content=f"refused {ident}", conversation=sender, reply_to=None, plane=plane,
+        reach="drop", authority="none", rule="test", why=why,
+        blocked_reason=reason, interval_s=interval_s,
+    ), now=at)
+
+
+def test_drops_lists_reason_and_time_and_filters_by_plane_reason_since(tmp_path):
+    """Every refusal, with why and when — the rows that used to sit invisible."""
+    from hermes_nostr_gateway.store import Store
+
+    now = 1_800_000_000
+    with Store(tmp_path / "drops.db") as s:
+        _drop(s, "spam", plane="nip17", sender="aa" * 32, at=now - 60,
+              why="per-sender rate limit exceeded", reason="rate_limited")
+        _drop(s, "stranger", plane="nip01", sender="bb" * 32, at=now - 30,
+              why="no rule matched")
+        # A row cut from a digest by its quota is a drop too, and says which.
+        _drop(s, "quotacut", plane="nip17", sender="cc" * 32, at=now - 10,
+              why="quota 3/h exceeded", interval_s=900)
+        # Ordinary mail is not a drop, and is what `pending` exists to count.
+        from hermes_nostr_gateway.store import Inbound
+        assert s.add(Inbound(
+            id="normal", wrapper_id="w-del", sender="dd" * 32, kind=14, created_at=now,
+            content="hello", conversation="dd" * 32, reply_to=None, plane="nip17",
+            reach="immediate", authority="instructions", rule="t", why="t",
+        ), now=now)
+
+        everything = s.drops(now=now)
+        assert [row["id"] for row in everything["drops"]] == ["quotacut", "stranger", "spam"]
+        assert {row["id"]: row["reason"] for row in everything["drops"]} == {
+            "spam": "rate_limited", "stranger": "not_allowlisted", "quotacut": "digest_quota"}
+        spam = everything["drops"][-1]
+        assert spam["received_at"] == now - 60 and spam["age_s"] == 60
+        assert spam["why"] == "per-sender rate limit exceeded"
+        assert everything["total"] == 3 and everything["live"] == 3
+        assert everything["expired"] == 0
+
+        # Accounting: a reason-less drop is blocked, not pending for ever.
+        stats = s.stats()
+        assert stats["pending"] == 1, "only the ordinary row is pending"
+        assert stats["blocked"] == 3 and stats["blocked"] == everything["total"]
+
+        assert [r["id"] for r in s.drops(plane="nip01", now=now)["drops"]] == ["stranger"]
+        assert [r["id"] for r in s.drops(reason="rate_limited", now=now)["drops"]] == ["spam"]
+        assert [r["id"] for r in s.drops(since=now - 40, now=now)["drops"]] == [
+            "quotacut", "stranger"]
+        # The page is bounded; the count still describes the whole matching set.
+        page = s.drops(limit=1, now=now)
+        assert [r["id"] for r in page["drops"]] == ["quotacut"] and page["total"] == 3
+
+
+def test_drops_past_the_ttl_are_reported_expired_not_hidden(tmp_path):
+    """Retention is not deletion: an old refusal is still listed, and marked expired."""
+    from hermes_nostr_gateway.store import Store
+
+    now = 1_800_000_000
+    week = 7 * 86400
+    with Store(tmp_path / "ttl.db") as s:
+        _drop(s, "old", plane="nip17", sender="aa" * 32, at=now - 10 * 86400,
+              why="no rule matched")
+        _drop(s, "fresh", plane="nip17", sender="aa" * 32, at=now - 3600,
+              why="no rule matched")
+
+        result = s.drops(ttl_s=week, now=now)
+        assert [row["id"] for row in result["drops"]] == ["fresh", "old"]
+        assert [row["expired"] for row in result["drops"]] == [False, True]
+        assert result["total"] == 2 and result["live"] == 1 and result["expired"] == 1
+        assert s.drop_counts(week, now=now) == {"total": 2, "live": 1, "expired": 1}
+        # The row is still on the record; nothing was pruned behind the operator's back.
+        assert s.db.execute("SELECT COUNT(*) AS n FROM rumors WHERE id = 'old'"
+                            ).fetchone()["n"] == 1
+
+
+def test_drops_ttl_config_is_strict_and_defaults_to_a_week():
+    import pytest
+
+    from hermes_nostr_gateway.store import DEFAULT_DROPS_TTL_HOURS, drops_ttl_seconds
+
+    assert drops_ttl_seconds({}) == DEFAULT_DROPS_TTL_HOURS * 3600
+    assert drops_ttl_seconds({"ttl_hours": 2}) == 7200
+    with pytest.raises(ValueError):
+        drops_ttl_seconds({"ttl_hours": 0})
+
+
 def test_live_store_gains_the_blocked_reason_column(tmp_path):
     """A DB created before blocked frames existed must migrate on open, not fail."""
     import sqlite3

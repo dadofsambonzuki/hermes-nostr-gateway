@@ -10,6 +10,8 @@ from hermes_nostr_gateway.server import SocketServer
 
 
 class FakeHandler:
+    dropped = None
+
     async def status(self):
         return {"identity": "me", "rumors": 1}
 
@@ -18,6 +20,13 @@ class FakeHandler:
 
     def history(self, limit):
         return {"messages": [{"id": "r1"}] * min(limit, 1)}
+
+    def drops(self, *, plane=None, reason=None, since=None, limit=100):
+        self.dropped = {"plane": plane, "reason": reason, "since": since, "limit": limit}
+        return {"drops": [{"id": "r1", "plane": "nip17", "sender": "aa",
+                           "reason": "rate_limited", "received_at": 1_700_000_000,
+                           "age_s": 60, "expired": False}],
+                "total": 1, "live": 1, "expired": 0, "ttl_s": 604800}
 
     def peers(self):
         return {"peers": []}
@@ -88,6 +97,29 @@ async def test_status_and_history(server, tmp_path):
                                  {"op": "status"}, {"op": "history", "limit": 5})
     assert status["type"] == "status" and status["identity"] == "me"
     assert history["type"] == "history" and len(history["messages"]) == 1
+
+
+async def test_drops_op_passes_its_filters_and_defaults(tmp_path):
+    """`drops` is the op that makes a refusal visible: plane, reason and since reach it."""
+    handler = FakeHandler()
+    srv = SocketServer(tmp_path / "dr.sock", handler)
+    await srv.start()
+    try:
+        (frame,) = await call(tmp_path / "dr.sock",
+                              {"op": "drops", "plane": "nip17", "reason": "rate_limited",
+                               "since": 1_700_000_000, "limit": 5})
+        assert frame["type"] == "drops" and frame["total"] == 1
+        assert frame["drops"][0]["reason"] == "rate_limited"
+        assert frame["drops"][0]["expired"] is False
+        assert handler.dropped == {"plane": "nip17", "reason": "rate_limited",
+                                   "since": 1_700_000_000, "limit": 5}
+
+        (frame,) = await call(tmp_path / "dr.sock", {"op": "drops"})
+        assert frame["type"] == "drops"
+        assert handler.dropped == {"plane": None, "reason": None, "since": None,
+                                   "limit": 100}
+    finally:
+        await srv.stop()
 
 
 async def test_send_round_trip(server, tmp_path):

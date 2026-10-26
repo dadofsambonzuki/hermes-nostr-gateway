@@ -147,6 +147,20 @@ _RUMOR_COLUMNS = {
     "digest_batch": "TEXT",
 }
 
+#: How long a drop stays "live" in `drops` and in the status count. Older rows are still
+#: stored and still listed — marked `expired` — because a refusal is evidence: deleting it
+#: would hide that a peer is being turned away, while never ageing it makes last month's
+#: spam wave look like a live problem.
+DEFAULT_DROPS_TTL_HOURS = 168
+
+
+def drops_ttl_seconds(cfg: dict[str, Any] | None = None) -> int:
+    """`drops.ttl_hours` as seconds — one parser for the daemon and the CLI."""
+    hours = float((cfg or {}).get("ttl_hours", DEFAULT_DROPS_TTL_HOURS))
+    if hours <= 0:
+        raise ValueError("drops.ttl_hours must be positive")
+    return int(hours * 3600)
+
 
 @dataclass
 class Inbound:
@@ -263,6 +277,13 @@ class Store:
                 (next_rumor, self.identity),
             )
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS rumors_cursor ON rumors (cursor)")
+        # `drops` filters a small subset of the table. The index has to be created here,
+        # after the ALTERs: an index whose predicate names a column a pre-`blocked_reason`
+        # database does not have yet would make opening that database fail outright.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS rumors_drops ON rumors (received_at)"
+            " WHERE reach = 'drop' OR blocked_reason IS NOT NULL"
+        )
 
     def _ensure_cursor(self) -> None:
         self.db.execute(
@@ -644,6 +665,84 @@ class Store:
             self._with_attachments(items)
         return items
 
+    # -- drops (refused messages) ---------------------------------------
+    #: Why a row was refused, in the same words the `blocked` frame uses. A rule that
+    #: says `reach: drop` stores no reason, so it reads as `not_allowlisted`; a row cut
+    #: from a digest by its quota says so rather than borrowing that name.
+    _REASON_SQL = (
+        "CASE WHEN blocked_reason IS NOT NULL THEN blocked_reason"
+        " WHEN digest_state = 'dropped' THEN 'digest_quota'"
+        " ELSE 'not_allowlisted' END"
+    )
+    #: A drop is a message policy decided not to deliver. Both shapes count: an explicit
+    #: `reach: drop` (which leaves `blocked_reason` null) and a row carrying a reason.
+    _DROP_SQL = "(reach = 'drop' OR blocked_reason IS NOT NULL)"
+
+    def _drop_filters(self, *, plane: str | None, reason: str | None,
+                      since: int | None) -> tuple[str, list[Any]]:
+        clauses = [self._DROP_SQL]
+        params: list[Any] = []
+        if plane:
+            clauses.append("plane = ?")
+            params.append(str(plane))
+        if reason:
+            clauses.append(f"{self._REASON_SQL} = ?")
+            params.append(str(reason))
+        if since is not None:
+            clauses.append("received_at >= ?")
+            params.append(int(since))
+        return " AND ".join(clauses), params
+
+    def drops(self, *, plane: str | None = None, reason: str | None = None,
+              since: int | None = None, limit: int = 100, ttl_s: int | None = None,
+              now: int | None = None) -> dict[str, Any]:
+        """Refused messages, newest first, with why and when — the `drops` op's answer.
+
+        `expired` marks a row older than `ttl_s`: retained, because the record of a
+        refusal is evidence, but distinguishable from something refused this week.
+        `total`/`live`/`expired` count the whole matching set; `drops` is one page of it.
+        No `content` is selected: a refusal is metadata, and a blocked frame must never
+        carry chat text (§13.3) — the same rule applies to the listing.
+        """
+        stamp = int(time.time()) if now is None else int(now)
+        ttl = DEFAULT_DROPS_TTL_HOURS * 3600 if ttl_s is None else int(ttl_s)
+        where, params = self._drop_filters(plane=plane, reason=reason, since=since)
+        counts = self.db.execute(
+            f"SELECT COUNT(*) AS total, SUM(received_at < ?) AS expired FROM rumors"
+            f" WHERE {where}",
+            [stamp - ttl, *params],
+        ).fetchone()
+        total = int(counts["total"] or 0)
+        expired = int(counts["expired"] or 0)
+        rows = self.db.execute(
+            f"SELECT id, plane, sender, kind, rule, why, received_at, created_at,"
+            f" {self._REASON_SQL} AS reason FROM rumors WHERE {where}"
+            f" ORDER BY received_at DESC, rowid DESC LIMIT ?",
+            [*params, max(1, min(int(limit), 500))],
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["age_s"] = max(0, stamp - int(item["received_at"]))
+            item["expired"] = item["age_s"] > ttl
+            items.append(item)
+        return {"drops": items, "total": total, "live": total - expired,
+                "expired": expired, "ttl_s": ttl}
+
+    def drop_counts(self, ttl_s: int | None = None, *,
+                    now: int | None = None) -> dict[str, int]:
+        """The refusal count `status` carries: how many, how many still current."""
+        ttl = DEFAULT_DROPS_TTL_HOURS * 3600 if ttl_s is None else int(ttl_s)
+        stamp = int(time.time()) if now is None else int(now)
+        row = self.db.execute(
+            f"SELECT COUNT(*) AS total, SUM(received_at < ?) AS expired FROM rumors"
+            f" WHERE {self._DROP_SQL}",
+            (stamp - ttl,),
+        ).fetchone()
+        total = int(row["total"] or 0)
+        expired = int(row["expired"] or 0)
+        return {"total": total, "live": total - expired, "expired": expired}
+
     def conversations(self, plane: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """The distinct conversations we hold messages for on `plane`, newest first.
 
@@ -686,10 +785,14 @@ class Store:
         return out
 
     def stats(self) -> dict[str, Any]:
+        # A refusal is never "pending delivery": a `reach: drop` row carries no
+        # blocked_reason, so before this it sat in the pending count for ever even
+        # though no path would ever deliver or replay it.
         row = self.db.execute(
             "SELECT COUNT(*) AS total,"
-            " SUM(delivered_at IS NULL AND blocked_reason IS NULL) AS pending,"
-            " SUM(blocked_reason IS NOT NULL) AS blocked FROM rumors"
+            " SUM(delivered_at IS NULL AND blocked_reason IS NULL"
+            "     AND COALESCE(reach, '') != 'drop') AS pending,"
+            " SUM(blocked_reason IS NOT NULL OR reach = 'drop') AS blocked FROM rumors"
         ).fetchone()
         invites = self.db.execute("SELECT COUNT(*) AS n FROM concord_invites").fetchone()
         media = self.db.execute(
