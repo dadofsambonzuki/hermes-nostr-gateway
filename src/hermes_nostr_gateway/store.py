@@ -644,6 +644,24 @@ class Store:
             self._with_attachments(items)
         return items
 
+    def conversations(self, plane: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """The distinct conversations we hold messages for on `plane`, newest first.
+
+        Evidence, not a cache: a restarted process can answer "what is this plane
+        attached to?" from rows it already stored instead of from whatever happened
+        to be resolved since it booted. `plane` is a parameter so every plane can
+        use the same query; the bound keeps a pathological store from turning a
+        status call into a full table walk.
+        """
+        rows = self.db.execute(
+            "SELECT conversation, COUNT(*) AS messages, MAX(created_at) AS last_at"
+            " FROM rumors WHERE plane = ? AND conversation IS NOT NULL"
+            " AND conversation != '' GROUP BY conversation"
+            " ORDER BY last_at DESC, conversation ASC LIMIT ?",
+            (str(plane), max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     # -- Concord invites (verified, never delivered as messages) ---------
     def record_invite(self, *, id: str, inviter: str, community_id: str, name: str,
                       relays: list[str], bundle: dict[str, Any]) -> bool:

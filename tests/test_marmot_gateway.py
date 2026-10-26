@@ -274,3 +274,44 @@ async def test_enabled_true_is_what_attaches_the_same_socket(tmp_path, no_nak):
     finally:
         await gateway.stop()
         await agent.stop()
+
+
+async def test_a_restarted_gateway_reports_the_chat_before_any_new_event(tmp_path, no_nak):
+    """The queue item: `conversations: []` after a restart, until something arrives.
+
+    A restart throws away every in-memory resolution, but not the messages. The
+    first `status` after connecting must list the group from that evidence and say
+    whether wn-agent still confirms it — an empty list is not an answer.
+    """
+    agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
+    cfg = config_for(tmp_path, marmot={"enabled": True, "socket": str(agent.path),
+                                       "account_id_hex": ACCOUNT})
+    first = Gateway(cfg)
+    assert first.marmot_worker is not None
+    try:
+        await first.start()
+        await wait_until(lambda: first.marmot_worker.connected)
+        await agent.push(text="this survives the restart")
+        await wait_until(lambda: first.store.conversations("marmot"))
+    finally:
+        await first.stop()
+
+    second = Gateway(cfg)
+    assert second.marmot_worker is not None
+    try:
+        await second.start()
+        await wait_until(lambda: second.marmot_worker.enumerated is not None)
+        status = await second.status()
+        conversations = status["marmot"]["conversations"]
+        assert [row["group"] for row in conversations] == [GROUP]
+        assert conversations[0]["messages"] == 1
+        assert conversations[0]["verified"] is True
+        assert conversations[0]["member_count"] == 2
+        assert status["marmot"]["enumeration"]["at"] is not None
+        assert status["marmot"]["enumeration"]["errors"] == {}
+        assert "no group-list request" in status["marmot"]["enumeration"]["source"]
+        # Nothing was delivered in between: the answer came from stored evidence.
+        assert status["marmot"]["worker"]["events"] == 0
+    finally:
+        await second.stop()
+        await agent.stop()

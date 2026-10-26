@@ -26,7 +26,7 @@ from hermes_nostr_gateway.planes.marmot import (
     resolve_account_id,
 )
 from hermes_nostr_gateway.policy import Policy
-from hermes_nostr_gateway.store import Store
+from hermes_nostr_gateway.store import Inbound, Store
 
 ACCOUNT = "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
 GROUP = "fcc995ef9affe55608ff3fe9f917de51"
@@ -57,6 +57,7 @@ class FakeWnAgent:
         self.subscribed = asyncio.Event()
         self.send_fail = False
         self.group_info_fail = False
+        self.group_info_fail_groups: set[str] = set()
         self.timeline_rows: list[dict] = []
         self._server: asyncio.AbstractServer | None = None
         self._stamp = 1_790_000_000
@@ -133,7 +134,8 @@ class FakeWnAgent:
                 await self._send(writer, {"type": "account_list", "accounts": [
                     {"account_id_hex": self.account_id_hex, "label": "hermes-agent"}]}, request)
             elif kind == "group_info":
-                if self.group_info_fail:
+                if (self.group_info_fail
+                        or request.get("group_id_hex") in self.group_info_fail_groups):
                     await self._send(writer, {"type": "error", "code": "group_not_found",
                                               "message": "no such group"}, request)
                 else:
@@ -221,6 +223,16 @@ def store(tmp_path):
 def plane_for(store, agent, policy: Policy | None = None) -> MarmotPlane:
     return MarmotPlane(store, policy or Policy(POLICY),
                        control=MarmotControl(agent.path), account_id_hex=ACCOUNT)
+
+
+def remember(store, group: str, *, text: str, at: int, sender: str = MUM) -> None:
+    """Store a Marmot message the way a previous run would have."""
+    message_id = os.urandom(32).hex()
+    assert store.add(Inbound(
+        id=message_id, wrapper_id=message_id, sender=sender, kind=APP_MESSAGE_KIND,
+        created_at=at, content=text, conversation=group, reply_to=None,
+        plane="marmot", reach="digest", authority="none", rule="t", why="t",
+    ))
 
 
 # -- inbound normalisation -------------------------------------------------
@@ -360,6 +372,58 @@ async def test_resolver_refuses_a_non_group_target(store, agent):
     assert exc.value.code == "invalid_target"
 
 
+async def test_conversations_before_any_resolve_come_from_stored_messages(store, agent):
+    """The restart case: nothing has been resolved yet, but history says which chat."""
+    remember(store, GROUP, text="we spoke before the restart", at=1_700_000_000)
+    remember(store, OTHER_GROUP, text="a more recent group", at=1_700_000_100)
+    resolver = MarmotResolver(plane_for(store, agent))
+
+    rows = resolver.conversations()
+    assert [row["group"] for row in rows] == [OTHER_GROUP, GROUP]
+    assert all(row["messages"] == 1 for row in rows)
+    # Known, but not yet proven against wn-agent: unverified, not invisible.
+    assert all(row["verified"] is False for row in rows)
+    assert resolver.enumeration()["at"] is None
+
+
+async def test_enumeration_verifies_every_stored_group_once(store, agent):
+    remember(store, GROUP, text="one", at=1_700_000_000)
+    remember(store, OTHER_GROUP, text="two", at=1_700_000_100)
+    resolver = MarmotResolver(plane_for(store, agent))
+
+    summary = await resolver.enumerate()
+    assert summary["groups"] == 2 and summary["verified"] == 2
+    assert summary["errors"] == {} and summary["at"] is not None
+    assert len([r for r in agent.requests if r.get("type") == "group_info"]) == 2
+    rows = {row["group"]: row for row in resolver.conversations()}
+    assert rows[GROUP]["verified"] is True and rows[GROUP]["member_count"] == 2
+    assert rows[GROUP]["messages"] == 1
+
+
+async def test_enumeration_names_a_group_it_cannot_verify(store, agent):
+    remember(store, GROUP, text="still here", at=1_700_000_000)
+    remember(store, OTHER_GROUP, text="we left this one", at=1_700_000_100)
+    agent.group_info_fail_groups.add(OTHER_GROUP)
+    resolver = MarmotResolver(plane_for(store, agent))
+
+    summary = await resolver.enumerate()
+    assert summary["groups"] == 2 and summary["verified"] == 1
+    assert "group_not_found" in summary["errors"][OTHER_GROUP]
+    rows = {row["group"]: row for row in resolver.conversations()}
+    assert rows[GROUP]["verified"] is True
+    assert rows[OTHER_GROUP]["verified"] is False
+    assert rows[OTHER_GROUP]["error"]
+
+
+async def test_enumeration_includes_the_configured_subscription_group(store, agent):
+    """A worker restricted to one group is attached to it before any message."""
+    resolver = MarmotResolver(plane_for(store, agent))
+    summary = await resolver.enumerate(extra=[OTHER_GROUP])
+    assert summary["groups"] == 1 and summary["verified"] == 1
+    assert [row["group"] for row in resolver.conversations()] == [OTHER_GROUP]
+    assert resolver.conversations()[0]["messages"] == 0
+
+
 # -- worker ----------------------------------------------------------------
 
 
@@ -410,6 +474,31 @@ async def test_worker_reconnects_after_the_subscription_drops(store, agent, tmp_
         await asyncio.gather(task, return_exceptions=True)
     assert [event["message"]["text"] for event in received] == ["after reconnect"]
     assert worker.last_error is not None  # the drop was recorded, not swallowed
+
+
+async def test_worker_enumerates_known_conversations_as_soon_as_it_connects(store, agent):
+    """After a restart the status has an answer before the next message arrives."""
+    remember(store, GROUP, text="from before the restart", at=1_700_000_000)
+    plane = plane_for(store, agent)
+    resolver = MarmotResolver(plane)
+    # Restricted to a second group with no stored history: the subscription's
+    # own group is attached too, so it must be enumerated as well.
+    worker = MarmotWorker(plane, resolver=resolver, group_id_hex=OTHER_GROUP,
+                          base_delay=0.01, max_delay=0.05)
+    task = asyncio.create_task(worker.run(lambda event: None))
+    try:
+        await wait_until(lambda: worker.connected)
+        await wait_until(lambda: worker.enumerated is not None)
+    finally:
+        worker.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert worker.enumerated is not None
+    assert worker.enumerated["groups"] == 2 and worker.enumerated["verified"] == 2
+    rows = {row["group"]: row for row in resolver.conversations()}
+    assert set(rows) == {GROUP, OTHER_GROUP}
+    assert rows[GROUP]["messages"] == 1 and rows[GROUP]["verified"] is True
+    assert rows[OTHER_GROUP]["messages"] == 0 and rows[OTHER_GROUP]["verified"] is True
 
 
 # -- the wire itself -------------------------------------------------------

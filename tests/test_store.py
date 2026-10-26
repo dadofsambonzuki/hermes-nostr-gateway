@@ -25,6 +25,27 @@ def test_distinct_messages_from_same_sender_both_stored(tmp_path):
         assert s.add(Inbound(id="b", wrapper_id="b", content="two", plane="nip17", **base))
 
 
+def test_conversations_are_evidence_not_a_cache(tmp_path):
+    from hermes_nostr_gateway.store import Inbound, Store
+
+    def add(s, *, mid: str, group: str, at: int, plane: str) -> None:
+        assert s.add(Inbound(
+            id=mid, wrapper_id=mid, sender="dd" * 32, kind=9, created_at=at,
+            content=f"text {mid}", conversation=group, reply_to=None, plane=plane,
+            reach="digest", authority="none", rule="t", why="t",
+        ))
+
+    with Store(tmp_path / "conversations.db") as s:
+        add(s, mid="m2", group="aa" * 16, at=1_700_000_000, plane="marmot")
+        add(s, mid="m1", group="bb" * 16, at=1_700_000_100, plane="marmot")
+        add(s, mid="m3", group="cc" * 32, at=1_700_000_200, plane="nip17")
+        rows = s.conversations("marmot")
+        assert [row["conversation"] for row in rows] == ["bb" * 16, "aa" * 16]
+        assert rows[0]["messages"] == 1 and rows[0]["last_at"] == 1_700_000_100
+        # Newest first and bounded, so status cannot walk an unbounded table.
+        assert s.conversations("marmot", limit=1) == [rows[0]]
+
+
 def test_pending_immediate_is_replayed_but_old_or_sent_is_not(tmp_path):
     import time
 

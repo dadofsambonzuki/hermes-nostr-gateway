@@ -241,7 +241,8 @@ class Gateway:
             return
         self.marmot = plane
         self.marmot_resolver = MarmotResolver(plane)
-        self.marmot_worker = MarmotWorker(plane, group_id_hex=cfg.get("group"))
+        self.marmot_worker = MarmotWorker(plane, resolver=self.marmot_resolver,
+                                          group_id_hex=cfg.get("group"))
         log.info("marmot plane via %s (account %s…)", socket, account[:12])
 
     # -- lifecycle ------------------------------------------------------
@@ -761,7 +762,8 @@ class Gateway:
             # outside, and only the counters tell them apart.
             "marmot": (
                 {"worker": self.marmot_worker.stats(),
-                 "conversations": self.marmot_resolver.conversations()}
+                 "conversations": self.marmot_resolver.conversations(),
+                 "enumeration": self.marmot_resolver.enumeration()}
                 if self.marmot and self.marmot_worker and self.marmot_resolver
                 else {"enabled": False, "error": self.marmot_error,
                       "reason": self.marmot_idle}

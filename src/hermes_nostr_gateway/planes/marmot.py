@@ -31,7 +31,7 @@ import random
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 from ..policy import Policy
 from ..store import Inbound, Store
@@ -493,12 +493,27 @@ class MarmotResolver:
     lookup — but sending into a group id nobody has is a silent failure the caller
     cannot see, so a resolved target is always verified with `group_info` once and
     cached.
+
+    A cache alone cannot answer "what is attached?" after a restart, which is why
+    `conversations()` is built from the messages this gateway has stored and
+    `enumerate()` re-verifies them on every connect. wn-agent 0.10.4's control
+    protocol has no group-list request — an unknown `group_list` frame is not even
+    answered — so a group this gateway has never exchanged a message with cannot be
+    discovered before its first message. That limit is reported, not hidden behind an
+    empty list.
     """
 
-    def __init__(self, plane: MarmotPlane, *, prefix: str = "marmot:"):
+    def __init__(self, plane: MarmotPlane, *, prefix: str = "marmot:",
+                 history_limit: int = 50):
         self.plane = plane
         self.prefix = prefix
+        self.history_limit = max(1, int(history_limit))
         self._groups: dict[str, dict[str, Any]] = {}
+        #: Groups the last enumeration could not verify, and why.
+        self.errors: dict[str, str] = {}
+        self.last_enumeration: int | None = None
+        self.last_groups = 0
+        self.last_verified = 0
 
     def parse(self, target: str | None) -> str | None:
         text = str(target or "").strip()
@@ -524,7 +539,92 @@ class MarmotResolver:
         return info
 
     def conversations(self) -> list[dict[str, Any]]:
-        return [self._groups[key] for key in sorted(self._groups)]
+        """Every group this plane has evidence for, newest activity first.
+
+        Evidence is a stored Marmot row (inbound or our own send) or a group
+        resolved since this process started. `verified` says whether the last
+        `group_info` succeeded, so history for a group we have left is named as
+        unverified instead of silently vanishing.
+        """
+        rows = self.plane.store.conversations("marmot", limit=self.history_limit)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            group = str(row["conversation"])
+            seen.add(group)
+            out.append(self._entry(group, messages=int(row["messages"]),
+                                   last_at=int(row["last_at"] or 0)))
+        for group in sorted(self._groups):
+            if group not in seen:
+                out.append(self._entry(group, messages=0, last_at=None))
+        return out
+
+    def enumeration(self) -> dict[str, Any]:
+        """What the last connect-time enumeration tried, proved and failed."""
+        return {
+            "at": self.last_enumeration,
+            "groups": self.last_groups,
+            "verified": self.last_verified,
+            "errors": dict(self.errors),
+            "source": (
+                "stored marmot conversations, each verified with group_info; "
+                "wn-agent 0.10.4 has no group-list request, so a group this gateway "
+                "has never exchanged a message with cannot be listed"
+            ),
+        }
+
+    async def enumerate(self, extra: Iterable[str] = ()) -> dict[str, Any]:
+        """Verify every group the plane has evidence for, once per connect.
+
+        `extra` is the worker's configured subscription group, which is attached
+        even when this gateway has not stored a message from it yet. A group that
+        fails `group_info` is recorded and left unverified: dropping the error
+        would make a dead conversation look like a quiet one.
+        """
+        groups: list[str] = [
+            str(row["conversation"])
+            for row in self.plane.store.conversations("marmot", limit=self.history_limit)
+        ]
+        for value in extra:
+            group = str(value or "").strip().lower()
+            if group and group not in groups:
+                groups.append(group)
+        self.last_enumeration = int(time.time())
+        self.last_groups = len(groups)
+        self.last_verified = 0
+        self.errors = {}
+        for group in groups:
+            try:
+                info = await self.plane.group(group)
+            except MarmotError as exc:
+                detail = f"{exc.code}: {exc}"
+            except Exception as exc:  # noqa: BLE001 - one bad group must not stop the rest
+                detail = f"{type(exc).__name__}: {exc}"
+            else:
+                self._groups[group] = info
+                self.last_verified += 1
+                continue
+            self.errors[group] = detail[:200]
+            self._groups.pop(group, None)
+            log.info("marmot conversation %s… unverified: %s", group[:10], detail)
+        if groups:
+            log.info("marmot conversations enumerated: %d/%d verified",
+                     self.last_verified, self.last_groups)
+        return self.enumeration()
+
+    def _entry(self, group: str, *, messages: int,
+               last_at: int | None) -> dict[str, Any]:
+        cached = self._groups.get(group)
+        return {
+            "group": group,
+            "messages": messages,
+            "last_at": last_at,
+            "verified": cached is not None,
+            "member_count": int(cached["member_count"]) if cached else None,
+            "is_direct": bool(cached["is_direct"]) if cached else None,
+            "agent_created": bool(cached["agent_created"]) if cached else None,
+            "error": self.errors.get(group),
+        }
 
 
 class MarmotWorker:
@@ -539,11 +639,15 @@ class MarmotWorker:
         self,
         plane: MarmotPlane,
         *,
+        resolver: MarmotResolver | None = None,
         group_id_hex: str | None = None,
         base_delay: float = 2.0,
         max_delay: float = 60.0,
     ):
         self.plane = plane
+        #: Optional: when present, every (re)connect re-states which groups we hold
+        #: messages for, so `status` can answer before the next event arrives.
+        self.resolver = resolver
         self.group_id_hex = group_id_hex
         self.base_delay = float(base_delay)
         self.max_delay = float(max_delay)
@@ -552,6 +656,7 @@ class MarmotWorker:
         self.last_error: str | None = None
         self.connected = False
         self.connected_at: int | None = None
+        self.enumerated: dict[str, Any] | None = None
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -565,8 +670,24 @@ class MarmotWorker:
     def _established(self) -> None:
         self.connected = True
         self.connected_at = int(time.time())
-        log.info("marmot inbound established (account %s…)",
-                 self.plane.account_id_hex[:12])
+        log.info("marmot inbound established (account %s…)", self.plane.account_id_hex[:12])
+
+    async def _acknowledged(self) -> None:
+        """The link is up; say which conversations are attached as well.
+
+        Enumeration runs on the ack rather than on a timer because this is the
+        moment a restarted worker has an empty cache and `status` would otherwise
+        report `conversations: []` to a question the store can answer. It is status
+        enrichment, not the link: a failure here must not drop the subscription.
+        """
+        self._established()
+        if self.resolver is None:
+            return
+        extra = [self.group_id_hex] if self.group_id_hex else []
+        try:
+            self.enumerated = await self.resolver.enumerate(extra)
+        except Exception:  # noqa: BLE001 - never let a status nicety kill the link
+            log.exception("marmot conversation enumeration failed")
 
     async def run(self, on_message: MessageHandler) -> None:
         attempt = 0
@@ -575,7 +696,7 @@ class MarmotWorker:
                 async for event in self.plane.control.subscribe(
                     account_id_hex=self.plane.account_id_hex,
                     group_id_hex=self.group_id_hex,
-                    on_ack=self._established,
+                    on_ack=self._acknowledged,
                 ):
                     if self.connected is False:  # pragma: no cover - defensive
                         self._established()

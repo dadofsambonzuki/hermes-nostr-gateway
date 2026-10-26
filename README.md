@@ -242,6 +242,17 @@ than looking like a bad target. If the flag *is* set and the plane is still abse
 changes to `no wn-agent control socket at <path>` — that is a daemon or `home:` problem, not an
 opt-in one.
 
+`status` answers "what is attached?" from evidence, not from what happens to have been resolved
+since the last start. On every (re)connect the plane takes the group ids of the Marmot messages
+in its own store, re-verifies each with `group_info`, and reports them under
+`marmot.conversations` (`group`, `messages`, `last_at`, `verified`, `member_count`); the
+`marmot.enumeration` block records when that ran and names any group it could not verify, with
+the error, so history for a group we have left is visible rather than dropped. That is also the
+limit: wn-agent 0.10.4's control protocol has no group-list request (an unknown `group_list`
+frame is not even answered), so a group this gateway has never exchanged a message with cannot
+be listed until its first message arrives — the `source` line says so instead of leaving an
+empty list to be misread.
+
 ## Rate limits and blocked frames
 
 One token bucket per sender, shared by every plane (NIP-17, NIP-04, Marmot), so
