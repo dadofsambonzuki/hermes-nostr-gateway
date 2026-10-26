@@ -1,9 +1,10 @@
 """Unix-socket API: NDJSON in, NDJSON out, 0600, local only.
 
-One connection may both subscribe and request. Ops: subscribe, status, send, history,
-peers, ack, mark_read, ping, plus the Marmot reads (`marmot.group`, `marmot.timeline`)
-that only exist when that plane is attached. No TCP, no HTTP in v1 — there is no auth
-surface to get wrong, and the adapter is a local process by design. See
+One connection may both subscribe and request. Ops: subscribe, status, health, send,
+history, peers, ack, mark_read, ping, plus the Marmot reads (`marmot.group`,
+`marmot.timeline`) that only exist when that plane is attached. `health` is the one-call
+frame the overnight cron reads instead of parsing logs. No TCP, no HTTP in v1 — there is
+no auth surface to get wrong, and the adapter is a local process by design. See
 docs/gateway-spec.md §5.
 """
 
@@ -49,6 +50,8 @@ async def request(path: str | Path, frame: dict[str, Any], *,
 
 class Handler(Protocol):
     async def status(self) -> dict[str, Any]: ...
+    async def health(self, *, quiet_minutes: int | None = None,
+                     pending_stale_minutes: int | None = None) -> dict[str, Any]: ...
     async def send(self, *, to: str, text: str, reply_to: str | None, cid: str | None) -> dict[str, Any]: ...
     def history(self, limit: int) -> dict[str, Any]: ...
     def drops(self, *, plane: str | None, reason: str | None,
@@ -147,6 +150,23 @@ class SocketServer:
                                 await self._send(writer, frame)
                     elif op == "status":
                         await self._send(writer, {"type": "status", **(await self.handler.status())})
+                    elif op == "health":
+                        # One call, and it is the same frame whatever the daemon's age:
+                        # an older daemon that has no `health` says so by code, so the
+                        # cron reports "daemon too old" instead of an empty narrative.
+                        handler = getattr(self.handler, "health", None)
+                        if handler is None:
+                            await self._send(writer, {"type": "error", "op": op,
+                                                      "code": "unsupported",
+                                                      "error": "health is not available "
+                                                               "on this daemon"})
+                        else:
+                            minutes = req.get("pending_stale_minutes")
+                            quiet = req.get("quiet_minutes")
+                            await self._send(writer, await handler(
+                                quiet_minutes=None if quiet is None else int(quiet),
+                                pending_stale_minutes=None if minutes is None else int(minutes),
+                            ))
                     elif op == "send":
                         frame = await self.handler.send(
                             to=req["to"], text=req["text"],

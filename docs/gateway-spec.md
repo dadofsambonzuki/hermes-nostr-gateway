@@ -146,6 +146,7 @@ socket 0600, directory 0700. No TCP in v1; no HTTP.
 |---|---|---|
 | `identities.list` | — | `npub`, transports, relay counts |
 | `status` | — | version, uptime, queue depth, per-relay state, allowlist size |
+| `health` | `quiet_minutes?`, `pending_stale_minutes?` | per plane: last event + age, pending, blocked, degraded + reasons; relay totals; one `summary` line |
 | `send` | `identity`, `to`, `text`, `transport=auto`, `reply_to?`, `attachments?: [{path, alt?}]` | `rumor_id`, `event_ids`, `relays_ok[]`, `relays_failed[]`, `sent_at`, `attachments[]` |
 | `react` | `identity`, `to`, `rumor_id`, `emoji="+"` | `reaction_rumor_id`, per-relay results |
 | `media.get` | `identity`, `sha256` or `url` (or `rumor_id`) | `path`, `mime`, `size`, verified `sha256`, `cached` |

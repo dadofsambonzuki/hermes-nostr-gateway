@@ -5,10 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, cast
 
 from .crypto import SdkCrypto
+from .health import (
+    DEFAULT_PENDING_STALE_MINUTES,
+    default_planes,
+    health_report,
+    relay_verdicts,
+)
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .peer_inbox import (
     InboxResolver,
@@ -205,6 +212,19 @@ class Gateway:
         self.workers: list[RelayWorker] = []
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
+        #: Set by `start()`. `status`/`health` report the age of this number, not the age
+        #: of the process: a construct-only Gateway (a test, a `--once` run) has no uptime
+        #: to claim, and `None` says so instead of counting from import.
+        self._started_at: float | None = None
+
+    def plane_names(self) -> list[str]:
+        """The planes this process attached, in a stable order.
+
+        `status` and `health` must agree on this: a plane missing from `health` is a
+        plane the cron will never mention, which is how a whole transport goes quiet
+        without anyone noticing.
+        """
+        return default_planes(marmot=self.marmot is not None)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -251,6 +271,7 @@ class Gateway:
     # -- lifecycle ------------------------------------------------------
     async def start(self) -> None:
         await self.server.start()
+        self._started_at = time.time()
         for relay in self.relays_read:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
@@ -727,8 +748,7 @@ class Gateway:
             "socket": str(self.socket_path),
             "relays_read": self.relays_read,
             "relays_configured": self.relays_configured,
-            "planes": ["nip17", "nip01", "nip04", "concord"]
-                      + (["marmot"] if self.marmot else []),
+            "planes": self.plane_names(),
             "relays_publish": self.relays_publish,
             "peer_inbox": {
                 "enabled": self.peer_cfg.enabled,
@@ -774,8 +794,48 @@ class Gateway:
                       "reason": self.marmot_idle}
             ),
             "workers": [self._worker_state(w) for w in self.workers],
-            "uptime_s": None,
+            "uptime_s": self.uptime_s(),
         }
+
+    def uptime_s(self) -> int | None:
+        """Seconds since `start()`, or None when this Gateway never started."""
+        return int(time.time() - self._started_at) if self._started_at else None
+
+    async def health(self, *, quiet_minutes: int | None = None,
+                     pending_stale_minutes: int | None = None) -> dict[str, Any]:
+        """One call, per plane: last event, backlog, blocks, degraded flag.
+
+        The same live worker state the `status` op exposes goes in, so a relay that is
+        down degrades every plane with one reason rather than four mysteries. The
+        counters come from the store, which is the only place a "last event at" exists.
+        """
+        now = time.time()
+        verdicts = relay_verdicts(
+            {"workers": [self._worker_state(w) for w in self.workers],
+             "relays_read": self.relays_read},
+            relays=self.relays_configured, now=now,
+            quiet_minutes=(30 if quiet_minutes is None else int(quiet_minutes)),
+        )
+        notes: list[str] = []
+        if self.marmot is None:
+            why = self.marmot_error or self.marmot_idle
+            if why:
+                notes.append(f"marmot plane not attached: {why}")
+        return health_report(
+            planes=self.plane_names(),
+            plane_rows=self.store.plane_report(),
+            verdicts=verdicts,
+            wraps=self.store.wrap_report_by_plane(),
+            daemon=True,
+            identity=self.me,
+            socket_path=str(self.socket_path),
+            uptime_s=self.uptime_s(),
+            now=now,
+            pending_stale_minutes=(DEFAULT_PENDING_STALE_MINUTES
+                                   if pending_stale_minutes is None
+                                   else int(pending_stale_minutes)),
+            notes=notes,
+        )
 
     @staticmethod
     def _worker_state(worker: Any) -> dict[str, Any]:

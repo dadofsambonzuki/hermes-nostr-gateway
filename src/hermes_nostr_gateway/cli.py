@@ -16,9 +16,12 @@ import yaml
 from .crypto import SdkCrypto
 from .health import (
     BAD,
+    default_planes,
+    health_report,
     human_age,
     relay_verdicts,
     render,
+    render_health,
     reports_event_times,
     running_but_unconfigured,
     stale_rows,
@@ -307,7 +310,10 @@ def cmd_status(args) -> int:
         print(f"daemon:   not running ({socket_path}: {problem})")
         print("relays:   (no live worker state; the daemon answers this question)")
     else:
-        print(f"daemon:   up ({socket_path}, {len(frame.get('workers') or [])} worker(s))")
+        workers = len(frame.get("workers") or [])
+        uptime = frame.get("uptime_s")
+        ago = f", up {human_age(uptime)}" if uptime is not None else ""
+        print(f"daemon:   up ({socket_path}, {workers} worker(s){ago})")
         print("relays:   (live worker state)")
     for line in render(verdicts):
         print(line)
@@ -337,6 +343,69 @@ def cmd_status(args) -> int:
                 print(f"  {worker.get('relay')}  {said}")
 
     return _status_exit(frame, verdicts, args)
+
+
+def cmd_health(args) -> int:
+    """One call, one frame: what the gateway did per plane and what is degraded.
+
+    The overnight narrative is generated from this, so it must not need a second
+    command and must not be assembled from log lines. When the daemon is not running
+    the answer is still produced — from the store, labelled history, and degraded.
+    """
+    from .gateway import default_socket_path, relay_read_plan
+    from .server import request
+
+    cfg = load_config(args.config)
+    _crypto, store, _policy, plane = build(cfg)
+    relays, _ = relay_read_plan(cfg)
+    socket_path = Path(os.path.expanduser(
+        args.socket or cfg.get("socket") or str(default_socket_path())))
+
+    frame: dict[str, Any] | None = None
+    problem: str | None = None
+    try:
+        reply = asyncio.run(request(socket_path, {
+            "op": "health",
+            "quiet_minutes": args.quiet_minutes,
+            "pending_stale_minutes": args.pending_stale_minutes,
+        }))
+        if reply.get("type") == "health":
+            frame = reply
+        elif reply.get("code") == "unsupported":
+            problem = str(reply.get("error") or "this daemon has no health op")
+        else:
+            problem = (f"unexpected reply {reply.get('type')!r}"
+                       + (f": {reply['error']}" if reply.get("error") else ""))
+    except (OSError, TimeoutError, ValueError) as exc:
+        problem = str(exc) or exc.__class__.__name__
+
+    if frame is None:
+        now = time.time()
+        frame = health_report(
+            planes=default_planes(
+                marmot=(cfg.get("marmot") or {}).get("enabled") is True),
+            plane_rows=store.plane_report(),
+            verdicts=relay_verdicts(None, relays=relays, now=now,
+                                    quiet_minutes=args.quiet_minutes),
+            wraps=store.wrap_report_by_plane(),
+            daemon=False,
+            daemon_error=problem,
+            identity=plane.me,
+            socket_path=str(socket_path),
+            now=now,
+            pending_stale_minutes=args.pending_stale_minutes,
+            notes=["plane counters are from the store: with no daemon they are "
+                   "history, not live state"],
+        )
+
+    if args.json:
+        print(json.dumps(frame, indent=2))
+    else:
+        for line in render_health(frame):
+            print(line)
+    if args.check and frame.get("verdict") != "ok":
+        return 1
+    return 0
 
 
 def _history_text(row: dict[str, Any] | None, now: float) -> str:
@@ -507,6 +576,17 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("-v", "--verbose", action="store_true",
                           help="also show each worker's last stderr line (diagnostics)")
     p_status.set_defaults(func=cmd_status)
+
+    p_health = sub.add_parser("health", help="one call: per-plane health for a cron to read")
+    p_health.add_argument("--socket", default=None, help="daemon socket override")
+    p_health.add_argument("--quiet-minutes", type=int, default=30,
+                          help="silence window before a relay reads quiet (default 30)")
+    p_health.add_argument("--pending-stale-minutes", type=int, default=10,
+                          help="undelivered backlog older than this is degraded (default 10)")
+    p_health.add_argument("--json", action="store_true", help="the whole frame, for a cron")
+    p_health.add_argument("--check", action="store_true",
+                          help="exit 1 when degraded or when the daemon is not running")
+    p_health.set_defaults(func=cmd_health)
 
     p_serve = sub.add_parser("serve", help="run the gateway daemon (socket + relays)")
     p_serve.add_argument("--socket", default=None, help="socket path override")
