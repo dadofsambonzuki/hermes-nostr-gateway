@@ -23,7 +23,8 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
       → PR nevent1qqstfl2fujt8t3ftz4yzq2wnqasmnsp8f9w05n33kknknpz5d6nmtxcpz3mhxue69uhhyetvv9ujumn8d96zuer9wcljzvaw (pr/publish-bindings)
 - [x] **P3 — Drops first-class** — `drops` op, TTL, status count. See plan P3.
       → PR nevent1qqsx2yvad6xl03pd7wkqqckm72x7saf6dc5t9dsuzh7trx4nqz8dxpspz3mhxue69uhhyetvv9ujumn8d96zuer9wcwc5egd (pr/drops-first-class)
-- [ ] **P4 — Bot and echo policy** — kind-0 bot flag, reply cap, echo suppression. See plan P4.
+- [x] **P4 — Bot and echo policy** — kind-0 bot flag, reply cap, echo suppression. See plan P4.
+      → PR nevent1qqsx0j9w954d6senywzyc37rkctq6xsgver40dn6rfk6ap9t4e4rk9spz3mhxue69uhhyetvv9ujumn8d96zuer9wc3nxmlv (pr/bot-echo-policy)
 - [ ] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
       error string, one-call health. See plan P5.
 - [ ] **P6 — Store off the loop** — WAL, batching, 500-event burst benchmark. See plan P6.
