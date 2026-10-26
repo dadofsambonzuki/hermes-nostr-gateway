@@ -57,12 +57,19 @@ media:
   timeout: 20                # seconds per HTTP request
 
 # Marmot: proxied to wn-agent, never reimplemented — MLS stays theirs (spec §16).
-# OPT-IN, and off by default on purpose. Hermes' own Marmot platform plugin reads the
-# same wn-agent socket; with both attached the agent receives every group message
-# twice. Set `enabled: true` only in the process meant to be the transport — i.e.
-# after disabling the Hermes Marmot plugin — and leave it false otherwise.
+# ONE OWNER (docs/marmot-ownership.md): the gateway owns the wn-agent control socket and
+# Hermes' own Marmot platform plugin is being retired. Both readers attached deliver every
+# group message to the agent twice, so that combination is a startup error — `hng serve`
+# refuses with the reason and exits 2. Until the flip the plugin is the carrier: leave
+# `enabled: false` here and Hermes keeps carrying Marmot.
 marmot:
   enabled: false                   # true = this gateway is the Marmot transport
+  # Is Hermes' own Marmot platform plugin still on the same socket? `auto` reads
+  # platforms.marmot.enabled out of Hermes' config (below), so the flag is not copied and
+  # cannot drift; true/false pins it where there is no Hermes config to read (a container).
+  # A missing file is "unknown", which never refuses a start.
+  hermes_platform: auto
+  # hermes_config: ~/.hermes/config.yaml   # default: $HERMES_HOME/config.yaml
   socket: ~/.marmot-agents/hermes/dev/wn-agent.sock
   home: ~/.marmot-agents/hermes     # account_id_hex is read from accounts/*/account.json
   # label: hermes-agent             # only needed when that home holds more than one account

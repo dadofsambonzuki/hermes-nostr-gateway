@@ -32,7 +32,11 @@ def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
         "defaults": POLICY["defaults"],
     }
     if marmot is not None:
-        cfg["marmot"] = marmot
+        # These tests are the plane, not the ownership guard. Pin the other reader off
+        # so a host whose ~/.hermes/config.yaml happens to enable platforms.marmot (as
+        # the development box does) cannot change what they prove;
+        # test_marmot_ownership.py covers the guard itself.
+        cfg["marmot"] = {"hermes_platform": False, **marmot}
     return cfg
 
 

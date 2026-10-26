@@ -28,11 +28,13 @@ has to know which protocol a message arrived on. When it is finished, this is wh
 - **Coverage that is measured, not assumed.** Reads span the identity's follows, its NIP-65
   write relays and the sender app-relay defaults; per-relay event counts and last errors are in
   `hng status`, because "we read all relays" is a claim a status line should be able to prove.
-- **Marmot stays Marmot — and is opt-in.** MLS is `wn-agent`'s job; the gateway speaks its
+- **Marmot stays Marmot — and has one owner.** MLS is `wn-agent`'s job; the gateway speaks its
   control socket as a proxy plane rather than reimplementing a protocol it does not own. The
-  plane attaches only when `marmot.enabled: true`, because Hermes' own Marmot plugin can be
-  subscribed to the same socket and two subscribers mean two agent runs per message (below).
-  `wn-agent` remains the transport underneath either way.
+  gateway is the owner of that socket and Hermes' own Marmot plugin is being retired
+  ([`docs/marmot-ownership.md`](docs/marmot-ownership.md)); until the flip the plugin is the
+  carrier and the plane attaches only when `marmot.enabled: true`. Both readers switched on at
+  once is a startup error, never a warning (below). `wn-agent` remains the transport underneath
+  either way.
 
 The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md); host-side operations
 are kept with the host's own infrastructure documentation rather than in this repository.
@@ -265,16 +267,35 @@ them in the DM or feed read set. They are named under `relays.whitenoise` for th
 to use through `wn-agent`. The trade is deliberate: a DM that exists *only* there is not fetched
 by the DM workers, and if one ever goes missing this is the first thing to check.
 
-## Marmot is opt-in
+## Marmot: one socket, one owner
 
-The `marmot` plane is a proxy to `wn-agent`'s control socket, and it does **not** attach unless
-the config says `marmot.enabled: true`. The default is off for a specific reason: Hermes ships
-its own Marmot platform plugin, usually configured against the same account and the same socket,
-and two subscribers on one control socket deliver the same group message to the agent twice — two
-runs, two replies, duplicate side effects. Setting the flag is the operator choosing which
-process is the transport; it is not a way to get Marmot *and* keep the plugin.
+The `marmot` plane is a proxy to `wn-agent`'s control socket. **The gateway is the owner of
+that socket**: it holds the subscription, normalises group messages into the same frames as
+every other plane, and sends out through the same `wn-agent` the phone talks to. Hermes' own
+Marmot platform plugin is being retired once the gateway has carried the traffic cleanly for a
+week — the decision, the flip and its rollback are one config line each way in
+[`docs/marmot-ownership.md`](docs/marmot-ownership.md).
 
-An idle plane is not a silent one: startup logs
+Two readers on one socket is not a second opinion, it is duplicate work: one group message
+becomes two agent runs, two replies, and doubled side effects. So a configuration with both
+switched on refuses to start:
+
+```
+refusing to start: marmot.enabled: true while Hermes' Marmot platform is still enabled
+(platforms.marmot.enabled: true in /home/ubuntu/.hermes/config.yaml). Both read the same
+wn-agent control socket, so every group message would reach the agent twice, …
+```
+
+The guard knows because `marmot.hermes_platform: auto` (the default) reads
+`platforms.marmot.enabled` from Hermes' own config — `$HERMES_HOME/config.yaml`, default
+`~/.hermes/config.yaml`, or `marmot.hermes_config` for a different Hermes home. `true`/`false`
+pins the answer where there is no Hermes config to read (a container); a missing file is
+*unknown* and never blocks a start. The socket's `status` op reports
+`marmot.hermes_platform: {enabled, source}` — what the guard concluded and where it read it.
+
+Until the flip the plugin is the carrier and `marmot.enabled` stays `false`; the plane then
+does **not** attach, whatever socket is present. An idle plane is not a silent one: startup
+logs
 
 ```
 marmot plane idle: opt-in only: set marmot.enabled: true to attach it. …
