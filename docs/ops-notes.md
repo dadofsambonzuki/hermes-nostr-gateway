@@ -34,7 +34,9 @@ agent talks NDJSON over a Unix socket.
   `ReadWritePaths=/home/ubuntu/.local/state/hermes-nostr-gateway`. A new store, socket or
   media cache anywhere else in `$HOME` fails as read-only at runtime; add it to the unit,
   `systemctl daemon-reload`, restart. `PATH` must also keep `~/.local/bin`, because every relay
-  worker is a `nak` child.
+  worker is a `nak` child. The media cache defaults to
+  `~/.local/state/hermes-nostr-gateway/media` for exactly this reason — a `share/` path would
+  only fail when the first blob is fetched.
 - **`TimeoutStopSec=15` bounds a stop that does not finish.** The restart at 12:31 on
   2026-10-24 logged `State 'stop-sigterm' timed out. Killing.` — the drop-in converted a
   90-second wait into a 15-second one ending in SIGKILL. Treat `systemctl restart` as hard:

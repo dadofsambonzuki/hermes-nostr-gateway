@@ -62,7 +62,7 @@ unit is `deploy/hermes-nostr-gateway.service`. From a checkout:
 ```sh
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
-uv pip install --python .venv/bin/python -e '.[media,dev]'
+uv pip install --python .venv/bin/python -e '.[dev]'
 cp config.example.yaml config.yaml
 $EDITOR config.yaml                      # point identity.secret_file at a 0600 JSON file
 .venv/bin/hng --config config.yaml status
@@ -130,6 +130,8 @@ identity:
   secret_file: /run/secrets/nostr-secret.json
 store: /var/lib/hermes-nostr-gateway/gateway.db
 socket: /var/lib/hermes-nostr-gateway/gateway.sock
+media:
+  dir: /var/lib/hermes-nostr-gateway/media     # on the state volume, not the layer
 relays:
   read: [wss://relay.day.ag/chat, wss://nos.lol]
   publish: [wss://relay.day.ag/chat, wss://nos.lol]
@@ -257,6 +259,64 @@ peer degrades to blocked rather than a queue that grows, and no blocked message 
 look like chat to a consumer. `rate_limit: {burst: 10, per_hour: 30}` in the config
 overrides the defaults; `enabled: false` turns it off.
 
+## Media
+
+Attachments are not a separate event kind. A sender puts NIP-92 `imeta` tags on the text
+rumor — one per file — and the message frame carries the same metadata:
+
+```json
+{"type":"message","plane":"nip17","id":"…","content":"look at this",
+ "attachments":[{"url":"https://blossom.example/<sha256>","sha256":"…","mime":"image/jpeg",
+                 "size":184320,"alt":"the garden","status":"available"}]}
+```
+
+Nothing is downloaded on receipt, so a hostile sender cannot spend our bandwidth by sending
+a message. The adapter asks for the blob it wants:
+
+```json
+{"op":"media.get","sha256":"<64 hex>"}     // or {"url": "…"}, or {"rumor_id": "…"}
+```
+
+```json
+{"type":"media","op":"media.get","sha256":"…","path":"/…/media/…","mime":"image/jpeg",
+ "size":184320,"cached":false,"url":"https://blossom.example/…","rumor_id":"…"}
+```
+
+`path` is a 0600 file in the cache (default `~/.local/state/hermes-nostr-gateway/media`,
+which is inside the systemd unit's writable path — see `docs/ops-notes.md`); the bytes are
+verified against `sha256` before the file is written, and a second call returns
+`cached: true` without a request. `hng media <sha256|url>` takes the same path from a shell.
+
+Caps live under `media:` in the config: 25 MiB per blob, four per message, a MIME allowlist
+(`image/*`, `audio/*`, `video/mp4`, `application/pdf`, `text/plain`), and 512 MiB of cache
+with the oldest blobs evicted first. The type is **sniffed from the bytes, never taken from
+`m`**: a JPEG labelled `text/plain` is still a JPEG, and bytes that are not a recognised
+type are refused rather than guessed (SVG is not recognised, so it arrives as `text/plain`
+and is never presented as an image). Refusals are an error frame with a code:
+
+```json
+{"type":"error","op":"media.get","code":"too_large","error":"the sender declares 31457280 bytes, over the 26214400 byte cap"}
+```
+
+| code | meaning |
+|---|---|
+| `unknown_blob` | no message we hold references that sha256/url |
+| `unverifiable` | the `imeta` tag carried no usable sha256 |
+| `too_large` | declared size, `Content-Length`, or the streamed body is over the cap |
+| `too_many_files` | that attachment is beyond the four-per-message cap |
+| `type_unknown`, `type_not_allowed` | the bytes are not a type we hand to an agent |
+| `hash_mismatch` | the server served bytes that are not the blob |
+| `insecure_url`, `bad_url`, `host_not_allowed` | not a hash-addressed public https blob url |
+| `not_found`, `fetch_failed` | every candidate failed; the message names the reason |
+| `media_disabled` | `media.enabled: false` |
+
+A peer's Blossom server is used only when the url ends in the blob's sha256 and resolves to
+a public address, with redirects refused; configured servers are trusted as configured (a
+local one may be http) and are tried by hash after the message's own url. That is what stops
+the socket being a general-purpose fetcher while still reading attachments from the servers
+peers actually use — and because the hash is checked, a hostile server can only fail to
+serve the blob, never substitute content for it.
+
 ## Shape
 
 ```
@@ -277,7 +337,8 @@ agent runtime (Hermes plugin)
   instruct it; see spec §17.
 - **Relay coverage is a correctness property.** Reading only the identity's `10050` misses DMs
   that exist only on the sender's app relays — measured, not theorised (spec §3).
-- **The gateway never interprets content.** No fetching beyond configured Blossom servers, no
+- **The gateway never interprets content.** No fetching beyond a Blossom blob a stored
+  message references and addresses by sha256 (lazy, capped, verified — see "Media"), no
   command parsing, no reply policy, no read receipts.
 
 ## Credits

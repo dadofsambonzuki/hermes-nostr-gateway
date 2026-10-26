@@ -23,6 +23,7 @@ from .health import (
     running_but_unconfigured,
     stale_rows,
 )
+from .media import MediaError, media_config, resolve_attachment
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .publisher import publish
@@ -279,6 +280,7 @@ def cmd_status(args) -> int:
             "pending": stats["pending"],
             "blocked": stats["blocked"],
             "invites": stats["invites"],
+            "media": stats.get("media") or {},
             "relays": [verdict.as_dict() for verdict in verdicts],
             "not_in_config": stale,
         }, indent=2))
@@ -289,6 +291,9 @@ def cmd_status(args) -> int:
     print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery, "
           f"{stats['blocked']} blocked)")
     print(f"invites:  {stats['invites']} concord invite(s)")
+    media = stats.get("media") or {}
+    print(f"media:    {media.get('attachments', 0)} attachment(s), "
+          f"{media.get('cached', 0)} cached")
     if frame is None:
         print(f"daemon:   not running ({socket_path}: {problem})")
         print("relays:   (no live worker state; the daemon answers this question)")
@@ -356,6 +361,32 @@ def cmd_recent(args) -> int:
         direction = "out" if row["authority"] == "self" else "in "
         print(f"[{row['created_at']}] {direction} {row['sender'][:10]}… {row['reach']:<9} "
               f"{(row['content'] or '')[:90]}")
+    return 0
+
+
+def cmd_media(args) -> int:
+    """Fetch one blob an inbound message references — the same path `media.get` takes."""
+    cfg = load_config(args.config)
+    _crypto, store, _policy, _plane = build(cfg)
+    media_cfg = media_config(cfg.get("media"))
+    if not media_cfg.enabled:
+        print("media is disabled: set media.enabled: true", file=sys.stderr)
+        return 1
+    ref = args.ref.strip()
+    try:
+        entry = (resolve_attachment(store, url=ref)
+                 if ref.startswith(("http://", "https://"))
+                 else resolve_attachment(store, sha256=ref.lower()))
+        result = media_cfg.fetcher().fetch(entry)
+    except MediaError as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 1
+    store.mark_media_fetched(result["sha256"], result["path"])
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        cached = " (cached)" if result["cached"] else ""
+        print(f"{result['path']}  {result['mime']}  {result['size']} bytes{cached}")
     return 0
 
 
@@ -449,6 +480,11 @@ def main(argv: list[str] | None = None) -> int:
     p_recent = sub.add_parser("recent", help="recent messages")
     p_recent.add_argument("-n", "--number", type=int, default=20)
     p_recent.set_defaults(func=cmd_recent)
+
+    p_media = sub.add_parser("media", help="fetch a Blossom blob an inbound message references")
+    p_media.add_argument("ref", help="the blob's sha256, or the imeta url")
+    p_media.add_argument("--json", action="store_true")
+    p_media.set_defaults(func=cmd_media)
 
     sub.add_parser("replay-skip",
                    help="record a handover: the pending backlog is already answered"

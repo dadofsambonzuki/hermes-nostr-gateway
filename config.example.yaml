@@ -40,6 +40,22 @@ whitenoise:
 
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
 
+# Media (spec §4b). An inbound attachment is recorded from its NIP-92 `imeta` tag but
+# never fetched on receipt: the adapter asks for a blob with `media.get`, and only then
+# does the gateway download it, verify the sha256, sniff the type and cache it. The caps
+# are enforced before the request (a declared size over the cap) and while reading the
+# body (a server that omits or lies about Content-Length).
+# The cache directory must be writable by the unit: this one is inside the sandbox's
+# ReadWritePaths (see docs/ops-notes.md).
+media:
+  enabled: true
+  blossom_servers: [https://blossom.day.ag]   # tried by sha256 if the message's url fails
+  dir: ~/.local/state/hermes-nostr-gateway/media
+  max_bytes: 26214400        # 25 MiB per blob
+  max_files: 4               # attachments per message; later ones are refused
+  max_cache_bytes: 536870912 # 512 MiB on disk, oldest blobs evicted first
+  timeout: 20                # seconds per HTTP request
+
 # Marmot: proxied to wn-agent, never reimplemented — MLS stays theirs (spec §16).
 # OPT-IN, and off by default on purpose. Hermes' own Marmot platform plugin reads the
 # same wn-agent socket; with both attached the agent receives every group message
