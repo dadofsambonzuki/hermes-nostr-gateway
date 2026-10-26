@@ -34,7 +34,7 @@ from hermes_nostr_gateway.server import SocketServer
 from hermes_nostr_gateway.store import Inbound, Store
 
 NOW = 1_800_000_000
-RELAY = "wss://relay.day.ag/chat"
+RELAY = "wss://relay.example.com/chat"
 OTHER = "wss://nos.lol"
 SENDER = "ab" * 32
 

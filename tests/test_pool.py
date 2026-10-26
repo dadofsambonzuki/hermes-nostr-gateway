@@ -310,7 +310,7 @@ def gateway_cfg(tmp_path, **extra):
     (tmp_path / "secret.json").write_text(json.dumps({"secret_key_hex": secret}))
     cfg = {
         "identity": {"secret_file": str(tmp_path / "secret.json")},
-        "relays": {"read": ["wss://relay.day.ag/chat"], "publish": ["wss://nos.lol"]},
+        "relays": {"read": ["wss://relay.example.com/chat"], "publish": ["wss://nos.lol"]},
         "store": str(tmp_path / "gw.db"),
         "groups": {}, "policies": [], "defaults": {},
     }
@@ -348,7 +348,7 @@ async def test_gateway_wires_the_pool_by_default_and_nak_children_only_on_the_fl
     assert gateway.pool is not None and not gateway.legacy_transport
     await gateway.start()
     try:
-        assert ("pool", "wss://relay.day.ag/chat") in built
+        assert ("pool", "wss://relay.example.com/chat") in built
         assert not any(name == "legacy" for name, _ in built)
         assert (await gateway.status())["transport"]["mode"] == "pool"
     finally:
@@ -360,7 +360,7 @@ async def test_gateway_wires_the_pool_by_default_and_nak_children_only_on_the_fl
     assert legacy.pool is None and legacy.legacy_transport
     await legacy.start()
     try:
-        assert ("legacy", "wss://relay.day.ag/chat") in built
+        assert ("legacy", "wss://relay.example.com/chat") in built
         assert (await legacy.status())["transport"]["mode"] == "legacy"
     finally:
         await legacy.stop()

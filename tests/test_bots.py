@@ -66,12 +66,12 @@ def test_bot_flag_is_none_when_the_profile_is_unreadable_or_not_a_profile():
     assert bot_flag({"kind": 0, "content": "{not json"}) is None
     assert bot_flag({"kind": 1, "content": json.dumps({"bot": True})}) is None
     assert bot_flag({"kind": 0, "content": json.dumps(["bot"])}) is None
-    assert bot_flag({"kind": 0, "content": json.dumps({"name": "Hal"})}) is None
+    assert bot_flag({"kind": 0, "content": json.dumps({"name": "peer-bot"})}) is None
 
 
 def test_profile_name_prefers_display_name():
-    event = {"kind": 0, "content": json.dumps({"display_name": "Hal", "name": "hal-bot"})}
-    assert profile_name(event) == "Hal"
+    event = {"kind": 0, "content": json.dumps({"display_name": "peer-bot", "name": "peer-bot"})}
+    assert profile_name(event) == "peer-bot"
     assert profile_name({"kind": 0, "content": "not json"}) is None
 
 
