@@ -353,8 +353,15 @@ rumor — one per file — and the message frame carries the same metadata:
                  "size":184320,"alt":"the garden","status":"available"}]}
 ```
 
-Nothing is downloaded on receipt, so a hostile sender cannot spend our bandwidth by sending
-a message. The adapter asks for the blob it wants:
+The gateway hands a message over with the sender's `imeta` claims attached and no bytes:
+nothing is downloaded on receipt, so a hostile sender cannot spend our bandwidth by sending
+a message. Delivery is where the agent's side joins in: the Hermes adapter calls
+`media.get` for every attachment on a message it is about to hand the agent — before the
+turn starts, because a turn that begins without the picture cannot go back for it — and
+puts the resulting file in Hermes' cache as `media_urls` / `media_types`. A refused
+attachment is named in the message text (`[attachment not delivered: <code>]`), never
+silently dropped. `NOSTR_MEDIA=0` turns the fetch off for a deployment that does not want
+attachments on disk — the message still arrives, noting `media_disabled`.
 
 ```json
 {"op":"media.get","sha256":"<64 hex>"}     // or {"url": "…"}, or {"rumor_id": "…"}

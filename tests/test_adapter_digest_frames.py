@@ -7,56 +7,13 @@ authorise. The live gateway log shows the result once per digest window —
 batch delivered. These tests pin the adapter's half of the fix: a digest is delivered into
 the owner's home session, and its content can never arrive as instructions.
 
-The adapter runs inside Hermes, so its ``gateway.*`` imports are not on this venv's path.
-Stub the three modules it needs before loading it: the digest path itself is stdlib-only.
+The adapter runs inside Hermes, so ``adapter_harness`` stubs its ``gateway.*`` imports.
 """
 import asyncio
-import importlib.util
-import sys
-import types
-from pathlib import Path
 
+from adapter_harness import Kw, load_adapter
 
-def _stub(name, **attrs):
-    module = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    sys.modules[name] = module
-
-
-class _SendResult:
-    def __init__(self, success=True, error=None, retryable=False, message_id=None, raw_response=None):
-        self.success = success
-        self.error = error
-        self.retryable = retryable
-        self.message_id = message_id
-        self.raw_response = raw_response
-
-
-class _Kw:
-    """Stand-in for SessionSource/MessageEvent: keyword attributes, nothing else."""
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class _MessageType:
-    TEXT = "text"
-
-
-_stub("gateway")
-_stub("gateway.config", Platform=object, PlatformConfig=object)
-_stub("gateway.platforms")
-_stub("gateway.platforms.base", BasePlatformAdapter=object, SendResult=_SendResult,
-      SessionSource=_Kw)
-_stub("gateway.platforms.event", MessageEvent=_Kw, MessageType=_MessageType)
-
-_spec = importlib.util.spec_from_file_location(
-    "nostr_adapter_digest",
-    Path(__file__).resolve().parents[1] / "integrations" / "hermes-plugin" / "adapter.py",
-)
-adapter = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(adapter)
+adapter = load_adapter("nostr_adapter_digest")
 
 OWNER = "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
 PEER = "ab" * 32  # a second agent, synthetic
@@ -139,7 +96,7 @@ def test_a_digest_frame_is_delivered_not_rejected(monkeypatch):
 def test_the_frames_own_sender_is_what_the_harness_rejects():
     """Guard against a vacuous test: the frame's literal sender fails the same gate."""
     frame = _digest_frame()
-    legacy = _Kw(source=_Kw(user_id=frame["sender"]))
+    legacy = Kw(source=Kw(user_id=frame["sender"]))
     assert not _harness_admits(legacy, {OWNER, PEER})
 
 

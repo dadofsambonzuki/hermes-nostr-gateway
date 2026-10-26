@@ -4,45 +4,13 @@ Two properties are load-bearing. An ack that fails may not tear down the reader 
 (that converts a transient socket error into a duplicate-delivery loop), and a replayed
 frame for a message Hermes already has must be acknowledged rather than answered again.
 
-The adapter runs inside Hermes, so its `gateway.*` imports are not on this venv's path;
-the stubs below are the same shape `test_adapter_control_filter.py` uses.
+The adapter runs inside Hermes, so ``adapter_harness`` stubs its ``gateway.*`` imports.
 """
-import importlib.util
-import sys
-import types
 from collections import deque
-from pathlib import Path
 
+from adapter_harness import load_adapter
 
-def _stub(name, **attrs):
-    module = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    sys.modules[name] = module
-
-
-class _Kw:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class _MessageType:
-    TEXT = "text"
-
-
-_stub("gateway")
-_stub("gateway.config", Platform=object, PlatformConfig=object)
-_stub("gateway.platforms")
-_stub("gateway.platforms.base", BasePlatformAdapter=object, SendResult=_Kw,
-      SessionSource=_Kw)
-_stub("gateway.platforms.event", MessageEvent=_Kw, MessageType=_MessageType)
-
-_spec = importlib.util.spec_from_file_location(
-    "nostr_adapter_delivery",
-    Path(__file__).resolve().parents[1] / "integrations" / "hermes-plugin" / "adapter.py",
-)
-adapter = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(adapter)
+adapter = load_adapter("nostr_adapter_delivery")
 
 
 def _bare_adapter():

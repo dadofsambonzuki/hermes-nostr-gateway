@@ -297,8 +297,14 @@ Written as a contract the daemon enforces, not advice for callers:
 2. map `message` / `reaction` frames to inbound events;
 3. `ack` once durably queued;
 4. `send` / `react` for replies, passing the peer npub and `reply_to` when threading;
-5. `media.get` only when the agent asks for the file;
+5. `media.get` for each attachment on a message it is about to hand the agent — before
+   `handle_message`, so the turn starts with the file on disk — and never for a `blocked`
+   frame or a digest batch;
 6. surface `blocked`/`delivery` frames as warnings, never as user-visible chat.
+
+A refusal is part of the contract, not an error to swallow: the adapter passes the code to
+the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
+attachment the agent cannot see must not read as a message that never had one.
 
 The adapter MUST NOT re-implement allowlisting, unwrapping, relay choice, retries or media
 fetching — if it needs to, the gateway is missing an operation.
