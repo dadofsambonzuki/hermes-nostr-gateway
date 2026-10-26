@@ -25,8 +25,9 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
       → PR nevent1qqsx2yvad6xl03pd7wkqqckm72x7saf6dc5t9dsuzh7trx4nqz8dxpspz3mhxue69uhhyetvv9ujumn8d96zuer9wcwc5egd (pr/drops-first-class)
 - [x] **P4 — Bot and echo policy** — kind-0 bot flag, reply cap, echo suppression. See plan P4.
       → PR nevent1qqsx0j9w954d6senywzyc37rkctq6xsgver40dn6rfk6ap9t4e4rk9spz3mhxue69uhhyetvv9ujumn8d96zuer9wc3nxmlv (pr/bot-echo-policy)
-- [ ] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
+- [x] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
       error string, one-call health. See plan P5.
+      → PR nevent1qqstypl33pqz702tt370hgqrymmwv84l96427qyuuqj2uyenxg4es5qpz3mhxue69uhhyetvv9ujumn8d96zuer9wc5c2ts7 (pr/truthful-status-health)
 - [ ] **P6 — Store off the loop** — WAL, batching, 500-event burst benchmark. See plan P6.
 - [ ] **P7 — Concord: real vector or explicitly experimental.** See plan P7.
 - [ ] **P8 — Security hardening** — SO_PEERCRED, LoadCredential, ops notes. See plan P8.
