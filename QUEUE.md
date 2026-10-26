@@ -21,7 +21,8 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
 - [x] **P2 — Publish through the bindings** — one signed event, per-relay send, same-event
       retry, no subprocess. See plan P2.
       → PR nevent1qqstfl2fujt8t3ftz4yzq2wnqasmnsp8f9w05n33kknknpz5d6nmtxcpz3mhxue69uhhyetvv9ujumn8d96zuer9wcljzvaw (pr/publish-bindings)
-- [ ] **P3 — Drops first-class** — `drops` op, TTL, status count. See plan P3.
+- [x] **P3 — Drops first-class** — `drops` op, TTL, status count. See plan P3.
+      → PR nevent1qqsx2yvad6xl03pd7wkqqckm72x7saf6dc5t9dsuzh7trx4nqz8dxpspz3mhxue69uhhyetvv9ujumn8d96zuer9wcwc5egd (pr/drops-first-class)
 - [ ] **P4 — Bot and echo policy** — kind-0 bot flag, reply cap, echo suppression. See plan P4.
 - [ ] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
       error string, one-call health. See plan P5.
