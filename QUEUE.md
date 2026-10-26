@@ -15,8 +15,9 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
       the plugin retires after a clean week. Enforce the double-delivery guard as a startup
       error. See plan P0.
       → PR nevent1qqs0848n23umnl6ryshelqnyhn9na7w9d58rwedgwz6hcgtuhtsrkggpz3mhxue69uhhyetvv9ujumn8d96zuer9wc78tts2 (pr/marmot-ownership)
-- [ ] **P1 — Read transport on nostr-sdk's relay pool** — replace per-relay `nak` children,
+- [x] **P1 — Read transport on nostr-sdk's relay pool** — replace per-relay `nak` children,
       in-process NIP-42, legacy path behind a flag. See plan P1.
+      → PR nevent1qqszukd2xa0mz8zjv3g6va5y7cq8f2qcwsxlqtc844tyf4dd6mfwkzqur5urm (pr/read-transport-pool)
 - [ ] **P2 — Publish through the bindings** — one signed event, per-relay send, same-event
       retry, no subprocess. See plan P2.
 - [ ] **P3 — Drops first-class** — `drops` op, TTL, status count. See plan P3.
