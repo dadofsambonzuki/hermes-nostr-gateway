@@ -2,7 +2,7 @@
 
 The old column was relay_stats.last_error: the last stderr line of a `nak` child. A
 healthy relay showed `connecting to nos.lol... ok.`, a gated one showed `authenticating
-to relay.day.ag/chat as …`, and a relay dropped from the config kept its row forever.
+to relay.example.com/chat as …`, and a relay dropped from the config kept its row forever.
 That is not a health verdict, and it once sent a person chasing a relay that was fine.
 
 These tests pin the replacement: a per-relay verdict from the running daemon's live
@@ -34,13 +34,13 @@ from hermes_nostr_gateway.health import (
 from hermes_nostr_gateway.store import Store
 
 NOW = 1_800_000_000
-RELAY = "wss://relay.day.ag/chat"
+RELAY = "wss://relay.example.com/chat"
 OTHER = "wss://nos.lol"
 REMOVED = "wss://relay.eu.whitenoise.chat"
 
 #: What a healthy relay's child prints, and what used to be shown as its "error".
-CONNECT_OK = "connecting to relay.day.ag... ok."
-AUTH_NOTICE = "authenticating to relay.day.ag/chat as 740fcd907b10beed…"
+CONNECT_OK = "connecting to relay.example.com... ok."
+AUTH_NOTICE = "authenticating to relay.example.com/chat as 740fcd907b10beed…"
 CONNECT_FAILED = "failed to connect to any of the given relays."
 
 
@@ -346,9 +346,9 @@ def test_status_json_carries_the_verdicts_and_the_stale_rows(tmp_path, capsys):
 def test_peer_inbox_additions_are_not_reported_as_config_drift():
     """A relay discovered from a peer's 10050 is an addition, not a stale config entry."""
     frame = {"workers": [
-        {"relay": "wss://relay.day.ag/chat", "purpose": "dm"},
+        {"relay": "wss://relay.example.com/chat", "purpose": "dm"},
         {"relay": "wss://relay.damus.io", "purpose": "peer-inbox"},
         {"relay": "wss://stale.example", "purpose": "dm"},
     ]}
-    extra = running_but_unconfigured(frame, {"wss://relay.day.ag/chat"})
+    extra = running_but_unconfigured(frame, {"wss://relay.example.com/chat"})
     assert extra == ["wss://stale.example"]

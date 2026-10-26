@@ -4,7 +4,7 @@ label: Nostr
 kind: platform
 version: 0.1.0
 description: Nostr DM platform adapter backed by the local Hermes Nostr Gateway socket
-author: day.ag
+author: Hermes Nostr Gateway contributors
 api_version: 1
 requires_env: []
 optional_env:

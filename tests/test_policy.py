@@ -3,17 +3,17 @@ import pytest
 from hermes_nostr_gateway.policy import Policy, parse_interval
 
 FAM = "npub1family"
-HAL = "npub1hal"
+PEER = "npub1peer"
 STRANGER = "npub1stranger"
 
 CONFIG = {
-    "groups": {"family": [FAM], "hal": [HAL]},
+    "groups": {"family": [FAM], "peers": [PEER]},
     "policies": [
         {"name": "family-mentions", "match": {"group": "family", "kinds": [1], "mention": True},
          "reach": "immediate", "authority": "instructions"},
         {"name": "any-mentions", "match": {"group": "any", "kinds": [1], "mention": True},
          "reach": "digest(15m)", "authority": "none"},
-        {"name": "hal-feed", "match": {"group": "hal", "kinds": [1]},
+        {"name": "peer-feed", "match": {"group": "peers", "kinds": [1]},
          "reach": "digest(60m)", "authority": "instructions"},
         {"name": "unknown-dms", "match": {"group": "unknown", "kinds": [1059], "dm": True},
          "reach": "digest(1h)", "authority": "none"},
@@ -54,7 +54,7 @@ def test_stranger_mention_digests_without_authority(policy):
 
 
 def test_named_group_feed_digests_with_authority(policy):
-    d = policy.decide(sender=HAL, kind=1, mention=False)
+    d = policy.decide(sender=PEER, kind=1, mention=False)
     assert (d.reach, d.interval_s, d.authority) == ("digest", 3600, "instructions")
 
 

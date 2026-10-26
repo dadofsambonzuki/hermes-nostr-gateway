@@ -1,6 +1,6 @@
 """Concord (Armada/Vector) private-stream reader for CORD-01/02/03/05.
 
-Restored from Hal's extraction (`pr/extract-bitfest-plugin`, review item in
+Restored from an earlier extraction (`pr/extract-adapter`, review item in
 QUEUE.md). It reads only: nothing here signs, publishes or joins; the write path
 is a separate module on purpose.
 

@@ -8,11 +8,11 @@ from hermes_nostr_gateway.store import Store
 
 ME = "aa" * 32
 FRIEND = "bb" * 32
-HAL = "cc" * 32
+PEER = "cc" * 32
 STRANGER = "dd" * 32
 
 CFG = {
-    "groups": {"friends": [FRIEND], "hal": [HAL]},
+    "groups": {"friends": [FRIEND], "peers": [PEER]},
     "policies": [
         {"name": "friend-mentions", "match": {"group": "friends", "kinds": [1], "mention": True},
          "reach": "immediate", "authority": "instructions"},
@@ -58,9 +58,9 @@ def test_plain_note_is_ignored_without_a_rule(store):
 
 
 def test_author_rule_matches(store):
-    p = plane(store, [FeedRule(name="hal-feed", authors={HAL})])
-    msg = p.handle("relay", note(HAL, "gm"))
-    assert msg and msg.why.endswith("feed:hal-feed")
+    p = plane(store, [FeedRule(name="peer-feed", authors={PEER})])
+    msg = p.handle("relay", note(PEER, "gm"))
+    assert msg and msg.why.endswith("feed:peer-feed")
 
 
 def test_keyword_rule_matches_case_insensitively(store):

@@ -82,20 +82,19 @@ burst.
 - Acceptance: p99 loop lag under 50 ms during a burst; no rows lost on kill -9 (WAL);
   a benchmark is committed so the claim is testable.
 
-## P7 — Concord: prove it or label it
+## P7 — Concord is a supported plane (corrected)
 
-No real Concord event has ever been parsed; every test uses our own fixtures. Obtain a real
-invite (or a recorded one from a client) and add it as a vector. If that cannot be obtained,
-mark the plane experimental in `README.md` and gate it behind `concord.enabled: false` by
-default, so nobody believes it is production-ready.
-
-- Acceptance: either a real-vector test passes, or the plane is explicitly labelled and off.
+An earlier draft called this plane experimental and proposed switching it off by default.
+That was wrong: Concord is in production on more than one deployment, so the plane stays
+attached and documented like any other. The only thing owed is accuracy in the docs — and,
+eventually, a recorded real invite as a test vector so the parser is exercised by something
+other than our own fixtures. That vector is a nice-to-have, not a gate.
 
 ## P8 — Security hardening
 
 - `SO_PEERCRED` on accept: the socket answers only the same uid.
 - Key via systemd `LoadCredential`, not `Environment` (out of `systemctl show` and child env).
-- `docs/ops-notes.md` updated with both.
+- the host's operating notes (kept outside this repo) updated with both.
 
 ## P9 — Attachments reach the agent
 
@@ -110,7 +109,7 @@ the blob and attach it to the `MessageEvent` so the agent sees the image, not a 
 - One PR per item, branch `pr/<slug>`, opened with `ngit pr create`; **no direct commits to
   master**, including from the cron worker.
 - The cron worker runs in its own worktree (`~/work/gateway-worker`), one item per run.
-- Merge only after Nathan confirms. A blocked item is marked BLOCKED in `QUEUE.md` with the
+- Merge only after the operator confirms. A blocked item is marked BLOCKED in `QUEUE.md` with the
   question, and a DM is sent; the worker moves on.
 
 ## Out of scope

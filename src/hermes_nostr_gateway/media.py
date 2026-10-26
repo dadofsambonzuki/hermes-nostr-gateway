@@ -51,8 +51,8 @@ DEFAULT_MAX_BYTES = 25 * MIB
 DEFAULT_MAX_FILES = 4
 DEFAULT_MAX_CACHE_BYTES = 512 * MIB
 DEFAULT_TIMEOUT = 20.0
-#: The day.ag haven serves Blossom on its own vhost; `relay.day.ag` path-routes it too.
-DEFAULT_SERVERS: tuple[str, ...] = ("https://blossom.day.ag",)
+#: A Blossom server is host-specific; configure it rather than baking one in. too.
+DEFAULT_SERVERS: tuple[str, ...] = ()
 #: Deliberately inside the directory the systemd unit can write
 #: (`ReadWritePaths=…/.local/state/hermes-nostr-gateway`); a cache under `share/` would
 #: be read-only at runtime on this host and fail only when the first blob is fetched.
@@ -114,7 +114,7 @@ def _seconds(raw: dict[str, Any], key: str, default: float) -> float:
 def media_config(raw: dict[str, Any] | None) -> MediaConfig:
     """Read `media`, loudly: a malformed cap is a config error, not a silent default.
 
-    Keys: `enabled` (true), `blossom_servers` ([blossom.day.ag]), `dir`
+    Keys: `enabled` (true), `blossom_servers` (configured), `dir`
     (~/.local/state/hermes-nostr-gateway/media), `max_bytes` (25 MiB),
     `max_files` (4), `max_cache_bytes` (512 MiB), `timeout` (20 s).
     """

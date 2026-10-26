@@ -26,7 +26,7 @@ Some prose about how the queue works.
       — landed abc1234: it works.
 - [ ] **Next thing** — do the next thing.
       Done when: it is done.
-- [ ] **Parked thing** — needs a choice from Nathan.
+- [ ] **Parked thing** — needs a choice from the operator.
       — BLOCKED: which way?
 
 Rules for the cron: never work one already marked BLOCKED.
@@ -52,7 +52,7 @@ def test_blocked_entry_is_skipped_but_still_counted():
 
 def test_a_fully_parked_queue_reads_as_one_idle_line():
     text = "- [ ] **Parked** — needs a decision.\n      — BLOCKED: which way?\n"
-    assert render(text) == "queue empty — 1 blocked, waiting on Nathan"
+    assert render(text) == "queue empty — 1 blocked, waiting on the operator"
     assert len(render(text).splitlines()) == 1
 
 

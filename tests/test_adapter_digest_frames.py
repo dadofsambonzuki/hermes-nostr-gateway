@@ -59,7 +59,7 @@ adapter = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(adapter)
 
 OWNER = "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
-HAL = "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+PEER = "ab" * 32  # a second agent, synthetic
 
 
 def _digest_frame(**overrides):
@@ -130,7 +130,7 @@ def test_a_digest_frame_is_delivered_not_rejected(monkeypatch):
 
     assert len(inst.delivered) == 1, "the harness must receive the batch, not drop it"
     event = inst.delivered[0]
-    assert _harness_admits(event, {OWNER, HAL})
+    assert _harness_admits(event, {OWNER, PEER})
     assert event.text == frame["content"]
     assert event.raw_message is frame
     assert inst.acked == [frame["id"]], "the batch is acked only after Hermes took it"
@@ -140,7 +140,7 @@ def test_the_frames_own_sender_is_what_the_harness_rejects():
     """Guard against a vacuous test: the frame's literal sender fails the same gate."""
     frame = _digest_frame()
     legacy = _Kw(source=_Kw(user_id=frame["sender"]))
-    assert not _harness_admits(legacy, {OWNER, HAL})
+    assert not _harness_admits(legacy, {OWNER, PEER})
 
 
 def test_digest_content_is_data_and_cannot_be_instructions(monkeypatch):

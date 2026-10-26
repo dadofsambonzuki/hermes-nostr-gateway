@@ -7,13 +7,13 @@ from hermes_nostr_gateway.policy import Policy
 from hermes_nostr_gateway.store import Store
 
 ME = "aa" * 32
-HAL = "bb" * 32
+PEER = "bb" * 32
 STRANGER = "cc" * 32
 
 CFG = {
-    "groups": {"hal": [HAL]},
+    "groups": {"peers": [PEER]},
     "policies": [
-        {"name": "hal-dms", "match": {"group": "hal", "dm": True}, "reach": "immediate",
+        {"name": "peer-dms", "match": {"group": "peers", "dm": True}, "reach": "immediate",
          "authority": "instructions"},
         {"name": "unknown-dms", "match": {"group": "unknown", "dm": True},
          "reach": "digest(1h)", "authority": "none"},
@@ -55,11 +55,11 @@ def build(store, rumors):
 
 
 def test_authorised_dm_becomes_an_immediate_message(store):
-    plane = build(store, {"w1": rumor("r1", HAL)})
+    plane = build(store, {"w1": rumor("r1", PEER)})
     msg = plane.handle("relay", wrap("w1"))
-    assert msg and msg.sender == HAL
+    assert msg and msg.sender == PEER
     assert (msg.reach, msg.authority) == ("immediate", "instructions")
-    assert msg.conversation == HAL
+    assert msg.conversation == PEER
 
 
 def test_stranger_dm_is_delivered_without_authority(store):
@@ -68,12 +68,12 @@ def test_stranger_dm_is_delivered_without_authority(store):
 
 
 def test_invite_is_not_a_message(store):
-    plane = build(store, {"w1": rumor("r1", HAL, kind=3313)})
+    plane = build(store, {"w1": rumor("r1", PEER, kind=3313)})
     assert plane.handle("relay", wrap("w1")) is None
 
 
 def test_unknown_inner_kind_is_dropped(store):
-    plane = build(store, {"w1": rumor("r1", HAL, kind=4242)})
+    plane = build(store, {"w1": rumor("r1", PEER, kind=4242)})
     assert plane.handle("relay", wrap("w1")) is None
 
 
@@ -83,18 +83,18 @@ def test_self_copy_is_ignored(store):
 
 
 def test_dm_for_someone_else_is_ignored(store):
-    plane = build(store, {"w1": rumor("r1", HAL, recipient=STRANGER)})
+    plane = build(store, {"w1": rumor("r1", PEER, recipient=STRANGER)})
     assert plane.handle("relay", wrap("w1")) is None
 
 
 def test_same_wrapper_is_processed_once(store):
-    plane = build(store, {"w1": rumor("r1", HAL)})
+    plane = build(store, {"w1": rumor("r1", PEER)})
     assert plane.handle("relay", wrap("w1")) is not None
     assert plane.handle("relay", wrap("w1")) is None
 
 
 def test_same_rumor_via_a_different_wrapper_is_deduped(store):
-    rumors = {"w1": rumor("r1", HAL), "w2": rumor("r1", HAL)}
+    rumors = {"w1": rumor("r1", PEER), "w2": rumor("r1", PEER)}
     plane = build(store, rumors)
     assert plane.handle("relay-a", wrap("w1")) is not None
     assert plane.handle("relay-b", wrap("w2")) is None  # same message, second relay
@@ -106,6 +106,6 @@ def test_unreadable_wrap_is_not_fatal(store):
 
 
 def test_reply_threading_is_preserved(store):
-    plane = build(store, {"w1": rumor("r1", HAL, eid="parent")})
+    plane = build(store, {"w1": rumor("r1", PEER, eid="parent")})
     msg = plane.handle("relay", wrap("w1"))
     assert msg.reply_to == "parent"

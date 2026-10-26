@@ -1,6 +1,6 @@
 """Concord write path (CORD-01/02/03): Channel and Guestbook publishes.
 
-Restored from Hal's extraction (`pr/extract-bitfest-plugin`, QUEUE.md). The
+Restored from an earlier extraction (`pr/extract-adapter`, QUEUE.md). The
 identity is passed in as `nostr_sdk.Keys` instead of being read from the
 environment inside each build function (spec §18 review item 2). The reader
 stays read-only; everything that signs lives here.

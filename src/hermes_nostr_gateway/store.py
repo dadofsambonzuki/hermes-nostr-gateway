@@ -2,7 +2,7 @@
 
 Dedupe keys on the *rumor* id, not the wrapper: the same message arrives once per relay
 with a different wrapper id each time, so wrapper-level dedupe misses duplicates across
-relays (Hal's finding, spec §14).
+relays (spec §14).
 
 v1 is one identity per process. ``rumors`` therefore carries no identity column; the
 ``delivery_cursor`` row is keyed by the local npub so digest tables remain ready for a
