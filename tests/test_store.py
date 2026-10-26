@@ -160,3 +160,74 @@ def test_skip_pending_records_a_handover(tmp_path):
         # A handover answers the backlog, not the future.
         _immediate(s, "after")
         assert [r["id"] for r in s.pending_immediate()] == ["after"]
+
+
+def test_retry_ttl_expires_old_wraps_and_leaves_fresh_ones_retryable(tmp_path):
+    """Age bounds a dead relay's backlog; a row that keeps failing cannot renew itself."""
+    from hermes_nostr_gateway.store import Store
+
+    now = 1_800_000_000
+    day = 24 * 3600
+    with Store(tmp_path / "wraps.db") as s:
+        stale = {"id": "aa" * 32, "kind": 1059}
+        fresh = {"id": "bb" * 32, "kind": 1059}
+        never_tried = {"id": "cc" * 32, "kind": 1059}
+        delivered = {"id": "dd" * 32, "kind": 1059}
+        s.record_wrap(stale, "r1", "ee" * 32, ["wss://down.example"], now=now - 25 * 3600)
+        s.record_wrap(fresh, "r2", "ee" * 32, ["wss://down.example"], now=now - 3600)
+        s.record_wrap(never_tried, "r3", "ee" * 32, ["wss://down.example"], now=now - 25 * 3600)
+        s.record_wrap(delivered, "r4", "ee" * 32, ["wss://ok.example"], now=now - 25 * 3600)
+        s.mark_wrap(stale["id"], "wss://down.example", ok=False, error="connection refused")
+        s.mark_wrap(fresh["id"], "wss://down.example", ok=False, error="503")
+        s.mark_wrap(delivered["id"], "wss://ok.example", ok=True)
+
+        assert s.expire_wraps(day, now=now) == 2
+        rows = {row["id"]: row for row in s.db.execute("SELECT * FROM outbound_wraps")}
+        assert rows[stale["id"]]["status"] == "expired"
+        assert rows[stale["id"]]["last_error"] == "connection refused", \
+            "the real failure is part of the record"
+        assert rows[never_tried["id"]]["status"] == "expired"
+        assert rows[never_tried["id"]]["last_error"] == "retry TTL exceeded"
+        assert rows[fresh["id"]]["status"] == "failed", "a fresh row must stay retryable"
+        assert rows[delivered["id"]]["status"] == "sent", "a delivered wrap is not expirable"
+
+        assert [row["id"] for row in s.pending_wraps()] == [fresh["id"]]
+        assert s.wrap_counts() == {"expired": 2, "failed": 1, "sent": 1}
+
+        # Expiry is not re-applied to rows already expired.
+        assert s.expire_wraps(day, now=now) == 0
+
+
+def test_live_wrap_table_gains_created_at_dated_by_last_attempt(tmp_path):
+    """A DB from before the TTL migrates; old failures must not look brand new."""
+    import sqlite3
+    import time
+
+    from hermes_nostr_gateway.store import Store
+
+    path = tmp_path / "old-wraps.db"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE outbound_wraps (id TEXT NOT NULL, relay TEXT NOT NULL,"
+        " event TEXT NOT NULL, rumor_id TEXT NOT NULL, recipient TEXT NOT NULL,"
+        " status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,"
+        " last_error TEXT, last_attempt INTEGER, PRIMARY KEY (id, relay))"
+    )
+    attempted = int(time.time()) - 30 * 86400
+    old.execute(
+        "INSERT INTO outbound_wraps (id, relay, event, rumor_id, recipient, status,"
+        " attempts, last_attempt) VALUES ('aa', 'wss://down.example', '{}', 'r', 'e',"
+        " 'failed', 2, ?)",
+        (attempted,),
+    )
+    old.execute(
+        "INSERT INTO outbound_wraps (id, relay, event, rumor_id, recipient)"
+        " VALUES ('bb', 'wss://down.example', '{}', 'r', 'e')"
+    )
+    old.commit()
+    old.close()
+
+    with Store(path) as s:
+        rows = {row["id"]: row for row in s.db.execute("SELECT * FROM outbound_wraps")}
+        assert rows["aa"]["created_at"] == attempted, "the last attempt is the only age known"
+        assert rows["bb"]["created_at"] > attempted, "an undated pending row stays retryable"

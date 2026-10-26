@@ -190,6 +190,14 @@ class Gateway:
         replay = cfg.get("replay") or {}
         self.replay_limit = int(replay.get("limit", 20))
         self.replay_max_age_minutes = int(replay.get("max_age_minutes", 120))
+        # Retry TTL: age bounds a dead relay's backlog, not the per-row attempt cap —
+        # that only helps rows that get a turn. Expired rows are kept (not deleted) so
+        # an operator can still see what was given up on.
+        retry = cfg.get("retry") or {}
+        ttl_hours = float(retry.get("ttl_hours", 24))
+        if ttl_hours <= 0:
+            raise ValueError("retry.ttl_hours must be positive")
+        self.retry_ttl_seconds = int(ttl_hours * 3600)
         self.server = SocketServer(self.socket_path, self)
         self.workers: list[RelayWorker] = []
         self._tasks: list[asyncio.Task] = []
@@ -654,6 +662,12 @@ class Gateway:
 
     async def retry_failed(self) -> int:
         import json as _json
+        # Expire first: a row past the TTL must not spend a publish attempt, and a
+        # backlog of them must not sit in `pending_wraps` for days.
+        expired = self.store.expire_wraps(self.retry_ttl_seconds)
+        if expired:
+            log.info("expired %d wrap(s) older than the retry TTL (%gh)",
+                     expired, self.retry_ttl_seconds / 3600)
         # Retry a few at a time: a burst of replays trips our own relay's connection
         # limiter and turns one failure into a hundred.
         pending = self.store.pending_wraps()[:5]
@@ -739,6 +753,8 @@ class Gateway:
             "replay": {"limit": self.replay_limit,
                        "max_age_minutes": self.replay_max_age_minutes,
                        "floor": self.store.replay_floor()},
+            "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
+                      "wraps": self.store.wrap_counts()},
             "relay_stats": stats["relays"],
             # Instrument the plane rather than inferring it from `ps`: a worker that
             # reconnects every 60s and one that died at startup look identical from

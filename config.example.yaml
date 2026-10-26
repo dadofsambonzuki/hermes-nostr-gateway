@@ -86,6 +86,14 @@ replay:
   limit: 20
   max_age_minutes: 120
 
+# Outbound retry. A wrap that failed at one relay is republished from storage as the
+# same signed event (never re-wrapped) in small batches. Age, not attempts, bounds the
+# backlog: a row still failing after `ttl_hours` is marked `expired` and never tried
+# again, so one dead relay cannot keep the queue churning for days. Expired rows stay
+# in the table, and `hng status` reports wrap counts by status.
+retry:
+  ttl_hours: 24
+
 groups:
   family: []
   team: []

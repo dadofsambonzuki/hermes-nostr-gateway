@@ -281,6 +281,7 @@ def cmd_status(args) -> int:
             "blocked": stats["blocked"],
             "invites": stats["invites"],
             "media": stats.get("media") or {},
+            "wraps": store.wrap_counts(),
             "relays": [verdict.as_dict() for verdict in verdicts],
             "not_in_config": stale,
         }, indent=2))
@@ -294,6 +295,9 @@ def cmd_status(args) -> int:
     media = stats.get("media") or {}
     print(f"media:    {media.get('attachments', 0)} attachment(s), "
           f"{media.get('cached', 0)} cached")
+    wraps = store.wrap_counts()
+    print(f"retry:    {wraps.get('pending', 0) + wraps.get('failed', 0)} wrap(s) retryable, "
+          f"{wraps.get('expired', 0)} expired, {wraps.get('sent', 0)} sent")
     if frame is None:
         print(f"daemon:   not running ({socket_path}: {problem})")
         print("relays:   (no live worker state; the daemon answers this question)")

@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS outbound_wraps (
     event       TEXT NOT NULL,
     rumor_id    TEXT NOT NULL,
     recipient   TEXT NOT NULL,
+    -- When the wrap was first offered to this relay. The retry TTL is measured from
+    -- here, not from `last_attempt`: a row that keeps failing must not renew its own
+    -- lease and churn for ever.
+    created_at  INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'pending',
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT,
@@ -219,6 +223,20 @@ class Store:
             if name not in cols:
                 self.db.execute(f"ALTER TABLE rumors ADD COLUMN {name} {kind}")
 
+        wrap_cols = {row["name"] for row in self.db.execute("PRAGMA table_info(outbound_wraps)")}
+        if "created_at" not in wrap_cols:
+            self.db.execute(
+                "ALTER TABLE outbound_wraps ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
+            )
+        # A row from before the TTL has no creation time. Its last attempt is the
+        # closest age we have for a failed row; a row never attempted gets `now`, which
+        # keeps it retryable rather than expiring history we cannot date.
+        self.db.execute(
+            "UPDATE outbound_wraps SET created_at = COALESCE(last_attempt, ?)"
+            " WHERE created_at = 0",
+            (int(time.time()),),
+        )
+
         self.db.execute(
             "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
         )
@@ -274,12 +292,14 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- outbound wraps (retry uses the same signed event) ---------------
-    def record_wrap(self, event: dict, rumor_id: str, recipient: str, relays: list[str]) -> None:
+    def record_wrap(self, event: dict, rumor_id: str, recipient: str, relays: list[str],
+                    *, now: int | None = None) -> None:
+        stamp = int(time.time()) if now is None else int(now)
         for relay in relays:
             self.db.execute(
-                "INSERT INTO outbound_wraps (id, relay, event, rumor_id, recipient) "
-                "VALUES (?,?,?,?,?) ON CONFLICT(id, relay) DO NOTHING",
-                (event["id"], relay, json.dumps(event), rumor_id, recipient),
+                "INSERT INTO outbound_wraps (id, relay, event, rumor_id, recipient, created_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(id, relay) DO NOTHING",
+                (event["id"], relay, json.dumps(event), rumor_id, recipient, stamp),
             )
 
     def mark_wrap(self, wrap_id: str, relay: str, *, ok: bool, error: str | None = None) -> None:
@@ -289,10 +309,34 @@ class Store:
             ("sent" if ok else "failed", int(time.time()), error, wrap_id, relay),
         )
 
+    def expire_wraps(self, ttl_seconds: int, *, now: int | None = None) -> int:
+        """Mark retryable wraps older than the TTL `expired`.
+
+        The attempt cap alone does not bound a backlog: it only helps a row that gets a
+        turn, and five rows a pass is days of churn for thousands of dead-relay rows.
+        Age is measured from the first attempt, so retrying a row cannot renew it. Sent
+        rows are already done and are left alone.
+        """
+        cutoff = (int(time.time()) if now is None else int(now)) - int(ttl_seconds)
+        cur = self.db.execute(
+            "UPDATE outbound_wraps SET status = 'expired',"
+            " last_error = COALESCE(last_error, 'retry TTL exceeded')"
+            " WHERE status IN ('pending', 'failed') AND created_at < ?",
+            (cutoff,),
+        )
+        return cur.rowcount
+
+    def wrap_counts(self) -> dict[str, int]:
+        """Outbound-wrap rows per status, so `status` can show what was given up on."""
+        rows = self.db.execute(
+            "SELECT status, COUNT(*) AS n FROM outbound_wraps GROUP BY status"
+        ).fetchall()
+        return {str(row["status"]): int(row["n"]) for row in rows}
+
     def pending_wraps(self, max_attempts: int = 6) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT * FROM outbound_wraps WHERE status != 'sent' AND attempts < ? "
-            "ORDER BY attempts, last_attempt IS NULL DESC",
+            "SELECT * FROM outbound_wraps WHERE status IN ('pending', 'failed')"
+            " AND attempts < ? ORDER BY attempts, last_attempt IS NULL DESC",
             (max_attempts,),
         ).fetchall()
         return [dict(r) for r in rows]

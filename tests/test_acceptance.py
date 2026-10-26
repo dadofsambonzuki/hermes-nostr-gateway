@@ -167,3 +167,55 @@ async def test_flooding_sender_degrades_to_blocked_not_a_message(tmp_path, monke
         await writer.wait_closed()
     finally:
         await gw.stop()
+
+
+async def test_retry_pass_expires_a_wrap_past_the_ttl_without_republishing(
+        tmp_path, monkeypatch):
+    """Spec's outbox: failures retry, but a dead relay's backlog must age out."""
+    from hermes_nostr_gateway import gateway as gateway_mod
+
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    sender = sdk.Keys.generate()
+    cfg = config_for(tmp_path, sender.public_key().to_hex())
+    cfg["retry"] = {"ttl_hours": 24}
+    gw = Gateway(cfg, socket_path=tmp_path / "gateway.sock")
+    relay = "wss://down.example"
+    now = int(time.time())
+    stale = {"id": "e" * 64, "kind": 1059}
+    fresh = {"id": "f" * 64, "kind": 1059}
+
+    published: list[str] = []
+
+    def fake_publish(event, relays, secret=None):
+        published.append(event["id"])
+        return {url: (True, None) for url in relays}
+
+    monkeypatch.setattr(gateway_mod, "publish", fake_publish)
+    try:
+        gw.store.record_wrap(stale, "rumor-1", "aa" * 32, [relay], now=now - 25 * 3600)
+        gw.store.mark_wrap(stale["id"], relay, ok=False, error="connection refused")
+        gw.store.record_wrap(fresh, "rumor-2", "aa" * 32, [relay], now=now)
+        gw.store.mark_wrap(fresh["id"], relay, ok=False, error="503")
+
+        assert gw.retry_ttl_seconds == 24 * 3600
+        assert await gw.retry_failed() == 1
+
+        assert published == [fresh["id"]], "an expired wrap must not be republished"
+        rows = {row["id"]: row for row in gw.store.db.execute("SELECT * FROM outbound_wraps")}
+        assert rows[stale["id"]]["status"] == "expired"
+        assert rows[fresh["id"]]["status"] == "sent"
+        assert gw.store.wrap_counts() == {"expired": 1, "sent": 1}
+    finally:
+        gw.store.close()
+
+
+def test_a_retry_ttl_must_be_positive(tmp_path, monkeypatch):
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    cfg = config_for(tmp_path, sdk.Keys.generate().public_key().to_hex())
+    cfg["retry"] = {"ttl_hours": 0}
+    try:
+        Gateway(cfg, socket_path=tmp_path / "gateway.sock")
+    except ValueError as exc:
+        assert "retry.ttl_hours" in str(exc)
+    else:
+        raise AssertionError("a zero retry TTL would expire every wrap at birth")
