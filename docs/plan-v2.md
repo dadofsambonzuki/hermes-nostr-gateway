@@ -82,14 +82,13 @@ burst.
 - Acceptance: p99 loop lag under 50 ms during a burst; no rows lost on kill -9 (WAL);
   a benchmark is committed so the claim is testable.
 
-## P7 — Concord: prove it or label it
+## P7 — Concord is a supported plane (corrected)
 
-No real Concord event has ever been parsed; every test uses our own fixtures. Obtain a real
-invite (or a recorded one from a client) and add it as a vector. If that cannot be obtained,
-mark the plane experimental in `README.md` and gate it behind `concord.enabled: false` by
-default, so nobody believes it is production-ready.
-
-- Acceptance: either a real-vector test passes, or the plane is explicitly labelled and off.
+An earlier draft called this plane experimental and proposed switching it off by default.
+That was wrong: Concord is in production across this host and Bitfest, so the plane stays
+attached and documented like any other. The only thing owed is accuracy in the docs — and,
+eventually, a recorded real invite as a test vector so the parser is exercised by something
+other than our own fixtures. That vector is a nice-to-have, not a gate.
 
 ## P8 — Security hardening
 

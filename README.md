@@ -184,6 +184,18 @@ resolver that quietly swaps in the PyPI release of the same version fails a name
 instead of Concord at runtime. The repository's canonical home is Nostr, so there is no
 `.github/workflows` copy for a mirror to drift from.
 
+## Concord
+
+Concord is a serverless, end-to-end encrypted community protocol: no server, no moderator
+daemon, membership is keyed and a channel is a stream of sealed envelopes. The gateway treats
+it as one more plane. An invite arrives inside a kind-1059 wrap whose inner kind is `3313`, is
+recorded in `concord_invites`, and never surfaces as a message; channel traffic is decrypted
+with the stream key derived from the NIP-44 v2 conversation key (`nip44_v2_conversation_key`).
+
+It is in production use, not experimental: this host and the Bitfest host (Hal) run the same
+protocol against the same relays. `status`, the startup log and `hng status` report it as one
+of the attached planes like any other.
+
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's
