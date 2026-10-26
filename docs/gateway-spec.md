@@ -212,7 +212,7 @@ contributors need one toolchain rather than two. `pynostr` (0.7.0, one wheel, un
 not a candidate.
 
 The one deliberate exception to "official": the installed 0.45.1 binding is our fork build that
-exposes `nip44_conversation_key` (Concord derives stream keys from it). `requirements.txt` pins
+exposes `nip44_v2_conversation_key` (Concord derives stream keys from it). `requirements.txt` pins
 it by URL and hash — see README, "The patched `nostr-sdk` wheel".
 
 Consequence for the seed: the BitFest plugin is Python, so §18 is a **Python extraction, not a
@@ -220,7 +220,7 @@ port**. Anything in this table that reads Rust-is, read it as "the binding does 
 
 | Concern | Choice |
 |---|---|
-| Relays, signing, NIP-44/59, NIP-42, subscriptions | `nostr-sdk` 0.45.1 (official rust-nostr bindings, patched for `nip44_conversation_key`) |
+| Relays, signing, NIP-44/59, NIP-42, subscriptions | `nostr-sdk` 0.45.1 (official rust-nostr bindings, upstream `nip44_v2_conversation_key`) |
 | Runtime | `asyncio`; `asyncio.start_unix_server` for the socket |
 | Storage | `sqlite3` (stdlib), WAL, one writer task — no ORM |
 | Socket codec | `json` stdlib, newline framing (NDJSON) |

@@ -39,7 +39,7 @@ COPY src ./src
 # version into a build failure instead of a runtime Concord error.
 RUN python -m pip install --no-cache-dir -r requirements.txt \
  && python -m pip install --no-cache-dir '.' \
- && python -c "import nostr_sdk as sdk; assert callable(getattr(sdk, 'nip44_conversation_key', None)), 'the PyPI nostr-sdk is installed: nip44_conversation_key missing'"
+ && python -c "import nostr_sdk as sdk; assert callable(getattr(sdk, 'nip44_v2_conversation_key', None)), 'the PyPI nostr-sdk is installed: nip44_v2_conversation_key missing'"
 
 COPY config.example.yaml /etc/hermes-nostr-gateway/config.example.yaml
 

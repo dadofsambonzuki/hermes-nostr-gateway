@@ -3,11 +3,11 @@
 The HKDF chain is Concord's own protocol — CORD fixes the salt, label and counter
 layout — but every curve operation comes from rust-nostr: the stream public key is
 derived by the binding, and the NIP-44 conversation key is
-`sdk.nip44_conversation_key(secret, public)`. Concord's "conversation key" is the
+`sdk.nip44_v2_conversation_key(secret, public)`. Concord's "conversation key" is the
 self-ECDH of the derived stream keypair, so no elliptic-curve maths lives here.
 
 The released 0.45.1 wheel does not expose that call. A wheel without it is a hard
-error (see `crypto.nip44_conversation_key`), never a reason to reimplement ECDH.
+error (see `crypto.nip44_v2_conversation_key`), never a reason to reimplement ECDH.
 """
 
 from __future__ import annotations
@@ -88,5 +88,5 @@ def group_key(label: str, secret: bytes, id32: bytes, epoch: Optional[int]) -> G
     sk = scalar_normalize(secret, label, id32, epoch)
     sk_hex = f"{sk:064x}"
     pk = crypto.pubkey_from_secret(sk_hex)
-    conv_key = crypto.nip44_conversation_key(sk_hex, pk)
+    conv_key = crypto.nip44_v2_conversation_key(sk_hex, pk)
     return GroupKey(sk=sk, pk=pk, conv_key=conv_key)

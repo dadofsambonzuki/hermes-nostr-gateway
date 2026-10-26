@@ -53,15 +53,15 @@ def make_invite(owner: sdk.Keys, *, channel_id: str | None = None,
 
 
 def test_conversation_key_matches_the_nip44_vector():
-    derived = crypto.nip44_conversation_key(NIP44_VECTOR["sec1"], NIP44_VECTOR["pub2"])
+    derived = crypto.nip44_v2_conversation_key(NIP44_VECTOR["sec1"], NIP44_VECTOR["pub2"])
     assert derived.hex() == NIP44_VECTOR["conversation_key"]
     assert len(derived) == 32
 
 
 def test_conversation_key_is_symmetric():
     one, two = sdk.Keys.generate(), sdk.Keys.generate()
-    a = crypto.nip44_conversation_key(one.secret_key().to_hex(), two.public_key().to_hex())
-    b = crypto.nip44_conversation_key(two.secret_key().to_hex(), one.public_key().to_hex())
+    a = crypto.nip44_v2_conversation_key(one.secret_key().to_hex(), two.public_key().to_hex())
+    b = crypto.nip44_v2_conversation_key(two.secret_key().to_hex(), one.public_key().to_hex())
     assert a == b
 
 

@@ -10,10 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  # Patched build, not the PyPI release — see README, "The patched nostr-sdk wheel".
+  # Built from upstream nostr-sdk-ffi 0f230cb, not the PyPI release — see README.
   # `nostr-sdk==0.45.1` would install the release wheel on a clean venv and leave the
-  # Concord plane without nip44_conversation_key.
-  "nostr-sdk @ https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl",
+  # Concord plane without nip44_v2_conversation_key. Keep this URL identical to
+  # requirements.txt; tests/test_wheel_pin.py fails if they drift.
+  "nostr-sdk @ https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44v2/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl",
   "websockets>=12",
   "PyYAML>=6.0",
   "pydantic>=2.6",

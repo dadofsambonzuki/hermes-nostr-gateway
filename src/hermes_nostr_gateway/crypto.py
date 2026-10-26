@@ -141,20 +141,22 @@ def _secret_key(hex_secret: str) -> sdk.SecretKey:
     return sdk.SecretKey.parse(parse_secret(hex_secret))
 
 
-def nip44_conversation_key(secret_hex: str, peer_hex: str) -> bytes:
+def nip44_v2_conversation_key(secret_hex: str, peer_hex: str) -> bytes:
     """NIP-44 v2 conversation key for *any* pair, derived by the binding.
 
     Concord derives its stream keys from this value, so it has to come from
     `nostr-sdk` rather than a local ECDH: an unreviewed second implementation of
-    the curve maths is exactly what this project refuses to ship. The released
-    0.45.1 wheel does not expose the call, so an unpatched wheel fails loudly here
-    instead of silently falling back.
+    the curve maths is exactly what this project refuses to ship. The function is
+    upstream now (`nip44_v2_conversation_key`, merged in nostrdevkit/nostr-sdk-ffi
+    #96), so anything older than that build fails loudly here instead of silently
+    falling back.
     """
-    derive = getattr(sdk, "nip44_conversation_key", None)
+    derive = getattr(sdk, "nip44_v2_conversation_key", None)
     if derive is None:
         raise CryptoError(
-            "this nostr-sdk wheel does not expose nip44_conversation_key — the Concord "
-            "plane needs the patched wheel (see README); do not derive ECDH locally")
+            "this nostr-sdk build does not expose nip44_v2_conversation_key "
+            "(upstream in nostrdevkit/nostr-sdk-ffi #96); install the pinned wheel "
+            "rather than deriving ECDH locally")
     try:
         return bytes(derive(_secret_key(secret_hex),
                             sdk.PublicKey.parse(normalize_pubkey(peer_hex))))

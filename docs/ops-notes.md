@@ -48,7 +48,7 @@ agent talks NDJSON over a Unix socket.
   re-created by hand. Record that here rather than assuming the repo is the whole unit.
 - **The wheel is pinned for a reason.** A reinstall must use `requirements.txt` /
   `pyproject.toml`; a plain `pip install nostr-sdk` resolves the PyPI 0.45.1 and silently
-  drops `nip44_conversation_key`, after which the first Concord derivation raises
+  drops `nip44_v2_conversation_key`, after which the first Concord derivation raises
   `CryptoError` naming the patched wheel.
 
 Day-to-day:

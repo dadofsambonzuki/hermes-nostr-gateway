@@ -110,27 +110,28 @@ Tests and lint need no relay and no secret:
 .venv/bin/ruff check src tests scripts
 ```
 
-### The patched `nostr-sdk` wheel
+### The `nostr-sdk` build
 
-`requirements.txt` and `pyproject.toml` install `nostr-sdk` from a patched build, never from
-PyPI. Concord derives its stream keys from the NIP-44 v2 conversation key, and the released
-bindings do not expose `nip44_conversation_key` — a 16-line addition to
-`src/protocol/nips/nip44.rs`:
+Concord derives its stream keys from the NIP-44 v2 conversation key. That function is now
+**upstream**: `nip44_v2_conversation_key`, merged in
+[`nostrdevkit/nostr-sdk-ffi#96`](https://github.com/nostrdevkit/nostr-sdk-ffi/pull/96) at
+`0f230cb` (the maintainer renamed it from the name it was proposed under). We consume that
+build and carry **no local patch**: if the installed bindings lack the function, the first
+Concord derivation raises `CryptoError` naming the required build rather than deriving ECDH
+locally.
 
 | | |
 |---|---|
-| Fork | [`dadofsambonzuki/nostr-sdk-ffi`](https://github.com/dadofsambonzuki/nostr-sdk-ffi), branch `feat/nip44-conversation-key` |
-| Source commit | `eddb08d` — *feat(python): expose NIP-44 conversation key* |
-| Upstream PR | [`nostrdevkit/nostr-sdk-ffi#96`](https://github.com/nostrdevkit/nostr-sdk-ffi/pull/96) |
-| Wheel | `https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl` |
-| sha256 | `2a728769109d4d2f42cf3de37c591e2f24487471f0e5971ddefa5b638d261de6` (mirrored content-addressed at `relay.day.ag/2a7287…whl`) |
+| Function | `nip44_v2_conversation_key(secret_key, public_key) -> bytes` |
+| Upstream | `nostr-sdk-ffi` `0f230cb`, PR #96, merged 26 Oct 2026 |
+| Wheel | https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44v2/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl |
+| sha256 | d8fb8b5d5bd087976f4b888f192543c871e6ca455a3f839625c403dd5bba9626 |
+| Mirror | `relay.day.ag` (content-addressed) |
 
-The version number is unchanged (0.45.1), so `pip install nostr-sdk` or an install that resolves
-the dependency by name *succeeds* and quietly swaps in the release wheel. That is why the
-dependency is a direct URL with a hash: a clean venv cannot silently lose the patch. The failure
-is not silent at runtime either — the first Concord derivation raises `CryptoError` naming the
-patched wheel, and `tests/test_concord.py` checks the derivation against a NIP-44 vector. If you
-rebuild from the fork branch, update the URL and the hash in `requirements.txt` together.
+The version number stays `0.45.1`, so `pip install nostr-sdk` or a resolver that installs the
+dependency by name *succeeds* and quietly swaps in the PyPI release. That is why the
+dependency is a direct URL with a hash: a clean venv cannot silently lose the function. If you
+rebuild, update the URL and the hash in `requirements.txt` together.
 
 ## Container
 
@@ -179,7 +180,7 @@ ruff check src tests scripts
 
 `.ngit/act/workflows/test.yml` runs both on every push to `master` and every Nostr pull
 request through the ngit-ci coordinator. It installs `requirements.txt` first and then
-asserts that the installed `nostr-sdk` really exposes `nip44_conversation_key`, so a
+asserts that the installed `nostr-sdk` really exposes `nip44_v2_conversation_key`, so a
 resolver that quietly swaps in the PyPI release of the same version fails a named step
 instead of Concord at runtime. The repository's canonical home is Nostr, so there is no
 `.github/workflows` copy for a mirror to drift from.
