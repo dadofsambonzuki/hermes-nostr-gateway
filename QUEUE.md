@@ -7,7 +7,7 @@ One item per run. Each item is a **scoped PR**, never a commit to master:
 
 The 20-minute worker takes the first unchecked item, implements it, runs the full suite,
 pushes the branch, opens the PR, then ticks the box with the PR id. If it needs a decision,
-mark it BLOCKED with the question and DM Nathan; move to the next item.
+mark it BLOCKED with the question and DM the operator; move to the next item.
 
 Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
 

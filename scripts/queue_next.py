@@ -119,7 +119,7 @@ def render(text: str, *, now: float | None = None, mtime: float | None = None) -
     blocked = len(unchecked) - len(actionable)
     if not actionable:
         if blocked:
-            return f"queue empty — {blocked} blocked, waiting on Nathan"
+            return f"queue empty — {blocked} blocked, waiting on the operator"
         return EMPTY_LINE
     lines = [
         f"next: {actionable[0].title}",

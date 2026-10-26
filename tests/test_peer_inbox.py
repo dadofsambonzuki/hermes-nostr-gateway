@@ -1,7 +1,7 @@
 """Read coverage for the people we talk to: their 10050 inboxes, bounded.
 
 Spec §3 treats relay coverage as a correctness property. A fixed `relays.read` misses
-a peer who publishes only into their own inbox relays — that is how Nathan's
+a peer who publishes only into their own inbox relays — that is how a peer's
 `auth.nostr1.com` and `nip17.com` were missed until they were added by hand. These
 tests pin the replacement behaviour:
 
@@ -124,7 +124,7 @@ async def wait_for(predicate, timeout: float = 3.0) -> None:
 
 def test_additions_are_deduplicated_against_the_read_set():
     assert inbox_additions(
-        base=["wss://relay.day.ag/chat", "wss://nos.lol"],
+        base=["wss://relay.example.com/chat", "wss://nos.lol"],
         candidates=["wss://NOS.lol/", "wss://peer.example", "wss://peer.example/"],
         cap=4,
     ) == ["wss://peer.example"]
@@ -254,7 +254,7 @@ def test_nak_resolver_authenticates_with_our_identity_when_it_has_the_secret(mon
 
     monkeypatch.setattr(peer_mod.subprocess, "run", fake_run)
     secret = "00" * 32
-    resolver = NakInboxResolver(["wss://relay.day.ag/chat"], secret=secret, nak="nak")
+    resolver = NakInboxResolver(["wss://relay.example.com/chat"], secret=secret, nak="nak")
 
     assert resolver.inbox_relays(PEER) == []
     assert "--auth" in seen["argv"]
@@ -270,20 +270,20 @@ async def test_peer_inbox_relays_join_the_dm_read_set_with_one_worker_each(
         PEER: ["wss://peer-one.example", "wss://peer-two.example"],
         PEER2: ["wss://peer-two.example/"],
     })
-    cfg = gateway_config(tmp_path, read=["wss://relay.day.ag/chat"],
-                         groups={"family": [PEER], "hal": [PEER2]})
+    cfg = gateway_config(tmp_path, read=["wss://relay.example.com/chat"],
+                         groups={"family": [PEER], "peers": [PEER2]})
     gw = build_gateway(monkeypatch, tmp_path, cfg, resolver=resolver)
 
     await gw.start()
     try:
         await wait_for(lambda: len(gw.peer_relays) == 2)
-        assert gw.relays_configured == ["wss://relay.day.ag/chat"]
-        assert gw.relays_read == ["wss://relay.day.ag/chat", "wss://peer-one.example",
+        assert gw.relays_configured == ["wss://relay.example.com/chat"]
+        assert gw.relays_read == ["wss://relay.example.com/chat", "wss://peer-one.example",
                                   "wss://peer-two.example"]
         # One DM worker per addition, no feed or mention subscription: the cap is the
         # connection bound, not three times it.
         assert [(w["relay"], w["kinds"], w["purpose"]) for w in built] == [
-            ("wss://relay.day.ag/chat", (1059, 4), "dm"),
+            ("wss://relay.example.com/chat", (1059, 4), "dm"),
             ("wss://peer-one.example", (1059, 4), "peer-inbox"),
             ("wss://peer-two.example", (1059, 4), "peer-inbox"),
         ]

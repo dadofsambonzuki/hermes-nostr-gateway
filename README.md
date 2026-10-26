@@ -35,15 +35,15 @@ has to know which protocol a message arrived on. When it is finished, this is wh
   `wn-agent` remains the transport underneath either way.
 
 The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md); host-side operations
-are in [`docs/ops-notes.md`](docs/ops-notes.md). Where the current build differs from this
+are kept with the host's own infrastructure documentation rather than in this repository.
+Where the current build differs from this
 target is tracked in [`QUEUE.md`](QUEUE.md), not here — a README that doubles as a progress log
 goes stale between commits.
 
 ## Pieces
 
-- **Operating notes** — [`docs/ops-notes.md`](docs/ops-notes.md): the service, its socket and the
-  host-side gates (`relay.day.ag`'s web-of-trust depth and rate limits) that explain its
-  refusals. Mirrored for the host at `~/Projects/infra/ops/hermes-nostr-gateway.md`.
+- **Host notes** — the service unit, its socket and the relay gates that explain refusals are
+  host-specific: they live with the host's infrastructure documentation, not here.
 - **Conformance probes** — `scripts/probe_nip17_conformance.py` executes the NIP-17 traps this
   design has to respect: a wrap's `p` tag is the recipient identity key, wraps are backdated up
   to two days against a three-day read window, the watermark belongs on the inner rumor, NIP-42
@@ -54,7 +54,7 @@ goes stale between commits.
   in step with the live copy under `~/.hermes/plugins/nostr/`.
 - **Queue gate** — `scripts/queue_next.py` and `deploy/queue-gate.sh`: the cron queue worker's
   monitor source, so an idle tick costs no agent run (see "Working the queue" below).
-- **Prior art** — [`docs/prior-art/`](docs/prior-art/) holds the handover this design leans on.
+- **Prior art** — `wn-agent`/mdk and Armada, credited below.
 
 ## Working the queue
 
@@ -123,7 +123,7 @@ bindings do not expose `nip44_conversation_key` — a 16-line addition to
 | Source commit | `eddb08d` — *feat(python): expose NIP-44 conversation key* |
 | Upstream PR | [`nostrdevkit/nostr-sdk-ffi#96`](https://github.com/nostrdevkit/nostr-sdk-ffi/pull/96) |
 | Wheel | `https://github.com/dadofsambonzuki/nostr-sdk-ffi/releases/download/wheel-0.45.1-nip44/nostr_sdk-0.45.1-cp39-abi3-linux_x86_64.whl` |
-| sha256 | `2a728769109d4d2f42cf3de37c591e2f24487471f0e5971ddefa5b638d261de6` (mirrored content-addressed at `relay.day.ag/2a7287…whl`) |
+| sha256 | `2a728769109d4d2f42cf3de37c591e2f24487471f0e5971ddefa5b638d261de6` |
 
 The version number is unchanged (0.45.1), so `pip install nostr-sdk` or an install that resolves
 the dependency by name *succeeds* and quietly swaps in the release wheel. That is why the
@@ -153,8 +153,8 @@ socket: /var/lib/hermes-nostr-gateway/gateway.sock
 media:
   dir: /var/lib/hermes-nostr-gateway/media     # on the state volume, not the layer
 relays:
-  read: [wss://relay.day.ag/chat, wss://nos.lol]
-  publish: [wss://relay.day.ag/chat, wss://nos.lol]
+  read: [wss://relay.example.com/chat, wss://nos.lol]
+  publish: [wss://relay.example.com/chat, wss://nos.lol]
 YAML
 
 docker run -d --name hermes-nostr-gateway --restart unless-stopped \
@@ -192,8 +192,8 @@ it as one more plane. An invite arrives inside a kind-1059 wrap whose inner kind
 recorded in `concord_invites`, and never surfaces as a message; channel traffic is decrypted
 with the stream key derived from the NIP-44 v2 conversation key (`nip44_v2_conversation_key`).
 
-It is in production use, not experimental: this host and the Bitfest host (Hal) run the same
-protocol against the same relays. `status`, the startup log and `hng status` report it as one
+It is in production use, not experimental: it runs wherever this gateway runs, against the
+same relays as every other plane. `status`, the startup log and `hng status` report it as one
 of the attached planes like any other.
 
 ## Relays and kinds
@@ -223,7 +223,7 @@ relays:
     enabled: true          # the gate; on by default because coverage is correctness
     max_extra: 4           # hard cap on relays added, for the process lifetime
     refresh_minutes: 60    # 0 = resolve once at startup
-    # lookup: [wss://relay.day.ag/chat, wss://nos.lol]   # default: first 4 of read + publish
+    # lookup: [wss://relay.example.com/chat, wss://nos.lol]   # default: first 4 of read + publish
 ```
 
 The bounds matter as much as the lookup:
@@ -326,7 +326,7 @@ a message. The adapter asks for the blob it wants:
 ```
 
 `path` is a 0600 file in the cache (default `~/.local/state/hermes-nostr-gateway/media`,
-which is inside the systemd unit's writable path — see `docs/ops-notes.md`); the bytes are
+which is inside the service unit's writable path); the bytes are
 verified against `sha256` before the file is written, and a second call returns
 `cached: true` without a request. `hng media <sha256|url>` takes the same path from a shell.
 
@@ -389,8 +389,6 @@ agent runtime (Hermes plugin)
 - **Marmot / `wn-agent`** (`github.com/marmot-protocol/mdk`) — the agent-connector shape this
   follows, and the Marmot plane itself.
 - **Armada** (soapbox.pub) — reference client for NIP-17 and Concord.
-- **Hal**, the BitFest bot (`npub19etsn3sn…`) — the relay-coverage finding and testing discipline
-  in [`docs/prior-art/hal-whitenoise-dm-handover.md`](docs/prior-art/hal-whitenoise-dm-handover.md).
 - The NIP authors, obviously.
 
 ## Licence

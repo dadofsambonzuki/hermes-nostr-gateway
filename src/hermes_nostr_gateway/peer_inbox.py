@@ -3,8 +3,8 @@
 Spec §3 makes relay coverage a correctness property. A fixed `relays.read` covers our own
 inbox and the app-relay defaults, but a NIP-17 sender publishes to the *recipient's*
 kind-10050 relays: a peer whose 10050 names relays we do not read is invisible, and the
-miss is silent. That is measured, not theoretical — Nathan's 10050 is
-`auth.nostr1.com`, `relay.day.ag/chat`, `nip17.com`, and the first and last had to be
+miss is silent. That is measured, not theoretical — a real 10050 can be
+on three different relays, and two of them had to be
 added to the read list by hand.
 
 So the read set is not fixed any more: the inbox relays of every pubkey named in
@@ -254,7 +254,7 @@ class NakInboxResolver:
         self.limit = limit
         self.timeout = timeout
         # Authenticate as our identity where the lookup relay wants NIP-42. Without
-        # this `relay.day.ag/chat` answers "restricted" and a 10050 held only there
+        # one relay answers "restricted" while a 10050 held only there
         # would be missed.
         self.secret = secret
         self.nak = nak or shutil.which("nak") or "nak"

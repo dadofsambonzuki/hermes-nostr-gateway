@@ -106,7 +106,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         self._connected = asyncio.Event()
         # Destinations this adapter has actually heard from. A reply may go to one of
         # these (or the configured home channel) and nowhere else: a notice that falls
-        # back to "whatever peer Hermes last spoke to" is how the Hal echo loop started.
+        # back to "whatever peer Hermes last spoke to" is how a two-agent echo loop starts.
         self._peers: set[str] = set()
         # Ids already handed to the agent. A replayed frame (ack failed, or the gateway
         # restarted) must be acknowledged again, never answered twice — the gateway's

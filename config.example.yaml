@@ -10,8 +10,8 @@ relays:
   # An entry is a URL, or {url, kinds} when that relay's filter must be narrower than
   # subscription when it appears in the same REQ — its wraps would go with it.
   read:
-    - wss://relay.day.ag/chat
-    - wss://relay.day.ag/inbox
+    - wss://relay.example.com/chat
+    - wss://relay.example.com/inbox
     - wss://nos.lol
     - wss://relay.primal.net
     - wss://relay.ditto.pub
@@ -25,10 +25,10 @@ relays:
     enabled: true            # the gate; on by default because coverage is correctness
     max_extra: 4             # hard cap, deduplicated against relays.read
     refresh_minutes: 60      # 0 = resolve once at startup
-    # lookup: [wss://relay.day.ag/chat, wss://nos.lol]   # default: first 4 of read+publish
+    # lookup: [wss://relay.example.com/chat, wss://nos.lol]   # default: first 4 of read+publish
   # Publish set is a floor; the recipient's 10050 relays are added per message.
   publish:
-    - wss://relay.day.ag/chat
+    - wss://relay.example.com/chat
     - wss://nos.lol
     - wss://relay.primal.net
 
@@ -46,10 +46,10 @@ store: ~/.local/state/hermes-nostr-gateway/gateway.db
 # are enforced before the request (a declared size over the cap) and while reading the
 # body (a server that omits or lies about Content-Length).
 # The cache directory must be writable by the unit: this one is inside the sandbox's
-# ReadWritePaths (see docs/ops-notes.md).
+# ReadWritePaths in the service unit.
 media:
   enabled: true
-  blossom_servers: [https://blossom.day.ag]   # tried by sha256 if the message's url fails
+  blossom_servers: [https://blossom.example.com]  # tried by sha256 if the message's url fails
   dir: ~/.local/state/hermes-nostr-gateway/media
   max_bytes: 26214400        # 25 MiB per blob
   max_files: 4               # attachments per message; later ones are refused
@@ -97,7 +97,7 @@ retry:
 groups:
   family: []
   team: []
-  hal: ["npub19etsn3snus0mgps7jhw6dn0cf57haxedeuqqk6n6duewuz2j02lq6pm7ry"]
+  peer: ["npub1examplepeernpub000000000000000000000000000000000000000000000"]
 
 policies:
   - name: family-dms
@@ -108,8 +108,8 @@ policies:
     match: {group: family, kinds: [1], mention: true}
     reach: immediate
     authority: instructions
-  - name: hal-dms
-    match: {group: hal, kinds: [14, 1059], dm: true}
+  - name: peer-dms
+    match: {group: peer, kinds: [14, 1059], dm: true}
     reach: immediate
     authority: instructions
   # Marmot application messages are inner kind 9; a group is not a DM, so match on kind.

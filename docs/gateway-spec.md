@@ -1,7 +1,7 @@
 # hermes-nostr-gateway — planes, socket API and trust model (v2)
 
 Status: **approved for build** — v2 2026-10-23: planes and attention policy added, seed code
-identified. Repo: `nostr://npub1cn67…/relay.ngit.dev/hermes-nostr-gateway`. Supersedes the phase-0
+identified. Canonical home: this repository, published over NIP-34. Supersedes the phase-0
 wrapper as the design target; that wrapper is now retired (`nip17_wrapper.py` deleted — `hng
 send` / `hng listen` and the daemon cover it), and its four traps are encoded in §4 and §7 and
 checked executably by `scripts/probe_nip17_conformance.py`.
@@ -57,7 +57,7 @@ expected.
 ## 3. Relay policy
 
 - **Read** hinges on the identity's `kind 10050` (DM relay list) **and the sender's app-relay set**.
-  Measured on BitFest (Hal, 23 Oct): 2 of 4 real DMs existed *only* on `relay.ditto.pub`,
+  Measured over four real DMs (Oct 2026): 2 of 4 existed *only* on `relay.ditto.pub`,
   `relay.dreamith.to` and `relay.eu.whitenoise.chat` — none of which the adapter read — so they
   were missed with no error and no log line. Stream `{kinds:[1059], "#p":[me], since: now-3d,
   until: now+5m}` over 10050 **plus** the app-relay defaults (ditto, dreamith, eu/us
@@ -77,7 +77,7 @@ expected.
   wrapper's.
 - **Write** uses the *recipient's* 10050 when known (cache it; refresh on miss), else the
   identity's own 10050, else `default_write_relays` from config. Never fan out to a long tail.
-- **NIP-42**: relays that require auth (our own `relay.day.ag/chat` and `/inbox`) must be
+- **NIP-42**: relays that gate reads on web-of-trust (a self-hosted relay typically does) must be
   authenticated as the identity before publish or stream. Auth failure on one relay is a
   per-relay failure, not a send failure.
 - **Success = at least one relay accepted**, reported per relay. Bursts can trip a relay's
@@ -113,7 +113,7 @@ forwarding). One tag per attachment:
  "size <bytes>", "dim <WxH>", "alt <description>"]
 ```
 
-- **Outbound:** bytes go to Blossom first (`blossom_servers`, default the day.ag haven); the
+- **Outbound:** bytes go to Blossom first (`blossom_servers`, default: the configured server); the
   response is verified (sha256 + size match what was uploaded), then the rumor is built with
   the returned URL. Caps: 25 MB per file, 4 files per message, MIME allowlist (`image/*`,
   `audio/*`, `video/mp4`, `application/pdf`, `text/plain`). Refuse **before** uploading, so a
@@ -215,7 +215,7 @@ The one deliberate exception to "official": the installed 0.45.1 binding is our 
 exposes `nip44_conversation_key` (Concord derives stream keys from it). `requirements.txt` pins
 it by URL and hash — see README, "The patched `nostr-sdk` wheel".
 
-Consequence for the seed: the BitFest plugin is Python, so §18 is a **Python extraction, not a
+Consequence for the seed: the reference plugin is Python, so §18 is a **Python extraction, not a
 port**. Anything in this table that reads Rust-is, read it as "the binding does this for us".
 
 | Concern | Choice |
@@ -307,7 +307,7 @@ fetching — if it needs to, the gateway is missing an operation.
 
 | # | Decision | Outcome |
 |---|---|---|
-| A | Key ownership | **Share Holly's npub with wn-agent**, disjoint-kind table enforced at startup |
+| A | Key ownership | **Share the agent's key with wn-agent**, disjoint-kind table enforced at startup |
 | B | Language | **Python on `nostr-sdk` bindings** (decided; §8) |
 | C | NIP-04 in v1 | **Yes**, same process, allowlist-gated |
 | D | Allowlist authority | **Gateway-side**, mirrored read-only in the adapter |
@@ -324,7 +324,7 @@ fetching — if it needs to, the gateway is missing an operation.
 4. Re-publish the same wrap → no second row, no second frame.
 5. A wrap stamped 47 h ago → accepted; 4 days old → rejected `stale_or_future`.
 6. Kill a relay mid-send → `relays_failed` names it, outbox retries, success on ≥1 relay.
-7. Publish through an auth-required relay (`relay.day.ag/chat`) → NIP-42 then success.
+7. Publish through an auth-required relay (`relay.example.com/chat`) → NIP-42 then success.
 8. 11 messages from one sender inside a minute → 10 delivered, 11th `rate_limited`.
 9. Self-copy round trip → own sent message appears in `history`.
 10. `kill -9` after insert, before ack → consumer replays from `acked+1`, no loss, no duplicate.
@@ -340,10 +340,9 @@ fetching — if it needs to, the gateway is missing an operation.
 
 ---
 
-## 14. Live-testing corrections (Hal, BitFest, 23 Oct 2026)
+## 14. Live-testing corrections (Oct 2026)
 
-Measured against real relays while debugging Armada→bot DMs; full note in
-`docs/prior-art/hal-whitenoise-dm-handover.md`.
+Measured against real relays while debugging client-to-bot DMs.
 
 1. **Dedupe on the inner rumor, not the wrapper.** The same message arrives once per relay
    with a *different* wrapper id each time, so wrapper-level dedupe cannot work across relays.
@@ -381,13 +380,9 @@ Measured against real relays while debugging Armada→bot DMs; full note in
   proxies it rather than reimplementing MLS.
 - **Armada** (`soapbox.pub`) — reference client for NIP-17 DMs and Concord; its DM planes
   (`nip17`, `nip04`) and `imeta` handling informed §4b.
-- **Hal, the BitFest bot** (`npub19etsn3sn…`) — the live-testing corrections in §14 and the
-  relay-coverage finding in §3.
-- **BitFest's existing Hermes `nostr` plugin** (`~/.hermes/plugins/nostr` on bitfest.uk: 
-  `adapter.py`, `nostr_crypto.py`, `concord_write.py`, ~1,419 lines, with a `platforms/nostr/
-  seen-ids.json` state file). This is prior art of our own and the intended **seed** for the
-  daemon: lift the crypto and Concord write paths out of the adapter rather than rewrite them.
-  Ownership/licence to be confirmed before it goes into a public repo.
+- **Existing platform adapters for Hermes** — a working `nostr` adapter (crypto, Concord write
+  path, seen-ids state) is the intended **seed** for the daemon: lift those paths out rather
+  than rewrite them. Any third-party code is used only with compatible licensing.
 
 ---
 
@@ -436,11 +431,11 @@ lists of npubs in config. Rules are ordered, first match wins, and anything unma
 groups:
   family: [npub1cn67…, npub1jwh6…]
   team:   [npub1…]
-  hal:    [npub19etsn3sn…]
+  peer:   [npub1example…]
 policies:
   - match: {group: family, kinds: [1], mention: true}    -> {reach: immediate, authority: instructions}
   - match: {group: any,    kinds: [1], mention: true}    -> {reach: digest(15m), authority: none}
-  - match: {group: hal,    kinds: [1]}                   -> {reach: digest(60m), authority: instructions}
+  - match: {group: peer,   kinds: [1]}                   -> {reach: digest(60m), authority: instructions}
   - match: {group: unknown, kinds: [4, 1059]}            -> {reach: digest(60m), authority: none}
 defaults: {reach: digest(15m), authority: none, quota: 60/h}
 ```
@@ -462,7 +457,7 @@ Rules:
 
 ---
 
-## 18. Seed from the BitFest plugin
+## 18. Seed from an existing adapter
 
 The extraction target, in review order:
 
@@ -477,6 +472,6 @@ The extraction target, in review order:
 4. `~/.hermes/platforms/nostr/seen-ids.json` → seed data for `wraps_seen`, migrated once at first
    start, then owned by SQLite.
 
-The PR is Hal's (authorship stays with him); it lands on a `pr/extract-biffest-plugin` branch and
+Authorship stays with the contributor; it lands on an extraction branch and
 is reviewed against the checklist in §10 plus: no key material in logs, no network writes outside
 configured relays, no `eval`/`exec`/shell, dependencies pinned.

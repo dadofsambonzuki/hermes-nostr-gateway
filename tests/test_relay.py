@@ -117,11 +117,11 @@ def test_default_dm_subscription_asks_for_wraps_and_legacy_dms():
 
 def test_config_pins_a_narrower_kind_set_per_relay():
     cfg = {"relays": {"read": [
-        "wss://relay.day.ag/chat",
+        "wss://relay.example.com/chat",
         {"url": "wss://relay.eu.whitenoise.chat", "kinds": [1059]},
     ]}}
     urls, kinds = relay_read_plan(cfg)
-    assert urls == ["wss://relay.day.ag/chat", "wss://relay.eu.whitenoise.chat"]
+    assert urls == ["wss://relay.example.com/chat", "wss://relay.eu.whitenoise.chat"]
     assert kinds == {"wss://relay.eu.whitenoise.chat": (1059,)}
 
 
@@ -133,11 +133,11 @@ def test_read_entry_without_a_url_is_an_error_not_a_silent_skip():
 
 
 @pytest.mark.parametrize("relay,expected", [
-    ("wss://relay.day.ag/chat", True),
-    ("wss://relay.day.ag/chat/", True),
+    ("wss://relay.example.com/chat", True),
+    ("wss://relay.example.com/chat/", True),
     ("wss://relay.eu.whitenoise.chat", True),
     ("wss://nos.lol", False),
-    ("wss://relay.day.ag/inbox", False),
+    ("wss://relay.example.com/inbox", False),
 ])
 def test_which_relays_carry_no_public_feeds(relay, expected):
     assert restricted_relay(relay) is expected
@@ -252,9 +252,9 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
     (tmp_path / "secret.json").write_text(json.dumps({"secret_key_hex": secret}))
     cfg = {
         "identity": {"secret_file": str(tmp_path / "secret.json")},
-        "relays": {"read": ["wss://relay.day.ag/chat",
+        "relays": {"read": ["wss://relay.example.com/chat",
                             {"url": "wss://relay.eu.whitenoise.chat", "kinds": [1059]}],
-                   "publish": ["wss://relay.day.ag/chat"]},
+                   "publish": ["wss://relay.example.com/chat"]},
         "store": str(tmp_path / "gw.db"),
         "groups": {}, "policies": [], "defaults": {},
     }
@@ -284,7 +284,7 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
     gateway = Gateway(cfg, socket_path=tmp_path / "gw.sock")
     await gateway.start()
     try:
-        assert built == [("wss://relay.day.ag/chat", (1059, 4)),
+        assert built == [("wss://relay.example.com/chat", (1059, 4)),
                          ("wss://relay.eu.whitenoise.chat", (1059,))]
     finally:
         await gateway.stop()
@@ -296,11 +296,11 @@ async def test_worker_records_connect_auth_and_event_times_while_the_child_runs(
     """The facts a verdict needs must exist *during* the run, not only after it dies."""
     delivered = event_id()
     install_fake_nak(monkeypatch, [{
-        "stderr": "connecting to relay.day.ag... ok.\n"
-                  "authenticating to relay.day.ag/chat as 740fcd907b10beed…",
+        "stderr": "connecting to relay.example.com... ok.\n"
+                  "authenticating to relay.example.com/chat as 740fcd907b10beed…",
         "lines": [(json.dumps(delivered) + "\n").encode()],
     }])
-    worker = RelayWorker("wss://relay.day.ag/chat", ME, kinds=(1059,), secret="00" * 32)
+    worker = RelayWorker("wss://relay.example.com/chat", ME, kinds=(1059,), secret="00" * 32)
 
     def handler(_relay: str, _event: dict) -> None:
         worker.stop()
