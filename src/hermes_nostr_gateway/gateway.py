@@ -33,6 +33,7 @@ from .planes.marmot import (
 from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
+from .pool import PoolWorker, RelayPool
 from .publisher import publish
 from .relay import RelayWorker
 from .server import SocketServer
@@ -199,9 +200,33 @@ class Gateway:
             raise ValueError("retry.ttl_hours must be positive")
         self.retry_ttl_seconds = int(ttl_hours * 3600)
         self.server = SocketServer(self.socket_path, self)
-        self.workers: list[RelayWorker] = []
+        self.workers: list[Any] = []
+        # Read transport (plan P1): one `nostr-sdk` client, one subscription per filter
+        # set, NIP-42 answered in-process. `transport.legacy: true` keeps the per-relay
+        # `nak req --stream` children for one release, so a relay that behaves
+        # differently can be compared side by side; it is the rollback.
+        self.legacy_transport = bool((cfg.get("transport") or {}).get("legacy", False))
+        self.pool: RelayPool | None = None
+        if not self.legacy_transport:
+            self.pool = RelayPool(self._secret, on_refusal=self._note_refusal)
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
+
+    def _new_worker(self, relay: str, *, kinds: tuple[int, ...],
+                    p_tag: str | None = None, authors: tuple[str, ...] = (),
+                    purpose: str = "dm") -> Any:
+        """Build a read worker on whichever transport is configured.
+
+        Both classes expose the same counters and `live_state()`, which is what `status`,
+        `health` and `_guarded` consume — so the rest of the gateway does not branch.
+        """
+        if self.pool is not None:
+            return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
+                              authors=authors, purpose=purpose,
+                              on_refusal=self._note_refusal)
+        return RelayWorker(relay, self.me, kinds=kinds, p_tag=p_tag, authors=authors,
+                           secret=self._secret, purpose=purpose,
+                           on_refusal=self._note_refusal)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -258,21 +283,18 @@ class Gateway:
             # Per relay, not per gateway: a relay that refuses one kind closes the
             # whole REQ, so `kinds` is config-pinnable and then negotiated at runtime.
             kinds = self.relay_kinds.get(relay) or DM_KINDS
-            worker = RelayWorker(relay, self.me, kinds=kinds, p_tag=self.me,
-                                 secret=self._secret, on_refusal=self._note_refusal)
+            worker = self._new_worker(relay, kinds=kinds, p_tag=self.me)
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker)))
             # Feeds: kind 1 from people WE FOLLOW, never the global firehose.
             authors = tuple(sorted(set(self.follows) | set(self.nip01.authors)))
             if authors and not restricted:
-                feed = RelayWorker(relay, self.me, kinds=(1,), authors=authors,
-                                   secret=self._secret, purpose="feed")
+                feed = self._new_worker(relay, kinds=(1,), authors=authors, purpose="feed")
                 self.workers.append(feed)
                 self._tasks.append(asyncio.create_task(self._guarded(feed)))
             # Mentions of us by strangers: a small #p filter, separate from follows.
             if not restricted:
-                mentions = RelayWorker(relay, self.me, kinds=(1,), p_tag=self.me,
-                                       secret=self._secret, purpose="mentions")
+                mentions = self._new_worker(relay, kinds=(1,), p_tag=self.me, purpose="mentions")
                 self.workers.append(mentions)
                 self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
@@ -351,9 +373,9 @@ class Gateway:
         mentions). A peer's inbox is a DM path only, so `max_extra` is the real bound
         on new connections rather than three times it.
         """
-        worker = RelayWorker(relay, self.me, kinds=self.relay_kinds.get(relay) or DM_KINDS,
-                             p_tag=self.me, secret=self._secret,
-                             on_refusal=self._note_refusal, purpose="peer-inbox")
+        worker = self._new_worker(relay,
+                                  kinds=self.relay_kinds.get(relay) or DM_KINDS,
+                                  p_tag=self.me, purpose="peer-inbox")
         self.relays_read.append(relay)
         self.peer_relays.append(relay)
         self.workers.append(worker)
@@ -454,6 +476,8 @@ class Gateway:
                 asyncio.gather(*self._tasks, return_exceptions=True), 6)
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("workers did not unwind in 6s; stopping anyway")
+        if self.pool is not None:
+            await self.pool.stop()
         await self.server.stop()
         self.store.close()
 
@@ -754,6 +778,12 @@ class Gateway:
             "replay": {"limit": self.replay_limit,
                        "max_age_minutes": self.replay_max_age_minutes,
                        "floor": self.store.replay_floor()},
+            # Which read transport is running, and what it is doing: `legacy` names the
+            # subprocess path so a status read cannot be mistaken for the pool.
+            "transport": (self.pool.stats() if self.pool is not None
+                          else {"mode": "legacy", "subscriptions": len(self.workers),
+                                "events": sum(getattr(w, "events", 0)
+                                              for w in self.workers)}),
             "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
                       "wraps": self.store.wrap_counts()},
             "relay_stats": stats["relays"],

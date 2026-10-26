@@ -38,7 +38,7 @@ PEER2 = "c" * 64
 # -- fixtures and fakes -----------------------------------------------------
 
 def gateway_config(tmp_path, *, read=(), publish=(), groups=None, peer_inbox=None,
-                   whitenoise=None) -> dict:
+                   whitenoise=None, transport=None) -> dict:
     secret_file = tmp_path / "secret.json"
     secret_file.write_text(
         json.dumps({"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()})
@@ -56,6 +56,8 @@ def gateway_config(tmp_path, *, read=(), publish=(), groups=None, peer_inbox=Non
         "defaults": {},
         "marmot": {"enabled": False},
     }
+    if transport is not None:
+        cfg["transport"] = transport
     if whitenoise:
         cfg["whitenoise"] = list(whitenoise)
     return cfg
@@ -84,11 +86,17 @@ class FakeResolver:
 
 
 def install_recording_worker(monkeypatch) -> list[dict]:
-    """Replace RelayWorker with a recorder, so wiring is testable without nak."""
+    """Replace both worker classes with a recorder, so wiring is testable without I/O.
+
+    The gateway builds `PoolWorker` by default and `RelayWorker` under
+    `transport.legacy`, and the recorder has to accept either constructor:
+    `PoolWorker(pool, relay, me, …)` or `RelayWorker(relay, me, …)`.
+    """
     built: list[dict] = []
 
     class RecordingWorker:
-        def __init__(self, relay, me, **kwargs):
+        def __init__(self, *args, **kwargs):
+            relay = next(arg for arg in args if str(arg).startswith("wss://"))
             self.relay = relay
             self.kinds = kwargs.get("kinds", ())
             self.requested_kinds = self.kinds
@@ -107,6 +115,7 @@ def install_recording_worker(monkeypatch) -> list[dict]:
         def stop(self):
             self._stop.set()
 
+    monkeypatch.setattr(gateway_mod, "PoolWorker", RecordingWorker)
     monkeypatch.setattr(gateway_mod, "RelayWorker", RecordingWorker)
     return built
 
@@ -482,13 +491,15 @@ def asked_kinds(argv: list[str]) -> list[int]:
 
 
 async def test_a_peer_relay_that_refuses_kind_4_keeps_reading_wraps(monkeypatch, tmp_path):
+    """The subprocess path still negotiates kinds; the pool covers the same rule."""
     peer = "wss://peer-inbox.example"
     calls = install_fake_nak(monkeypatch, [
         {"stderr": "CLOSED: filter validation failed: kind not allowed: 4"},
         {"stderr": "connecting... ok."},
     ])
     resolver = FakeResolver({PEER: [peer]})
-    cfg = gateway_config(tmp_path, groups={"family": [PEER]})
+    cfg = gateway_config(tmp_path, groups={"family": [PEER]},
+                         transport={"legacy": True})
     gw = build_gateway(monkeypatch, tmp_path, cfg, resolver=resolver)
 
     await gw.start()
@@ -513,7 +524,8 @@ async def test_a_peer_relay_that_refuses_every_kind_is_not_resubscribed(monkeypa
         {"stderr": "must never be spawned"},
     ])
     resolver = FakeResolver({PEER: [peer]})
-    cfg = gateway_config(tmp_path, groups={"family": [PEER]})
+    cfg = gateway_config(tmp_path, groups={"family": [PEER]},
+                         transport={"legacy": True})
     gw = build_gateway(monkeypatch, tmp_path, cfg, resolver=resolver)
 
     await gw.start()

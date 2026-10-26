@@ -247,7 +247,8 @@ def test_refusal_is_recorded_where_hng_status_reads_it(tmp_path):
 
 # -- wiring ----------------------------------------------------------------
 
-async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
+@pytest.mark.parametrize("transport", ["pool", "legacy"])
+async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch, transport):
     secret = sdk.Keys.generate().secret_key().to_hex()
     (tmp_path / "secret.json").write_text(json.dumps({"secret_key_hex": secret}))
     cfg = {
@@ -257,6 +258,7 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
                    "publish": ["wss://relay.day.ag/chat"]},
         "store": str(tmp_path / "gw.db"),
         "groups": {}, "policies": [], "defaults": {},
+        "transport": {"legacy": transport == "legacy"},
     }
     monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
     # Keep the test off the live wn-agent socket: this is about relay wiring.
@@ -265,7 +267,12 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
     built: list[tuple[str, tuple[int, ...]]] = []
 
     class FakeWorker:
-        def __init__(self, relay, me, **kwargs):
+        """Accepts both constructors: PoolWorker(pool, relay, …) and RelayWorker(relay, …)."""
+
+        def __init__(self, *args, **kwargs):
+            # PoolWorker(pool, relay, …) vs RelayWorker(relay, me, …): the relay is the
+            # first argument that is a URL.
+            relay = next(arg for arg in args if str(arg).startswith("wss://"))
             built.append((relay, kwargs["kinds"]))
             self.relay, self.events, self.last_error = relay, 0, None
             self.kinds = kwargs.get("kinds", ())
@@ -279,6 +286,7 @@ async def test_gateway_gives_each_relay_its_own_kind_set(tmp_path, monkeypatch):
         def stop(self):
             self._stop.set()
 
+    monkeypatch.setattr(gateway_mod, "PoolWorker", FakeWorker)
     monkeypatch.setattr(gateway_mod, "RelayWorker", FakeWorker)
 
     gateway = Gateway(cfg, socket_path=tmp_path / "gw.sock")
