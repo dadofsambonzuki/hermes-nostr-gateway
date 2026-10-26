@@ -426,7 +426,14 @@ class Gateway:
             worker.stop()
         for task in self._tasks:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        # A worker that is mid-`nak` may take a moment to unwind; it must not hold the
+        # process past systemd's stop timeout, or the unit dies by SIGKILL and in-flight
+        # publishes are lost with it.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._tasks, return_exceptions=True), 6)
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("workers did not unwind in 6s; stopping anyway")
         await self.server.stop()
         self.store.close()
 

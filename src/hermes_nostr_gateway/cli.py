@@ -370,8 +370,12 @@ def cmd_policy_test(args) -> int:
 
 
 
+STOP_BUDGET_S = 8.0
+
+
 def cmd_serve(args) -> int:
     import logging
+    import os
     import signal
 
     from .gateway import Gateway
@@ -391,7 +395,18 @@ def cmd_serve(args) -> int:
             except NotImplementedError:  # pragma: no cover
                 pass
         await stop.wait()
-        await gw.stop()
+        log = logging.getLogger("hng")
+        log.info("stop requested; shutting down")
+        # A clean stop, but never an unbounded one: something in the worker/executor
+        # teardown can hold the loop past systemd's TimeoutStopSec, and the resulting
+        # SIGKILL loses in-flight publishes. Give it a budget, then exit on our terms.
+        try:
+            await asyncio.wait_for(gw.stop(), STOP_BUDGET_S)
+            log.info("shutdown complete")
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("shutdown exceeded %ss; exiting anyway", STOP_BUDGET_S)
+        logging.shutdown()
+        os._exit(0)
 
     asyncio.run(run())
     return 0
