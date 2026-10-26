@@ -102,11 +102,17 @@ service's config without recording why in the commit; if tests fail and the fix 
 obvious in the same run, mark BLOCKED with the failure in the note. To DM Nathan, write the
 text to a file and send it with `hermes send --to marmot --file <path>` (`hermes send` takes
 a positional body, not `--text`).
-- [ ] **Media (M3)** — the one milestone with no code: a `media.get` socket op that fetches
+- [x] **Media (M3)** — the one milestone with no code: a `media.get` socket op that fetches
       a Blossom blob referenced by a message, with size/type caps and a per-blob cache, so
       the adapter can hand the agent an image instead of a URL. Done when: an inbound DM
       with an attachment yields bytes the adapter can read, and an oversized or unknown
       blob is refused with a named reason.
+      — landed 6813263: `media.get` (and `hng media`) resolves a blob a stored message
+      references, then downloads lazily, verifies sha256, sniffs MIME, caps at 25 MiB/4 per
+      message and caches 0600 under `~/.local/state/…/media` (512 MiB, oldest evicted);
+      named refusals (`too_large`, `unknown_blob`, `hash_mismatch`, `type_unknown`,
+      `insecure_url`, …), attachments ride the message frame + replay, `[media]` extras gone;
+      255 tests green. The daemon picks it up on its next restart.
 - [ ] **Retry TTL** — `retry_failed()` retries a failed relay publish forever; the 3,370-row
       loop backlog only stopped because it was expired by hand. Bound it by age (24h) so a
       future backlog cannot churn for days. Done when: a row older than the TTL is marked
