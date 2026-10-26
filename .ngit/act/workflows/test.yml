@@ -8,7 +8,7 @@ name: Test
 # that carries the patched nostr-sdk wheel's URL and hash, so it goes first;
 # `.[dev]` then sees 0.45.1 already satisfied instead of resolving the PyPI
 # release of the same version, which would silently drop
-# `nip44_conversation_key` and fail Concord only at runtime. The assertion step
+# `nip44_v2_conversation_key` and fail Concord only at runtime. The assertion step
 # turns that silent swap into a named CI failure.
 #
 # pytest and ruff are separate steps so a failure names its gate, and neither
@@ -37,17 +37,26 @@ jobs:
 
       - name: Install the hash-pinned wheel, the package, and the dev tools
         run: |
-          python -m pip install --disable-pip-version-check -r requirements.txt
-          python -m pip install --disable-pip-version-check -e '.[dev]'
+          python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+          python -m pip install --no-cache-dir --disable-pip-version-check -e '.[dev]'
 
-      - name: Assert the patched nostr-sdk is the one installed
+      - name: Force the pinned wheel into this interpreter
+        run: |
+          # pip treats a preinstalled 0.45.1 (from the runner image) as satisfying the
+          # requirement, so the URL wheel never lands and the assertion below fails on a
+          # tree that is actually correct. Reinstall it by URL, unambiguously.
+          WHEEL="$(grep -oE 'https://[^ ]+\.whl' requirements.txt | head -1)"
+          python -m pip install --no-cache-dir --disable-pip-version-check \
+            --force-reinstall --no-deps "$WHEEL"
+
+      - name: Assert the pinned nostr-sdk is the one installed
         run: |
           python - <<'PY'
           import nostr_sdk as sdk
 
-          assert callable(getattr(sdk, "nip44_conversation_key", None)), (
-              "the PyPI nostr-sdk is installed: nip44_conversation_key is missing; "
-              "install from requirements.txt so the patched wheel is used"
+          assert callable(getattr(sdk, "nip44_v2_conversation_key", None)), (
+              f"wrong nostr_sdk at {sdk.__file__}: nip44_v2_conversation_key is missing; "
+              "the pinned wheel is what provides it"
           )
           PY
 
