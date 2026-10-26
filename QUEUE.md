@@ -11,9 +11,10 @@ mark it BLOCKED with the question and DM Nathan; move to the next item.
 
 Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
 
-- [ ] **P0 — Marmot ownership, in writing and in code** — gateway owns the wn-agent socket;
+- [x] **P0 — Marmot ownership, in writing and in code** — gateway owns the wn-agent socket;
       the plugin retires after a clean week. Enforce the double-delivery guard as a startup
       error. See plan P0.
+      → PR nevent1qqs0848n23umnl6ryshelqnyhn9na7w9d58rwedgwz6hcgtuhtsrkggpz3mhxue69uhhyetvv9ujumn8d96zuer9wc78tts2 (pr/marmot-ownership)
 - [ ] **P1 — Read transport on nostr-sdk's relay pool** — replace per-relay `nak` children,
       in-process NIP-42, legacy path behind a flag. See plan P1.
 - [ ] **P2 — Publish through the bindings** — one signed event, per-relay send, same-event
