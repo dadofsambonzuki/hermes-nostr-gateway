@@ -102,6 +102,22 @@ service's config without recording why in the commit; if tests fail and the fix 
 obvious in the same run, mark BLOCKED with the failure in the note. To DM Nathan, write the
 text to a file and send it with `hermes send --to marmot --file <path>` (`hermes send` takes
 a positional body, not `--text`).
+- [ ] **Media (M3)** — the one milestone with no code: a `media.get` socket op that fetches
+      a Blossom blob referenced by a message, with size/type caps and a per-blob cache, so
+      the adapter can hand the agent an image instead of a URL. Done when: an inbound DM
+      with an attachment yields bytes the adapter can read, and an oversized or unknown
+      blob is refused with a named reason.
+- [ ] **Retry TTL** — `retry_failed()` retries a failed relay publish forever; the 3,370-row
+      loop backlog only stopped because it was expired by hand. Bound it by age (24h) so a
+      future backlog cannot churn for days. Done when: a row older than the TTL is marked
+      `expired` on the next pass, with a test.
+- [ ] **Marmot conversations after reconnect** — the plane reports `conversations: []` until
+      the first event arrives, where it reported this chat before the restart. Enumerate on
+      connect (or say why it cannot) so `status` is not ambiguous about what is attached.
+- [ ] **Queue worker idle behaviour** — when there is no unchecked item, the 20-minute run
+      should stop quietly instead of attempting tools and logging blocked-tool warnings.
+      Done when: an empty queue produces one line, no tool attempts.
+
 
 ## Decisions (do not re-litigate)
 
