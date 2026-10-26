@@ -150,6 +150,7 @@ socket 0600, directory 0700. No TCP in v1; no HTTP.
 | `react` | `identity`, `to`, `rumor_id`, `emoji="+"` | `reaction_rumor_id`, per-relay results |
 | `media.get` | `identity`, `sha256` or `url` (or `rumor_id`) | `path`, `mime`, `size`, verified `sha256`, `cached` |
 | `history` | `identity`, `peer`, `limit`, `before?` | messages, newest first |
+| `drops` | `plane?`, `reason?`, `since?` (epoch seconds), `limit?` | refused messages: id, plane, sender, `reason`, `why`, `received_at`, `age_s`, `expired`; plus `total`/`live`/`expired` over the whole matching set |
 | `peers` | `identity` | known peers + last activity + blocked count |
 | `ack` | `cursor` | advances the durable cursor (§7) |
 | `subscribe` | `since_cursor?` | ack + stream of frames |

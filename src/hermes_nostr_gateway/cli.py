@@ -28,7 +28,7 @@ from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .publisher import publish
 from .relay import OneShot, RelayWorker
-from .store import Store
+from .store import Store, drops_ttl_seconds
 
 DEFAULT_CONFIG = Path("config.yaml")
 
@@ -234,6 +234,8 @@ def cmd_status(args) -> int:
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
     stats = store.stats()
+    drops_ttl = drops_ttl_seconds(cfg.get("drops"))
+    drops = {**store.drop_counts(drops_ttl), "ttl_hours": drops_ttl / 3600}
     now = time.time()
     relays, _ = relay_read_plan(cfg)
     publish = [str(relay) for relay in (cfg.get("relays") or {}).get("publish") or []]
@@ -279,6 +281,7 @@ def cmd_status(args) -> int:
             "rumors": stats["total"],
             "pending": stats["pending"],
             "blocked": stats["blocked"],
+            "drops": drops,
             "invites": stats["invites"],
             "media": stats.get("media") or {},
             "wraps": store.wrap_counts(),
@@ -291,6 +294,8 @@ def cmd_status(args) -> int:
     print(f"store:    {store.path}")
     print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery, "
           f"{stats['blocked']} blocked)")
+    print(f"drops:    {drops['total']} refused ({drops['live']} live, "
+          f"{drops['expired']} expired; ttl {drops['ttl_hours']:.0f}h)")
     print(f"invites:  {stats['invites']} concord invite(s)")
     media = stats.get("media") or {}
     print(f"media:    {media.get('attachments', 0)} attachment(s), "
@@ -365,6 +370,32 @@ def cmd_recent(args) -> int:
         direction = "out" if row["authority"] == "self" else "in "
         print(f"[{row['created_at']}] {direction} {row['sender'][:10]}… {row['reach']:<9} "
               f"{(row['content'] or '')[:90]}")
+    return 0
+
+
+def cmd_drops(args) -> int:
+    """Refused messages: what policy dropped, why, and when — the `drops` op's client."""
+    import datetime
+
+    cfg = load_config(args.config)
+    _crypto, store, _policy, _plane = build(cfg)
+    ttl_s = drops_ttl_seconds(cfg.get("drops"))
+    since = args.since
+    if args.since_hours:
+        since = int(time.time()) - args.since_hours * 3600
+    result = store.drops(plane=args.plane, reason=args.reason, since=since,
+                         limit=args.limit, ttl_s=ttl_s)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"{result['total']} drop(s): {result['live']} live, {result['expired']} expired"
+          f" (ttl {ttl_s // 3600}h)")
+    for row in result["drops"]:
+        when = datetime.datetime.fromtimestamp(
+            row["received_at"], datetime.UTC).strftime("%d %b %H:%M")
+        mark = "  [expired]" if row["expired"] else ""
+        print(f"[{when}] {row['plane']:<7} {row['sender'][:12]}… {row['reason']}"
+              f"  {row['why']}{mark}")
     return 0
 
 
@@ -484,6 +515,18 @@ def main(argv: list[str] | None = None) -> int:
     p_recent = sub.add_parser("recent", help="recent messages")
     p_recent.add_argument("-n", "--number", type=int, default=20)
     p_recent.set_defaults(func=cmd_recent)
+
+    p_drops = sub.add_parser("drops", help="messages policy refused, with reason and time")
+    p_drops.add_argument("--plane", default=None,
+                         help="nip17, nip01, nip04, marmot or concord")
+    p_drops.add_argument("--reason", default=None,
+                         help="not_allowlisted, rate_limited or digest_quota")
+    p_drops.add_argument("--since", type=int, default=None, help="epoch seconds")
+    p_drops.add_argument("--since-hours", type=int, default=None,
+                         help="only drops received in the last N hours")
+    p_drops.add_argument("-n", "--limit", type=int, default=50)
+    p_drops.add_argument("--json", action="store_true")
+    p_drops.set_defaults(func=cmd_drops)
 
     p_media = sub.add_parser("media", help="fetch a Blossom blob an inbound message references")
     p_media.add_argument("ref", help="the blob's sha256, or the imeta url")

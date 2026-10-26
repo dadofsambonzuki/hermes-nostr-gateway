@@ -8,12 +8,13 @@ key), and a send is durable before it is attempted.
 from __future__ import annotations
 
 import json
+import time
 
 import nostr_sdk as sdk
 import yaml
 
 from hermes_nostr_gateway import cli
-from hermes_nostr_gateway.store import Store
+from hermes_nostr_gateway.store import Inbound, Store
 
 
 def make_config(tmp_path) -> tuple[str, str]:
@@ -78,6 +79,36 @@ def test_listen_understands_a_pinned_relay_kind_set(tmp_path, monkeypatch):
     assert [worker["relay"] for worker in captured] == [
         "wss://relay.example", "wss://relay.eu.whitenoise.chat"]
     assert captured[1]["kinds"] == (1059,), "a pinned kind set reached the worker as a dict"
+
+
+def test_drops_command_shows_why_and_when_and_filters(tmp_path, capsys):
+    """`hng drops` is how an operator sees a refusal without opening sqlite."""
+    path, _ = make_config(tmp_path)
+    now = int(time.time())
+    peer = "aa" * 32
+    store = Store(tmp_path / "cli.db")
+    for ident, plane, reason, why in (
+        ("r1", "nip17", "rate_limited", "per-sender rate limit exceeded"),
+        ("r2", "nip01", None, "no rule matched"),
+    ):
+        assert store.add(Inbound(
+            id=ident, wrapper_id="w" + ident, sender=peer, kind=14, created_at=now,
+            content=f"refused {ident}", conversation=peer, reply_to=None, plane=plane,
+            reach="drop", authority="none", rule="defaults", why=why,
+            blocked_reason=reason,
+        ), now=now)
+    store.close()
+
+    assert cli.main(["--config", path, "drops"]) == 0
+    out = capsys.readouterr().out
+    assert "2 drop(s)" in out
+    assert "rate_limited" in out and "per-sender rate limit exceeded" in out
+    assert "not_allowlisted" in out and "no rule matched" in out
+
+    assert cli.main(["--config", path, "drops", "--plane", "nip01"]) == 0
+    filtered = capsys.readouterr().out
+    assert "1 drop(s)" in filtered and "not_allowlisted" in filtered
+    assert "rate_limited" not in filtered
 
 
 def test_send_publishes_with_the_identity_secret(tmp_path, monkeypatch):

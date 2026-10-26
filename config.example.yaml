@@ -94,6 +94,13 @@ replay:
 retry:
   ttl_hours: 24
 
+# Drops (messages policy refused: not allowlisted, rate limited, or cut from a digest by
+# its quota). They are stored as evidence and listed by the `drops` socket op / `hng
+# drops`, with the reason and when. After `ttl_hours` a drop is still listed and still
+# counted, but marked `expired` — the status line separates live refusals from history.
+drops:
+  ttl_hours: 168          # one week: long enough to see a spam wave, short enough to age
+
 groups:
   family: []
   team: []
