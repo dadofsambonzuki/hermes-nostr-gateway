@@ -113,10 +113,17 @@ a positional body, not `--text`).
       named refusals (`too_large`, `unknown_blob`, `hash_mismatch`, `type_unknown`,
       `insecure_url`, …), attachments ride the message frame + replay, `[media]` extras gone;
       255 tests green. The daemon picks it up on its next restart.
-- [ ] **Retry TTL** — `retry_failed()` retries a failed relay publish forever; the 3,370-row
+- [x] **Retry TTL** — `retry_failed()` retries a failed relay publish forever; the 3,370-row
       loop backlog only stopped because it was expired by hand. Bound it by age (24h) so a
       future backlog cannot churn for days. Done when: a row older than the TTL is marked
       `expired` on the next pass, with a test.
+      — landed 9fc21f5: `outbound_wraps.created_at` (stamped at first offer, so a retry cannot
+      renew its own lease), `expire_wraps()` at the head of every pass marks rows older than
+      `retry.ttl_hours` (24 default) `expired`, and `pending_wraps()` now selects only
+      `pending`/`failed` — a hand-marked `expired` row was still retried because the old filter
+      was `status != 'sent'`. Migration dates pre-TTL rows from `last_attempt`; `hng status`
+      reports wrap counts by status; 259 tests green, ruff clean, live-DB copy expired 225 rows
+      in one pass (4,406 expired, 44 retryable). The daemon picks it up on its next restart.
 - [ ] **Marmot conversations after reconnect** — the plane reports `conversations: []` until
       the first event arrives, where it reported this chat before the restart. Enumerate on
       connect (or say why it cannot) so `status` is not ambiguous about what is attached.
