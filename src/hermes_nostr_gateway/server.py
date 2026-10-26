@@ -80,7 +80,14 @@ class SocketServer:
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            # Since 3.12 wait_closed() also waits for live client handlers, and the
+            # Hermes adapter holds its connection open by design — so this call was the
+            # 15s SIGKILL on every restart (two for two). Bound it: closing the listener
+            # is what matters, the handlers are aborted with the loop.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), 2)
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning("socket server still had open handlers at shutdown; not waiting")
         # Do not await client shutdown here: a half-open test connection would make
         # stop() hang forever.
         for writer in list(self._clients):
