@@ -2,10 +2,14 @@
 
 import asyncio
 import json
+import os
+import socket
+import struct
 
 import pytest
 import pytest_asyncio
 
+from hermes_nostr_gateway import server as socket_server
 from hermes_nostr_gateway.server import SocketServer
 
 
@@ -131,6 +135,87 @@ async def test_replay_skip_records_a_handover(server, tmp_path):
     (frame,) = await call(tmp_path / "s.sock", {"op": "replay.skip"})
     assert frame["type"] == "ok"
     assert frame["skipped"] == 3 and frame["replay_floor"] == 1234
+
+class FakePeerSocket:
+    """Just the call `peer_uid` makes, with the kernel's answer stubbed in."""
+
+    def __init__(self, uid: int, pid: int = 4321, gid: int = 1000):
+        self.payload = struct.pack("3i", pid, uid, gid)
+
+    def getsockopt(self, level, option, size):
+        assert (level, option) == (socket.SOL_SOCKET, socket.SO_PEERCRED)
+        assert size == len(self.payload)
+        return self.payload
+
+
+def test_peer_uid_is_the_kernel_credential():
+    assert socket_server.peer_uid(FakePeerSocket(uid=1001)) == 1001
+
+
+def test_peer_uid_unwraps_the_asyncio_transport_socket():
+    class TransportSocket:  # what transport.get_extra_info("socket") may hand back
+        _sock = FakePeerSocket(uid=1002)
+
+    assert socket_server.peer_uid(TransportSocket()) == 1002
+
+
+def test_peer_uid_is_unknown_rather_than_wrong():
+    class Unsupported:
+        def getsockopt(self, *args):
+            raise OSError(95, "Operation not supported")
+
+    assert socket_server.peer_uid(Unsupported()) is None
+    assert socket_server.peer_uid(None) is None
+
+
+async def test_the_live_path_reports_this_uid_and_not_none(tmp_path):
+    """`get_extra_info("socket")` must really answer, or the check is a silent no-op."""
+    seen: list[int | None] = []
+
+    class Recording(SocketServer):
+        async def _handle(self, reader, writer):
+            seen.append(socket_server.peer_uid(writer.get_extra_info("socket")))
+            await super()._handle(reader, writer)
+
+    srv = Recording(tmp_path / "uid.sock", FakeHandler())
+    await srv.start()
+    try:
+        (frame,) = await call(tmp_path / "uid.sock", {"op": "ping"})
+        assert frame["type"] == "pong"
+    finally:
+        await srv.stop()
+    assert seen == [os.getuid()], "peer_uid saw no credential on a real connection"
+
+
+async def test_a_connection_from_another_uid_is_closed_without_a_reply(tmp_path, monkeypatch):
+    """0600 is checked at connect(); this is the check that survives a passed descriptor."""
+    monkeypatch.setattr(socket_server, "peer_uid", lambda sock: os.getuid() + 1)
+    srv = SocketServer(tmp_path / "refused.sock", FakeHandler())
+    await srv.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "refused.sock"))
+        writer.write(b'{"op":"ping"}\n')
+        await writer.drain()
+        # No reply, whether as a clean EOF or an abortive close: the daemon never reads the
+        # frame, so the unread bytes make Linux answer RST rather than FIN.
+        try:
+            assert await asyncio.wait_for(reader.readline(), 2) == b"", \
+                "a connection from another uid was answered instead of closed"
+        except ConnectionResetError:
+            pass
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionResetError:
+            pass  # the RST can also land on the close, not just the read
+    finally:
+        await srv.stop()
+
+
+async def test_a_same_uid_connection_is_answered(server, tmp_path):
+    (frame,) = await call(tmp_path / "s.sock", {"op": "ping"})
+    assert frame["type"] == "pong"
+
 
 async def test_subscribe_replays_digest_and_ack_uses_frame(tmp_path):
     srv = SocketServer(tmp_path / "d.sock", DigestHandler())

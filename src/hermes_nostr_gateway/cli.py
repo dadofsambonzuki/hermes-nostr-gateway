@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from .crypto import SdkCrypto
+from .crypto import CryptoError, SdkCrypto, parse_secret
 from .health import (
     BAD,
     human_age,
@@ -43,12 +43,87 @@ def load_config(path: str | None = None) -> dict[str, Any]:
     raise SystemExit("no config found: pass --config or create config.yaml")
 
 
+def read_secret_file(path: str | Path) -> str:
+    """Read a key file: the account JSON, or a file holding the key itself.
+
+    A systemd credential is the source file copied byte for byte, so both shapes arrive
+    here; a raw hex file usually has a trailing newline from `echo`/`install`, which is
+    stripped. Never include the value in an error.
+    """
+    location = Path(path)
+    try:
+        text = location.read_text().strip()
+    except OSError as exc:
+        raise SystemExit(f"{location}: cannot read the identity key: {exc.strerror}") from None
+    if not text:
+        raise SystemExit(f"{location}: the identity key file is empty")
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{location}: not valid JSON ({exc.msg})") from None
+        secret = data.get("secret_key_hex") or data.get("secret_key")
+        if not secret:
+            raise SystemExit(f"{location}: no secret_key_hex or secret_key in the JSON")
+        return str(secret).strip()
+    return text
+
+
+def credential_path(name: str) -> Path:
+    """Where systemd puts `LoadCredential=<name>:<source>` for this service.
+
+    `$CREDENTIALS_DIRECTORY` is a per-unit tmpfs that systemd mounts for a service with at
+    least one LoadCredential=; the value never reaches the environment, which is the point.
+    """
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory:
+        raise SystemExit(
+            f"identity.secret_credential: {name!r} needs $CREDENTIALS_DIRECTORY, which "
+            "systemd sets for a unit with LoadCredential=. Add "
+            f"LoadCredential={name}:<root-owned file> to the unit and start it under "
+            "systemd, or set identity.secret_file instead"
+        )
+    path = Path(directory) / name
+    if not path.exists():
+        raise SystemExit(
+            f"identity.secret_credential: {name!r} is not in $CREDENTIALS_DIRECTORY "
+            f"({directory}); check the unit's LoadCredential= line"
+        )
+    return path
+
+
+def _checked_secret(secret: str, source: str) -> str:
+    """Normalise to hex, and name the source when it is not a key at all."""
+    try:
+        return parse_secret(secret)
+    except CryptoError as exc:
+        raise SystemExit(f"{source}: {exc}") from None
+
+
 def secret_from(cfg: dict[str, Any]) -> str:
-    if cfg.get("identity", {}).get("secret_env"):
-        return os.environ[cfg["identity"]["secret_env"]]
-    path = Path(os.path.expanduser(cfg["identity"]["secret_file"]))
-    data = json.loads(path.read_text())
-    return data.get("secret_key_hex") or data["secret_key"]
+    """The identity key, from the first source the config names.
+
+    `secret_credential` is what a service should use: systemd copies the key into
+    `$CREDENTIALS_DIRECTORY`, mode 0400, and it appears in neither `systemctl show` nor
+    the process environment — so no child process inherits it. `secret_env` and
+    `secret_file` remain for a hand-run CLI and for the container.
+    """
+    identity = cfg.get("identity") or {}
+    if identity.get("secret_credential"):
+        name = str(identity["secret_credential"])
+        path = credential_path(name)
+        return _checked_secret(read_secret_file(path), f"credential {name!r} ({path})")
+    if identity.get("secret_env"):
+        name = str(identity["secret_env"])
+        try:
+            value = os.environ[name]
+        except KeyError:
+            raise SystemExit(f"identity.secret_env: ${name} is not set") from None
+        return _checked_secret(value, f"environment ${name}")
+    if not identity.get("secret_file"):
+        raise SystemExit("identity: set secret_credential, secret_env or secret_file")
+    path = os.path.expanduser(str(identity["secret_file"]))
+    return _checked_secret(read_secret_file(path), f"secret_file {path}")
 
 
 def _decode_npub(npub: str) -> str:

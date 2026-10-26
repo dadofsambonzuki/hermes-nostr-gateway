@@ -15,7 +15,8 @@ has to know which protocol a message arrived on. When it is finished, this is wh
 
 - **One socket.** NDJSON over a 0600 Unix socket, no network listener, carrying every plane:
   DMs (NIP-17, legacy NIP-04), public feeds and mentions (NIP-01), Concord communities, and
-  Marmot groups proxied to `wn-agent`.
+  Marmot groups proxied to `wn-agent`. Every connection is checked with `SO_PEERCRED`, so the
+  socket answers only the uid the daemon runs as.
 - **One policy.** Every message, whatever the plane, is classified for *reach* — wake the agent
   now, or fold it into a digest — and for *authority* — instructions, or data it may read but
   not obey. Sender trust is decided once, centrally, not per transport.
@@ -84,7 +85,7 @@ uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 uv pip install --python .venv/bin/python -e '.[dev]'
 cp config.example.yaml config.yaml
-$EDITOR config.yaml                      # point identity.secret_file at a 0600 JSON file
+$EDITOR config.yaml                      # key: identity.secret_file (or a systemd credential)
 .venv/bin/hng --config config.yaml status
 .venv/bin/hng --config config.yaml serve
 ```

@@ -20,7 +20,7 @@ agent talks NDJSON over a Unix socket.
 | Socket | `~/.local/state/hermes-nostr-gateway/gateway.sock`, mode **0600** |
 | State | `gateway.db` (SQLite, WAL) in the same directory |
 | Client | `integrations/hermes-plugin/`; `NOSTR_GATEWAY_SOCKET` overrides the path |
-| Identity | Holly's agent key `740fcd90…`; secret `~/.marmot-agents/hermes/accounts/hermes-agent/secret.json`, shared with the Marmot connector |
+| Identity | Holly's agent key `740fcd90…`; secret `~/.marmot-agents/hermes/accounts/hermes-agent/secret.json`, shared with the Marmot connector; the unit receives it as a systemd credential (see **Key handling**) |
 | Stop bound | drop-in `/etc/systemd/system/hermes-nostr-gateway.service.d/stop-timeout.conf`: `TimeoutStopSec=15` |
 
 - **`XDG_RUNTIME_DIR` silently moves the socket.** `default_socket_path()` prefers
@@ -63,6 +63,94 @@ printf '{"op":"ping"}\n' | nc -U ~/.local/state/hermes-nostr-gateway/gateway.soc
 A healthy start logs `socket listening at …` then `gateway up: <pubkey> on N relays`. The
 socket answers one JSON object per line; `subscribe` is the only op that turns the connection
 into a delivery stream.
+
+## Key handling
+
+Two host-side rules keep the socket and the identity key from being readable by anything
+but this service. Both are enforced by the daemon and the unit, not by convention.
+
+### The socket answers only its own uid (`SO_PEERCRED`)
+
+Mode 0600 on `gateway.sock` is checked when a process calls `connect()`. It says nothing
+about a descriptor already open in another process, or about a second account that can
+reach the path. So every accepted connection is checked with `SO_PEERCRED` **before a
+single frame is read**: if the connecting process's uid is not the daemon's own, the
+connection is closed with no reply (not even an error frame) and the journal gets
+
+```
+socket: refused connection from uid 1001; this daemon runs as 1000
+```
+
+The check is Linux-only; where `SO_PEERCRED` does not exist it is skipped rather than
+faked, and the 0600 mode is what is left. A same-uid adapter sees no change. It separates
+*users*, not processes: anything running as `ubuntu` can still talk to the socket — that
+is the adapter's own account, and the socket carries no per-process auth by design.
+
+### The key is a systemd credential, not an `Environment=` line
+
+`Environment=NOSTR_SECRET_KEY=…` would be readable in `systemctl show`, inherited by every
+child process, and left in `/proc/<pid>/environ`. `LoadCredential=` avoids all three:
+systemd copies a root-owned file into `$CREDENTIALS_DIRECTORY` (a per-unit tmpfs under
+`/run/credentials`, read-only and readable only by the unit's own user and group — 0440 on
+this host, measured — and removed when the unit stops) and sets only the directory path in
+the unit's environment.
+
+The unit carries:
+
+```ini
+LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json
+```
+
+and `config.yaml` names the credential rather than a path:
+
+```yaml
+identity:
+  secret_credential: nostr_secret
+```
+
+`secret_from()` tries `secret_credential`, then `secret_env`, then `secret_file`, and each
+failure names the source: no `$CREDENTIALS_DIRECTORY` means the unit is missing its
+`LoadCredential=` line (or the process was started by hand), and a name absent from the
+directory means the source file was not there at start. The credential may be the account
+JSON (`{"secret_key_hex": "…"}`) or a file holding the key itself; whitespace is stripped
+and the key is normalised to hex, so an `nsec` or a trailing newline is accepted. An
+invalid key names the credential, never the value.
+
+Adopting it on this host, in this order (the unit will not start while the source is
+missing, so the file comes first):
+
+```bash
+sudo install -d -m 0750 /etc/hermes-nostr-gateway
+sudo install -m 0400 -o root -g root \
+  ~/.marmot-agents/hermes/accounts/hermes-agent/secret.json \
+  /etc/hermes-nostr-gateway/identity.json
+# then: add the LoadCredential= line to the unit, set identity.secret_credential in
+# config.yaml, and only then:
+sudo systemctl daemon-reload && sudo systemctl restart hermes-nostr-gateway
+```
+
+Verify, in this order:
+
+```bash
+systemctl show hermes-nostr-gateway -p LoadCredential        # the path, never the key
+systemctl show hermes-nostr-gateway -p Environment | grep -c NOSTR_SECRET_KEY   # 0
+journalctl -u hermes-nostr-gateway -n 5 | grep 'socket listening'               # started
+.venv/bin/hng status                                         # the usual five-second check
+```
+
+- **The daemon's environment carries no key; its `nak` children still do.** Relay workers
+  and the publisher pass `NOSTR_SECRET_KEY` to each `nak` child explicitly, because that
+  is the only channel nak offers for NIP-42 and for signing. That value is visible in
+  `/proc/<child>/environ` to the same uid only, and it is a per-child decision, not the
+  systemd `Environment=` inheritance this credential removes. Fixing it means an upstream
+  nak option (`--sec-file` or similar); it is not something the unit can do.
+- **The source file can now be root-only.** That is the part that changes the threat
+  model: the service user no longer needs to read the agent's account directory, so a
+  compromise of the gateway process cannot re-read the key file — only the copy systemd
+  handed it.
+- **`secret_file` and `secret_env` still work** for a hand-run `hng serve`, the dogfood
+  CLI and the container (`/run/secrets/nostr-secret.json`). They are the fallbacks, not the
+  recommended shape for the unit.
 
 ## The Marmot plane is opt-in
 

@@ -2,7 +2,13 @@
 identity:
   # Path to a JSON file holding {"secret_key_hex": "..."} — never inline, never argv.
   secret_file: ~/.marmot-agents/hermes/accounts/hermes-agent/secret.json
-  # secret_env: NOSTR_SECRET_KEY   # alternative to secret_file
+  # Under systemd, prefer a credential over a file the service user can read itself:
+  # LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json in the unit puts
+  # the key in $CREDENTIALS_DIRECTORY (readable only by the unit's user/group), out of
+  # `systemctl show` and the environment.
+  # Any of these three may be set; the order of precedence is as listed.
+  # secret_credential: nostr_secret
+  # secret_env: NOSTR_SECRET_KEY   # hand-run CLI only: an env var is the weakest of the three
 
 relays:
   # Read set = our 10050 inbox relays PLUS the sender's app relays. Reading only the
