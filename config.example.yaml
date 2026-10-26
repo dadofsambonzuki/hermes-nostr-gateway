@@ -94,6 +94,21 @@ replay:
 retry:
   ttl_hours: 24
 
+# Bot peers. A peer whose kind-0 metadata says `bot: true` is a program, and two agents
+# answering each other have no natural stopping point — one bounce put 3,370 rows in the
+# store for a sentence repeated in both directions. The flag is fetched once per peer
+# (kind 0 is not in the read set) and cached in the store, so this costs one lookup per
+# peer, not one per message. Humans are never subject to this block.
+bots:
+  enabled: true
+  # Bot messages delivered to the agent per hour, per peer. Each delivery is a reply we
+  # will make, so this bounds our replies; 0 means this gateway does not talk to bots.
+  max_replies_per_hour: 6
+  # Our own text coming back from that peer inside this window is an echo, not a message.
+  echo_window: 15m
+  # A bot can never reach the agent immediately; this is the digest window it gets instead.
+  digest_interval: 15m
+
 groups:
   family: []
   team: []

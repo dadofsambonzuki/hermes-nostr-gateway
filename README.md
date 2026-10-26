@@ -366,6 +366,9 @@ agent runtime (Hermes plugin)
   gateway written to one client bakes in its quirks.
 - **Reach and authority are separate.** A public bot can hear strangers without letting them
   instruct it; see spec §17.
+- **A bot peer is not a person.** Kind-0 `bot: true` caps a peer at digest reach, refuses our
+  own text echoed back, and allows a handful of messages an hour — the three rules that stop
+  two agents answering each other for ever (spec §17, "Bot peers").
 - **Relay coverage is a correctness property.** Reading only the identity's `10050` misses DMs
   that exist only on the sender's app relays — measured, not theorised (spec §3).
 - **The gateway never interprets content.** No fetching beyond a Blossom blob a stored

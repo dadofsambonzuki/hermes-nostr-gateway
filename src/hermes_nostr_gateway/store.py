@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS rumors (
 );
 CREATE INDEX IF NOT EXISTS rumors_pending ON rumors (delivered_at, received_at);
 CREATE INDEX IF NOT EXISTS rumors_sender ON rumors (sender, created_at);
+-- Echo suppression reads our own recent text per conversation; without this the query
+-- is a full scan on every message from a bot peer.
+CREATE INDEX IF NOT EXISTS rumors_conversation ON rumors (conversation, received_at);
 
 CREATE TABLE IF NOT EXISTS wrappers (
     id         TEXT PRIMARY KEY,
@@ -75,6 +78,18 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Kind-0 claims we have read, so a restart does not refetch every peer and a peer that
+-- is a bot stays one. `bot` is 0/1, never NULL: a profile that said nothing about `bot`
+-- is a human by omission, which is different from a peer we have never looked up (no row).
+CREATE TABLE IF NOT EXISTS profiles (
+    pubkey     TEXT PRIMARY KEY,
+    name       TEXT,
+    bot        INTEGER NOT NULL DEFAULT 0,
+    event_id   TEXT,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS profiles_bot ON profiles (bot);
 
 CREATE TABLE IF NOT EXISTS concord_invites (
     id           TEXT PRIMARY KEY,
@@ -659,6 +674,55 @@ class Store:
             " AND conversation != '' GROUP BY conversation"
             " ORDER BY last_at DESC, conversation ASC LIMIT ?",
             (str(plane), max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- profiles (kind-0 `bot` claims) ----------------------------------
+    def record_profile(self, *, pubkey: str, name: str | None = None, is_bot: bool = False,
+                       event_id: str | None = None, now: int | None = None) -> None:
+        """Remember what a peer's kind 0 claims, replacing an older claim.
+
+        `bot` is stored as 0/1 rather than NULL so "read, and it said no" is a fact:
+        the registry must not refetch a peer whose profile simply has no `bot` field.
+        """
+        stamp = int(time.time()) if now is None else int(now)
+        self.db.execute(
+            "INSERT INTO profiles (pubkey, name, bot, event_id, updated_at) VALUES (?,?,?,?,?)"
+            " ON CONFLICT(pubkey) DO UPDATE SET name = COALESCE(excluded.name, name),"
+            " bot = excluded.bot, event_id = COALESCE(excluded.event_id, event_id),"
+            " updated_at = excluded.updated_at",
+            (pubkey.strip().lower(), name, 1 if is_bot else 0, event_id, stamp),
+        )
+
+    def profile(self, pubkey: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM profiles WHERE pubkey = ?", (pubkey.strip().lower(),)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def bot_peers(self) -> list[dict[str, Any]]:
+        """Every peer we have read as a bot, newest claim first."""
+        rows = self.db.execute(
+            "SELECT * FROM profiles WHERE bot = 1 ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def profile_count(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"])
+
+    def recent_outbound(self, conversation: str, since: int, *,
+                        limit: int = 50) -> list[dict[str, Any]]:
+        """Our own text to one conversation since `since`, newest first.
+
+        Echo suppression reads this rather than a process-local buffer: the same loop
+        can continue across a restart, and `hng send` writes the same rows as the
+        daemon, so both are covered by one rule.
+        """
+        rows = self.db.execute(
+            "SELECT id, content, received_at FROM rumors WHERE authority = 'self'"
+            " AND reach = 'sent' AND conversation = ? AND received_at >= ?"
+            " ORDER BY received_at DESC LIMIT ?",
+            (conversation, int(since), max(1, int(limit))),
         ).fetchall()
         return [dict(row) for row in rows]
 

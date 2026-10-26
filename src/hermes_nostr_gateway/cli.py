@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from .bots import BotRegistry
 from .crypto import SdkCrypto
 from .health import (
     BAD,
@@ -72,8 +73,16 @@ def build(cfg: dict[str, Any]) -> tuple[SdkCrypto, Store, Policy, Nip17Plane]:
     store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store = Store(store_path, identity=crypto.our_pubkey())
-    policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
-                     "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit")})
+    # The CLI reads bot flags from the store but never fetches one: a one-shot command
+    # should not spend a child process on a profile, and the daemon owns discovery.
+    policy = Policy(
+        {"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
+         "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit"),
+         "bots": cfg.get("bots")},
+        bot_lookup=BotRegistry(store).is_bot,
+        echo_lookup=lambda peer, since: [row["content"] or ""
+                                         for row in store.recent_outbound(peer, since)],
+    )
     return crypto, store, policy, Nip17Plane(crypto, store, policy)
 
 
@@ -396,10 +405,22 @@ def cmd_media(args) -> int:
 
 def cmd_policy_test(args) -> int:
     cfg = load_config(args.config)
-    policy = Policy({"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
-                     "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit")})
-    d = policy.decide(sender=to_hex(args.sender), kind=args.kind,
-                      mention=args.mention, dm=args.dm, event_id=args.event_id)
+    store = Store(Path(os.path.expanduser(cfg.get("store", "gateway.db"))),
+                  identity="policy-test")
+    try:
+        policy = Policy(
+            {"groups": normalise_groups(cfg), "policies": cfg.get("policies"),
+             "defaults": cfg.get("defaults"), "rate_limit": cfg.get("rate_limit"),
+             "bots": cfg.get("bots")},
+            bot_lookup=(lambda _sender: True) if args.bot else None,
+            echo_lookup=lambda peer, since: [row["content"] or ""
+                                             for row in store.recent_outbound(peer, since)],
+        )
+        d = policy.decide(sender=to_hex(args.sender), kind=args.kind,
+                          mention=args.mention, dm=args.dm, event_id=args.event_id,
+                          text=args.text)
+    finally:
+        store.close()
     print(json.dumps(d.to_frame(), indent=2))
     return 0
 
@@ -500,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
     p_policy.add_argument("--mention", action="store_true")
     p_policy.add_argument("--dm", action="store_true")
     p_policy.add_argument("--event-id", default=None)
+    p_policy.add_argument("--text", default=None,
+                          help="message text, so the echo rule can be exercised")
+    p_policy.add_argument("--bot", action="store_true",
+                          help="judge the sender as a bot peer (kind-0 bot: true)")
     p_policy.set_defaults(func=cmd_policy_test)
 
     args = parser.parse_args(argv)
