@@ -400,6 +400,7 @@ class MarmotPlane:
             mention=bool(event.get("mentions_self")),
             dm=bool(self._direct.get(group)),
             event_id=message_id,
+            text=str(message.get("text") or ""),
         )
         if decision.duplicate:
             return None

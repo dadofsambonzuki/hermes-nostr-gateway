@@ -73,7 +73,9 @@ class Nip17Plane:
         if recipient and recipient != self.me:
             return None  # addressed to someone else
 
-        decision = self.policy.decide(sender=sender, kind=kind, dm=True, event_id=rumor.get("id"))
+        decision = self.policy.decide(sender=sender, kind=kind, dm=True,
+                                      event_id=rumor.get("id"),
+                                      text=rumor.get("content", ""))
         msg = Inbound(
             id=rumor["id"],
             wrapper_id=wrapper_id,

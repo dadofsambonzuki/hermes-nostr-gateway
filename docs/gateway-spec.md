@@ -463,6 +463,28 @@ Rules:
 - The policy engine also decides DM delivery (§10 item 1) — one mechanism, not a separate feed
   allowlist bolted on.
 
+### Bot peers
+
+A peer whose kind-0 metadata carries `bot: true` is a program, and the gateway applies three
+extra rules to it. The flag is read from kind-0 once per peer and cached in the store
+(`profiles`), because kind 0 is not in the read set; a peer we have never looked up is
+treated as a human for exactly one message while the fetch runs.
+
+- **Never immediate.** A rule that would score a bot `immediate` scores it `digest(bots.digest_interval)`
+  instead, including when a duplicate event would otherwise promote it. A machine that can
+  repeat itself must not choose what interrupts the agent.
+- **Echo suppression.** Our own text arriving back from that peer inside `bots.echo_window`
+  is not a message and is refused with `blocked_reason: echo`. The comparison is our stored
+  outbound rows, so it holds across a restart and covers `hng send` as well as the daemon.
+- **Reply cap.** `bots.max_replies_per_hour` bot messages per peer per hour reach the agent;
+  the next is refused with `blocked_reason: bot_reply_cap`. It is enforced on delivery, so a
+  loop costs nothing before it is refused, and each delivery is one reply we will make.
+
+The first two exist because of one incident: two agents answered each other for hours and
+stored **3,370 rows** of the same sentence. `tests/test_bots.py` reproduces that loop as a
+regression test — a fixed-content bounce must stop on the first echo, and a varying one at
+the cap. Humans are exempt: a person who repeats themselves, or messages often, is a person.
+
 ---
 
 ## 18. Seed from an existing adapter

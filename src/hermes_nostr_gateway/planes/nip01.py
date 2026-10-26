@@ -89,7 +89,8 @@ class Nip01Plane:
             return None
         event_id = event.get("id") or ""
         decision = self.policy.decide(
-            sender=sender, kind=event["kind"], mention=reason == "mention", event_id=event_id
+            sender=sender, kind=event["kind"], mention=reason == "mention", event_id=event_id,
+            text=event.get("content", ""),
         )
         if decision.duplicate:
             return None

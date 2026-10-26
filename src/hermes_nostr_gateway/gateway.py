@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import yaml
 
+from .bots import BotRegistry, nak_fetcher
 from .crypto import SdkCrypto
 from .health import (
     DEFAULT_PENDING_STALE_MINUTES,
@@ -237,13 +238,19 @@ class Gateway:
         # touches the network at startup.
         self.media_cfg: MediaConfig = media_config(cfg.get("media"))
         self.media = self.media_cfg.fetcher()
+        # Who is a bot (kind-0 `bot: true`). The registry is created before the policy
+        # because the policy asks it on every decision; its fetch resolves the publish
+        # set lazily, so a relay list that is parsed a few lines below is still the one
+        # used at fetch time.
+        self.bots = BotRegistry(self.store, fetcher=nak_fetcher(lambda: self.relays_publish))
         groups = normalise_groups(cfg)
         self.policy = Policy({
             "groups": groups,
             "policies": cfg.get("policies"),
             "defaults": cfg.get("defaults"),
             "rate_limit": cfg.get("rate_limit"),
-        })
+            "bots": cfg.get("bots"),
+        }, bot_lookup=self.bots.is_bot, echo_lookup=self._echo_lookup)
         self.concord = ConcordPlane(self.store)
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
                                 on_invite=self.concord.handle_invite)
@@ -585,6 +592,7 @@ class Gateway:
             worker.stop()
         for task in self._tasks:
             task.cancel()
+        self.bots.cancel()
         # A worker that is mid-`nak` may take a moment to unwind; it must not hold the
         # process past systemd's stop timeout, or the unit dies by SIGKILL and in-flight
         # publishes are lost with it.
@@ -619,8 +627,22 @@ class Gateway:
             }
         return msg.to_frame()
 
+    def _echo_lookup(self, peer: str, since: int) -> list[str]:
+        """Our own text to one peer since `since` — evidence for the echo rule.
+
+        The store, not a process buffer: a bounce survives a restart, and `hng send`
+        writes the same rows as the daemon, so one rule covers both senders.
+        """
+        return [row["content"] or "" for row in self.store.recent_outbound(peer, since)]
+
     def _on_event(self, relay: str, event: dict) -> None:
         kind = event.get("kind")
+        if kind == 0:
+            # Profile metadata: the bot flag the policy needs, never a message. We do
+            # not subscribe to kind 0 today (it would cost a worker per relay for a
+            # claim that changes rarely), but a relay that offers one is worth taking.
+            self.bots.ingest(event)
+            return
         if kind == 1059:
             msg = self.plane.handle(relay, event)
         elif kind == 4:
@@ -662,7 +684,7 @@ class Gateway:
         except Exception:  # noqa: BLE001 - undecryptable is not fatal
             return None
         decision = self.policy.decide(sender=sender, kind=4, dm=True,
-                                      event_id=str(event.get("id") or ""))
+                                      event_id=str(event.get("id") or ""), text=text)
         if decision.duplicate:
             return None
         msg = Inbound(
@@ -896,6 +918,7 @@ class Gateway:
                        "floor": self.store.replay_floor()},
             "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
                       "wraps": self.store.wrap_counts()},
+            "bots": {**self.policy.bot_status(), **self.bots.status()},
             "relay_stats": stats["relays"],
             # Instrument the plane rather than inferring it from `ps`: a worker that
             # reconnects every 60s and one that died at startup look identical from
