@@ -7,16 +7,37 @@ relays (Hal's finding, spec §14).
 v1 is one identity per process. ``rumors`` therefore carries no identity column; the
 ``delivery_cursor`` row is keyed by the local npub so digest tables remain ready for a
 multi-identity daemon later. See ``docs/digest-cursor.md``.
+
+Writes (docs/store-writes.md)
+-----------------------------
+A connection is per thread, and every connection opens the file with
+``journal_mode=WAL``, a busy timeout and ``synchronous=NORMAL`` (the default; ``FULL``
+is selectable so the benchmark can measure the old cost). WAL is what lets the daemon
+read on the event loop while the writer thread commits, without either blocking the
+other. ``NORMAL`` is the durability setting that matters here: a committed transaction
+is in the WAL before the commit returns, so ``kill -9`` loses nothing, while the
+per-commit fsync that ``FULL`` adds is exactly what used to stall the loop. It is *not*
+power-loss durable — that needs ``FULL`` and a slower write path.
+
+The batch entry points (``add_many``, ``wrappers_seen``, ``note_relays``) exist so a
+burst costs one transaction instead of one per row; ``StoreWriter`` (writer.py) calls
+them from its own thread. ``add``, ``wrapper_seen`` and ``note_relay`` route to an
+attached writer when there is one and write directly when there is not — which is how
+the CLI, the tests and a ``kill -9`` recovery script keep their simple behaviour.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    from .writer import StoreWriter
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rumors (
@@ -197,8 +218,25 @@ class Inbound:
 
 
 class Store:
-    def __init__(self, path: str | Path = "gateway.db", *, identity: str = ""):
+    #: Applied to every connection. `busy_timeout` is not optional once two threads
+    #: hold the file: without it a reader that arrives mid-checkpoint gets SQLITE_BUSY
+    #: instead of waiting the few milliseconds the writer needs.
+    PRAGMAS = (
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA busy_timeout=5000",
+    )
+    #: Durability levels we accept. `NORMAL` in WAL survives `kill -9` without an fsync
+    #: per commit; `FULL` is the setting the daemon used before P6, kept so the burst
+    #: benchmark can measure what the fsync actually cost.
+    SYNCHRONOUS = ("OFF", "NORMAL", "FULL", "EXTRA")
+
+    def __init__(self, path: str | Path = "gateway.db", *, identity: str = "",
+                 synchronous: str = "NORMAL"):
         self.path = str(path)
+        level = str(synchronous).upper()
+        if level not in self.SYNCHRONOUS:
+            raise ValueError(f"bad synchronous level: {synchronous!r}")
+        self.synchronous = level
         # A store that did not exist a moment ago owns no undelivered history: any
         # pending rows it is given were answered by whoever held the messages before
         # the import copy. Start the replay floor at now for that case only — a normal
@@ -206,13 +244,69 @@ class Store:
         # mid-delivery.
         fresh = not Path(self.path).exists()
         self.identity = identity
-        self.db = sqlite3.connect(self.path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        #: Set when writes belong to a `StoreWriter` (writer.py): every write method
+        #: below then answers from the writer's in-memory index and hands it the row.
+        self._writer: StoreWriter | None = None
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._conn_lock = threading.Lock()
+        #: Write transactions started. A burst's cost is the count, not a guess: the
+        #: batching claim in docs/store-writes.md is measured against this.
+        self.transactions = 0
         self.db.executescript(SCHEMA)
         self._migrate()
         if fresh:
             self.set_replay_floor()
+
+    # -- connections ----------------------------------------------------
+    @property
+    def db(self) -> sqlite3.Connection:
+        """The connection for this thread, opened on first use.
+
+        One connection per thread, not one shared: SQLite serialises writers at the
+        file level anyway, and a shared connection would make the event loop's reads
+        wait behind the writer thread's transaction in *Python* as well as in SQLite.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._open()
+            self._local.conn = conn
+        return conn
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        for pragma in self.PRAGMAS:
+            conn.execute(pragma)
+        conn.execute(f"PRAGMA synchronous={self.synchronous}")
+        with self._conn_lock:
+            self._connections.append(conn)
+        return conn
+
+    def _begin(self) -> None:
+        self.transactions += 1
+        self.db.execute("BEGIN IMMEDIATE")
+
+    # -- writer handoff --------------------------------------------------
+    def attach_writer(self, writer: StoreWriter) -> None:
+        """Route writes to `writer`. Reads keep using this thread's connection."""
+        self._writer = writer
+
+    def detach_writer(self) -> None:
+        self._writer = None
+
+    @property
+    def writer(self) -> StoreWriter | None:
+        return self._writer
+
+    async def flush(self) -> int:
+        """Wait for the writer to commit everything queued. 0 when nothing is attached."""
+        if self._writer is None:
+            return 0
+        return await self._writer.flush()
+
+    def writer_stats(self) -> dict[str, Any]:
+        return self._writer.stats() if self._writer is not None else {}
 
     # -- schema migration -----------------------------------------------
     def _migrate(self) -> None:
@@ -270,22 +364,78 @@ class Store:
         )
 
     # -- wrappers (transport level) -------------------------------------
+    def wrappers_seen(self, rows: list[tuple[str, str]]) -> list[bool]:
+        """Insert wrapper ids in one transaction; True where the id was already known.
+
+        Same contract per row as `wrapper_seen`, batched: a relay's replay after a
+        restart arrives as a burst, and one commit for it is the difference between a
+        stall and a hiccup.
+        """
+        if not rows:
+            return []
+        stamp = int(time.time())
+        out: list[bool] = []
+        self._begin()
+        try:
+            for wrapper_id, relay in rows:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO wrappers (id, relay, seen_at) VALUES (?, ?, ?)",
+                    (wrapper_id, relay, stamp),
+                )
+                out.append(cur.rowcount == 0)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return out
+
+    def _wrapper_known(self, wrapper_id: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM wrappers WHERE id = ? LIMIT 1", (wrapper_id,)
+        ).fetchone()
+        return row is not None
+
     def wrapper_seen(self, wrapper_id: str, relay: str = "") -> bool:
-        cur = self.db.execute(
-            "INSERT OR IGNORE INTO wrappers (id, relay, seen_at) VALUES (?, ?, ?)",
-            (wrapper_id, relay, int(time.time())),
-        )
-        return cur.rowcount == 0
+        """True when this wrapper has been seen before (so the event is a duplicate).
+
+        With a writer attached the *read* still happens here: it is a primary-key
+        lookup with no fsync, and it is what makes a restart's replay of the last three
+        days harmless. Only the insert is handed over.
+        """
+        if self._writer is not None:
+            if self._wrapper_known(wrapper_id):
+                return True
+            return self._writer.note_wrapper(wrapper_id, relay)
+        return self.wrappers_seen([(wrapper_id, relay)])[0]
+
+    def note_relays(self, rows: list[dict[str, Any]]) -> None:
+        """Apply relay counters in one transaction: `{"relay", "events", "error"}`."""
+        if not rows:
+            return
+        stamp = int(time.time())
+        self._begin()
+        try:
+            for row in rows:
+                events = int(row.get("events") or 0)
+                self.db.execute(
+                    "INSERT INTO relay_stats (relay, events, last_event, last_error)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(relay) DO UPDATE SET"
+                    " events = events + excluded.events,"
+                    " last_event = COALESCE(excluded.last_event, last_event),"
+                    " last_error = COALESCE(excluded.last_error, last_error)",
+                    (str(row.get("relay")), events,
+                     stamp if events else None, row.get("error")),
+                )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     def note_relay(self, relay: str, *, events: int = 0, error: str | None = None) -> None:
-        self.db.execute(
-            "INSERT INTO relay_stats (relay, events, last_event, last_error) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(relay) DO UPDATE SET "
-            "events = events + excluded.events, "
-            "last_event = COALESCE(excluded.last_event, last_event), "
-            "last_error = COALESCE(excluded.last_error, last_error)",
-            (relay, events, int(time.time()) if events else None, error),
-        )
+        if self._writer is not None:
+            self._writer.note_relay(relay, events=events, error=error)
+            return
+        self.note_relays([{"relay": relay, "events": events, "error": error}])
 
     def relay_report(self) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM relay_stats ORDER BY relay").fetchall()
@@ -342,83 +492,151 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- rumors (application level) -------------------------------------
-    def add(self, msg: Inbound, *, now: int | None = None) -> bool:
-        """Insert a rumor and assign its cursor in one transaction.
+    def duplicate_of(self, msg: Inbound) -> bool:
+        """Whether this rumor is already stored: same id, or same sender and text ±2s.
 
         A sender may write the same text over NIP-17 and NIP-04; ids differ per plane,
-        so also dedupe on (sender, created_at, content). A duplicate rolls the cursor
-        allocation back, so the sequence stays contiguous.
+        so both checks are needed. Read-only, so the writer can ask it on the event loop
+        while a commit is in flight elsewhere.
         """
-        stamp = int(time.time()) if now is None else int(now)
-        digest_rule = msg.rule if msg.reach in ("digest", "drop") and msg.rule else None
-        digest_state = None
-        if msg.reach == "digest":
-            digest_state = "queued"
-        elif msg.reach == "drop" and msg.interval_s is not None:
-            digest_state = "dropped"
+        if self.db.execute("SELECT 1 FROM rumors WHERE id = ? LIMIT 1",
+                           (msg.id,)).fetchone() is not None:
+            return True
+        if msg.authority == "self":
+            return False
+        row = self.db.execute(
+            "SELECT id FROM rumors WHERE sender = ? AND created_at BETWEEN ? AND ? "
+            "AND content = ? LIMIT 1",
+            (msg.sender, msg.created_at - 2, msg.created_at + 2, msg.content),
+        ).fetchone()
+        return row is not None
 
-        self.db.execute("BEGIN IMMEDIATE")
+    def add(self, msg: Inbound, *, now: int | None = None) -> bool:
+        """Store one rumor; True when it is new.
+
+        With a writer attached this only appends to its queue (and answers a duplicate
+        id from memory): the transaction happens off the event loop, on the writer's
+        thread, and `now` is then the batch's arrival stamp rather than the caller's.
+        Without one it writes here and now, which is what the CLI and the tests want.
+        """
+        if self._writer is not None:
+            return self._writer.offer(msg)
+        return self.add_many([msg], now=now)[0]
+
+    def reserve_cursors(self, count: int) -> int:
+        """Reserve a block of cursors and return the first one.
+
+        A writer hands cursors out from a reserved block, so a burst costs one
+        `delivery_cursor` write per block instead of one per message — and, because the
+        reservation is a transaction on the file, no two processes (the daemon, an `hng`
+        command) can be handed the same number. Cursors reserved but unused when the
+        process exits are skipped: cursors are monotonic and never move backwards, and a
+        gap is legal (spec §7).
+        """
+        count = max(1, int(count))
+        self._begin()
         try:
-            if msg.authority != "self":
-                row = self.db.execute(
-                    "SELECT id FROM rumors WHERE sender = ? AND created_at BETWEEN ? AND ? "
-                    "AND content = ? LIMIT 1",
-                    (msg.sender, msg.created_at - 2, msg.created_at + 2, msg.content),
-                ).fetchone()
-                if row is not None:
-                    self.db.execute("ROLLBACK")
-                    return False
             self._ensure_cursor()
             row = self.db.execute(
-                "SELECT next_rumor FROM delivery_cursor WHERE identity = ?",
-                (self.identity,),
+                "SELECT next_rumor FROM delivery_cursor WHERE identity = ?", (self.identity,)
             ).fetchone()
-            cursor = int(row["next_rumor"])
-            self.db.execute(
-                "INSERT INTO rumors (id, wrapper_id, sender, kind, created_at, conversation,"
-                " content, reply_to, plane, reach, authority, rule, why, received_at,"
-                " cursor, digest_rule, digest_state, digest_batch, blocked_reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
-                    msg.conversation, msg.content, msg.reply_to, msg.plane,
-                    msg.reach, msg.authority, msg.rule, msg.why, stamp,
-                    cursor, digest_rule, digest_state, None, msg.blocked_reason,
-                ),
-            )
+            first = int(row["next_rumor"])
             self.db.execute(
                 "UPDATE delivery_cursor SET next_rumor = ? WHERE identity = ?",
-                (cursor + 1, self.identity),
+                (first + count, self.identity),
             )
-            if digest_rule and (msg.reach == "digest" or digest_state == "dropped"):
-                self._ensure_digest_rule(digest_rule, int(msg.interval_s or 900), stamp)
-            # Attachments are part of the message, so they share its transaction: a
-            # message that survives without its attachment metadata would show the agent
-            # a photo it can never ask for.
-            for position, entry in enumerate(msg.attachments or []):
-                self.db.execute(
-                    "INSERT INTO attachments (rumor_id, position, sha256, url, mime,"
-                    " size, dim, alt) VALUES (?,?,?,?,?,?,?,?)"
-                    " ON CONFLICT(rumor_id, position) DO NOTHING",
-                    (
-                        msg.id, position,
-                        (entry.get("sha256") or None), entry.get("url"),
-                        entry.get("mime"), entry.get("size"), entry.get("dim"),
-                        entry.get("alt"),
-                    ),
-                )
             self.db.execute("COMMIT")
-        except sqlite3.IntegrityError:
-            self.db.execute("ROLLBACK")
-            return False
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        return first
 
-        msg.cursor = cursor
-        msg.digest_rule = digest_rule
-        msg.digest_state = digest_state
-        return True
+    def add_many(self, items: list[Inbound], *, now: int | None = None) -> list[bool]:
+        """Insert a batch of rumors in **one** transaction, in list order.
+
+        One commit for N rows is the point: the old path paid a transaction — and, at
+        `synchronous=FULL`, an fsync — per message, inside the relay read callback, so a
+        burst stalled the whole event loop. Each item's outcome is reported in order;
+        False means a duplicate (the same id, or the same sender and text within two
+        seconds), exactly as `add` would have said.
+
+        `now` stamps the whole batch: rows in one batch arrive together.
+        """
+        if not items:
+            return []
+        stamp = int(time.time()) if now is None else int(now)
+        results = [False] * len(items)
+        self._begin()
+        try:
+            self._ensure_cursor()
+            cursor_row = self.db.execute(
+                "SELECT next_rumor FROM delivery_cursor WHERE identity = ?",
+                (self.identity,),
+            ).fetchone()
+            next_rumor = int(cursor_row["next_rumor"])
+            max_used = next_rumor - 1
+            for position, msg in enumerate(items):
+                if self.duplicate_of(msg):
+                    continue
+                # A pre-assigned cursor (the writer reserved a block) is used as given;
+                # otherwise take the next free number.
+                cursor = int(msg.cursor) if msg.cursor is not None else max(
+                    next_rumor, max_used + 1)
+                digest_rule = msg.rule if msg.reach in ("digest", "drop") and msg.rule else None
+                digest_state = None
+                if msg.reach == "digest":
+                    digest_state = "queued"
+                elif msg.reach == "drop" and msg.interval_s is not None:
+                    digest_state = "dropped"
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO rumors (id, wrapper_id, sender, kind, created_at,"
+                    " conversation, content, reply_to, plane, reach, authority, rule, why,"
+                    " received_at, cursor, digest_rule, digest_state, digest_batch,"
+                    " blocked_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
+                        msg.conversation, msg.content, msg.reply_to, msg.plane,
+                        msg.reach, msg.authority, msg.rule, msg.why, stamp,
+                        cursor, digest_rule, digest_state, None, msg.blocked_reason,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    continue  # the id was already stored: a duplicate, not an error
+                results[position] = True
+                max_used = max(max_used, cursor)
+                if msg.cursor is None:
+                    next_rumor = max(next_rumor, cursor + 1)
+                msg.cursor = cursor
+                msg.digest_rule = digest_rule
+                msg.digest_state = digest_state
+                if digest_rule and (msg.reach == "digest" or digest_state == "dropped"):
+                    self._ensure_digest_rule(digest_rule, int(msg.interval_s or 900), stamp)
+                # Attachments are part of the message, so they share its transaction: a
+                # message that survives without its attachment metadata would show the
+                # agent a photo it can never ask for.
+                for attachment_position, entry in enumerate(msg.attachments or []):
+                    self.db.execute(
+                        "INSERT INTO attachments (rumor_id, position, sha256, url, mime,"
+                        " size, dim, alt) VALUES (?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(rumor_id, position) DO NOTHING",
+                        (
+                            msg.id, attachment_position,
+                            (entry.get("sha256") or None), entry.get("url"),
+                            entry.get("mime"), entry.get("size"), entry.get("dim"),
+                            entry.get("alt"),
+                        ),
+                    )
+            new_next = max(next_rumor, max_used + 1)
+            if new_next != int(cursor_row["next_rumor"]):
+                self.db.execute(
+                    "UPDATE delivery_cursor SET next_rumor = ? WHERE identity = ?",
+                    (new_next, self.identity),
+                )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return results
 
     def _ensure_digest_rule(self, rule: str, interval_s: int, now: int) -> None:
         interval_s = max(1, int(interval_s))
@@ -939,7 +1157,20 @@ class Store:
         return {"rule": rule, "frame": int(frame), "acked": cur.rowcount}
 
     def close(self) -> None:
-        self.db.close()
+        """Close every connection this Store opened, in any thread.
+
+        A writer's thread is stopped (and its queued rows flushed) before this is
+        called: closing a connection another thread is mid-transaction on would lose
+        that transaction.
+        """
+        with self._conn_lock:
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - already closed
+                pass
+        self._local = threading.local()
 
     def __enter__(self) -> "Store":
         return self

@@ -126,6 +126,15 @@ The migration backfills `cursor` for **every** existing rumor — immediate ones
 `received_at, id` order, then creates `UNIQUE INDEX rumors_cursor`. After backfill, a NULL cursor
 is not a valid state; the insert path always assigns one.
 
+**Amended for P6 (batched writes):** the allocation above is now per *block*. `StoreWriter`
+reserves 512 cursors in one `delivery_cursor` write (`Store.reserve_cursors`) and hands them out
+from memory, because a batched writer cannot afford a cursor write per message and an in-memory
+counter alone would race an `hng` command writing to the same file. Cursors stay monotonic and
+unique, and a batch assigns them inside its own transaction as before — but a block reserved and
+unused when the process exits is *skipped*, and a message rejected as a duplicate at flush time
+leaves its number unused. Gaps are legal: the promise is that a cursor never moves backwards, not
+that the sequence has no holes. See `docs/store-writes.md`.
+
 ## Window lifecycle
 
 - `window_start = floor(now / interval_s) * interval_s`; `window_end = window_start + interval_s`.

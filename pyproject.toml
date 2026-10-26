@@ -43,7 +43,7 @@ pythonpath = ["src", "scripts"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests", "scripts"]
+src = ["src", "tests", "scripts", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
