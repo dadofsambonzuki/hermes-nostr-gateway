@@ -28,7 +28,8 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
 - [x] **P5 — Truthful status + `health` op** — live vs historical relays, fix the mangled
       error string, one-call health. See plan P5.
       → PR nevent1qqstypl33pqz702tt370hgqrymmwv84l96427qyuuqj2uyenxg4es5qpz3mhxue69uhhyetvv9ujumn8d96zuer9wc5c2ts7 (pr/truthful-status-health)
-- [ ] **P6 — Store off the loop** — WAL, batching, 500-event burst benchmark. See plan P6.
+- [x] **P6 — Store off the loop** — WAL, batching, 500-event burst benchmark. See plan P6.
+      → PR nevent1qqsxqafuxtyezhnjqn8hsa00gyc4zur5j6nmzdyh59vsv8w3a85arfqpz3mhxue69uhhyetvv9ujumn8d96zuer9wcup3vq3 (pr/store-off-loop)
 - [ ] **P7 — Concord: real vector or explicitly experimental.** See plan P7.
 - [ ] **P8 — Security hardening** — SO_PEERCRED, LoadCredential, ops notes. See plan P8.
 - [ ] **P9 — Attachments reach the agent** — adapter calls `media.get`. See plan P9.
