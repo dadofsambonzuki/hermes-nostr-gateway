@@ -38,6 +38,13 @@ relays:
     - wss://nos.lol
     - wss://relay.primal.net
 
+# Read transport (plan P1). One `nostr-sdk` client in this process replaces the
+# per-relay `nak req --stream` children: one subscription per filter set, NIP-42
+# answered in-process with our own key, and the library's reconnect and backoff.
+# `legacy: true` keeps the subprocess workers for one release — it is the rollback.
+transport:
+  legacy: false
+
 # White Noise relays belong to the Marmot plane only (wn-agent), never the DM/feed
 # read set: they reject public kinds and are not a general NIP-17 inbox.
 whitenoise:

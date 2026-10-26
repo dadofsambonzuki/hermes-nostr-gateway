@@ -151,10 +151,14 @@ rebuild, update the URL and the hash in `requirements.txt` together.
 
 ## Container
 
-`Dockerfile` builds the same package with a pinned `nak` (the relay transport is a `nak`
-child per relay, so it is part of the image). The image runs as `gateway`, UID/GID 1000 by
-default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)` when the host user
-that owns the mounted files is not 1000.
+`Dockerfile` builds the same package with a pinned `nak` (reads run on the `nostr-sdk`
+client inside the process; `nak` is still what publishes and what a one-shot
+`hng --once` fetch uses, so it is part of the image). The image runs as `gateway`,
+UID/GID 1000 by default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)`
+when the host user that owns the mounted files is not 1000.
+
+The read transport — one client, one subscription per filter set, NIP-42 in-process, and
+the `transport.legacy: true` rollback — is described in `docs/transport-pool.md`.
 
 There is no network listener, so the socket is published through a volume, not a port:
 
