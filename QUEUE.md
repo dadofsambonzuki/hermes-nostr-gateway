@@ -30,7 +30,9 @@ Plan of record: `docs/plan-v2.md` (also filed as an ngit issue).
       → PR nevent1qqstypl33pqz702tt370hgqrymmwv84l96427qyuuqj2uyenxg4es5qpz3mhxue69uhhyetvv9ujumn8d96zuer9wc5c2ts7 (pr/truthful-status-health)
 - [x] **P6 — Store off the loop** — WAL, batching, 500-event burst benchmark. See plan P6.
       → PR nevent1qqsxqafuxtyezhnjqn8hsa00gyc4zur5j6nmzdyh59vsv8w3a85arfqpz3mhxue69uhhyetvv9ujumn8d96zuer9wcup3vq3 (pr/store-off-loop)
-- [x] **P7 — Concord: real vector or explicitly experimental.** See plan P7.
+- [x] **P7 — Concord: a supported plane, documented.** Corrected after review: it runs
+      in production here and on Bitfest, so it is neither experimental nor gated. See
+      `pr/concord-experimental`.
       → PR nevent1qqsvyraaescf2skzzypvtu2arh38847pfnfxh959ff4vv7730n4kqegpz3mhxue69uhhyetvv9ujumn8d96zuer9wc65yaqx (pr/concord-experimental)
 - [x] **P8 — Security hardening** — SO_PEERCRED, LoadCredential, ops notes. See plan P8.
       → PR nevent1qqsyzdqn6hpfrg7unw3q2enm9a4wz49r3krnwtas5362nrq452lenzqpz3mhxue69uhhyetvv9ujumn8d96zuer9wccg7xdz (pr/security-hardening)
