@@ -52,7 +52,27 @@ goes stale between commits.
   reaches the household inbox. `tests/test_conformance.py` exercises it.
 - **Hermes plugin** — `integrations/hermes-plugin/` (manifest, adapter, `register(ctx)` shim), kept
   in step with the live copy under `~/.hermes/plugins/nostr/`.
+- **Queue gate** — `scripts/queue_next.py` and `deploy/queue-gate.sh`: the cron queue worker's
+  monitor source, so an idle tick costs no agent run (see "Working the queue" below).
 - **Prior art** — [`docs/prior-art/`](docs/prior-art/) holds the handover this design leans on.
+
+## Working the queue
+
+`QUEUE.md` is where the remaining work is listed and what happened to it; the 20-minute Hermes cron
+job works its first unchecked, non-BLOCKED item and leaves a commit behind as the receipt. The job
+is monitor-gated, not prompt-only: `scripts/queue_next.py` runs *before* the agent and prints either
+one idle line — `queue empty — nothing pending` — or the next item with the pending/blocked counts
+and the whole hours since `QUEUE.md` last changed. Hermes suppresses the agent run while that output
+is byte-identical to the last run that woke it, so an empty queue costs one script execution, no
+model call and no tool attempts; the `waited:` hour bucket is also the retry valve for an item whose
+run died without editing the file.
+
+`hermes cron` only accepts monitor scripts from its own scripts directory, so
+`deploy/queue-gate.sh` is the source of truth and `~/.hermes/scripts/queue-gate.sh` is a
+pass-through copy (`cp` is the whole update step); the repo path is `QUEUE_REPO` with this
+checkout as the default. `tests/test_queue_next.py` pins the parse, the one-line idle output, the
+rules-text trap and wrapper/module equivalence. This is project tooling, not gateway surface — `hng`
+is not involved.
 
 ## Quick start (five minutes)
 
