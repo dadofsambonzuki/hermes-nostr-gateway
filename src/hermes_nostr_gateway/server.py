@@ -1,4 +1,4 @@
-"""Unix-socket API: NDJSON in, NDJSON out, 0600, local only.
+"""Unix-socket API: NDJSON in, NDJSON out, 0600, same uid only.
 
 One connection may both subscribe and request. Ops: subscribe, status, health, send,
 history, peers, ack, mark_read, ping, plus the Marmot reads (`marmot.group`,
@@ -6,6 +6,11 @@ history, peers, ack, mark_read, ping, plus the Marmot reads (`marmot.group`,
 frame the overnight cron reads instead of parsing logs. No TCP, no HTTP in v1 — there is
 no auth surface to get wrong, and the adapter is a local process by design. See
 docs/gateway-spec.md §5.
+
+The 0600 mode is necessary but not sufficient: it is checked when a process calls
+`connect()` and says nothing about a descriptor already open in another process. Every
+accepted connection is therefore checked with `SO_PEERCRED` — the kernel's record of the
+uid that connected — before a single frame is read.
 """
 
 from __future__ import annotations
@@ -14,10 +19,38 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import struct
 from pathlib import Path
 from typing import Any, Protocol
 
 log = logging.getLogger("hng.socket")
+
+#: `struct ucred` as SO_PEERCRED returns it: pid, uid, gid (Linux).
+_PEERCRED = struct.Struct("3i")
+
+
+def peer_uid(sock: Any) -> int | None:
+    """The uid at the other end of a connected AF_UNIX socket, or None if unknown.
+
+    The kernel fills this in when the connection is made, so it is the credential the
+    peer's process actually runs under — something the peer cannot claim in a frame.
+    None means "cannot say" (no SO_PEERCRED on this platform, or not a socket), never
+    "same uid"; the caller decides what to do with that.
+    """
+    if sock is None or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    # asyncio hands back a TransportSocket wrapper on some versions; the real socket
+    # object is one attribute down.
+    raw = getattr(sock, "_sock", sock)
+    try:
+        data = raw.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _PEERCRED.size)
+    except (AttributeError, OSError):
+        return None
+    if len(data) != _PEERCRED.size:
+        return None
+    _pid, uid, _gid = _PEERCRED.unpack(data)
+    return int(uid)
 
 
 async def request(path: str | Path, frame: dict[str, Any], *,
@@ -120,6 +153,19 @@ class SocketServer:
 
     # -- per connection -------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        uid = peer_uid(writer.get_extra_info("socket"))
+        if uid is not None and uid != os.getuid():
+            # A foreign uid gets no reply at all: not an error frame, not `pong` — the
+            # connection is closed before the first read. `uid is None` means the
+            # platform cannot answer the question, and the 0600 mode is what is left.
+            log.warning("socket: refused connection from uid %d; this daemon runs as %d",
+                        uid, os.getuid())
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+            return
         subscribed = False
         try:
             while line := await reader.readline():

@@ -12,10 +12,21 @@ WorkingDirectory=/home/ubuntu/Projects/hermes-nostr-gateway
 Environment=HOME=/home/ubuntu
 Environment=PYTHONPATH=/home/ubuntu/Projects/hermes-nostr-gateway/src
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The identity key arrives as a systemd credential, not an Environment= line: systemd
+# copies a root-owned file into $CREDENTIALS_DIRECTORY (a per-unit tmpfs, read-only to
+# anyone but the unit's own user/group, removed when the unit stops), so the key is in
+# neither `systemctl show` nor the process environment, and no child inherits it.
+# config.yaml names it:
+#     identity:
+#       secret_credential: nostr_secret
+# The source must exist before the first start, or the unit fails to start. Creating it
+# is documented in docs/ops-notes.md, "Key handling".
+LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json
 ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng serve
 Restart=always
 RestartSec=5
-# The socket is 0600 and local-only; there is no network listener.
+# The socket is 0600 and local-only, and the daemon refuses any connecting uid but its
+# own (SO_PEERCRED); there is no network listener.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
