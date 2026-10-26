@@ -41,10 +41,11 @@ whitenoise:
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
 
 # Media (spec §4b). An inbound attachment is recorded from its NIP-92 `imeta` tag but
-# never fetched on receipt: the adapter asks for a blob with `media.get`, and only then
-# does the gateway download it, verify the sha256, sniff the type and cache it. The caps
-# are enforced before the request (a declared size over the cap) and while reading the
-# body (a server that omits or lies about Content-Length).
+# never fetched on receipt: the adapter asks for a blob with `media.get` when it is about
+# to hand the message to the agent, and only then does the gateway download it, verify the
+# sha256, sniff the type and cache it. The caps are enforced before the request (a declared
+# size over the cap) and while reading the body (a server that omits or lies about
+# Content-Length). `NOSTR_MEDIA=0` in the agent's environment stops the fetch at the adapter.
 # The cache directory must be writable by the unit: this one is inside the sandbox's
 # ReadWritePaths (see docs/ops-notes.md).
 media:

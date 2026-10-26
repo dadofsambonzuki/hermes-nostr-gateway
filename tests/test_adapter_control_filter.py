@@ -1,54 +1,13 @@
 """Hermes sends its own control notices through the platform path; they must not ship.
 
-The adapter runs inside Hermes, so its `gateway.*` imports are not on this venv's path.
-Stub the three modules it needs before loading it: the filter itself is stdlib-only.
+The adapter runs inside Hermes, so ``adapter_harness`` stubs its ``gateway.*`` imports; the
+filter itself is stdlib-only.
 """
-import importlib.util
-import sys
-import types
 from collections import deque
-from pathlib import Path
 
+from adapter_harness import load_adapter
 
-def _stub(name, **attrs):
-    module = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    sys.modules[name] = module
-
-
-class _SendResult:
-    def __init__(self, success=True, error=None, retryable=False, message_id=None, raw_response=None):
-        self.success = success
-        self.error = error
-        self.retryable = retryable
-        self.message_id = message_id
-        self.raw_response = raw_response
-
-
-class _Kw:
-    """Stand-in for SessionSource/MessageEvent: keyword attributes, nothing else."""
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class _MessageType:
-    TEXT = "text"
-
-
-_stub("gateway")
-_stub("gateway.config", Platform=object, PlatformConfig=object)
-_stub("gateway.platforms")
-_stub("gateway.platforms.base", BasePlatformAdapter=object, SendResult=_SendResult,
-      SessionSource=_Kw)
-_stub("gateway.platforms.event", MessageEvent=_Kw, MessageType=_MessageType)
-
-_spec = importlib.util.spec_from_file_location(
-    "nostr_adapter",
-    Path(__file__).resolve().parents[1] / "integrations" / "hermes-plugin" / "adapter.py",
-)
-adapter = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(adapter)
+adapter = load_adapter("nostr_adapter_control")
 
 
 def test_control_notices_are_recognised():
@@ -74,7 +33,8 @@ def test_shutdown_warnings_are_control_notices():
 
 def test_the_class_still_owns_its_transport_methods():
     """A module-level block spliced into the class body once ate send() and _request()."""
-    for name in ("send", "_request", "_deliver", "_reader_loop", "_may_address"):
+    for name in ("send", "_request", "_deliver", "_reader_loop", "_may_address",
+                 "_blob", "_media_for"):
         assert name in vars(adapter.NostrGatewayAdapter), name
 
 

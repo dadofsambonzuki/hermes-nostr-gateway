@@ -19,7 +19,7 @@ agent talks NDJSON over a Unix socket.
 |---|---|
 | Socket | `~/.local/state/hermes-nostr-gateway/gateway.sock`, mode **0600** |
 | State | `gateway.db` (SQLite, WAL) in the same directory |
-| Client | `integrations/hermes-plugin/`; `NOSTR_GATEWAY_SOCKET` overrides the path |
+| Client | `integrations/hermes-plugin/`; `NOSTR_GATEWAY_SOCKET` overrides the path; `NOSTR_MEDIA=0` stops inbound attachment fetching |
 | Identity | Holly's agent key `740fcd90…`; secret `~/.marmot-agents/hermes/accounts/hermes-agent/secret.json`, shared with the Marmot connector |
 | Stop bound | drop-in `/etc/systemd/system/hermes-nostr-gateway.service.d/stop-timeout.conf`: `TimeoutStopSec=15` |
 
@@ -37,6 +37,13 @@ agent talks NDJSON over a Unix socket.
   worker is a `nak` child. The media cache defaults to
   `~/.local/state/hermes-nostr-gateway/media` for exactly this reason — a `share/` path would
   only fail when the first blob is fetched.
+- **An attachment reaches the agent through two caches, on purpose.** The gateway's cache
+  (`~/.local/state/hermes-nostr-gateway/media/<sha256>`) is the verified quarantine; the
+  adapter reads those bytes and hands them to Hermes' own media cache, so a routed profile's
+  sandbox mount and vision's cache-root check both resolve the file. When an image is missing
+  from a turn, read the text first: `[attachment not delivered: <code>]` is the gateway's
+  named refusal (`too_large`, `type_not_allowed`, `unknown_blob`, …), and a frame with no
+  `attachments` at all means the sender's `imeta` carried no hash. Neither is a relay problem.
 - **`TimeoutStopSec=15` bounds a stop that does not finish.** The restart at 12:31 on
   2026-10-24 logged `State 'stop-sigterm' timed out. Killing.` — the drop-in converted a
   90-second wait into a 15-second one ending in SIGKILL. Treat `systemctl restart` as hard:
