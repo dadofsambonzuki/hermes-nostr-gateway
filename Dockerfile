@@ -34,11 +34,11 @@ COPY requirements.txt pyproject.toml README.md LICENSE ./
 COPY src ./src
 # requirements.txt first: it is the only install path carrying the patched
 # nostr-sdk hash. The project install that follows resolves the remaining
-# runtime dependencies (PyYAML, websockets, pydantic, structlog, media extras),
-# and the assertion turns a resolver that swapped in the PyPI release of the
-# same version into a build failure instead of a runtime Concord error.
+# runtime dependencies (PyYAML, websockets, pydantic, structlog), and the
+# assertion turns a resolver that swapped in the PyPI release of the same
+# version into a build failure instead of a runtime Concord error.
 RUN python -m pip install --no-cache-dir -r requirements.txt \
- && python -m pip install --no-cache-dir '.[media]' \
+ && python -m pip install --no-cache-dir '.' \
  && python -c "import nostr_sdk as sdk; assert callable(getattr(sdk, 'nip44_conversation_key', None)), 'the PyPI nostr-sdk is installed: nip44_conversation_key missing'"
 
 COPY config.example.yaml /etc/hermes-nostr-gateway/config.example.yaml

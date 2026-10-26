@@ -60,6 +60,8 @@ class Handler(Protocol):
     def replay_skip(self) -> dict[str, Any]: ...
     async def marmot_group(self, group: str) -> dict[str, Any]: ...
     async def marmot_timeline(self, group: str, limit: int = 20) -> dict[str, Any]: ...
+    async def media_get(self, *, sha256: str | None, url: str | None,
+                        rumor_id: str | None) -> dict[str, Any]: ...
 
 
 class SocketServer:
@@ -184,6 +186,16 @@ class SocketServer:
                         else:
                             await self._send(writer, await handler(
                                 req.get("group") or "", int(req.get("limit", 20))))
+                    elif op == "media.get":
+                        handler = getattr(self.handler, "media_get", None)
+                        if handler is None:
+                            await self._send(writer, {"type": "error", "op": op,
+                                                      "code": "unsupported",
+                                                      "error": "media.get is not available"})
+                        else:
+                            await self._send(writer, await handler(
+                                sha256=req.get("sha256"), url=req.get("url"),
+                                rumor_id=req.get("rumor_id")))
                     elif op == "ping":
                         await self._send(writer, {"type": "pong"})
                     else:

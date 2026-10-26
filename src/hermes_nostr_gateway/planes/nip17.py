@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Protocol
 
+from ..media import imeta_attachments
 from ..policy import Policy
 from ..store import Inbound, Store
 
@@ -88,6 +89,9 @@ class Nip17Plane:
             why=decision.why,
             blocked_reason=decision.blocked_reason,
             interval_s=decision.interval_s,
+            # NIP-92 attachments are metadata on the text rumor, not a separate kind;
+            # the bytes stay remote until the adapter asks for them (spec §4b).
+            attachments=imeta_attachments(tags) or None,
         )
         if decision.duplicate:
             return None

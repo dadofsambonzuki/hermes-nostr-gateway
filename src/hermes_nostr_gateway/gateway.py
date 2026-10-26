@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .crypto import SdkCrypto
+from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .peer_inbox import (
     InboxResolver,
     NakInboxResolver,
@@ -103,6 +104,11 @@ def default_socket_path() -> Path:
     return Path.home() / ".local/state/hermes-nostr-gateway/gateway.sock"
 
 
+def _media_error(code: str, message: str) -> dict[str, Any]:
+    """One shape for every `media.get` refusal: a code the adapter can branch on."""
+    return {"type": "error", "op": "media.get", "code": code, "error": message[:300]}
+
+
 class Gateway:
     #: Logged and reported whenever the plane is not attached for want of an opt-in.
     #: Kept as one string so the log line, `hng status` and a refused send all tell
@@ -124,6 +130,11 @@ class Gateway:
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(store_path, identity=self.me)
+        # Media (spec §4b): attachments are recorded with the message and fetched only
+        # when the adapter asks, so this is configuration plus a cache — nothing here
+        # touches the network at startup.
+        self.media_cfg: MediaConfig = media_config(cfg.get("media"))
+        self.media = self.media_cfg.fetcher()
         groups = normalise_groups(cfg)
         self.policy = Policy({
             "groups": groups,
@@ -716,6 +727,15 @@ class Gateway:
             "pending": stats["pending"],
             "blocked": stats["blocked"],
             "invites": stats["invites"],
+            "media": {
+                "enabled": self.media_cfg.enabled,
+                "servers": list(self.media_cfg.servers),
+                "dir": str(self.media_cfg.dir),
+                "max_bytes": self.media_cfg.max_bytes,
+                "max_files": self.media_cfg.max_files,
+                "max_cache_bytes": self.media_cfg.max_cache_bytes,
+                **stats["media"],
+            },
             "replay": {"limit": self.replay_limit,
                        "max_age_minutes": self.replay_max_age_minutes,
                        "floor": self.store.replay_floor()},
@@ -749,7 +769,7 @@ class Gateway:
                 "last_error": getattr(worker, "last_error", None)}
 
     def history(self, limit: int) -> dict[str, Any]:
-        return {"messages": self.store.recent(limit)}
+        return {"messages": self.store.recent(limit, with_attachments=True)}
 
     def peers(self) -> dict[str, Any]:
         seen: dict[str, int] = {}
@@ -769,14 +789,19 @@ class Gateway:
         frames = []
         for row in self.store.pending_immediate(limit or self.replay_limit,
                                                 self.replay_max_age_minutes):
-            frames.append({
+            frame = {
                 "type": "message", "plane": row["plane"], "id": row["id"],
                 "sender": row["sender"], "conversation": row["conversation"],
                 "kind": row["kind"], "created_at": row["created_at"],
                 "content": row["content"], "reply_to": row["reply_to"],
                 "reach": row["reach"], "authority": row["authority"], "why": row["why"],
                 "replay": True,
-            })
+            }
+            # A replay has to carry the same attachments as the original frame, or the
+            # adapter sees a photo it can no longer ask for.
+            if row.get("attachments"):
+                frame["attachments"] = row["attachments"]
+            frames.append(frame)
         return frames
 
     def replay_skip(self) -> dict[str, Any]:
@@ -792,6 +817,35 @@ class Gateway:
             return self.store.ack_digest(rule, int(frame))
         self.store.mark_delivered(ids or [])
         return {"acked": ids or []}
+
+    # -- media (spec §4b) ------------------------------------------------
+    async def media_get(self, *, sha256: str | None = None, url: str | None = None,
+                        rumor_id: str | None = None) -> dict[str, Any]:
+        """Resolve a stored attachment, fetch and verify it, hand back a local path.
+
+        The download is blocking, so it runs in the executor; the store write that
+        records the cache file stays on the loop thread, where the connection lives
+        (`sqlite3` connections are not shared across threads here).
+        """
+        if not self.media_cfg.enabled:
+            return _media_error("media_disabled",
+                                "media is disabled: set media.enabled: true")
+        try:
+            entry = resolve_attachment(self.store, sha256=sha256, url=url,
+                                       rumor_id=rumor_id)
+        except MediaError as exc:
+            return _media_error(exc.code, str(exc))
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, self.media.fetch, entry)
+        except MediaError as exc:
+            return _media_error(exc.code, str(exc))
+        except OSError as exc:
+            # A full disk or an unwritable cache is a named refusal too: the adapter
+            # should not have to treat "no code" as a special case.
+            return _media_error("cache_failed", f"cannot cache the blob: {exc}")
+        self.store.mark_media_fetched(result["sha256"], result["path"])
+        return {"type": "media", "op": "media.get", **result}
 
     # -- Marmot reads (over the same socket, same normalised shapes) ------
     def _marmot_unavailable(self) -> str:

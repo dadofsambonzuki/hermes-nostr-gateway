@@ -82,6 +82,22 @@ CREATE TABLE IF NOT EXISTS concord_invites (
     received_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS attachments (
+    rumor_id   TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    sha256     TEXT,
+    url        TEXT,
+    mime       TEXT,
+    size       INTEGER,
+    dim        TEXT,
+    alt        TEXT,
+    local_path TEXT,
+    fetched_at INTEGER,
+    PRIMARY KEY (rumor_id, position)
+);
+CREATE INDEX IF NOT EXISTS attachments_blob ON attachments (sha256);
+CREATE INDEX IF NOT EXISTS attachments_url ON attachments (url);
+
 CREATE TABLE IF NOT EXISTS delivery_cursor (
     identity   TEXT PRIMARY KEY,
     next_rumor INTEGER NOT NULL DEFAULT 1,
@@ -149,6 +165,8 @@ class Inbound:
     digest_rule: str | None = None
     digest_state: str | None = None
     digest_batch: str | None = None
+    #: NIP-92 `imeta` metadata, in tag order. Claims only: the hash gates the fetch.
+    attachments: list[dict[str, Any]] | None = None
 
     def to_frame(self) -> dict[str, Any]:
         frame = {
@@ -165,6 +183,8 @@ class Inbound:
             "authority": self.authority,
             "why": self.why,
         }
+        if self.attachments:
+            frame["attachments"] = self.attachments
         if self.blocked_reason:
             frame["blocked_reason"] = self.blocked_reason
         if self.cursor is not None:
@@ -328,6 +348,21 @@ class Store:
             )
             if digest_rule and (msg.reach == "digest" or digest_state == "dropped"):
                 self._ensure_digest_rule(digest_rule, int(msg.interval_s or 900), stamp)
+            # Attachments are part of the message, so they share its transaction: a
+            # message that survives without its attachment metadata would show the agent
+            # a photo it can never ask for.
+            for position, entry in enumerate(msg.attachments or []):
+                self.db.execute(
+                    "INSERT INTO attachments (rumor_id, position, sha256, url, mime,"
+                    " size, dim, alt) VALUES (?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(rumor_id, position) DO NOTHING",
+                    (
+                        msg.id, position,
+                        (entry.get("sha256") or None), entry.get("url"),
+                        entry.get("mime"), entry.get("size"), entry.get("dim"),
+                        entry.get("alt"),
+                    ),
+                )
             self.db.execute("COMMIT")
         except sqlite3.IntegrityError:
             self.db.execute("ROLLBACK")
@@ -437,7 +472,9 @@ class Store:
             " ORDER BY received_at, rowid LIMIT ?",
             (cutoff, self.replay_floor(), limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        items = [dict(r) for r in rows]
+        self._with_attachments(items)
+        return items
 
     def skip_pending(self) -> int:
         """Declare the current backlog already answered, at a handover or an import.
@@ -454,6 +491,81 @@ class Store:
         )
         self.set_replay_floor(now)
         return cur.rowcount
+
+    # -- attachments (NIP-92 imeta, fetched lazily) ----------------------
+    def attachment_rows(self, rumor_id: str) -> list[dict[str, Any]]:
+        """Raw rows for one message, tag order included (media resolution needs it)."""
+        rows = self.db.execute(
+            "SELECT * FROM attachments WHERE rumor_id = ? ORDER BY position",
+            (rumor_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def attachments_for(self, rumor_id: str) -> list[dict[str, Any]]:
+        """Frame-shaped attachment metadata for a message, in tag order.
+
+        Identical to what the live frame carried: the sender's claims, with the digest
+        that lets the adapter ask for the blob. `status` says whether it can be asked
+        for at all — `unverifiable` when the tag carried no usable sha256 — and
+        `cached` whether the bytes are already on this host.
+        """
+        out: list[dict[str, Any]] = []
+        for row in self.attachment_rows(rumor_id):
+            item: dict[str, Any] = {}
+            for key in ("url", "sha256", "mime", "size", "dim", "alt"):
+                if row.get(key) is not None:
+                    item[key] = row[key]
+            item["status"] = "available" if row.get("sha256") else "unverifiable"
+            if row.get("local_path"):
+                item["cached"] = True
+            out.append(item)
+        return out
+
+    def find_attachment(self, *, sha256: str | None = None,
+                        url: str | None = None) -> dict[str, Any] | None:
+        """The first row for a blob digest or url, or None when no message holds it."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if sha256:
+            clauses.append("sha256 = ?")
+            params.append(sha256.lower())
+        if url:
+            clauses.append("url = ?")
+            params.append(url)
+        if not clauses:
+            return None
+        row = self.db.execute(
+            "SELECT * FROM attachments WHERE " + " AND ".join(clauses)
+            + " ORDER BY position LIMIT 1",
+            params,
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def mark_media_fetched(self, sha256: str, local_path: str) -> int:
+        """Record the cache file against every message that referenced the blob."""
+        cur = self.db.execute(
+            "UPDATE attachments SET local_path = ?, fetched_at = ? WHERE sha256 = ?",
+            (local_path, int(time.time()), sha256.lower()),
+        )
+        return cur.rowcount
+
+    def _with_attachments(self, items: list[dict[str, Any]]) -> None:
+        """Attach `attachments` to rumor rows in place, one query for the batch."""
+        ids = [str(item["id"]) for item in items if item.get("id")]
+        if not ids:
+            return
+        found: dict[str, list[dict[str, Any]]] = {}
+        for start in range(0, len(ids), 200):
+            chunk = ids[start:start + 200]
+            placeholders = ",".join("?" * len(chunk))
+            for row in self.db.execute(
+                f"SELECT DISTINCT rumor_id FROM attachments WHERE rumor_id IN ({placeholders})",
+                chunk,
+            ).fetchall():
+                found[str(row["rumor_id"])] = self.attachments_for(str(row["rumor_id"]))
+        for item in items:
+            if str(item.get("id")) in found:
+                item["attachments"] = found[str(item["id"])]
 
     # -- replay watermark ------------------------------------------------
     def get_meta(self, key: str, default: str | None = None) -> str | None:
@@ -479,11 +591,14 @@ class Store:
         self.set_meta("replay_floor", str(moment))
         return moment
 
-    def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+    def recent(self, limit: int = 20, *, with_attachments: bool = False) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM rumors ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        items = [dict(r) for r in rows]
+        if with_attachments:
+            self._with_attachments(items)
+        return items
 
     # -- Concord invites (verified, never delivered as messages) ---------
     def record_invite(self, *, id: str, inviter: str, community_id: str, name: str,
@@ -515,9 +630,15 @@ class Store:
             " SUM(blocked_reason IS NOT NULL) AS blocked FROM rumors"
         ).fetchone()
         invites = self.db.execute("SELECT COUNT(*) AS n FROM concord_invites").fetchone()
+        media = self.db.execute(
+            "SELECT COUNT(*) AS n,"
+            " COUNT(DISTINCT CASE WHEN local_path IS NOT NULL THEN sha256 END) AS cached"
+            " FROM attachments"
+        ).fetchone()
         return {"total": row["total"], "pending": row["pending"] or 0,
                 "blocked": row["blocked"] or 0,
-                "invites": invites["n"], "relays": self.relay_report()}
+                "invites": invites["n"], "relays": self.relay_report(),
+                "media": {"attachments": media["n"], "cached": media["cached"] or 0}}
 
     # -- digests --------------------------------------------------------
     def seal_digests(self, now: int | float | None = None, *, top_n: int = 5) -> list[dict[str, Any]]:

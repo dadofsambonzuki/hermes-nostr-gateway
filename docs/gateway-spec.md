@@ -118,11 +118,15 @@ forwarding). One tag per attachment:
   the returned URL. Caps: 25 MB per file, 4 files per message, MIME allowlist (`image/*`,
   `audio/*`, `video/mp4`, `application/pdf`, `text/plain`). Refuse **before** uploading, so a
   rejected file never becomes a public blob.
-- **Inbound:** parse `imeta`, download to `~/.local/share/nostr-dm/media/<sha256>`, verify the
-  hash, sniff the MIME rather than trusting the tag, enforce the same caps, and hand the
-  adapter a path plus metadata — never bytes, never a shell-escaped name. Downloads are lazy
-  (on `media.get`, not on receipt) so a hostile sender cannot make us pull 25 MB by sending a
-  message.
+- **Inbound:** parse `imeta`, download to the gateway's state directory
+  (`<state>/media/<sha256>`), verify the hash, sniff the MIME rather than trusting the tag,
+  enforce the same caps, and hand the adapter a path plus metadata — never bytes, never a
+  shell-escaped name. Downloads are lazy (on `media.get`, not on receipt) so a hostile
+  sender cannot make us pull 25 MB by sending a message. A blob is fetched only when a
+  stored message references it: the message's own url is used when it ends in that sha256,
+  is https and resolves to a public address (no redirects), and the configured
+  `blossom_servers` are then tried by hash. The hash check is what makes a peer's server
+  safe to talk to: a wrong body is refused, never cached.
 - **Reactions:** kind 7, content `+` or an emoji, tags `e`=<target rumor id>, `p`=<target
   author>, sealed and wrapped exactly like a kind 14. Stored against the target and matched on
   receive; a reaction to a rumor we do not hold is stored unresolved rather than dropped.
@@ -144,7 +148,7 @@ socket 0600, directory 0700. No TCP in v1; no HTTP.
 | `status` | — | version, uptime, queue depth, per-relay state, allowlist size |
 | `send` | `identity`, `to`, `text`, `transport=auto`, `reply_to?`, `attachments?: [{path, alt?}]` | `rumor_id`, `event_ids`, `relays_ok[]`, `relays_failed[]`, `sent_at`, `attachments[]` |
 | `react` | `identity`, `to`, `rumor_id`, `emoji="+"` | `reaction_rumor_id`, per-relay results |
-| `media.get` | `identity`, `sha256` or `url` | `path`, `mime`, `size`, verified `sha256` |
+| `media.get` | `identity`, `sha256` or `url` (or `rumor_id`) | `path`, `mime`, `size`, verified `sha256`, `cached` |
 | `history` | `identity`, `peer`, `limit`, `before?` | messages, newest first |
 | `peers` | `identity` | known peers + last activity + blocked count |
 | `ack` | `cursor` | advances the durable cursor (§7) |
@@ -262,8 +266,9 @@ Written as a contract the daemon enforces, not advice for callers:
    unless the sender's hex is in `allowed_senders` for that identity
    (`~/.config/nostr-dm/allowlist.json`, hot-reloaded, per-identity). Blocked messages emit a
    `blocked` frame with a reason and are never replied to.
-2. **The gateway never interprets content.** No URL fetching beyond the configured Blossom
-   servers, no command parsing, no policy decisions about replying. It is a transport.
+2. **The gateway never interprets content.** No fetching beyond a Blossom blob a stored
+   message references, addressed by its sha256 (lazy, capped, hash-verified; §4b), no
+   command parsing, no policy decisions about replying. It is a transport.
 3. **No auto-reply, ever, from the gateway.** An agent may choose to reply; the gateway will
    not, and it will not send read receipts at all in v1 (receipts leak presence).
 4. **Rate limits.** Per-sender token bucket: burst 10, sustained 30/hour. Over-limit is
