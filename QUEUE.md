@@ -124,9 +124,17 @@ a positional body, not `--text`).
       was `status != 'sent'`. Migration dates pre-TTL rows from `last_attempt`; `hng status`
       reports wrap counts by status; 259 tests green, ruff clean, live-DB copy expired 225 rows
       in one pass (4,406 expired, 44 retryable). The daemon picks it up on its next restart.
-- [ ] **Marmot conversations after reconnect** — the plane reports `conversations: []` until
+- [x] **Marmot conversations after reconnect** — the plane reports `conversations: []` until
       the first event arrives, where it reported this chat before the restart. Enumerate on
       connect (or say why it cannot) so `status` is not ambiguous about what is attached.
+      — landed c0ac7fe: `Store.conversations(plane)` makes stored messages the evidence;
+      `MarmotResolver.enumerate()` runs on every subscribe ack (stored groups + the configured
+      subscription group), `status` entries carry `verified`/`messages`/`last_at` and an
+      `enumeration` block names any group `group_info` refused. wn-agent 0.10.4 has no
+      group-list request (an unknown `group_list` frame is unanswered), so a group with no
+      stored message stays undiscoverable until its first message and `source` says so.
+      Live wn-agent on a copy of the live store confirmed the family group (13 messages,
+      2 members, `is_direct`) before any new event; 266 tests green, ruff clean.
 - [ ] **Queue worker idle behaviour** — when there is no unchecked item, the 20-minute run
       should stop quietly instead of attempting tools and logging blocked-tool warnings.
       Done when: an empty queue produces one line, no tool attempts.
