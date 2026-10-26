@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+import yaml
+
 from .crypto import SdkCrypto
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .peer_inbox import (
@@ -104,6 +106,94 @@ def default_socket_path() -> Path:
     return Path.home() / ".local/state/hermes-nostr-gateway/gateway.sock"
 
 
+# -- Marmot ownership (plan P0, docs/marmot-ownership.md) ----------------
+#
+# One wn-agent control socket, one reader. Hermes' Marmot platform plugin and this
+# gateway's `marmot` plane subscribe to the same account, so both attached means the
+# agent gets every group message twice: two runs, two replies, duplicate side effects.
+# That used to be a paragraph in the README and a log line; it is now a startup error,
+# because a rule that only lives in prose is re-broken by the next person in a hurry.
+
+OWNERSHIP_DOC = "docs/marmot-ownership.md"
+
+#: The Hermes config key the guard is about. Named once so the error, the log and the
+#: tests all quote the same setting.
+HERMES_MARMOT_KEY = "platforms.marmot.enabled"
+
+
+class MarmotOwnershipError(RuntimeError):
+    """Both readers of one wn-agent socket are switched on: pick a transport."""
+
+
+def hermes_config_path(cfg: dict[str, Any]) -> Path:
+    """Where Hermes' own config lives, as seen by this process.
+
+    `marmot.hermes_config` wins (a gateway in a container or beside a second Hermes
+    home needs that), then `$HERMES_HOME`, then the default `~/.hermes/config.yaml`.
+    """
+    configured = cfg.get("hermes_config")
+    if configured:
+        return Path(os.path.expanduser(str(configured)))
+    home = os.environ.get("HERMES_HOME") or "~/.hermes"
+    return Path(os.path.expanduser(home)) / "config.yaml"
+
+
+def hermes_marmot_state(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Whether Hermes' Marmot platform is attached to the same socket, and how we know.
+
+    Answers `{enabled, source}` where `enabled` is True, False, or None for "no
+    evidence either way". `marmot.hermes_platform` can pin it (`true`/`false`); the
+    default `auto` reads `platforms.marmot.enabled` out of Hermes' config, because that
+    is the setting this guard exists for and a copy of it in our config would drift out
+    of step exactly when it matters.
+
+    Absence is not consent: a host with no Hermes config (a container, a relay box)
+    has no second subscriber, so `auto` there returns None — reported, never refused.
+    A config that exists without a `platforms.marmot` block means the platform is not
+    enabled, which is Hermes' own default.
+    """
+    source = "marmot.hermes_platform"
+    value = cfg.get("hermes_platform", "auto")
+    if isinstance(value, bool):
+        return {"enabled": value, "source": source}
+    choice = str(value if value is not None else "auto").strip().lower()
+    if choice in {"true", "yes", "on", "enabled"}:
+        return {"enabled": True, "source": source}
+    if choice in {"false", "no", "off", "disabled"}:
+        return {"enabled": False, "source": source}
+    if choice not in {"", "auto", "unknown"}:
+        raise ValueError(
+            f"marmot.hermes_platform must be auto, true or false, not {value!r}")
+
+    path = hermes_config_path(cfg)
+    if not path.is_file():
+        return {"enabled": None, "source": f"no Hermes config at {path}"}
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        # Unreadable is unknown, not "off": a guard that fails open silently would be
+        # worse than no guard, so the state says so and `status` carries the reason.
+        return {"enabled": None, "source": str(path), "error": str(exc)[:200]}
+    platform = (data.get("platforms") or {}).get("marmot") if isinstance(data, dict) else None
+    enabled = bool(platform.get("enabled")) if isinstance(platform, dict) else False
+    return {"enabled": enabled, "source": str(path)}
+
+
+def marmot_ownership_error(state: dict[str, Any]) -> str:
+    """The refusal, with both ways out and the doc that explains the decision."""
+    source = state.get("source") or "Hermes' config"
+    return (
+        "marmot.enabled: true while Hermes' Marmot platform is still enabled "
+        f"({source} says {HERMES_MARMOT_KEY}: true). Both read the same wn-agent "
+        "control socket, so every group message would reach the agent twice, with two "
+        "replies and duplicate side effects. Choose one transport: either disable the "
+        "Hermes Marmot plugin (set platforms.marmot.enabled: false and `hermes plugins "
+        "disable marmot`) and keep marmot.enabled: true, or keep the plugin and "
+        f"set marmot.enabled: false. Pin it here with marmot.hermes_platform: false "
+        f"only when the plugin is genuinely off. See {OWNERSHIP_DOC}."
+    )
+
+
 def _media_error(code: str, message: str) -> dict[str, Any]:
     """One shape for every `media.get` refusal: a code the adapter can branch on."""
     return {"type": "error", "op": "media.get", "code": code, "error": message[:300]}
@@ -116,7 +206,8 @@ class Gateway:
     MARMOT_OPT_IN_REASON = (
         "opt-in only: set marmot.enabled: true to attach it. It is idle by default "
         "because Hermes' own Marmot platform plugin reads the same wn-agent socket, "
-        "so both attached deliver every group message to the agent twice"
+        "so both attached deliver every group message to the agent twice; see "
+        "docs/marmot-ownership.md for the ownership decision"
     )
 
     def __init__(self, cfg: dict[str, Any], *, socket_path: str | Path | None = None,
@@ -124,6 +215,10 @@ class Gateway:
         from .cli import normalise_groups, secret_from
 
         self.cfg = cfg
+        # Before the secret is read and before any store or socket is opened: a
+        # configuration that would deliver every Marmot message twice is not a
+        # process to start and then warn about.
+        self.hermes_marmot = self._guard_marmot_ownership(cfg.get("marmot") or {})
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
         self.me = self.crypto.our_pubkey()
@@ -203,6 +298,24 @@ class Gateway:
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
 
+    def _guard_marmot_ownership(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        """Refuse to start with two readers on one socket (plan P0).
+
+        `marmot.enabled: true` is this process saying it is the Marmot transport.
+        Hermes' own `platforms.marmot` plugin reading the same wn-agent account is the
+        other reader, and two of them mean every group message is delivered twice.
+        The decision is recorded in `docs/marmot-ownership.md`: the gateway owns the
+        socket and the plugin retires, so the conflict is an error rather than a
+        warning nobody reads.
+
+        Returns the evidence for `status`, so an operator can see *why* the guard did
+        or did not fire instead of guessing which config it read.
+        """
+        state = hermes_marmot_state(cfg)
+        if cfg.get("enabled") is True and state.get("enabled") is True:
+            raise MarmotOwnershipError(marmot_ownership_error(state))
+        return state
+
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
 
@@ -210,7 +323,9 @@ class Gateway:
         control socket: Hermes' Marmot platform plugin subscribes to the same
         account, so a gateway plane attached by default hands the agent a second
         copy of every group message. `marmot.enabled: true` is the operator saying
-        this process is the transport. Once opted in, a missing socket still means
+        this process is the transport — and `_guard_marmot_ownership` has already
+        refused the configuration where both readers are on. Once opted in, a missing
+        socket still means
         "nothing to attach to" and stays quiet; a socket that exists but cannot be
         used (no account file, two of them) disables only this plane and records why
         in `marmot_error` — the NIP-17 planes must not go down because a second
@@ -763,10 +878,12 @@ class Gateway:
             "marmot": (
                 {"worker": self.marmot_worker.stats(),
                  "conversations": self.marmot_resolver.conversations(),
-                 "enumeration": self.marmot_resolver.enumeration()}
+                 "enumeration": self.marmot_resolver.enumeration(),
+                 "hermes_platform": dict(self.hermes_marmot)}
                 if self.marmot and self.marmot_worker and self.marmot_resolver
                 else {"enabled": False, "error": self.marmot_error,
-                      "reason": self.marmot_idle}
+                      "reason": self.marmot_idle,
+                      "hermes_platform": dict(self.hermes_marmot)}
             ),
             "workers": [self._worker_state(w) for w in self.workers],
             "uptime_s": None,

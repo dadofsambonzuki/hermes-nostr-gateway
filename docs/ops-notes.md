@@ -64,27 +64,34 @@ A healthy start logs `socket listening at …` then `gateway up: <pubkey> on N r
 socket answers one JSON object per line; `subscribe` is the only op that turns the connection
 into a delivery stream.
 
-## The Marmot plane is opt-in
+## The Marmot plane: one socket, one owner
 
-The gateway can proxy `wn-agent`'s control socket, but only when the config says
-`marmot.enabled: true`. The rest of the section (`socket:`, `home:`, `label:`) is inert until
-then.
+The decision is [`marmot-ownership.md`](marmot-ownership.md): the gateway owns `wn-agent`'s
+control socket, and Hermes' Marmot platform plugin is retired once the gateway has carried a
+clean week. Until that flip the plugin is the carrier, and the gateway's plane attaches only
+when the config says `marmot.enabled: true`. The rest of the section (`socket:`, `home:`,
+`label:`) is inert until then.
 
-- **Why the default is off.** Hermes' own Marmot platform plugin (`platforms.marmot` in
-  `~/.hermes/config.yaml`, plugin `marmot`) subscribes to the same account and the same
-  socket. With both attached, one group message becomes two agent runs and two replies. The
-  flag chooses the transport; it does not add a second, harmless reader.
+- **Both readers on is a refused start, not a warning.** With `marmot.enabled: true` and
+  `platforms.marmot.enabled: true`, `hng serve` prints
+  `refusing to start: marmot.enabled: true while Hermes' Marmot platform is still enabled
+  (… says platforms.marmot.enabled: true) …` and exits 2, so the unit fails in the journal
+  instead of running and delivering every group message twice. Fix is one line either way —
+  `marmot.enabled: false`, or disable the plugin (`platforms.marmot.enabled: false`,
+  `hermes plugins disable marmot`, restart Hermes).
+- **How the guard knows.** `marmot.hermes_platform: auto` (default) reads
+  `platforms.marmot.enabled` from `$HERMES_HOME/config.yaml` (default
+  `~/.hermes/config.yaml`, or `marmot.hermes_config`); `true`/`false` pins it where there is
+  no Hermes config. A missing file is unknown and never refuses a start. The socket `status`
+  op reports `marmot.hermes_platform: {enabled, source}` with what it read and where.
 - **An idle plane says why.** The start log carries `marmot plane idle: opt-in only: set
   marmot.enabled: true …`, and the socket's `status` op reports `marmot.enabled: false` with
   that sentence in `marmot.reason`. `hng status --json` also carries it; the raw form is
   `printf '{"op":"status"}\n' | nc -U ~/.local/state/hermes-nostr-gateway/gateway.sock`.
-- **Turning it on means turning the other one off first.** Disable `platforms.marmot` (and
-  the `marmot` plugin entry) in Hermes, restart Hermes, then set `marmot.enabled: true` in
-  the gateway config and restart the service. The other order duplicates messages for as long
-  as both are up.
 - **The live `config.yaml` has no `marmot:` section** (checked 2026-10-25), so the service is
-  idle on this plane today. If group messages start arriving twice, check whether a `marmot:`
-  section with `enabled: true` was added while the Hermes plugin is still enabled.
+  idle on this plane today. That is the safe state: if a `marmot:` section with
+  `enabled: true` is ever added while the Hermes plugin is still on, the service now refuses
+  to start rather than duplicating messages — read the journal, not `ps`, for the reason.
 - **`no wn-agent control socket at <path>`** means the opt-in is right but nothing is
   listening: wn-agent is down, or `home:`/`socket:` point at another account's directory.
 

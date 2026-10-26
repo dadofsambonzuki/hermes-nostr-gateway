@@ -413,12 +413,18 @@ def cmd_serve(args) -> int:
     import os
     import signal
 
-    from .gateway import Gateway
+    from .gateway import Gateway, MarmotOwnershipError
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     cfg = load_config(args.config)
-    gw = Gateway(cfg, socket_path=args.socket)
+    try:
+        gw = Gateway(cfg, socket_path=args.socket)
+    except MarmotOwnershipError as exc:
+        # The guard working, not a crash: one line with both ways out, and a non-zero
+        # exit so systemd records a failed start instead of a daemon that runs wrong.
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        return 2
 
     async def run() -> None:
         await gw.start()
