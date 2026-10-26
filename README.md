@@ -52,6 +52,8 @@ goes stale between commits.
   reaches the household inbox. `tests/test_conformance.py` exercises it.
 - **Hermes plugin** — `integrations/hermes-plugin/` (manifest, adapter, `register(ctx)` shim), kept
   in step with the live copy under `~/.hermes/plugins/nostr/`.
+- **Publish path** — [`docs/publish.md`](docs/publish.md): one signed event sent per relay
+  through the bindings client, what the retry guarantees, and the `transport.legacy` rollback.
 - **Queue gate** — `scripts/queue_next.py` and `deploy/queue-gate.sh`: the cron queue worker's
   monitor source, so an idle tick costs no agent run (see "Working the queue" below).
 - **Prior art** — [`docs/prior-art/`](docs/prior-art/) holds the handover this design leans on.
@@ -240,6 +242,34 @@ us; they are not a general NIP-17 inbox, they refuse public kinds, and the gatew
 them in the DM or feed read set. They are named under `relays.whitenoise` for the Marmot plane
 to use through `wn-agent`. The trade is deliberate: a DM that exists *only* there is not fetched
 by the DM workers, and if one ever goes missing this is the first thing to check.
+
+## Publishing
+
+An outgoing message is signed once, in this process, and then sent to each relay through
+the same `nostr-sdk` client that does the reading. `publisher.py` never re-wraps: the daemon
+stores the signed wrap *before* the first attempt, and every retry — in the same call, or
+from the outbox on a five-minute pass — resends those exact bytes. A relay that comes back
+therefore sees the event it missed, and the peer sees one message, not two (spec §7).
+
+What that buys beyond one less process per message per relay:
+
+- NIP-42 is answered in-process by an authenticator holding our own key, so a restricted
+  relay accepts the write without the secret visiting a child's environment;
+- each relay's answer is recorded per relay and lands in `outbox_wraps`, which is what
+  `status.retry.wraps` counts;
+- a relay that has not answered within the OK timeout is sent the same event once more in
+  the same call. That is also how the AUTH race resolves: a restricted relay sends its
+  challenge around the first EVENT, so the second send is the one it accepts;
+- the client's relay set is bounded (24, least-recently-used pruned, configured publish
+  relays pinned), because a persistent client that keeps a socket per peer it has ever
+  messaged runs out of file descriptors;
+- `status.publish` names the transport (`mode: bindings`) and counts what it has sent and
+  what failed.
+
+`transport.legacy: true` selects the old `nak event --auth` child per relay. It is the
+rollback, kept for one release and then deleted; it is also the flag the read pool uses
+when P1 lands, so one line rolls back both transports. The design and the wire-level tests
+are in [`docs/publish.md`](docs/publish.md).
 
 ## Marmot is opt-in
 

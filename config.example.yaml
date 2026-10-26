@@ -32,6 +32,13 @@ relays:
     - wss://nos.lol
     - wss://relay.primal.net
 
+# Transport. The default is the bindings: one `nostr-sdk` client, an event signed once and
+# sent per relay, with the per-relay answer recorded in `outbox_wraps`. `legacy: true` is the
+# one-release rollback to a `nak event --auth` child per relay (and to `nak req --stream`
+# children for reads, once the read pool lands). See docs/publish.md.
+transport:
+  legacy: false
+
 # White Noise relays belong to the Marmot plane only (wn-agent), never the DM/feed
 # read set: they reject public kinds and are not a general NIP-17 inbox.
 whitenoise:

@@ -33,7 +33,7 @@ from .planes.marmot import (
 from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
-from .publisher import publish
+from .publisher import Publisher, make_publisher
 from .relay import RelayWorker
 from .server import SocketServer
 from .store import Store
@@ -126,6 +126,10 @@ class Gateway:
         self.cfg = cfg
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
+        # Publish transport (plan P2): one `nostr-sdk` client, one signed event per
+        # message, per-relay results. `transport.legacy: true` keeps the `nak` children
+        # as the rollback — the same flag that keeps `relay.RelayWorker` on reads.
+        self.publisher: Publisher = make_publisher(cfg, self._secret)
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +252,9 @@ class Gateway:
     # -- lifecycle ------------------------------------------------------
     async def start(self) -> None:
         await self.server.start()
+        # The publish set is known up front: connect it once, rather than paying a
+        # handshake per relay on the first message.
+        await self.publisher.warm(self.relays_publish)
         for relay in self.relays_read:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
@@ -455,6 +462,7 @@ class Gateway:
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("workers did not unwind in 6s; stopping anyway")
         await self.server.stop()
+        await self.publisher.aclose()
         self.store.close()
 
     async def run_forever(self) -> None:
@@ -565,7 +573,7 @@ class Gateway:
         for event in wraps.values():
             self.store.record_wrap(event, rumor["id"], peer, relays)
 
-        results = await loop.run_in_executor(None, self._publish_all, wraps, relays)
+        results = await self._publish_all(wraps, relays)
         for label, per_relay in results.items():
             for relay, (ok, error) in per_relay.items():
                 self.store.mark_wrap(wraps[label]["id"], relay, ok=ok, error=error)
@@ -617,9 +625,16 @@ class Gateway:
         rumor = self.crypto.build_rumor(text, peer, reply_to=reply_to)
         return rumor, {"peer": self.crypto.wrap(rumor, peer), "self": self.crypto.wrap(rumor, self.me)}
 
-    def _publish_all(self, wraps: dict, relays: list[str]) -> dict:
-        return {label: publish(event, relays, secret=self._secret)
-                for label, event in wraps.items()}
+    async def _publish_all(self, wraps: dict, relays: list[str]) -> dict:
+        """Publish every wrap through the one client; each was signed once upstream.
+
+        The publisher never re-wraps, so a retry — here, or in `retry_failed` — resends
+        the same event id and the peer sees one message, not two (spec §7).
+        """
+        labels = list(wraps)
+        sent = await asyncio.gather(
+            *(self.publisher.publish(wraps[label], relays) for label in labels))
+        return dict(zip(labels, sent, strict=True))
 
     def _recipient_relays(self, peer: str) -> list[str]:
         import json as _json
@@ -674,18 +689,13 @@ class Gateway:
         pending = self.store.pending_wraps()[:5]
         if not pending:
             return 0
-        loop = asyncio.get_running_loop()
         sent = 0
         for row in pending:
             event = _json.loads(row["event"])
-            # Bind both loop variables as defaults: run_in_executor schedules the
-            # callable, and a late lambda would otherwise publish a later row.
-            ok, error = await loop.run_in_executor(
-                None,
-                lambda event=event, row=row: list(
-                    publish(event, [row["relay"]], secret=self._secret).values()
-                )[0],
-            )
+            # The stored bytes are the signed wrap: resending them is what keeps the id
+            # (and the peer's view) stable across attempts.
+            outcome = await self.publisher.publish(event, [row["relay"]])
+            ok, error = outcome.get(row["relay"], (False, "not attempted"))
             self.store.mark_wrap(row["id"], row["relay"], ok=ok, error=error)
             sent += int(ok)
             import asyncio as _asyncio
@@ -727,6 +737,9 @@ class Gateway:
             "planes": ["nip17", "nip01", "nip04", "concord"]
                       + (["marmot"] if self.marmot else []),
             "relays_publish": self.relays_publish,
+            # Which publish transport is running, and how it has fared: `mode: legacy`
+            # is the `nak` rollback, so a status read cannot be mistaken.
+            "publish": self.publisher.stats(),
             "peer_inbox": {
                 "enabled": self.peer_cfg.enabled,
                 "max_extra": self.peer_cfg.max_extra,
