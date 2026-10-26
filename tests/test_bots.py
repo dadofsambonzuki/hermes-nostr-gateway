@@ -104,7 +104,7 @@ async def test_observe_fetches_kind0_once_and_only_until_it_is_known(tmp_path):
 
     def fetcher(pubkey: str) -> dict:
         calls.append(pubkey)
-        return kind0(pubkey, bot=True, name="Hal")
+        return kind0(pubkey, bot=True, name="peer-bot")
 
     registry = BotRegistry(store, fetcher=fetcher)
     assert registry.flag(BOT) is None  # schedules the fetch
@@ -436,11 +436,14 @@ async def test_a_kind0_event_marks_the_peer_and_is_never_stored_as_a_message(tmp
     gw = Gateway(gateway_config(tmp_path, peer), socket_path=tmp_path / "gateway.sock")
     await gw.start()
     try:
-        gw._on_event(RELAY, kind0(peer, bot=True, name="Hal"))
+        gw._on_event(RELAY, kind0(peer, bot=True, name="peer-bot"))
+        await gw.store_writer.flush()
         assert gw.bots.is_bot(peer)
         assert gw.store.stats()["total"] == 0, "a profile is not a message"
 
         gw._on_event(RELAY, wrap_for(sender, gw.me, "are you there?"))
+
+        await gw.store_writer.flush()
         rows = gw.store.recent(5)
         row = next(r for r in rows if r["sender"] == peer)
         assert row["reach"] == "digest"
@@ -460,13 +463,16 @@ async def test_our_own_words_returning_from_a_bot_are_stored_as_blocked(tmp_path
     await gw.start()
     try:
         gw._on_event(RELAY, kind0(peer, bot=True))
+        await gw.store_writer.flush()
         gw.store.add(Inbound(
             id="sent-1", wrapper_id="sent-wrap-1", sender=gw.me, kind=14,
             created_at=int(time.time()), content="Thursday at seven?",
             conversation=peer, reply_to=None, reach="sent", authority="self",
             rule="outbound", why="sent by us",
         ))
+        await gw.store_writer.flush()
         gw._on_event(RELAY, wrap_for(sender, gw.me, "Thursday at seven?"))
+        await gw.store_writer.flush()
         rows = gw.store.recent(5)
         row = next(r for r in rows if r["sender"] == peer)
         assert row["blocked_reason"] == "echo"
@@ -492,7 +498,8 @@ async def test_status_reports_the_bot_rules_and_who_is_flagged(tmp_path, monkeyp
     gw = Gateway(gateway_config(tmp_path, peer), socket_path=tmp_path / "gateway.sock")
     await gw.start()
     try:
-        gw._on_event(RELAY, kind0(peer, bot=True, name="Hal"))
+        gw._on_event(RELAY, kind0(peer, bot=True, name="peer-bot"))
+        await gw.store_writer.flush()
         frame = await gw.status()
         bots = frame["bots"]
         assert bots["enabled"] is True
@@ -500,6 +507,6 @@ async def test_status_reports_the_bot_rules_and_who_is_flagged(tmp_path, monkeyp
         assert bots["echo_window_s"] == 900
         assert bots["digest_interval_s"] == 900
         assert [entry["pubkey"] for entry in bots["flagged"]] == [peer]
-        assert bots["flagged"][0]["name"] == "Hal"
+        assert bots["flagged"][0]["name"] == "peer-bot"
     finally:
         await gw.stop()

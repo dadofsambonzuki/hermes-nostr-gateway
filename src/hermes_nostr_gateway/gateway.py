@@ -47,6 +47,7 @@ from .publisher import publish
 from .relay import RelayWorker
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
+from .writer import StoreWriter
 
 log = logging.getLogger("hng.gateway")
 
@@ -60,6 +61,25 @@ DM_KINDS: tuple[int, ...] = (1059, 4)
 def restricted_relay(relay: str) -> bool:
     """Relays that carry only the private path, never public feeds."""
     return relay.rstrip("/").endswith("/chat") or "whitenoise" in relay
+
+
+def store_write_options(raw: Any) -> dict[str, Any]:
+    """`store_write:` config -> `StoreWriter` kwargs.
+
+    Only two knobs earn a place here. `tick_ms` is both the write latency and the
+    `kill -9` exposure — 20 ms is the default, and shortening it trades throughput for
+    a smaller window. `batch_size` is rows per transaction. Everything else is a
+    measurement, not a preference.
+    """
+    config = raw or {}
+    if not isinstance(config, dict):
+        raise ValueError("store_write must be a mapping")
+    options: dict[str, Any] = {}
+    if config.get("tick_ms") is not None:
+        options["tick"] = max(1, int(config["tick_ms"])) / 1000
+    if config.get("batch_size") is not None:
+        options["batch_size"] = max(1, int(config["batch_size"]))
+    return options
 
 
 def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int, ...]]]:
@@ -233,6 +253,15 @@ class Gateway:
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(store_path, identity=self.me)
+        # Store writes leave the event loop: `store.add`, `wrapper_seen` and `note_relay`
+        # hand their rows to this writer, which commits them on its own thread in batches
+        # (see writer.py). Attached in `start()`, so nothing is queued before the daemon
+        # is actually reading relays.
+        self.store_writer = StoreWriter(
+            self.store, **store_write_options(cfg.get("store_write")))
+        #: Frames waiting on their row to be committed. Tracked so `stop()` can let them
+        #: finish instead of closing the store underneath them.
+        self._deliveries: set[asyncio.Task[None]] = set()
         # Media (spec §4b): attachments are recorded with the message and fetched only
         # when the adapter asks, so this is configuration plus a cache — nothing here
         # touches the network at startup.
@@ -394,6 +423,10 @@ class Gateway:
     async def start(self) -> None:
         await self.server.start()
         self._started_at = time.time()
+        # Before any relay worker exists: from here on, a store write is a queue append
+        # and the commit happens on the writer's thread.
+        await self.store_writer.start()
+        self.store.attach_writer(self.store_writer)
         for relay in self.relays_read:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
@@ -601,7 +634,19 @@ class Gateway:
                 asyncio.gather(*self._tasks, return_exceptions=True), 6)
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("workers did not unwind in 6s; stopping anyway")
+        # A frame already accepted must reach the adapter: it is only waiting on its
+        # flush, so let it finish while the server and the writer are both still up.
+        if self._deliveries:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self._deliveries), return_exceptions=True), 5)
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning("delivery tasks did not finish in 5s; stopping anyway")
         await self.server.stop()
+        # Queued rows are committed before the connection goes: a clean stop loses
+        # nothing, and the writer thread is joined so no write outlives the store.
+        await self.store_writer.stop()
+        self.store.detach_writer()
         self.store.close()
 
     async def run_forever(self) -> None:
@@ -656,7 +701,38 @@ class Gateway:
         # for their window. A drop or a rate-limited row still has to emit its `blocked`
         # frame, or a refusal reaches the agent as silence.
         if msg.reach == "immediate" or msg.reach == "drop" or getattr(msg, "blocked_reason", None):
-            asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
+            self._emit(msg)
+
+    def _emit(self, msg: Any) -> None:
+        """Hand a frame to the adapter, after its row is on disk.
+
+        The spec's promise is that a frame is delivered when it is inserted (§7). The
+        writer defers the insert by up to a tick, so the frame waits for that flush —
+        in a task, never in the read callback, so the loop stays free. Rows that arrive
+        while the flush runs are committed by the next one.
+        """
+        task = asyncio.create_task(self._deliver(self.frame_for(msg)))
+        self._deliveries.add(task)
+        task.add_done_callback(self._deliveries.discard)
+
+    async def _deliver(self, frame: dict[str, Any]) -> None:
+        failures = self.store_writer.failures
+        written = await self.store.flush()
+        if self.store_writer.failures > failures:
+            log.warning(
+                "delivering %s even though its store write failed (flushed %d row(s))",
+                frame.get("id") or frame.get("rumor_id"), written)
+        await self.server.broadcast(frame)
+
+    async def flush_writes(self) -> int:
+        """Commit queued rows before a socket read op answers.
+
+        `history`, `status`, `media.get` and an `ack` all read what the daemon has
+        accepted; the writer commits a tick later, so the read waits for it rather than
+        reporting a message that exists as missing. The cost is an executor hop on an op
+        that is already a round trip.
+        """
+        return await self.store.flush()
 
     def _on_marmot(self, event: dict) -> None:
         """A control event from wn-agent. Same normalised frame as any other plane."""
@@ -669,7 +745,7 @@ class Gateway:
             return
         if msg is None:
             return
-        asyncio.create_task(self.server.broadcast(self.frame_for(msg)))
+        self._emit(msg)
 
 
     def _handle_nip04(self, relay: str, event: dict) -> Any:
@@ -742,6 +818,9 @@ class Gateway:
                 content=text, conversation=peer, reply_to=reply_to, plane="nip17",
                 reach="sent", authority="self", rule="outbound", why="sent by us",
             ))
+            # The row is queued, so `mark_delivered` has nothing to update until the
+            # writer commits it: flush first, or our own message comes back as pending.
+            await self.store.flush()
             self.store.mark_delivered([rumor["id"]])
         return {
             "type": "delivery",
@@ -916,6 +995,9 @@ class Gateway:
             "replay": {"limit": self.replay_limit,
                        "max_age_minutes": self.replay_max_age_minutes,
                        "floor": self.store.replay_floor()},
+            # How the store is being written: a queue that keeps growing, or a flush
+            # time that keeps climbing, is the first sign the disk cannot keep up.
+            "store_write": self.store_writer.stats(),
             "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
                       "wraps": self.store.wrap_counts()},
             "bots": {**self.policy.bot_status(), **self.bots.status()},

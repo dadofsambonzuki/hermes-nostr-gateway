@@ -61,7 +61,7 @@ jobs:
           PY
 
       - name: Lint (ruff)
-        run: ruff check src tests scripts
+        run: ruff check src tests scripts benchmarks
 
       - name: Tests (pytest)
         run: python -m pytest -q

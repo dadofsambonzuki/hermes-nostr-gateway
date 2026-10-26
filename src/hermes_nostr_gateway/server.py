@@ -133,6 +133,12 @@ class SocketServer:
                     continue
                 op = req.get("op")
                 try:
+                    # Reads answer from what has been accepted, and the writer commits a
+                    # tick later: settle it first so an op never reports a queued row as
+                    # missing (see Gateway.flush_writes).
+                    settle = getattr(self.handler, "flush_writes", None)
+                    if settle is not None and op != "ping":
+                        await settle()
                     if op == "subscribe":
                         subscribed = True
                         self._clients.add(writer)

@@ -24,7 +24,9 @@ has to know which protocol a message arrived on. When it is finished, this is wh
   text and never as a command.
 - **Durability by default.** A message is stored before it is delivered, re-offered if the
   adapter never acknowledged it, and retried per relay by republishing the *same* signed event —
-  re-wrapping would change its id and show the peer a duplicate.
+  re-wrapping would change its id and show the peer a duplicate. Writes are batched onto a
+  dedicated thread (WAL, `synchronous=NORMAL`) so a burst cannot stall the event loop; the
+  measurements and the durability trade are in [`docs/store-writes.md`](docs/store-writes.md).
 - **Coverage that is measured, not assumed.** Reads span the identity's follows, its NIP-65
   write relays and the sender app-relay defaults; per-relay event counts and last errors are in
   `hng status`, because "we read all relays" is a claim a status line should be able to prove.
@@ -188,8 +190,12 @@ pytest and ruff are the two gates:
 
 ```sh
 python -m pytest -q                       # full suite
-ruff check src tests scripts
+ruff check src tests scripts benchmarks
 ```
+
+`pytest` includes `benchmarks/store_burst.py`'s claim as a test (a 500-event burst keeps
+p99 loop lag under 50 ms); the script itself is there to re-measure it by hand on a
+different disk.
 
 `.ngit/act/workflows/test.yml` runs both on every push to `master` and every Nostr pull
 request through the ngit-ci coordinator. It installs `requirements.txt` first and then

@@ -40,6 +40,13 @@ whitenoise:
 
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
 
+# Writes leave the event loop: a message is queued (with its dedupe decided against the
+# database, read-only) and committed in batches on a dedicated thread. See
+# docs/store-writes.md for the measurements and the durability trade.
+store_write:
+  tick_ms: 20        # how long a row may sit queued: write latency AND kill -9 exposure
+  batch_size: 512    # rows per transaction
+
 # Media (spec §4b). An inbound attachment is recorded from its NIP-92 `imeta` tag but
 # never fetched on receipt: the adapter asks for a blob with `media.get`, and only then
 # does the gateway download it, verify the sha256, sniff the type and cache it. The caps
