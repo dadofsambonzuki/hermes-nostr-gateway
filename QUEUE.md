@@ -135,9 +135,16 @@ a positional body, not `--text`).
       stored message stays undiscoverable until its first message and `source` says so.
       Live wn-agent on a copy of the live store confirmed the family group (13 messages,
       2 members, `is_direct`) before any new event; 266 tests green, ruff clean.
-- [ ] **Queue worker idle behaviour** — when there is no unchecked item, the 20-minute run
+- [x] **Queue worker idle behaviour** — when there is no unchecked item, the 20-minute run
       should stop quietly instead of attempting tools and logging blocked-tool warnings.
       Done when: an empty queue produces one line, no tool attempts.
+      — landed 961da4d: `scripts/queue_next.py` (+ `deploy/queue-gate.sh`, copied to
+      `~/.hermes/scripts/` because `hermes cron` only loads monitor scripts there) is now the job's
+      monitor source — one idle line, or the next non-BLOCKED item with pending/blocked counts and
+      an hour bucket that retries an item whose run died without editing the file; wired with
+      `hermes cron edit --monitor-script queue-gate.sh` plus a prompt that stops on the empty line.
+      278 tests green, ruff clean; live gate: baseline, then `no_change (agent run suppressed)` on
+      an empty queue — no agent run, no tool calls.
 
 
 ## Decisions (do not re-litigate)
