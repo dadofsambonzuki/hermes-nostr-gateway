@@ -32,9 +32,10 @@ the remaining dependency: the binary, the tests that spawn it, and the legacy tr
       `scripts/verify_adapter.py` (key generate, publish) use the bindings instead. Done
       when: neither file mentions `nak`, and the probe still runs against a live relay.
       → PR nevent1qqs205vzfv60pxu3wypuaz4juvmrxu2j5hkp6yl346nwn4yvyqx5hfqpz3mhxue69uhhyetvv9ujumn8d96zuer9wc3dvrze (pr/scripts-off-nak)
-- [ ] **4. Image and CI** — drop the `nak` download from `Dockerfile`; remove any CI step
+- [x] **4. Image and CI** — drop the `nak` download from `Dockerfile`; remove any CI step
       that installs or asserts the binary; keep the wheel assertion. Done when: an image
       builds without network access to the nak release and CI is green.
+      → PR nevent1qqsxprk29maf84r6yp5e85xmeywwnm4w8z93z3cqgcw4hk6spmrew3spz3mhxue69uhhyetvv9ujumn8d96zuer9wcdzm8f0 (pr/image-and-ci); image built without nak, CI never had one
 - [ ] **5. Delete `transport.legacy`** — remove the flag, its branches, and the `legacy`
       wording in comments and docs. Done when: `grep -rn "legacy" src config.example.yaml
       README.md` returns only NIP-04's "legacy DMs" wording, which is a protocol fact.
