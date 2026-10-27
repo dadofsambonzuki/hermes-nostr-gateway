@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NIP-17 conformance probes — the traps the retired phase-0 wrapper pinned down.
 
-`nip17_wrapper.py` was a `nak`-driven spike whose job was to prove the NIP-17 wire path
+`nip17_wrapper.py` was a throwaway spike whose job was to prove the NIP-17 wire path
 before the gateway existed. `hng send` / `hng listen` and the daemon replaced it, but its
 findings are protocol rules, not spike trivia: they are encoded in spec §4 and §7, and this
 script makes them executable. Retiring the wrapper then retires code, not coverage.
@@ -20,8 +20,9 @@ Exit status is 0 only when every probe passes.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import datetime as dt
 import json
-import subprocess
 import sys
 import tempfile
 import time
@@ -39,7 +40,7 @@ from hermes_nostr_gateway import crypto as crypto_mod  # noqa: E402
 from hermes_nostr_gateway.crypto import CryptoError, SdkCrypto  # noqa: E402
 from hermes_nostr_gateway.planes.nip17 import Nip17Plane  # noqa: E402
 from hermes_nostr_gateway.policy import Policy  # noqa: E402
-from hermes_nostr_gateway.relay import RelayWorker  # noqa: E402
+from hermes_nostr_gateway.pool import PoolWorker, RelayPool  # noqa: E402
 from hermes_nostr_gateway.store import Store  # noqa: E402
 
 # NIP-59 backdates gift-wrap timestamps uniformly over the two days before publication, so a
@@ -62,10 +63,6 @@ def _keypair() -> tuple[SdkCrypto, SdkCrypto]:
 
 def _p_tags(event: dict) -> list[str]:
     return [tag[1] for tag in event.get("tags", []) if isinstance(tag, list) and tag[0] == "p"]
-
-
-def _argv_p_scope(argv: list[str]) -> str | None:
-    return argv[argv.index("-p") + 1] if "-p" in argv else None
 
 
 # ── probes ───────────────────────────────────────────────────────────────────
@@ -138,12 +135,12 @@ def backdated_wrap_fits_the_read_window() -> None:
         f"no wrap was backdated; NIP-59 randomisation looks disabled: {ages}")
 
     me, _ = _keypair()
-    worker = RelayWorker("wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey(),
-                         secret="11" * 32)
-    args = worker._args()
-    assert "1059" in args, "the read subscription does not filter on kind 1059"
-    assert _argv_p_scope(args) == me.our_pubkey(), "the read subscription is not `#p`-scoped"
-    since = int(args[args.index("-s") + 1])
+    pool = RelayPool("11" * 32)
+    worker = PoolWorker(pool, "wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey())
+    spec = json.loads(worker.filter().as_json())
+    assert 1059 in spec["kinds"], "the read subscription does not filter on kind 1059"
+    assert spec.get("#p") == [me.our_pubkey()], "the read subscription is not `#p`-scoped"
+    since = int(spec["since"])
     assert since <= now - BACKDATE_MAX_S, (
         f"read window starts at {since} ({now - since}s back), inside the "
         f"{BACKDATE_MAX_S}s NIP-59 backdate window: messages would be hidden")
@@ -181,29 +178,29 @@ def watermark_is_the_inner_rumor() -> None:
         store.close()
 
 
-def relay_auth_signs_as_the_identity() -> None:
-    """§3: NIP-42 auth must use the identity, and the key never travels in argv.
+def read_path_signs_as_the_identity() -> None:
+    """§3: the read path authenticates as us, and an empty identity is never a firehose.
 
-    Without the secret in the child's environment nak authenticates as its *machine-default*
-    key; a web-of-trust relay then closes the subscription as `restricted` while the client
-    only reports "failed to connect". And an empty identity must be a hard error, not an
-    unfiltered firehose.
+    NIP-42 is answered in process by a signer built from our own key — there is no child
+    process, so the secret has nowhere to leak to and nothing to inherit it. An
+    unauthenticated client on a web-of-trust relay is closed as `restricted` while the
+    client only reports "failed to connect", so the key is what makes the read work.
     """
     me, _ = _keypair()
     secret = "22" * 32
-    worker = RelayWorker("wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey(),
-                         secret=secret)
-    argv = worker._args()
-    assert "--auth" in argv, "the subscription is not authenticated"
-    assert secret not in " ".join(argv), "the identity secret is visible in argv"
-    assert _argv_p_scope(argv) == me.our_pubkey(), "the subscription is not `#p`-scoped to us"
+    pool = RelayPool(secret)
+    assert pool.keys.public_key().to_hex() == SdkCrypto(secret).our_pubkey(), (
+        "the read transport's NIP-42 signer is not built from the configured identity")
+    worker = PoolWorker(pool, "wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey())
+    assert json.loads(worker.filter().as_json()).get("#p") == [me.our_pubkey()], (
+        "the subscription is not `#p`-scoped to us")
 
     for empty in ("", None, "  "):
         try:
-            RelayWorker("wss://relay.example", empty)  # type: ignore[arg-type]
+            PoolWorker(pool, "wss://relay.example", empty)  # type: ignore[arg-type]
         except ValueError:
             continue
-        raise AssertionError(f"RelayWorker accepted an empty identity: {empty!r}")
+        raise AssertionError(f"PoolWorker accepted an empty identity: {empty!r}")
 
 
 def self_copy_is_not_a_message() -> None:
@@ -236,7 +233,7 @@ PROBES: list[Probe] = [
     Probe("misaddressed-wrap-is-refused", "§4.2", misaddressed_wrap_is_refused),
     Probe("backdated-wrap-fits-the-read-window", "§3, §4.1", backdated_wrap_fits_the_read_window),
     Probe("watermark-is-the-inner-rumor", "§3", watermark_is_the_inner_rumor),
-    Probe("relay-auth-signs-as-the-identity", "§3", relay_auth_signs_as_the_identity),
+    Probe("read-path-signs-as-the-identity", "§3", read_path_signs_as_the_identity),
     Probe("self-copy-is-not-a-message", "§4.1, §13.9", self_copy_is_not_a_message),
 ]
 
@@ -258,15 +255,36 @@ def run_offline(stream=None) -> int:
     return 0 if failures == 0 else 1
 
 
-def _read_back(relay: str, peer_hex: str, wrap_id: str, timeout: int = 30) -> dict | None:
-    """Read the wrap the way a client would, with the filter that client would use."""
-    proc = subprocess.run(
-        ["nak", "req", "-k", "1059", "-p", peer_hex, "-i", wrap_id, "-l", "1", relay],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    for line in proc.stdout.splitlines():
-        if line.strip().startswith("{"):
-            return json.loads(line)
+async def _read_back(relay: str, peer_hex: str, wrap_id: str,
+                     timeout: int = 30) -> dict | None:
+    """Read the wrap the way a client would, with the filter that client would use.
+
+    Kind, the recipient's `#p` and the wrap's own id: a relay that never kept the wrap
+    answers nothing rather than substituting a neighbour. One short-lived client, closed
+    in every path — the read a client makes, through the binding the gateway reads with.
+    """
+    client = sdk.Client()
+    try:
+        await client.add_relay(sdk.RelayUrl.parse(relay))
+        await client.connect()
+        filt = (sdk.Filter()
+                .kinds([sdk.Kind(1059)])
+                .ids([sdk.EventId.parse(wrap_id)])
+                .custom_tag(sdk.SingleLetterTag.from_byte(ord("p")), peer_hex))
+        events = await asyncio.wait_for(
+            client.fetch_events(sdk.ReqTarget.auto([filt]),
+                                dt.timedelta(seconds=timeout)),
+            timeout + 2)
+        for event in events:
+            try:
+                return json.loads(event.as_json())
+            except Exception:  # noqa: BLE001 - an unreadable shape is a miss, not a crash
+                continue
+    finally:
+        try:
+            await client.shutdown()
+        except Exception:  # noqa: BLE001 - a closed client must not mask the answer
+            pass
     return None
 
 
@@ -275,9 +293,13 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
 
     Deliberately not addressed to the household identity: a probe should not leave an
     unknown-sender DM in the live inbox for the digest to pick up.
+
+    Send and read back on one event loop. uniffi's futures belong to the loop that was
+    running when the client was made, so a second `asyncio.run` for the readback raises
+    "attached to a different loop", and a closed loop keeps throwing after every callback.
     """
     from hermes_nostr_gateway.cli import load_config, secret_from
-    from hermes_nostr_gateway.publisher import publish
+    from hermes_nostr_gateway.publisher import BindingsPublisher
 
     cfg = load_config(config)
     identity_secret = secret_from(cfg)
@@ -288,7 +310,25 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
     targets = relays or list(cfg["relays"]["publish"])[:3]
     print(f"live: {me.our_pubkey()[:12]}… -> throwaway {peer.our_pubkey()[:12]}… via {targets}")
 
-    results = publish(wrap, targets, secret=identity_secret)
+    async def roundtrip() -> tuple[dict[str, tuple[bool, str | None]],
+                                   dict[str, tuple[dict | None, str | None]]]:
+        set_loop = getattr(sdk, "uniffi_set_event_loop", None)
+        if set_loop is not None:
+            set_loop(asyncio.get_running_loop())
+        publisher = BindingsPublisher(identity_secret)
+        try:
+            results = await publisher.publish(wrap, targets)
+        finally:
+            await publisher.aclose()
+        read: dict[str, tuple[dict | None, str | None]] = {}
+        for relay in [relay for relay, (ok, _) in results.items() if ok]:
+            try:
+                read[relay] = (await _read_back(relay, peer.our_pubkey(), wrap["id"]), None)
+            except Exception as exc:  # noqa: BLE001 - report, do not crash the run
+                read[relay] = (None, str(exc))
+        return results, read
+
+    results, read = asyncio.run(roundtrip())
     accepted = [relay for relay, (ok, _) in results.items() if ok]
     for relay, (ok, error) in results.items():
         print(f"  publish  {relay}  {'ok' if ok else 'FAILED'}" + (f": {error}" if error else ""))
@@ -298,10 +338,9 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
 
     retained = 0
     for relay in accepted:
-        try:
-            event = _read_back(relay, peer.our_pubkey(), wrap["id"])
-        except Exception as exc:  # noqa: BLE001 - report, do not crash the run
-            print(f"  readback {relay}  error: {exc}")
+        event, error = read.get(relay, (None, "no readback attempted"))
+        if error:
+            print(f"  readback {relay}  error: {error}")
             continue
         if not event:
             print(f"  readback {relay}  not retained (a publish receipt is not retention)")

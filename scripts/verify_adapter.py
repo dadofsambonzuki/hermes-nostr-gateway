@@ -6,30 +6,38 @@ Runs three checks and prints PASS/FAIL for each:
   2. status op over the adapter's transport
   3. inbound delivery from a throwaway key, asserting authority=none -> role_authorized=False
 
+The throwaway message is built and published with the gateway's own bindings, so the check
+needs no external binary: the stranger key, the kind-14 rumor and the gift wrap come from
+`nostr-sdk`, and the publish goes through the gateway's own publisher — the bytes the plugin
+receives are the bytes a real sender's client would produce.
+
 Usage:
-  PYTHONPATH=<hermes workspace>:<plugins dir> python3 scripts/verify_adapter.py
+  PYTHONPATH=<hermes workspace>:<plugins dir> \
+    /path/to/hermes-nostr-gateway/.venv/bin/python scripts/verify_adapter.py
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import subprocess
 import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "src") not in sys.path:  # runnable without `pip install -e .`
+    sys.path.insert(0, str(_ROOT / "src"))
+
+import nostr_sdk as sdk  # noqa: E402
+
+from hermes_nostr_gateway.crypto import SdkCrypto  # noqa: E402
+from hermes_nostr_gateway.publisher import publish  # noqa: E402
 
 SOCKET = Path(os.environ.get("NOSTR_GATEWAY_SOCKET",
                              "~/.local/state/hermes-nostr-gateway/gateway.sock")).expanduser()
 ME = os.environ.get("NOSTR_ME", "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29")
-
-
-def nak(args, stdin=None, sec=None):
-    env = dict(os.environ)
-    if sec:
-        env["NOSTR_SECRET_KEY"] = sec
-    proc = subprocess.run(["nak", *args], input=stdin, capture_output=True, text=True, env=env)
-    return [line for line in proc.stdout.splitlines() if line.startswith("{")]
+#: A public relay the plugin reads, so the check does not depend on the household's own set.
+RELAY = os.environ.get("NOSTR_VERIFY_RELAY", "wss://nos.lol")
+TEXT = "Adapter verification message from a throwaway key."
 
 
 def build_adapter():
@@ -51,6 +59,15 @@ def build_adapter():
     return adapter
 
 
+def send_from_a_stranger() -> dict[str, tuple[bool, str | None]]:
+    """A kind-14 rumor from a key in nobody's web of trust, wrapped and published."""
+    stranger_secret = sdk.Keys.generate().secret_key().to_hex()
+    stranger = SdkCrypto(stranger_secret)
+    rumor = stranger.build_rumor(TEXT, ME)
+    wrap = stranger.wrap(rumor, ME)
+    return publish(wrap, [RELAY], secret=stranger_secret)
+
+
 async def main() -> int:
     adapter = build_adapter()
     failures = 0
@@ -68,14 +85,13 @@ async def main() -> int:
         print(f"FAIL status op: {status}")
         failures += 1
 
-    stranger = subprocess.run(["nak", "key", "generate"], capture_output=True,
-                              text=True).stdout.strip().splitlines()[-1]
-    rumor = json.loads(nak(["event", "-k", "14", "-p", ME, "-c",
-                            "Adapter verification message from a throwaway key."], sec=stranger)[-1])
-    wrap = json.loads(nak(["gift", "wrap", "-p", ME, "--use-our-identity-key",
-                           "--use-their-identity-key"], stdin=json.dumps(rumor), sec=stranger)[-1])
-    subprocess.run(["nak", "event", "wss://nos.lol"], input=json.dumps(wrap),
-                   capture_output=True, text=True)
+    results = send_from_a_stranger()
+    accepted = [relay for relay, (ok, _) in results.items() if ok]
+    for relay, (ok, error) in results.items():
+        print(f"  publish    {relay}  {'ok' if ok else 'FAILED'}" + (f": {error}" if error else ""))
+    if not accepted:
+        print(f"FAIL throwaway wrap reached no relay: {results}")
+        failures += 1
 
     for _ in range(20):
         if adapter.seen:
