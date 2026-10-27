@@ -387,7 +387,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             await self._ack(message_id)
             return
         chat_id, session_key = entry
-        if sender != chat_id:
+        # Who may answer. In a DM the chat id *is* the peer, so only that key counts — another
+        # author's reaction is an opinion about a message even if the policy would let them
+        # instruct elsewhere. A room-style chat id (`concord:<community>:<channel>`, note the
+        # colons) names a place, not a person, so there the test is authority: answering a gate
+        # is an instruction, and whoever may instruct in that room may answer it.
+        room_style = ":" in chat_id
+        authorised_in_room = room_style and frame.get("authority") == "instructions"
+        if sender != chat_id and not authorised_in_room:
             # Only the conversation the prompt was sent to may answer it: anyone else's
             # reaction is an opinion about a message, not a decision about our gate.
             logger.warning("nostr reaction ignored: %s is not the prompt's recipient",

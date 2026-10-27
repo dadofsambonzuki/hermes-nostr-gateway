@@ -316,3 +316,34 @@ def test_reactions_are_recognised_by_shape():
     assert adapter.is_reaction_frame({"type": "reaction", "id": "x"})
     assert not adapter.is_reaction_frame({"type": "message", "kind": 14})
     assert not adapter.is_reaction_frame({"type": "blocked", "kind": 7})
+
+
+CHANNEL = "concord:" + "1" * 64 + ":" + "2" * 64
+
+
+async def test_a_channel_reaction_from_an_authorised_author_answers_the_prompt(approvals):
+    """In a Concord channel the chat id names the room, not a person: the sender is a
+    pubkey, so equality can never match. The author the policy lets instruct in that room
+    is the one who can answer its gate."""
+    inst = _adapter()
+    inst._remember_approval_prompt(PROMPT_ID, CHANNEL, SESSION)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d", sender=PEER))
+
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+
+async def test_a_channel_reaction_from_an_authorityless_author_is_ignored(approvals):
+    inst = _adapter()
+    inst._remember_approval_prompt(PROMPT_ID, CHANNEL, SESSION)
+    _pending(approvals)
+    frame = _reaction("\U0001f44d", sender=OTHER)
+    frame["authority"] = "none"
+
+    await inst._deliver(frame)
+
+    assert approvals.resolved == []
+    # Still answerable by someone who is allowed to instruct there.
+    await inst._deliver(_reaction("\U0001f44d", sender=PEER, rumor_id="f" * 63 + "2"))
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
