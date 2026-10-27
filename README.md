@@ -218,6 +218,10 @@ daemon, membership is keyed and a channel is a stream of sealed envelopes. The g
 it as one more plane. An invite arrives inside a kind-1059 wrap whose inner kind is `3313`, is
 recorded in `concord_invites`, and never surfaces as a message; channel traffic is decrypted
 with the stream key derived from the NIP-44 v2 conversation key (`nip44_v2_conversation_key`).
+A channel message is stored under `concord:<community>:<channel>`, and a reply to it is
+published back into that channel: the send path routes on the conversation, so an answer never
+lands in the DM of whoever happened to speak. `hng send --to concord:<community>:<channel>`
+hands the reply to the running daemon, which is the process that holds the community's keys.
 
 It is in production use, not experimental: it runs wherever this gateway runs, against the
 same relays as every other plane. `status`, the startup log and `hng status` report it as one

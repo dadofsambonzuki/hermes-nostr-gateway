@@ -29,6 +29,7 @@ from .health import (
     stale_rows,
 )
 from .media import MediaError, media_config, resolve_attachment
+from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .projects import ProjectMap
@@ -271,8 +272,43 @@ def recipient_relays(cfg: dict[str, Any], peer: str) -> list[str]:
     return relays[:6]
 
 
+def send_to_channel(args, cfg: dict[str, Any], conversation: str) -> int:
+    """Hand a channel reply to the daemon, which already holds the community.
+
+    A one-shot CLI would have to fetch the community and derive the channel's keys — the
+    read path over again. The running gateway has both, and `send` is the same op a DM
+    takes, so a reply into a channel has one implementation and one signer.
+    """
+    from .gateway import default_socket_path
+    from .server import request
+
+    socket_path = Path(os.path.expanduser(
+        cfg.get("socket") or str(default_socket_path())))
+    try:
+        frame = asyncio.run(request(socket_path, {
+            "op": "send", "to": conversation, "text": args.text,
+            "reply_to": args.reply_to}))
+    except (OSError, TimeoutError, ValueError) as exc:
+        print(f"a channel reply needs the running daemon: {exc}", file=sys.stderr)
+        return 1
+    if frame.get("type") == "error":
+        print(f"  {conversation} -> FAILED ({frame.get('error') or 'refused'})",
+              file=sys.stderr)
+        return 1
+    errors = frame.get("errors") or {}
+    for per_relay in (frame.get("relays") or {}).values():
+        for relay, ok in per_relay.items():
+            print(f"    {relay}: {'ok' if ok else errors.get(relay, 'failed')}")
+    ok = bool(frame.get("ok"))
+    detail = f" ({frame['error']})" if not ok and frame.get("error") else ""
+    print(f"  {conversation} -> {'sent' if ok else 'FAILED'}{detail}")
+    return 0 if ok else 1
+
+
 def cmd_send(args) -> int:
     cfg = load_config(args.config)
+    if is_concord_conversation(args.to):
+        return send_to_channel(args, cfg, str(args.to).strip())
     crypto, store, policy, plane = build(cfg)
     secret = secret_from(cfg)
     peer = to_hex(args.to)
@@ -676,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     p_listen.add_argument("--mark-read", action="store_true")
     p_listen.set_defaults(func=cmd_listen)
 
-    p_send = sub.add_parser("send", help="send a NIP-17 DM")
+    p_send = sub.add_parser("send", help="send a NIP-17 DM, or a Concord channel message")
     p_send.add_argument("--to", required=True)
     p_send.add_argument("--text", required=True)
     p_send.add_argument("--reply-to", default=None)

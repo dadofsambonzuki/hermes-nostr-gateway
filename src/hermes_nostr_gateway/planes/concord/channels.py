@@ -26,6 +26,9 @@ from .derive import GroupKey
 _MENTION = re.compile(r"(?:nostr:)?(npub1[0-9ac-hj-np-z]{20,}|nprofile1[0-9ac-hj-np-z]{20,}"
                       r"|[0-9a-fA-F]{64})")
 
+#: A channel conversation is named `<prefix><community>:<channel>`, for reads and for replies.
+CONVERSATION_PREFIX = "concord:"
+
 
 @dataclass(frozen=True)
 class ChannelStream:
@@ -35,9 +38,12 @@ class ChannelStream:
     channel_id: str
     name: str
     private: bool
+    #: The epoch the channel's stream key was derived with (the community root's when the
+    #: grant names none); the `epoch` tag carries the same number.
     epoch: int
     address: str            # the stream pubkey — the author of the channel's wraps
     chat_id: str            # `concord:<community>:<channel>`, the conversation an agent sees
+    key: Optional[str] = None   # a private channel's grant; public channels derive from the root
 
     @property
     def label(self) -> str:
@@ -45,7 +51,17 @@ class ChannelStream:
 
 
 def chat_id(community_id: str, channel_id: str) -> str:
-    return f"concord:{community_id}:{channel_id}"
+    return f"{CONVERSATION_PREFIX}{community_id}:{channel_id}"
+
+
+def is_conversation(value: str) -> bool:
+    """Does this send target name a channel rather than a peer?
+
+    The prefix is the whole test, on purpose: a channel this process no longer holds must
+    fail as a channel delivery error, never fall through to the DM path and come back as
+    "bad pubkey", which sends the caller looking in the wrong place.
+    """
+    return str(value or "").strip().lower().startswith(CONVERSATION_PREFIX)
 
 
 def streams(invite: c.Invite, channels: Iterable[c.Channel]) -> list[ChannelStream]:
@@ -59,8 +75,9 @@ def streams(invite: c.Invite, channels: Iterable[c.Channel]) -> list[ChannelStre
         out.append(ChannelStream(community_id=invite.community_id.hex(),
                                  channel_id=channel.id, name=channel.name,
                                  private=bool(channel.private), epoch=epoch,
-                                 address=gk.pk, chat_id=chat_id(invite.community_id.hex(),
-                                                                channel.id)))
+                                 address=gk.pk, key=channel.key,
+                                 chat_id=chat_id(invite.community_id.hex(),
+                                                channel.id)))
     return out
 
 
