@@ -22,11 +22,12 @@ the remaining dependency: the binary, the tests that spawn it, and the legacy tr
       `tests/test_pool.py`). Done when: the file imports no worker class and the suite is
       green with no skipped tests.
       → PR nevent1qqs03kwez4r0hn0cr9jaxy55vy7g3qr0me6u4cne892gpffhk7hq7sgpz3mhxue69uhhyetvv9ujumn8d96zuer9wc4sggu2 (pr/test-relay-no-worker)
-- [ ] **2. Delete the subprocess transport** — move `hng listen` to
+- [x] **2. Delete the subprocess transport** — move `hng listen` to
       `fetch.fetch_many_blocking` (`--once`) and `fetch.stream_events` (live); delete
       `RelayWorker` and `OneShot`; reduce `relay.py` to `refused_kinds` and the handler
       types. Done when: no `subprocess` import in `relay.py` or `cli.py`, and `hng listen
       --once` works against a relay.
+      → PR nevent1qqszuqe49e8ymdj4g85p0nemck8z85rjnn4jr5ldgtjg5tq7q747p5qpz3mhxue69uhhyetvv9ujumn8d96zuer9wcvh4fqj (pr/delete-subprocess-transport); also moved `NakInboxResolver` → `SdkInboxResolver`, the last `nak` child in `src/` outside the publish rollback
 - [ ] **3. Scripts off nak** — `scripts/probe_nip17_conformance.py` (four uses) and
       `scripts/verify_adapter.py` (key generate, publish) use the bindings instead. Done
       when: neither file mentions `nak`, and the probe still runs against a live relay.
