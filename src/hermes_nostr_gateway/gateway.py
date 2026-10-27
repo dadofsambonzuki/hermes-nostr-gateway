@@ -32,6 +32,9 @@ from .peer_inbox import (
     peer_pubkeys,
 )
 from .planes import nip04
+from .planes.concord import write as concord_write
+from .planes.concord.channels import is_conversation as is_concord_conversation
+from .planes.concord.channels import stream_key as concord_stream_key
 from .planes.concord.plane import ConcordPlane
 from .planes.marmot import (
     MarmotControl,
@@ -886,6 +889,11 @@ class Gateway:
     async def send(self, *, to: str, text: str, reply_to: str | None = None,
                    cid: str | None = None) -> dict[str, Any]:
         target = str(to or "").strip()
+        if is_concord_conversation(target):
+            # A message read in a channel is answered in that channel: the conversation it
+            # was stored under already names the room, so a reply must never become a DM to
+            # whoever happened to speak there.
+            return await self._send_concord(target, text, reply_to, cid)
         explicit_marmot = target.lower().startswith("marmot:")
         if self.marmot_resolver is None:
             # An explicit Marmot target with no plane attached must say so: falling
@@ -939,6 +947,72 @@ class Gateway:
             "relays": {label: {r: ok for r, (ok, _) in v.items()} for label, v in results.items()},
             "errors": {r: e for label, v in results.items() for r, (ok, e) in v.items() if not ok},
         }
+
+    async def _send_concord(self, conversation: str, text: str, reply_to: str | None,
+                            cid: str | None) -> dict[str, Any]:
+        """Publish a message back into the Concord channel a conversation came from.
+
+        The plane is the index, not the sender: it says which invite and channel the
+        conversation names, and it holds no key. The wrap is built here, with the identity
+        this process already signs DMs with, so a channel message has one implementation and
+        one signer.
+        """
+        found = self.concord.channel_for_conversation(conversation)
+        if found is None:
+            return {"type": "delivery", "id": cid, "ok": False,
+                    "conversation": conversation,
+                    "error": f"no readable Concord channel for {conversation!r}"}
+        invite, stream = found
+        try:
+            # The same grant the read path opens this channel with, so what we publish is
+            # what `handle_channel` (and every other member's client) can read back.
+            built = await asyncio.to_thread(
+                concord_write.build_channel_message, self.crypto.keys, invite,
+                stream.channel_id, text, channel_key=stream.key, epoch=stream.epoch,
+                quote=self._quote_for(reply_to))
+            concord_write.verify_envelope(
+                built, concord_stream_key(invite, stream, stream.key))
+        except Exception as exc:  # noqa: BLE001 - report, do not kill the socket
+            return {"type": "delivery", "id": cid, "ok": False,
+                    "conversation": stream.chat_id,
+                    "error": f"cannot build a channel message: {exc}"[:300]}
+
+        results = await concord_write.publish(built["wrap"], invite.relays)
+        ok = any(outcome == "ok" for outcome in results.values())
+        rumor, wrap = built["rumor"], built["wrap"]
+        if ok:
+            from .store import Inbound as _Inbound
+            self.store.add(_Inbound(
+                id=str(rumor["id"]), wrapper_id=str(wrap["id"]), sender=self.me,
+                kind=int(rumor.get("kind", 9)), created_at=int(rumor.get("created_at", 0)),
+                content=text, conversation=stream.chat_id, reply_to=reply_to,
+                plane="concord", reach="sent", authority="self", rule="outbound",
+                why="sent by us",
+            ))
+            # Queued through the writer, so flush before marking it delivered or our own
+            # message sits in `pending` as if it never went out.
+            await self.store.flush()
+            self.store.mark_delivered([str(rumor["id"])])
+        return {
+            "type": "delivery", "id": cid, "ok": ok, "conversation": stream.chat_id,
+            "message_id": str(rumor["id"]),
+            "relays": {"channel": {relay: outcome == "ok" for relay, outcome in results.items()}},
+            "errors": {relay: outcome for relay, outcome in results.items()
+                       if outcome != "ok"},
+        }
+
+    def _quote_for(self, reply_to: str | None) -> tuple[str, str] | None:
+        """`(wrap id, author)` for the message a reply answers, or None when it answers none.
+
+        Concord names a channel message by the wrap it arrived in — the wrap is what the
+        room's readers see — while the frame hands the agent the inner rumor's id. The
+        stored row is what turns one into the other; an id that is already a wrap id, or one
+        this store never saw, goes out as given.
+        """
+        if not reply_to:
+            return None
+        row = self.store.rumor(str(reply_to)) or {}
+        return (str(row.get("wrapper_id") or reply_to), str(row.get("sender") or ""))
 
     async def _send_marmot(self, group: str, text: str, reply_to: str | None,
                            cid: str | None) -> dict[str, Any]:

@@ -941,6 +941,17 @@ class Store:
             self._with_attachments(items)
         return items
 
+    def rumor(self, event_id: str) -> dict[str, Any] | None:
+        """One stored row by id, or None.
+
+        A reply names the message it answers; the row is what knows which wrapper that
+        message arrived in, and a Concord quote tag carries the wrapper id, not the rumor's.
+        """
+        row = self.db.execute(
+            "SELECT * FROM rumors WHERE id = ?", (str(event_id or ""),)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     # -- drops (refused messages) ---------------------------------------
     #: Why a row was refused, in the same words the `blocked` frame uses. A rule that
     #: says `reach: drop` stores no reason, so it reads as `not_allowlisted`; a row cut

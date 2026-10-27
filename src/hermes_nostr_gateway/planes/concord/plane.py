@@ -32,6 +32,9 @@ class ConcordPlane:
         self._streams: dict[str, ChannelStream] = {}
         self._keys: dict[str, GroupKey] = {}
         self._members: dict[str, set[str]] = {}
+        #: community id -> the invite it was learned from. A reply needs the bundle (relays,
+        #: root) and nothing else from it; the plane never signs with anything it holds.
+        self._invites: dict[str, Invite] = {}
         #: channel -> checkout map. Optional: with no config nothing resolves, and the
         #: plane behaves exactly as before.
         self.projects = projects
@@ -60,6 +63,9 @@ class ConcordPlane:
                 invite, stream.channel_id, None if channel is None else channel.key,
                 None if channel is None else channel.epoch)
         self._members[invite.community_id.hex()] = set(members)
+        # Remember the invite the channels came from: a reply is addressed by conversation
+        # alone, and the bundle is where its relays and root live.
+        self._invites[invite.community_id.hex()] = invite
         log.info("concord: %d readable channel(s) of %d watched in %r (%d member(s))",
                  len(fresh), len(readable), invite.bundle.get("name"), len(members))
         return fresh
@@ -72,6 +78,23 @@ class ConcordPlane:
 
     def channels(self) -> list[ChannelStream]:
         return list(self._streams.values())
+
+    def channel_for_conversation(self, conversation: str) -> Optional[tuple[Invite, ChannelStream]]:
+        """The invite and channel a stored `concord:<community>:<channel>` names, or None.
+
+        A lookup, not a builder: this plane holds no signing key, so the send path asks
+        where a conversation lives and builds the wrap itself with the identity it already
+        has (the same split as `Nip17Plane` and the publisher).
+        """
+        wanted = str(conversation or "").strip().lower()
+        if not wanted:
+            return None
+        for stream in self._streams.values():
+            if stream.chat_id.lower() != wanted:
+                continue
+            invite = self._invites.get(stream.community_id)
+            return (invite, stream) if invite is not None else None
+        return None
 
     def handle_channel(self, relay: str, wrap: dict[str, Any], policy: Any,
                        *, me_hex: str, me_npub: str) -> Optional[Inbound]:
