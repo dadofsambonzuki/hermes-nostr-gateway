@@ -1,12 +1,14 @@
-"""Cold, one-shot event lookups through the bindings.
+"""Cold and streaming reads through the bindings.
 
 The daemon's steady state is the relay pool (`pool.py`); these are the queries that have
 to happen before any subscription exists or outside the daemon entirely: our kind-3
-contact list, a peer's NIP-65 inbox relays, a peer's kind-0 bot flag, an npub decode.
+contact list, a peer's NIP-65 inbox relays, a peer's kind-0 bot flag, an npub decode —
+and the two reads `hng listen` is built from (one bounded fetch, one live subscription).
 
-They used to be `nak req -l 1` child processes whose stdout was parsed. Same query, same
-answer, but through the library that already signs our events — so the package has no
-runtime dependency on an external binary.
+They used to be `nak` child processes whose stdout was parsed. Same query, same answer,
+but through the library that already signs our events — so the package has no runtime
+dependency on an external binary, and a lookup that needs NIP-42 authenticates as the
+identity rather than as whatever key the child happened to hold.
 """
 from __future__ import annotations
 
@@ -15,9 +17,13 @@ import concurrent.futures
 import datetime as dt
 import json
 import logging
+import time
 from typing import Any, Iterable, Sequence
 
 import nostr_sdk as sdk
+
+from .crypto import parse_secret
+from .pool import KeysSigner
 
 log = logging.getLogger("hng.fetch")
 
@@ -35,8 +41,38 @@ def hex_of(who: str) -> str:
         return value
 
 
-def _filter(kinds: Sequence[int], author: str | None, limit: int) -> sdk.Filter:
-    filt = sdk.Filter().kinds([sdk.Kind(int(kind)) for kind in kinds]).limit(limit)
+def _client(secret: str | None = None) -> sdk.Client:
+    """A short-lived client, answering NIP-42 as our identity when given a secret.
+
+    A lookup relay that gates reads closes an unauthenticated REQ as `restricted`, which
+    reads exactly like a peer who publishes nothing — so the cold paths authenticate the
+    same way the daemon does. uniffi calls the async signer from a Rust worker thread,
+    where there is no running loop: bind it here or every AUTH attempt fails.
+    """
+    if not secret:
+        return sdk.Client()
+    keys = sdk.Keys.parse(parse_secret(secret))
+    set_loop = getattr(sdk, "uniffi_set_event_loop", None)
+    if set_loop is not None:
+        set_loop(asyncio.get_running_loop())
+    return sdk.ClientBuilder().authenticator(sdk.SignerAuthenticator(KeysSigner(keys))).build()
+
+
+def _filter(kinds: Sequence[int], author: str | None, limit: int | None,
+            p_tag: str | None = None, since: int | None = None) -> sdk.Filter:
+    """One filter: the kinds, an optional author, `#p`, cap and `since` floor.
+
+    A limit of 0 or None is omitted rather than sent as `limit: 0`: a live subscription
+    wants everything from now on, and some relays read an explicit zero as "nothing".
+    `since` is epoch seconds and is what keeps a reconnect from replaying history.
+    """
+    filt = sdk.Filter().kinds([sdk.Kind(int(kind)) for kind in kinds])
+    if limit:
+        filt = filt.limit(int(limit))
+    if since:
+        filt = filt.since(sdk.Timestamp.from_secs(int(since)))
+    if p_tag:
+        filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord("p")), p_tag)
     if author:
         filt = filt.author(sdk.PublicKey.parse(hex_of(author)))
     return filt
@@ -44,7 +80,8 @@ def _filter(kinds: Sequence[int], author: str | None, limit: int) -> sdk.Filter:
 
 async def fetch_first(*, relays: Iterable[str], kinds: Sequence[int],
                       author: str | None = None, limit: int = 1,
-                      timeout: float = DEFAULT_TIMEOUT_S) -> dict[str, Any] | None:
+                      timeout: float = DEFAULT_TIMEOUT_S, p_tag: str | None = None,
+                      secret: str | None = None) -> dict[str, Any] | None:
     """The first event matching `kinds` (and `author`) from any of `relays`, or None.
 
     One short-lived client, closed in every path: this runs on the cold path (once per
@@ -54,7 +91,7 @@ async def fetch_first(*, relays: Iterable[str], kinds: Sequence[int],
     urls = [str(url) for url in relays if url]
     if not urls:
         return None
-    client = sdk.Client()
+    client = _client(secret)
     try:
         for url in urls:
             try:
@@ -64,7 +101,7 @@ async def fetch_first(*, relays: Iterable[str], kinds: Sequence[int],
         await client.connect()
         events = await asyncio.wait_for(
             client.fetch_events(
-                sdk.ReqTarget.auto([_filter(kinds, author, limit)]),
+                sdk.ReqTarget.auto([_filter(kinds, author, limit, p_tag)]),
                 dt.timedelta(seconds=timeout)),
             timeout + 2)
         for event in events:
@@ -100,12 +137,13 @@ def fetch_first_blocking(**kwargs: Any) -> dict[str, Any] | None:
 
 async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str | None = None,
                      limit: int = 200, since: int | None = None,
-                     timeout: float = 12.0) -> list[dict[str, Any]]:
+                     timeout: float = 12.0, p_tag: str | None = None,
+                     secret: str | None = None) -> list[dict[str, Any]]:
     """Every event matching the filter, from every relay given (deduped by id)."""
     urls = [str(url) for url in relays if url]
     if not urls:
         return []
-    client = sdk.Client()
+    client = _client(secret)
     out: dict[str, dict[str, Any]] = {}
     try:
         for url in urls:
@@ -114,9 +152,7 @@ async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str
             except Exception:  # noqa: BLE001
                 continue
         await client.connect()
-        filt = _filter(kinds, author, limit)
-        if since:
-            filt = filt.since(sdk.Timestamp.from_secs(int(since)))
+        filt = _filter(kinds, author, limit, p_tag, since)
         events = await asyncio.wait_for(
             client.fetch_events(sdk.ReqTarget.auto([filt]), dt.timedelta(seconds=timeout)),
             timeout + 2)
@@ -147,20 +183,46 @@ def fetch_many_blocking(**kwargs: Any) -> list[dict[str, Any]]:
         return pool.submit(lambda: asyncio.run(fetch_many(**kwargs))).result()
 
 
-async def stream_events(*, relays: Iterable[str], kinds: Sequence[int], author: str | None,
-                        on_event) -> None:
-    """Live subscription through the binding, one client for every relay."""
+async def stream_events(*, relays: Iterable[str], kinds: Sequence[int],
+                        author: str | None = None, p_tag: str | None = None,
+                        since_days: int = 3, on_event,
+                        secret: str | None = None) -> None:
+    """Live subscription through the binding, one client for every relay given.
+
+    `on_event(relay, event)` is awaited for each new event, with the relay it arrived on:
+    the same shape the daemon's workers use, so `hng listen` hands both paths the same
+    handler. `since_days` bounds the history a reconnect replays — NIP-59 backdates wraps
+    up to two days, so a narrower window hides live messages (spec §3).
+
+    One subscription for the whole relay group is deliberate: `kinds` and `p_tag` are what
+    the caller pinned for those relays, and a client per relay would multiply connections
+    against the same relay set the daemon already reads.
+    """
     urls = [str(url) for url in relays if url]
-    client = sdk.Client()
+    if not urls:
+        return
+    client = _client(secret)
     try:
         for url in urls:
             try:
                 await client.add_relay(sdk.RelayUrl.parse(url))
-            except Exception:  # noqa: BLE001
-                continue
+            except Exception:  # noqa: BLE001 - one bad URL must not lose the stream
+                log.debug("stream: cannot add relay %s", url)
         await client.connect()
-        await client.subscribe([_filter(kinds, author, 0)], None)
-        async for notification in client.notifications():
+        window = int(time.time()) - since_days * 86400 if since_days else None
+        # `subscribe` takes a ReqTarget, not a filter list: `auto` targets every relay
+        # this client holds, which is the group the caller asked for.
+        await client.subscribe(sdk.ReqTarget.auto([_filter(kinds, author, None, p_tag, window)]),
+                               None)
+        # The binding's stream is pulled, not iterated: `ClientNotificationStream.next()`
+        # answers None once the client has shut down.
+        stream = client.notifications()
+        while True:
+            notification = await stream.next()
+            if notification is None:
+                break
+            if not getattr(notification, "is_new_event", lambda: False)():
+                continue
             event = getattr(notification, "event", None)
             if event is None:
                 continue
@@ -168,9 +230,15 @@ async def stream_events(*, relays: Iterable[str], kinds: Sequence[int], author: 
                 raw = json.loads(event.as_json())
             except Exception:  # noqa: BLE001
                 continue
-            await on_event(raw)
+            await on_event(_relay_of(notification, urls), raw)
     finally:
         try:
             await client.shutdown()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _relay_of(notification: Any, fallback: Sequence[str]) -> str:
+    """Which relay delivered this event — the fallback is only for a client that omits it."""
+    url = getattr(notification, "relay_url", None)
+    return str(url) if url else (fallback[0] if fallback else "")

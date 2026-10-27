@@ -22,8 +22,8 @@ from .health import (
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .peer_inbox import (
     InboxResolver,
-    NakInboxResolver,
     PeerInboxConfig,
+    SdkInboxResolver,
     inbox_additions,
     normalise_relay,
     now_seconds,
@@ -45,7 +45,6 @@ from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
 from .publisher import Publisher, make_publisher
-from .relay import RelayWorker
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
 from .writer import StoreWriter
@@ -55,7 +54,7 @@ log = logging.getLogger("hng.gateway")
 #: The DM subscription asks for NIP-17 wraps and legacy NIP-04 in one REQ. A relay
 #: that refuses one kind closes the whole filter, so this is only the default:
 #: `relays.read` can pin a narrower set per relay, and a refusal is negotiated at
-#: runtime (RelayWorker.note_refusals) rather than costing the relay entirely.
+#: runtime (PoolWorker.note_refusals) rather than costing the relay entirely.
 DM_KINDS: tuple[int, ...] = (1059, 4)
 
 
@@ -251,8 +250,8 @@ class Gateway:
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
         # Publish transport (plan P2): one `nostr-sdk` client, one signed event per
-        # message, per-relay results. `transport.legacy: true` keeps the `nak` children
-        # as the rollback — the same flag that keeps `relay.RelayWorker` on reads.
+        # message, per-relay results. `transport.legacy: true` still keeps the `nak`
+        # children as the rollback for writes; reads have no subprocess path left.
         self.publisher: Publisher = make_publisher(cfg, self._secret)
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
@@ -347,13 +346,10 @@ class Gateway:
         self.server = SocketServer(self.socket_path, self)
         self.workers: list[Any] = []
         # Read transport (plan P1): one `nostr-sdk` client, one subscription per filter
-        # set, NIP-42 answered in-process. `transport.legacy: true` keeps the per-relay
-        # `nak req --stream` children for one release, so a relay that behaves
-        # differently can be compared side by side; it is the rollback.
-        self.legacy_transport = bool((cfg.get("transport") or {}).get("legacy", False))
-        self.pool: RelayPool | None = None
-        if not self.legacy_transport:
-            self.pool = RelayPool(self._secret, on_refusal=self._note_refusal)
+        # set, NIP-42 answered in-process. It is the only read path: the per-relay
+        # `nak req --stream` children are gone, so there is no second implementation to
+        # keep in step and nothing for a flag to select.
+        self.pool = RelayPool(self._secret, on_refusal=self._note_refusal)
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
         #: Set by `start()`. `status`/`health` report the age of this number, not the age
@@ -390,19 +386,16 @@ class Gateway:
 
     def _new_worker(self, relay: str, *, kinds: tuple[int, ...],
                     p_tag: str | None = None, authors: tuple[str, ...] = (),
-                    purpose: str = "dm") -> Any:
-        """Build a read worker on whichever transport is configured.
+                    purpose: str = "dm") -> PoolWorker:
+        """Build a read worker: one relay's subscription set on the shared client.
 
-        Both classes expose the same counters and `live_state()`, which is what `status`,
-        `health` and `_guarded` consume — so the rest of the gateway does not branch.
+        `PoolWorker` is the only read transport now. Its counters and `live_state()` are
+        what `status`, `health` and `_guarded` consume, so the rest of the gateway does
+        not branch on how the events arrive.
         """
-        if self.pool is not None:
-            return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
-                              authors=authors, purpose=purpose,
-                              on_refusal=self._note_refusal)
-        return RelayWorker(relay, self.me, kinds=kinds, p_tag=p_tag, authors=authors,
-                           secret=self._secret, purpose=purpose,
-                           on_refusal=self._note_refusal)
+        return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
+                          authors=authors, purpose=purpose,
+                          on_refusal=self._note_refusal)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -541,10 +534,10 @@ class Gateway:
             return self.peer_resolver
         if not self.peer_cfg.lookup:
             return None
-        self.peer_resolver = NakInboxResolver(self.peer_cfg.lookup, secret=self._secret)
+        self.peer_resolver = SdkInboxResolver(self.peer_cfg.lookup, secret=self._secret)
         return self.peer_resolver
 
-    def _add_peer_relay(self, relay: str) -> RelayWorker:
+    def _add_peer_relay(self, relay: str) -> PoolWorker:
         """One DM worker for a peer's inbox — deliberately not a feed/mention pair.
 
         The configured read set costs up to three connections per relay (DM, feeds,
@@ -615,7 +608,7 @@ class Gateway:
                             self.peer_cfg.max_extra, url)
         return additions
 
-    async def _guarded(self, worker: RelayWorker) -> None:
+    async def _guarded(self, worker: PoolWorker) -> None:
         try:
             await worker.run(self._on_event)
         except asyncio.CancelledError:
@@ -647,7 +640,7 @@ class Gateway:
         for task in self._tasks:
             task.cancel()
         self.bots.cancel()
-        # A worker that is mid-`nak` may take a moment to unwind; it must not hold the
+        # A worker that is mid-reconnect may take a moment to unwind; it must not hold the
         # process past systemd's stop timeout, or the unit dies by SIGKILL and in-flight
         # publishes are lost with it.
         try:
@@ -1015,12 +1008,10 @@ class Gateway:
             # How the store is being written: a queue that keeps growing, or a flush
             # time that keeps climbing, is the first sign the disk cannot keep up.
             "store_write": self.store_writer.stats(),
-            # Which read transport is running, and what it is doing: `legacy` names the
-            # subprocess path so a status read cannot be mistaken for the pool.
-            "transport": (self.pool.stats() if self.pool is not None
-                          else {"mode": "legacy", "subscriptions": len(self.workers),
-                                "events": sum(getattr(w, "events", 0)
-                                              for w in self.workers)}),
+            # Which read transport is running, and what it is doing: one client, one
+            # subscription per filter set, so a relay that never received an event shows
+            # as a subscription that has been quiet rather than as a healthy one.
+            "transport": self.pool.stats(),
             "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
                       "wraps": self.store.wrap_counts()},
             "bots": {**self.policy.bot_status(), **self.bots.status()},
@@ -1087,7 +1078,7 @@ class Gateway:
         """Per-worker live state, including the fields a health verdict needs.
 
         Falls back to the counters for a worker that does not implement `live_state`
-        (a test double, or a plane that is not a `RelayWorker`).
+        (a test double, or a plane that is not a `PoolWorker`).
         """
         state = getattr(worker, "live_state", None)
         if callable(state):

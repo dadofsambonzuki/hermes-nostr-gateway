@@ -20,19 +20,15 @@ purpose, because an unbounded read set is a connection-limit incident:
 * the gateway gives an added relay ONE DM worker and no feed or mention subscription,
   so the cap really is the connection bound.
 
-A relay that refuses a kind is handled exactly like any other relay: `RelayWorker`
+A relay that refuses a kind is handled exactly like any other relay: `PoolWorker`
 drops that kind and resubscribes on the rest (spec §3). Nothing here special-cases the
 recovery path.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
@@ -236,59 +232,44 @@ class InboxResolver(Protocol):
         ...
 
 
-class NakInboxResolver:
-    """Resolve a peer's kind-10050 list with `nak req`.
+class SdkInboxResolver:
+    """Resolve a peer's kind-10050 list through the bindings.
 
-    The event is replaceable, so the newest one wins. Failures raise: the caller
-    records them per peer and keeps the relays it already reads, because a lookup
-    that timed out must never shrink coverage.
+    The event is replaceable, so the newest one wins. An empty answer leaves the relays
+    this process already reads untouched — a lookup that timed out must never shrink
+    coverage.
+
+    What an empty answer *means* is deliberately not decided here: the binding reports
+    the events a relay sent, not whether it answered EOSE, so "this peer advertises no
+    inbox" and "the lookup relay did not answer" arrive identically. `fetch` logs the
+    transport failure at debug; the coverage decision is the same either way.
     """
 
     def __init__(self, lookups: Iterable[str], *, limit: int | None = None,
-                 timeout: float = DEFAULT_LOOKUP_TIMEOUT, secret: str | None = None,
-                 nak: str | None = None):
+                 timeout: float = DEFAULT_LOOKUP_TIMEOUT, secret: str | None = None):
         self.lookups = tuple(lookups)
         # None means "ask every configured lookup relay". The gateway's default
         # derivation already bounds the list (`DEFAULT_LOOKUP_LIMIT`); an explicit
         # `relays.peer_inbox.lookup` is taken as written.
         self.limit = limit
         self.timeout = timeout
-        # Authenticate as our identity where the lookup relay wants NIP-42. Without
-        # one relay answers "restricted" while a 10050 held only there
+        # Authenticate as our identity where the lookup relay wants NIP-42. Without one
+        # relay answers "restricted" while a 10050 held only there
         # would be missed.
         self.secret = secret
-        self.nak = nak or shutil.which("nak") or "nak"
-
-    def _args(self, pubkey: str) -> list[str]:
-        args = [self.nak, "req"]
-        if self.secret:
-            args.append("--auth")
-        args += ["-k", str(INBOX_KIND), "-a", pubkey, "-l", "1"]
-        lookups = self.lookups if self.limit is None else self.lookups[: self.limit]
-        args += list(lookups)
-        return args
 
     def inbox_relays(self, pubkey: str) -> list[str]:
-        if not self.lookups:
+        lookups = self.lookups if self.limit is None else self.lookups[: self.limit]
+        if not lookups:
             return []
-        env = None
-        if self.secret:
-            env = dict(os.environ, NOSTR_SECRET_KEY=self.secret)
-        proc = subprocess.run(
-            self._args(pubkey), capture_output=True, text=True,
-            timeout=self.timeout, env=env,
+        from .fetch import fetch_many_blocking
+
+        events = fetch_many_blocking(
+            relays=lookups, kinds=[INBOX_KIND], author=pubkey, limit=1,
+            timeout=self.timeout, secret=self.secret,
         )
-        events: list[dict] = []
-        for line in (proc.stdout or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict) and event.get("kind", INBOX_KIND) == INBOX_KIND:
-                events.append(event)
+        events = [event for event in events
+                  if isinstance(event, dict) and event.get("kind", INBOX_KIND) == INBOX_KIND]
         if not events:
             return []
         newest = max(events, key=lambda event: int(event.get("created_at") or 0))

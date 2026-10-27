@@ -39,7 +39,7 @@ from hermes_nostr_gateway import crypto as crypto_mod  # noqa: E402
 from hermes_nostr_gateway.crypto import CryptoError, SdkCrypto  # noqa: E402
 from hermes_nostr_gateway.planes.nip17 import Nip17Plane  # noqa: E402
 from hermes_nostr_gateway.policy import Policy  # noqa: E402
-from hermes_nostr_gateway.relay import RelayWorker  # noqa: E402
+from hermes_nostr_gateway.pool import PoolWorker, RelayPool  # noqa: E402
 from hermes_nostr_gateway.store import Store  # noqa: E402
 
 # NIP-59 backdates gift-wrap timestamps uniformly over the two days before publication, so a
@@ -62,10 +62,6 @@ def _keypair() -> tuple[SdkCrypto, SdkCrypto]:
 
 def _p_tags(event: dict) -> list[str]:
     return [tag[1] for tag in event.get("tags", []) if isinstance(tag, list) and tag[0] == "p"]
-
-
-def _argv_p_scope(argv: list[str]) -> str | None:
-    return argv[argv.index("-p") + 1] if "-p" in argv else None
 
 
 # ── probes ───────────────────────────────────────────────────────────────────
@@ -138,12 +134,12 @@ def backdated_wrap_fits_the_read_window() -> None:
         f"no wrap was backdated; NIP-59 randomisation looks disabled: {ages}")
 
     me, _ = _keypair()
-    worker = RelayWorker("wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey(),
-                         secret="11" * 32)
-    args = worker._args()
-    assert "1059" in args, "the read subscription does not filter on kind 1059"
-    assert _argv_p_scope(args) == me.our_pubkey(), "the read subscription is not `#p`-scoped"
-    since = int(args[args.index("-s") + 1])
+    pool = RelayPool("11" * 32)
+    worker = PoolWorker(pool, "wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey())
+    spec = json.loads(worker.filter().as_json())
+    assert 1059 in spec["kinds"], "the read subscription does not filter on kind 1059"
+    assert spec.get("#p") == [me.our_pubkey()], "the read subscription is not `#p`-scoped"
+    since = int(spec["since"])
     assert since <= now - BACKDATE_MAX_S, (
         f"read window starts at {since} ({now - since}s back), inside the "
         f"{BACKDATE_MAX_S}s NIP-59 backdate window: messages would be hidden")
@@ -181,29 +177,29 @@ def watermark_is_the_inner_rumor() -> None:
         store.close()
 
 
-def relay_auth_signs_as_the_identity() -> None:
-    """§3: NIP-42 auth must use the identity, and the key never travels in argv.
+def read_path_signs_as_the_identity() -> None:
+    """§3: the read path authenticates as us, and an empty identity is never a firehose.
 
-    Without the secret in the child's environment nak authenticates as its *machine-default*
-    key; a web-of-trust relay then closes the subscription as `restricted` while the client
-    only reports "failed to connect". And an empty identity must be a hard error, not an
-    unfiltered firehose.
+    NIP-42 is answered in process by a signer built from our own key — there is no child
+    process, so the secret has nowhere to leak to and nothing to inherit it. An
+    unauthenticated client on a web-of-trust relay is closed as `restricted` while the
+    client only reports "failed to connect", so the key is what makes the read work.
     """
     me, _ = _keypair()
     secret = "22" * 32
-    worker = RelayWorker("wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey(),
-                         secret=secret)
-    argv = worker._args()
-    assert "--auth" in argv, "the subscription is not authenticated"
-    assert secret not in " ".join(argv), "the identity secret is visible in argv"
-    assert _argv_p_scope(argv) == me.our_pubkey(), "the subscription is not `#p`-scoped to us"
+    pool = RelayPool(secret)
+    assert pool.keys.public_key().to_hex() == SdkCrypto(secret).our_pubkey(), (
+        "the read transport's NIP-42 signer is not built from the configured identity")
+    worker = PoolWorker(pool, "wss://relay.example", me.our_pubkey(), p_tag=me.our_pubkey())
+    assert json.loads(worker.filter().as_json()).get("#p") == [me.our_pubkey()], (
+        "the subscription is not `#p`-scoped to us")
 
     for empty in ("", None, "  "):
         try:
-            RelayWorker("wss://relay.example", empty)  # type: ignore[arg-type]
+            PoolWorker(pool, "wss://relay.example", empty)  # type: ignore[arg-type]
         except ValueError:
             continue
-        raise AssertionError(f"RelayWorker accepted an empty identity: {empty!r}")
+        raise AssertionError(f"PoolWorker accepted an empty identity: {empty!r}")
 
 
 def self_copy_is_not_a_message() -> None:
@@ -236,7 +232,7 @@ PROBES: list[Probe] = [
     Probe("misaddressed-wrap-is-refused", "§4.2", misaddressed_wrap_is_refused),
     Probe("backdated-wrap-fits-the-read-window", "§3, §4.1", backdated_wrap_fits_the_read_window),
     Probe("watermark-is-the-inner-rumor", "§3", watermark_is_the_inner_rumor),
-    Probe("relay-auth-signs-as-the-identity", "§3", relay_auth_signs_as_the_identity),
+    Probe("read-path-signs-as-the-identity", "§3", read_path_signs_as_the_identity),
     Probe("self-copy-is-not-a-message", "§4.1, §13.9", self_copy_is_not_a_message),
 ]
 

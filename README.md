@@ -153,9 +153,10 @@ rebuild, update the URL and the hash in `requirements.txt` together.
 
 ## Container
 
-`Dockerfile` builds the same package with a pinned `nak` (reads run on the `nostr-sdk`
-client inside the process; `nak` is still what publishes and what a one-shot
-`hng --once` fetch uses, so it is part of the image). The image runs as `gateway`,
+`Dockerfile` builds the same package with a pinned `nak`. Nothing in the default read or
+write path shells out — reads and writes both run on the `nostr-sdk` client in the process
+— so `nak` is in the image only for the `transport.legacy: true` publish rollback, which
+the next change removes. The image runs as `gateway`,
 UID/GID 1000 by default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)`
 when the host user that owns the mounted files is not 1000.
 
@@ -304,9 +305,9 @@ What that buys beyond one less process per message per relay:
   what failed.
 
 `transport.legacy: true` selects the old `nak event --auth` child per relay. It is the
-rollback, kept for one release and then deleted; it is also the flag the read pool uses
-when P1 lands, so one line rolls back both transports. The design and the wire-level tests
-are in [`docs/publish.md`](docs/publish.md).
+publish rollback, kept for one release and then deleted. Reads have no such switch any
+more: the read pool is the only transport. The design and the wire-level tests are in
+[`docs/publish.md`](docs/publish.md).
 
 ## Marmot: one socket, one owner
 

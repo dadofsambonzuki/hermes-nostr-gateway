@@ -7,19 +7,18 @@ coverage, but the cost was a subprocess fleet: NIP-42 lifecycle lived in another
 program's stderr, a reconnect meant respawning a process, a refusal could only be read
 by regexing that stderr, and every relay's socket was a separate pgid to unwind.
 
-This module keeps the same *observable* surface — `RelayWorker`'s counters and
+This module keeps the same *observable* surface — per-worker counters and
 `live_state()`, so `hng status` and the health verdict do not change — but the I/O is
 one `Client` in this process. Per relay we open one subscription per filter set (the
 DM set, the feed set, the mentions set), the client answers NIP-42 itself through an
 `Authenticator` backed by our own keys, and reconnection is the library's job (relay
 options default to reconnect with a 30s retry interval, which is where a 429 backs off).
 
-The legacy path is not deleted yet: `transport.legacy: true` in config keeps
-`relay.RelayWorker` in charge for one release, so a relay that behaves differently can
-be compared side by side before the subprocess path is removed.
+It is also the only read path: the per-relay `nak req --stream` children are gone, so
+there is no second implementation to compare against and no flag that selects one.
 
-What is *not* here: publishing (P2) and the one-shot bootstrap/`hng --once` fetches.
-Those still shell out to `nak`; they are not workers.
+What is *not* here: publishing (`publisher.py`) and the cold or one-shot reads that
+`hng listen` is built from (`fetch.py`). Those are not subscriptions.
 """
 
 from __future__ import annotations
@@ -88,19 +87,16 @@ class KeysSigner(sdk.AsyncNostrSigner):
 class PoolWorker:
     """One relay's subscription set, on the shared client.
 
-    Deliberately the same attributes as `relay.RelayWorker`: `gateway.py` builds these
-    interchangeably from config, `_guarded` treats them the same, and `status`/`health`
-    read the same fields. What changes is where the events come from.
+    The counters and `live_state()` are the contract: `gateway.py` builds these from
+    config, `_guarded` treats them uniformly, and `status`/`health` read the same fields
+    for every relay.
     """
 
     def __init__(self, pool: "RelayPool", relay: str, me: str, *,
                  kinds: tuple[int, ...] = (1059,), authors: tuple[str, ...] = (),
-                 p_tag: str | None = None, auth: bool = True, secret: str | None = None,
-                 since_days: int = 3, nak: str | None = None,
+                 p_tag: str | None = None, auth: bool = True,
+                 since_days: int = 3,
                  on_refusal: RefusalHandler | None = None, purpose: str = "dm"):
-        # `secret`/`nak` are accepted and ignored so config wiring can pass the same
-        # kwargs to either worker class; the pool already holds the identity.
-        del secret, nak
         self.pool = pool
         self.relay = relay
         self.purpose = purpose
@@ -450,8 +446,8 @@ class RelayPool:
                 log.warning("pool: %s rate-limits us; backing off", relay)
                 return
             if worker.note_refusals(text) and worker.kinds:
-                # Same rule as the legacy worker: a refused kind is a filter problem,
-                # so resubscribe at once with what is left instead of backing off.
+                # A refused kind is a filter problem, so resubscribe at once with what
+                # is left instead of backing off.
                 try:
                     await self._request(worker)
                 except Exception as exc:  # noqa: BLE001 - recorded, not raised

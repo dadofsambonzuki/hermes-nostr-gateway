@@ -15,6 +15,7 @@ import yaml
 
 from .bots import BotRegistry
 from .crypto import CryptoError, SdkCrypto, parse_secret
+from .fetch import fetch_many_blocking, stream_events
 from .health import (
     BAD,
     default_planes,
@@ -31,7 +32,6 @@ from .media import MediaError, media_config, resolve_attachment
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .publisher import publish
-from .relay import OneShot, RelayWorker
 from .store import Store, drops_ttl_seconds
 
 DEFAULT_CONFIG = Path("config.yaml")
@@ -140,7 +140,7 @@ def normalise_groups(cfg: dict[str, Any]) -> dict[str, Any]:
     """Groups are authored as npubs but events carry hex, so normalise once, here.
 
     Keeping this in the CLI (not in Policy) leaves the policy engine dependency-free
-    and unit-testable without nak.
+    and unit-testable without a decode backend.
     """
     groups = cfg.get("groups") or {}
     return {name: [_decode_npub(m) if str(m).startswith("npub") else m for m in members]
@@ -198,53 +198,59 @@ def cmd_listen(args) -> int:
 
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
+    secret = secret_from(cfg)
     # `relays.read` may pin a per-relay kind set ({url, kinds}); listen only speaks
     # NIP-17, so the pin is respected but legacy kind 4 is not a listen default.
     relays, relay_kinds = relay_read_plan(cfg)
 
+    def kinds_for(relay: str) -> tuple[int, ...]:
+        return relay_kinds.get(relay) or (1059,)
+
     if args.once:
-        since = None
-        import time
-        if args.since_hours:
-            since = int(time.time()) - args.since_hours * 3600
-
-        async def run_once() -> int:
-            fetch = OneShot(plane.me, limit=args.limit, since=since)
-            total = 0
-            for relay in relays:
-                try:
-                    events = await fetch.fetch(relay)
-                except Exception as exc:  # noqa: BLE001 - report, do not crash
-                    store.note_relay(relay, error=str(exc)[:200])
-                    continue
-                store.note_relay(relay, events=len(events))
-                for event in events:
-                    msg = plane.handle(relay, event)
-                    if msg:
-                        print_message(msg, args.json)
-                        total += 1
-            return total
-
-        count = asyncio.run(run_once())
-        print(f"-- {count} new message(s) across {len(relays)} relays", file=sys.stderr)
+        since = int(time.time()) - args.since_hours * 3600 if args.since_hours else None
+        total = 0
+        # One bounded read per relay rather than one REQ across all of them: the
+        # per-relay count is the row `hng status` shows as history, and a relay that
+        # refuses a kind must not cost the others their results.
+        for relay in relays:
+            try:
+                events = fetch_many_blocking(relays=[relay], kinds=kinds_for(relay),
+                                             p_tag=plane.me, limit=args.limit, since=since,
+                                             secret=secret)
+            except Exception as exc:  # noqa: BLE001 - report, do not crash
+                store.note_relay(relay, error=str(exc)[:200])
+                continue
+            store.note_relay(relay, events=len(events))
+            for event in events:
+                msg = plane.handle(relay, event)
+                if msg:
+                    print_message(msg, args.json)
+                    total += 1
+        print(f"-- {total} new message(s) across {len(relays)} relays", file=sys.stderr)
         return 0
 
+    async def deliver(relay: str, event: dict) -> None:
+        await found(plane, relay, event, args)
+
     async def stream() -> None:
-        secret = secret_from(cfg)
         # `-p me` is not optional: a kind-1059 subscription without it is a firehose of
-        # every wrap on the relay, and the identity secret must reach the child so NIP-42
-        # authenticates as us rather than as nak's machine key.
-        workers = [RelayWorker(r, plane.me, kinds=relay_kinds.get(r) or (1059,),
-                               p_tag=plane.me, secret=secret) for r in relays]
-        tasks = [asyncio.create_task(w.run(lambda relay, event: found(plane, relay, event, args)))
-                 for w in workers]
+        # every wrap on the relay. `stream_events` scopes it and answers NIP-42 in
+        # process as our identity, so the key is never in an argv or a child's env.
+        # A pinned kind set is a per-relay filter, and a REQ is all-or-nothing at the
+        # relay: group the read set by kind set, one stream per group, so no relay is
+        # asked for a kind it refuses.
+        groups: dict[tuple[int, ...], list[str]] = {}
+        for relay in relays:
+            groups.setdefault(kinds_for(relay), []).append(relay)
+        tasks = [asyncio.create_task(stream_events(
+                     relays=group, kinds=kinds, p_tag=plane.me, on_event=deliver,
+                     secret=secret))
+                 for kinds, group in groups.items()]
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            for w in workers:
-                w.stop()
-            for t in tasks:
-                t.cancel()
+            for task in tasks:
+                task.cancel()
 
     try:
         asyncio.run(stream())
@@ -275,8 +281,8 @@ def cmd_send(args) -> int:
     ok_peer = False
     for label, wrap in wraps.items():
         # Durable before attempted, retried from the stored event rather than re-wrapped,
-        # and published through the same function the daemon uses so NIP-42 signs as us
-        # instead of as nak's machine-default key (spec §3, §7).
+        # and published through the same function the daemon uses, so NIP-42 signs as us
+        # in this process rather than as whatever key a child would have held (spec §3, §7).
         recipient = peer if label == "peer" else plane.me
         store.record_wrap(wrap, rumor["id"], recipient, relays)
         results = publish(wrap, relays, secret=secret)

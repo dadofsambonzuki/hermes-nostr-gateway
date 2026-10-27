@@ -8,7 +8,7 @@ tests pin the replacement behaviour:
 * resolve the configured groups' 10050 lists and add the relays, deduplicated;
 * never add more than `max_extra`, and never more than one DM worker per addition;
 * refresh on an interval, but never shrink coverage on a lookup failure;
-* leave kind refusal to `RelayWorker`, exactly like any other relay.
+* leave kind refusal to `PoolWorker`, exactly like any other relay.
 """
 
 from __future__ import annotations
@@ -19,14 +19,14 @@ import json
 import nostr_sdk as sdk
 import pytest
 
+from hermes_nostr_gateway import fetch as fetch_mod
 from hermes_nostr_gateway import gateway as gateway_mod
 from hermes_nostr_gateway import peer_inbox as peer_mod
-from hermes_nostr_gateway import relay as relay_mod
 from hermes_nostr_gateway.gateway import Gateway
 from hermes_nostr_gateway.peer_inbox import (
     DEFAULT_MAX_EXTRA,
     DEFAULT_REFRESH_MINUTES,
-    NakInboxResolver,
+    SdkInboxResolver,
     inbox_additions,
     peer_inbox_config,
 )
@@ -86,12 +86,7 @@ class FakeResolver:
 
 
 def install_recording_worker(monkeypatch) -> list[dict]:
-    """Replace both worker classes with a recorder, so wiring is testable without I/O.
-
-    The gateway builds `PoolWorker` by default and `RelayWorker` under
-    `transport.legacy`, and the recorder has to accept either constructor:
-    `PoolWorker(pool, relay, me, …)` or `RelayWorker(relay, me, …)`.
-    """
+    """Replace the worker class with a recorder, so wiring is testable without I/O."""
     built: list[dict] = []
 
     class RecordingWorker:
@@ -116,7 +111,6 @@ def install_recording_worker(monkeypatch) -> list[dict]:
             self._stop.set()
 
     monkeypatch.setattr(gateway_mod, "PoolWorker", RecordingWorker)
-    monkeypatch.setattr(gateway_mod, "RelayWorker", RecordingWorker)
     return built
 
 
@@ -215,16 +209,9 @@ def test_malformed_peer_inbox_config_is_an_error_not_a_silent_default(peer_inbox
         peer_inbox_config({"relays": {"peer_inbox": peer_inbox}})
 
 
-# -- the nak resolver -------------------------------------------------------
+# -- the inbox resolver -----------------------------------------------------
 
-class _Done:
-    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-
-
-def test_nak_resolver_takes_the_newest_inbox_list(monkeypatch):
+def test_the_resolver_takes_the_newest_inbox_list(monkeypatch):
     events = [
         {"kind": 10050, "created_at": 100,
          "tags": [["relay", "wss://old.example"]]},
@@ -235,39 +222,52 @@ def test_nak_resolver_takes_the_newest_inbox_list(monkeypatch):
             ["p", "not-a-relay"],
         ]},
     ]
-    calls: list[tuple[list[str], dict]] = []
+    calls: list[dict] = []
 
-    def fake_run(argv, **kwargs):
-        calls.append((list(argv), kwargs))
-        return _Done("\n".join(json.dumps(event) for event in events))
+    def fake_fetch(**kwargs):
+        calls.append(kwargs)
+        return list(events)
 
-    monkeypatch.setattr(peer_mod.subprocess, "run", fake_run)
-    resolver = NakInboxResolver(["wss://lookup.example"], nak="nak")
+    monkeypatch.setattr(fetch_mod, "fetch_many_blocking", fake_fetch)
+    resolver = SdkInboxResolver(["wss://lookup.example"])
 
+    # `wss://old.example` is the older event; the replaceable list that wins is the newer
+    # one, deduplicated and with the non-relay tags dropped.
     assert resolver.inbox_relays(PEER) == ["wss://new.example"]
-    argv = calls[0][0]
-    assert argv[:5] == ["nak", "req", "-k", "10050", "-a"]
-    assert argv[5] == PEER
-    assert argv[-1] == "wss://lookup.example"
-    assert "--auth" not in argv
-    assert calls[0][1]["env"] is None
+    assert calls[0]["relays"] == ("wss://lookup.example",)
+    assert calls[0]["kinds"] == [10050]
+    assert calls[0]["author"] == PEER
+    assert calls[0]["limit"] == 1
+    assert calls[0]["secret"] is None
 
 
-def test_nak_resolver_authenticates_with_our_identity_when_it_has_the_secret(monkeypatch):
+def test_the_resolver_authenticates_as_us_when_it_has_the_secret(monkeypatch):
     seen: dict = {}
 
-    def fake_run(argv, **kwargs):
-        seen["argv"] = list(argv)
-        seen["env"] = kwargs["env"]
-        return _Done("")
+    def fake_fetch(**kwargs):
+        seen.update(kwargs)
+        return []
 
-    monkeypatch.setattr(peer_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(fetch_mod, "fetch_many_blocking", fake_fetch)
     secret = "00" * 32
-    resolver = NakInboxResolver(["wss://relay.example.com/chat"], secret=secret, nak="nak")
+    resolver = SdkInboxResolver(["wss://relay.example.com/chat"], secret=secret)
 
     assert resolver.inbox_relays(PEER) == []
-    assert "--auth" in seen["argv"]
-    assert seen["env"]["NOSTR_SECRET_KEY"] == secret
+    assert seen["secret"] == secret
+
+
+def test_the_resolver_asks_only_the_bounded_lookup_set(monkeypatch):
+    seen: dict = {}
+
+    def fake_fetch(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(fetch_mod, "fetch_many_blocking", fake_fetch)
+    lookups = [f"wss://lookup-{n}.example" for n in range(4)]
+
+    assert SdkInboxResolver(lookups, limit=2).inbox_relays(PEER) == []
+    assert seen["relays"] == tuple(lookups[:2])
 
 
 # -- gateway wiring ---------------------------------------------------------
@@ -432,110 +432,35 @@ async def test_the_refresh_interval_picks_up_a_relay_advertised_later(monkeypatc
         await gw.stop()
 
 
-# -- refusal behaves exactly like any other relay ---------------------------
+# -- a dead inbox is reported, not churned ----------------------------------
 
-class _Stdout:
-    def __init__(self, lines: list[bytes]):
-        self._it = iter(lines)
+async def test_a_peer_inbox_worker_that_lost_every_kind_is_recorded_dead(monkeypatch, tmp_path):
+    """A relay that refuses every kind can never deliver: name it, keep it out of churn.
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return next(self._it)
-        except StopIteration:
-            raise StopAsyncIteration from None
-
-
-class _Stderr:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    async def read(self) -> bytes:
-        return self._payload
-
-
-class _FakeProc:
-    def __init__(self, *, lines=(), stderr=b"", returncode=0):
-        self.stdout = _Stdout(list(lines))
-        self.stderr = _Stderr(stderr)
-        self.returncode = returncode
-
-    def kill(self) -> None:
-        self.returncode = -9
-
-    async def wait(self) -> int:
-        return self.returncode
-
-
-def install_fake_nak(monkeypatch, script: list[dict]) -> list[list[str]]:
-    calls: list[list[str]] = []
-    steps = list(script)
-
-    async def fake_exec(*args, **kwargs):
-        calls.append([str(arg) for arg in args])
-        step = steps.pop(0) if steps else {"stderr": b"", "lines": []}
-        stderr = step.get("stderr", b"")
-        if isinstance(stderr, str):
-            stderr = stderr.encode()
-        return _FakeProc(lines=step.get("lines", []), stderr=stderr,
-                         returncode=step.get("returncode", 0))
-
-    monkeypatch.setattr(relay_mod.asyncio, "create_subprocess_exec", fake_exec)
-    return calls
-
-
-def asked_kinds(argv: list[str]) -> list[int]:
-    return [int(argv[i + 1]) for i, part in enumerate(argv) if part == "-k"]
-
-
-async def test_a_peer_relay_that_refuses_kind_4_keeps_reading_wraps(monkeypatch, tmp_path):
-    """The subprocess path still negotiates kinds; the pool covers the same rule."""
-    peer = "wss://peer-inbox.example"
-    calls = install_fake_nak(monkeypatch, [
-        {"stderr": "CLOSED: filter validation failed: kind not allowed: 4"},
-        {"stderr": "connecting... ok."},
-    ])
-    resolver = FakeResolver({PEER: [peer]})
-    cfg = gateway_config(tmp_path, groups={"family": [PEER]},
-                         transport={"legacy": True})
-    gw = build_gateway(monkeypatch, tmp_path, cfg, resolver=resolver)
-
-    await gw.start()
-    try:
-        await wait_for(lambda: len([c for c in calls if c[-1] == peer]) >= 2)
-        peer_calls = [c for c in calls if c[-1] == peer]
-        assert asked_kinds(peer_calls[0]) == [1059, 4]
-        assert asked_kinds(peer_calls[1]) == [1059], "kind 4 must be dropped, wraps kept"
-        worker = next(w for w in gw.workers if w.relay == peer)
-        assert worker.refused == {4}
-        assert worker.kinds == (1059,)
-        assert worker.purpose == "peer-inbox"
-    finally:
-        await gw.stop()
-
-
-async def test_a_peer_relay_that_refuses_every_kind_is_not_resubscribed(monkeypatch, tmp_path):
+    Kind negotiation itself is `PoolWorker`'s (covered by `tests/test_pool.py`); what is
+    pinned here is what the gateway does with the outcome — the relay stays in the read
+    set (so a refresh will not re-add it) and `status` names it instead of leaving a
+    quiet-looking relay behind.
+    """
     peer = "wss://dead-inbox.example"
-    calls = install_fake_nak(monkeypatch, [
-        {"stderr": "CLOSED: kind not allowed: 4"},
-        {"stderr": "CLOSED: kind not allowed: 1059"},
-        {"stderr": "must never be spawned"},
-    ])
     resolver = FakeResolver({PEER: [peer]})
-    cfg = gateway_config(tmp_path, groups={"family": [PEER]},
-                         transport={"legacy": True})
+    cfg = gateway_config(tmp_path, groups={"family": [PEER]})
     gw = build_gateway(monkeypatch, tmp_path, cfg, resolver=resolver)
 
-    await gw.start()
-    try:
-        await wait_for(lambda: gw._dead_peer_relays == {peer})
-        assert len([c for c in calls if c[-1] == peer]) == 2
+    class DeadWorker:
+        relay = peer
+        purpose = "peer-inbox"
+        kinds: tuple[int, ...] = ()
+        last_error = "relay refuses every kind we subscribed to ([1059, 4])"
 
-        # A refresh sees the relay in the read set already: no reconnect, no churn.
-        assert await gw.refresh_peer_relays() == []
-        assert len([c for c in calls if c[-1] == peer]) == 2
-        assert (await gw.status())["peer_inbox"]["dead"] == [peer]
-    finally:
-        await gw.stop()
+        async def run(self, _handler):
+            return None
+
+    gw.relays_read.append(peer)
+    gw.peer_relays.append(peer)
+    await gw._guarded(DeadWorker())
+
+    assert gw._dead_peer_relays == {peer}
+    assert (await gw.status())["peer_inbox"]["dead"] == [peer]
+    assert await gw.refresh_peer_relays() == [], "a dead inbox must not be re-added"
+    assert gw.peer_relays == [peer]

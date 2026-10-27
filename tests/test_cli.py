@@ -33,52 +33,59 @@ def make_config(tmp_path) -> tuple[str, str]:
 
 def test_listen_is_scoped_to_our_inbox_and_signed_as_us(tmp_path, monkeypatch):
     path, secret = make_config(tmp_path)
+    me = sdk.Keys.parse(secret).public_key().to_hex()
     captured = []
 
-    class FakeWorker:
-        def __init__(self, relay, me, **kwargs):
-            captured.append({"relay": relay, "me": me, **kwargs})
+    async def fake_stream(**kwargs):
+        captured.append(kwargs)
 
-        async def run(self, handler):
-            return None
-
-        def stop(self):
-            pass
-
-    monkeypatch.setattr(cli, "RelayWorker", FakeWorker)
+    monkeypatch.setattr(cli, "stream_events", fake_stream)
     assert cli.main(["--config", path, "listen"]) == 0
 
-    assert captured, "listen started no workers"
-    for worker in captured:
-        assert worker["p_tag"] == worker["me"], "subscription is not `#p`-scoped to us"
-        assert worker["secret"] == secret, "worker would authenticate as nak's machine key"
+    assert captured, "listen started no streams"
+    for call in captured:
+        assert call["p_tag"] == me, "subscription is not `#p`-scoped to us"
+        assert call["secret"] == secret, "the stream would read as an anonymous client"
 
 
-def test_listen_understands_a_pinned_relay_kind_set(tmp_path, monkeypatch):
+def test_listen_groups_relays_by_their_pinned_kind_set(tmp_path, monkeypatch):
+    """A REQ is all-or-nothing at the relay, so a pinned kind set gets its own stream."""
     path, _ = make_config(tmp_path)
     cfg = yaml.safe_load(open(path))
-    cfg["relays"]["read"] = ["wss://relay.example",
-                             {"url": "wss://relay.eu.whitenoise.chat", "kinds": [1059]}]
+    cfg["relays"]["read"] = ["wss://relay.example", "wss://relay.two.example",
+                             {"url": "wss://relay.pinned.example", "kinds": [1059, 4]}]
     open(path, "w").write(yaml.safe_dump(cfg))
 
     captured = []
 
-    class FakeWorker:
-        def __init__(self, relay, me, **kwargs):
-            captured.append({"relay": relay, **kwargs})
+    async def fake_stream(**kwargs):
+        captured.append(kwargs)
 
-        async def run(self, handler):
-            return None
-
-        def stop(self):
-            pass
-
-    monkeypatch.setattr(cli, "RelayWorker", FakeWorker)
+    monkeypatch.setattr(cli, "stream_events", fake_stream)
     assert cli.main(["--config", path, "listen"]) == 0
 
-    assert [worker["relay"] for worker in captured] == [
-        "wss://relay.example", "wss://relay.eu.whitenoise.chat"]
-    assert captured[1]["kinds"] == (1059,), "a pinned kind set reached the worker as a dict"
+    assert {tuple(call["kinds"]): call["relays"] for call in captured} == {
+        (1059,): ["wss://relay.example", "wss://relay.two.example"],
+        (1059, 4): ["wss://relay.pinned.example"],
+    }
+
+
+def test_listen_once_reads_each_relay_with_a_p_scoped_filter(tmp_path, monkeypatch):
+    path, secret = make_config(tmp_path)
+    me = sdk.Keys.parse(secret).public_key().to_hex()
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "fetch_many_blocking", fake_fetch)
+    assert cli.main(["--config", path, "listen", "--once", "--limit", "5"]) == 0
+
+    assert [call["relays"] for call in calls] == [["wss://relay.example"]]
+    assert calls[0]["kinds"] == (1059,)
+    assert calls[0]["p_tag"] == me and calls[0]["secret"] == secret
+    assert calls[0]["limit"] == 5
 
 
 def test_drops_command_shows_why_and_when_and_filters(tmp_path, capsys):

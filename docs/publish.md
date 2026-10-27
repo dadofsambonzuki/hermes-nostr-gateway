@@ -61,13 +61,12 @@ for the duration of the send.
 
 ## What is still a subprocess
 
-- **Ad-hoc reads** — `Gateway._load_follows()` (the kind-3 lookup at startup) and
-  `hng --once` / `OneShot` still shell out to `nak`. They are one-shot reads, not
-  workers; moving them is a separate change.
-- **`transport.legacy: true`** — the rollback, below.
+- **Ad-hoc reads** — none: the kind-3 contact list, the peer kind-10050 inboxes and
+  `hng listen` (both `--once` and live) read through the bindings via `fetch.py`.
+- **`transport.legacy: true`** — the publish rollback, below.
 
-So `ps` on a running gateway shows `nak` only for those one-shot reads, and never for a
-publish.
+So `ps` on a running gateway shows `nak` only when that flag is set, and never on a
+default config.
 
 ## Rolling back
 
