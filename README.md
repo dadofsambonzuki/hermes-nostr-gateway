@@ -39,11 +39,11 @@ has to know which protocol a message arrived on. When it is finished, this is wh
   once is a startup error, never a warning (below). `wn-agent` remains the transport underneath
   either way.
 
-The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md); host-side operations
-are kept with the host's own infrastructure documentation rather than in this repository.
-Where the current build differs from this
-target is tracked in [`QUEUE.md`](QUEUE.md), not here — a README that doubles as a progress log
-goes stale between commits.
+The authoritative design is [`docs/gateway-spec.md`](docs/gateway-spec.md) and the standing
+decisions are in [`docs/decisions.md`](docs/decisions.md); host-side operations are kept with the
+host's own infrastructure documentation rather than in this repository. Remaining work is not
+tracked in this tree either — it is a task on the host's kanban board (see "Where the work
+lives"), so a README that doubles as a progress log cannot go stale between commits.
 
 ## Pieces
 
@@ -59,27 +59,33 @@ goes stale between commits.
   in step with the live copy under `~/.hermes/plugins/nostr/`.
 - **Publish path** — [`docs/publish.md`](docs/publish.md): one signed event sent per relay
   through the bindings client, and what the retry guarantees.
-- **Queue gate** — `scripts/queue_next.py` and `deploy/queue-gate.sh`: the cron queue worker's
-  monitor source, so an idle tick costs no agent run (see "Working the queue" below).
+- **Standing decisions** — [`docs/decisions.md`](docs/decisions.md): the calls already made
+  (the Marmot-only relay set, no names in the tree, Concord is supported), so they are not
+  re-opened by accident.
 - **Prior art** — `wn-agent`/mdk and Armada, credited below.
 
-## Working the queue
+## Where the work lives
 
-`QUEUE.md` is where the remaining work is listed and what happened to it; the 20-minute Hermes cron
-job works its first unchecked, non-BLOCKED item and leaves a commit behind as the receipt. The job
-is monitor-gated, not prompt-only: `scripts/queue_next.py` runs *before* the agent and prints either
-one idle line — `queue empty — nothing pending` — or the next item with the pending/blocked counts
-and the whole hours since `QUEUE.md` last changed. Hermes suppresses the agent run while that output
-is byte-identical to the last run that woke it, so an empty queue costs one script execution, no
-model call and no tool attempts; the `waited:` hour bucket is also the retry valve for an item whose
-run died without editing the file.
+Remaining work is not a checklist in this tree. It is a set of cards on this host's Hermes
+kanban board — the `gateway` board, bound to this project — and the board's dispatcher is what
+runs them: a card gets a git worktree, a branch and an agent, in parallel with its siblings, and
+an empty board costs nothing at all because there is no scheduled prompt to spend.
 
-`hermes cron` only accepts monitor scripts from its own scripts directory, so
-`deploy/queue-gate.sh` is the source of truth and `~/.hermes/scripts/queue-gate.sh` is a
-pass-through copy (`cp` is the whole update step); the repo path is `QUEUE_REPO` with this
-checkout as the default. `tests/test_queue_next.py` pins the parse, the one-line idle output, the
-rules-text trap and wrapper/module equivalence. This is project tooling, not gateway surface — `hng`
-is not involved.
+What that means for anyone adding work:
+
+- **One card, one scoped PR.** The card body names the gate (`ruff check src tests scripts
+  benchmarks`, `python -m pytest -q` on the checkout's own venv) and the branch, `pr/<slug>`.
+  Nothing lands on `master` directly, and the operator merges.
+- **A question is a block, not a TODO.** A card that needs a decision is blocked on the board
+  with the question in the comment thread; the answer becomes a line in
+  [`docs/decisions.md`](docs/decisions.md) when it is meant to hold.
+- **The card body carries the decisions it depends on.** A worker cannot see its siblings, so
+  anything two cards must agree on is settled once and written into both.
+
+This repository used to carry `QUEUE.md` and a 20-minute cron worker that walked it, with a
+monitor script so an idle queue cost no model call. All three are gone: a queue file only one
+host could see was a second source of truth, and the board's dispatcher already does the
+gating the monitor script was written for.
 
 ## Quick start (five minutes)
 

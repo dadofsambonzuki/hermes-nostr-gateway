@@ -107,10 +107,11 @@ the blob and attach it to the `MessageEvent` so the agent sees the image, not a 
 ## Working agreement
 
 - One PR per item, branch `pr/<slug>`, opened with `ngit pr create`; **no direct commits to
-  master**, including from the cron worker.
-- The cron worker runs in its own worktree (`~/work/gateway-worker`), one item per run.
-- Merge only after the operator confirms. A blocked item is marked BLOCKED in `QUEUE.md` with the
-  question, and a DM is sent; the worker moves on.
+  master**.
+- Items are cards on the host's Hermes kanban board, and the board's dispatcher runs each one in
+  its own worktree.
+- Merge only after the operator confirms. A card that needs a decision is blocked on the board
+  with the question, and the worker moves on to the next card.
 
 ## Out of scope
 

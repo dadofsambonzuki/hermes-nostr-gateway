@@ -1,9 +1,9 @@
 """Concord write path (CORD-01/02/03): Channel and Guestbook publishes.
 
-Restored from an earlier extraction (`pr/extract-adapter`, QUEUE.md). The
-identity is passed in as `nostr_sdk.Keys` instead of being read from the
-environment inside each build function (spec §18 review item 2). The reader
-stays read-only; everything that signs lives here.
+Restored from an earlier extraction (`pr/extract-adapter`). The identity is passed
+in as `nostr_sdk.Keys` instead of being read from the environment inside each build
+function (spec §18 review item 2). The reader stays read-only; everything that signs
+lives here.
 
 Envelope shape (CORD-01):
   wrap(1059, signed by the plane's derived stream key)

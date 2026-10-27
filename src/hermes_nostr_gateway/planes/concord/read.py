@@ -1,8 +1,7 @@
 """Concord (Armada/Vector) private-stream reader for CORD-01/02/03/05.
 
-Restored from an earlier extraction (`pr/extract-adapter`, review item in
-QUEUE.md). It reads only: nothing here signs, publishes or joins; the write path
-is a separate module on purpose.
+Restored from an earlier extraction (`pr/extract-adapter`). It reads only: nothing here
+signs, publishes or joins; the write path is a separate module on purpose.
 
 Every wrap is decrypted through a :class:`~.derive.GroupKey`, whose NIP-44
 conversation key comes from rust-nostr. The reader never handles raw scalar

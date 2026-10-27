@@ -129,7 +129,7 @@ Seven days of real group traffic with the plugin off, and all of:
   event being skipped by design.
 
 Any failure means: roll back (one line), keep the plugin, and file the failure as its own
-queue item. The plugin does not retire on a promise.
+board card. The plugin does not retire on a promise.
 
 ## After the clean week
 
@@ -145,6 +145,6 @@ queue item. The plugin does not retire on a promise.
 - **MLS itself.** `wn-agent` owns group protocol, key packages and the encrypted send. The
   gateway never reimplements it (spec §16).
 - **The relay set.** White Noise relays stay Marmot-only and are never part of the DM or
-  feed read set (see `QUEUE.md`, "Decisions").
+  feed read set (see [`decisions.md`](decisions.md)).
 - **Who may instruct the agent.** That is the attention policy, per sender group, on every
   plane — unchanged by which process reads this socket.
