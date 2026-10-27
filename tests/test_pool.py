@@ -15,6 +15,7 @@ import nostr_sdk as sdk
 import pytest
 
 from hermes_nostr_gateway import gateway as gateway_mod
+from hermes_nostr_gateway import sdkloop
 from hermes_nostr_gateway.gateway import DM_KINDS, Gateway
 from hermes_nostr_gateway.pool import PoolWorker, RelayPool
 
@@ -177,6 +178,62 @@ async def test_an_event_for_another_subscription_is_not_delivered():
         # A NEW_EVENT for a subscription we do not own must be ignored, not counted.
         await asyncio.sleep(0.05)
         assert got == [] and worker.events == 0
+    finally:
+        worker.stop()
+        await asyncio.wait_for(task, timeout=2)
+        await pool.stop()
+
+
+class BindingCheckingStream(FakeStream):
+    """A stream that only works when uniffi's global loop is the one awaiting it.
+
+    That is the production behaviour: a future built on a closed loop answers
+    `got Future attached to a different loop`, and the pump retries for ever.
+    """
+
+    async def next(self):
+        if sdkloop.current() is not asyncio.get_running_loop():
+            raise RuntimeError("Task got Future attached to a different loop")
+        return await super().next()
+
+
+# -- the loop the pump rides on ---------------------------------------------
+
+async def test_the_pump_rebinds_a_loop_a_one_shot_left_closed():
+    """A cold fetch in a worker thread must not kill the daemon's pump.
+
+    `fetch_*_blocking` runs `asyncio.run` on a thread; before the fix it left uniffi's
+    process-global loop pointing at the loop it had just closed, and every `next()` on
+    the pump's stream then failed — `0/8 relay(s) ok` with every relay healthy.
+    """
+    keys = sdk.Keys.generate()
+    client = FakeClient()
+    client.stream = BindingCheckingStream()
+    pool = RelayPool(SECRET, client=client)
+    worker = make_worker(pool)
+    got: list[dict] = []
+
+    task = asyncio.create_task(worker.run(lambda _relay, event: got.append(event)))
+    try:
+        await wait_for(lambda: worker.alive)
+
+        def one_shot_in_a_thread() -> None:
+            async def inner() -> None:
+                sdkloop.bind()  # what a cold read binds, then abandons when it closes
+
+            asyncio.run(inner())
+
+        await asyncio.to_thread(one_shot_in_a_thread)
+        assert sdkloop.current().is_closed()
+
+        client.stream.push(sdk.ClientNotification.NEW_EVENT(
+            relay_url=sdk.RelayUrl.parse(RELAY + "/"),
+            subscription_id=worker.subscription_id,
+            event=a_signed_event(keys)))
+        await wait_for(lambda: got)
+
+        assert got[0]["kind"] == 1059
+        assert worker.events == 1
     finally:
         worker.stop()
         await asyncio.wait_for(task, timeout=2)

@@ -22,6 +22,7 @@ from typing import Any, Iterable, Sequence
 
 import nostr_sdk as sdk
 
+from . import sdkloop
 from .crypto import parse_secret
 from .pool import KeysSigner
 
@@ -52,9 +53,8 @@ def _client(secret: str | None = None) -> sdk.Client:
     if not secret:
         return sdk.Client()
     keys = sdk.Keys.parse(parse_secret(secret))
-    set_loop = getattr(sdk, "uniffi_set_event_loop", None)
-    if set_loop is not None:
-        set_loop(asyncio.get_running_loop())
+    # The async signer runs on a Rust worker thread: bind before the client is built.
+    sdkloop.bind()
     return sdk.ClientBuilder().authenticator(sdk.SignerAuthenticator(KeysSigner(keys))).build()
 
 
@@ -126,13 +126,15 @@ def fetch_first_blocking(**kwargs: Any) -> dict[str, Any] | None:
 
     A caller already inside a running loop cannot `asyncio.run`; it gets a worker thread
     and blocks — which is what the subprocess did before this, only without a binary.
+    Either way the loop is one-shot: `run_isolated` puts the bindings' global back, so
+    the daemon's pump keeps its own loop (see `sdkloop`).
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(fetch_first(**kwargs))
+        return sdkloop.run_isolated(fetch_first(**kwargs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(fetch_first(**kwargs))).result()
+        return pool.submit(lambda: sdkloop.run_isolated(fetch_first(**kwargs))).result()
 
 
 async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str | None = None,
@@ -175,12 +177,13 @@ async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str
 
 
 def fetch_many_blocking(**kwargs: Any) -> list[dict[str, Any]]:
+    """`fetch_many` for callers that are not async; one-shot loop, binding restored."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(fetch_many(**kwargs))
+        return sdkloop.run_isolated(fetch_many(**kwargs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(fetch_many(**kwargs))).result()
+        return pool.submit(lambda: sdkloop.run_isolated(fetch_many(**kwargs))).result()
 
 
 async def stream_events(*, relays: Iterable[str], kinds: Sequence[int],

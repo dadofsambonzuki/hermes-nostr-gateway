@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable
 
 import nostr_sdk as sdk
 
+from . import sdkloop
 from .crypto import parse_secret
 from .relay import Handler, RefusalHandler, refused_kinds
 
@@ -275,9 +276,7 @@ class RelayPool:
         # `asyncio.get_running_loop()` does not exist: bind the loop explicitly or every
         # NIP-42 attempt dies with "no running event loop" and a restricted relay closes
         # the subscription as unauthenticated.
-        set_loop = getattr(sdk, "uniffi_set_event_loop", None)
-        if set_loop is not None:
-            set_loop(asyncio.get_running_loop())
+        sdkloop.ensure()
         self.started_at = self.started_at or time.time()
         self._pump = asyncio.create_task(self._pump_notifications())
         await self._started.wait()
@@ -297,6 +296,8 @@ class RelayPool:
         while not worker._stop.is_set() and not self._stop.is_set():
             worker.attempts += 1
             worker.attempt_started_at = time.time()
+            # Retries can outlive the loop a cold fetch rebound; assert ours each attempt.
+            sdkloop.ensure()
             try:
                 await self.client.connect(and_wait=CONNECT_TIMEOUT)
                 output = await self._request(worker)
@@ -379,6 +380,7 @@ class RelayPool:
         except Exception:  # noqa: BLE001 - absent is the normal case
             log.debug("pool: unsubscribe before re-REQ of %s failed",
                       worker.subscription_id, exc_info=True)
+        sdkloop.ensure()
         return await self.client.subscribe(self._target(worker), id=worker.subscription_id)
 
     # -- pump ----------------------------------------------------------
@@ -393,6 +395,10 @@ class RelayPool:
             return
         self._started.set()
         while not self._stop.is_set():
+            # A one-shot fetch or publish in a worker thread rebinds uniffi's
+            # process-global loop to its own and then closes it; without this the next
+            # `next()` builds its future on that dead loop and every relay worker dies.
+            sdkloop.ensure()
             try:
                 notification = await stream.next()
             except asyncio.CancelledError:
