@@ -13,6 +13,7 @@ import nostr_sdk as sdk
 import yaml
 
 from .bots import BotRegistry, kind0_fetcher
+from .control import ControlConfig
 from .crypto import SdkCrypto
 from .health import (
     DEFAULT_PENDING_STALE_MINUTES,
@@ -291,6 +292,9 @@ class Gateway:
             "bots": cfg.get("bots"),
         }, bot_lookup=self.bots.is_bot, echo_lookup=self._echo_lookup)
         self.cfg_concord = cfg.get("concord") or {}
+        #: Where a confirmation may be asked, and whose word needs none. Config only:
+        #: the plane that needs it says so through `self.control`, never a hard-coded key.
+        self.control = ControlConfig.from_config(cfg.get("control"))
         self.concord = ConcordPlane(
             self.store,
             solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)),
@@ -527,6 +531,11 @@ class Gateway:
     async def start(self) -> None:
         await self.server.start()
         self._started_at = time.time()
+        # One line, because a missing destination is a configuration fact the operator
+        # should see at boot rather than discover when a confirmation goes nowhere.
+        for problem in self.control.problems:
+            log.warning("control: %s", problem)
+        log.info("control pane: %s", "; ".join(self.control.describe()))
         # Before any relay worker exists: from here on, a store write is a queue append
         # and the commit happens on the writer's thread.
         await self.store_writer.start()

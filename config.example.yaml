@@ -172,3 +172,18 @@ policies:
 defaults:
   reach: digest(15m)
   authority: none
+
+# The control pane: where a confirmation is asked, and whose word needs none. One
+# destination per plane; a plane with no entry is reported as unconfigured rather than
+# guessed. `hng control` prints the resolved pane.
+#
+# control:
+#   concord: concord:<community>:<channel>   # e.g. the #ops channel
+#   nip17: npub1...                          # a DM peer that answers confirmations
+#   marmot: <group id>                       # a White Noise group
+#   trusted_npubs:                           # trusted in every plane
+#     - npub1...
+#   planes:
+#     concord:
+#       trusted_npubs:                       # trusted here as well, not instead
+#         - npub1...

@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from .bots import BotRegistry
+from .control import ControlConfig
 from .crypto import CryptoError, SdkCrypto, parse_secret
 from .fetch import fetch_many_blocking, stream_events
 from .health import (
@@ -577,6 +578,26 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def cmd_control(args) -> int:
+    """Where a confirmation goes per plane, and who is trusted enough not to need one."""
+    cfg = load_config(args.config)
+    control = ControlConfig.from_config(cfg.get("control"))
+    if args.json:
+        print(json.dumps({
+            "targets": control.targets,
+            "trusted_npubs": sorted(control.trusted),
+            "planes": {plane: sorted(keys) for plane, keys in control.per_plane.items()},
+            "problems": list(control.problems),
+        }, indent=2))
+        return 0
+    for problem in control.problems:
+        print(f"config: {problem}", file=sys.stderr)
+    print("control pane")
+    for line in control.describe():
+        print(f"  {line}")
+    return 0
+
+
 def cmd_drops(args) -> int:
     """Refused messages: what policy dropped, why, and when — the `drops` op's client."""
     import datetime
@@ -769,6 +790,10 @@ def main(argv: list[str] | None = None) -> int:
     p_projects = sub.add_parser("projects", help="channel -> checkout mapping (concord.projects)")
     p_projects.add_argument("--json", action="store_true")
     p_projects.set_defaults(func=cmd_projects)
+
+    p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
+    p_control.add_argument("--json", action="store_true")
+    p_control.set_defaults(func=cmd_control)
 
     sub.add_parser("replay-skip",
                    help="record a handover: the pending backlog is already answered"
