@@ -254,16 +254,27 @@ a former staffer rotates the root rather than trusting the fold alone.
 ### Channel → project mapping
 
 A channel is a context, not a repository. What tells an agent which checkout a channel's work
-belongs to is a lookup the gateway does before it hands over the message:
+belongs to — and, when the channel is driven by a queue, where that work is filed — is a lookup
+the gateway does before it hands over the message:
 
 ```yaml
 concord:
   projects:
-    - channel: Ops                      # channel name, or its hex id
-      path: ~/Projects/hermes-nostr-gateway
-      name: hermes-nostr-gateway        # optional; defaults to the directory name
-      community: f56b6914…              # optional; restrict to one community
+    - channel: example-channel          # channel name, or its hex id
+      path: ~/Projects/example          # the checkout
+      name: example                     # optional; defaults to the directory name
+      community: <community id>         # optional; restrict to one community
+      project: example-project          # optional; Hermes project (worktrees, branches)
+      board: example-channel            # optional; kanban board this channel queues on
 ```
+
+`path`, `project` and `board` are three names with three jobs, and none is inferred from another.
+`path` is where the code is. `project` is the Hermes project: per-profile state that anchors a
+worktree and its branch convention, which is what queued work needs to land anywhere. `board` is
+the queue the work is filed on. A checkout with no `board` is manual work, and a channel with no
+`board` is simply not kanban-driven — nothing is created because a channel exists. A `board`
+without a `project` is a config error, because nothing anchors the worktree, so the entry is
+reported and never resolved rather than half-used.
 
 - A channel matches on its id or its current name; an id match wins, so renaming a channel in
   the client does not move its project.
@@ -271,11 +282,22 @@ concord:
 - A path that does not exist is kept and reported, never silently ignored: an unmounted or
   moved checkout is a fact to see, not a config edit to guess at.
 
-`hng projects` prints the map with each checkout's state (present, a git tree, whether it
-carries an `AGENTS.md`); `hng projects --json` is the same for a script. `ConcordPlane.project_for()`
-returns `{"name", "path"}` for a channel — the field an inbound channel message will carry once
-channel ingestion is wired. Today the resolver and its admin surface exist; invites, not
-messages, are what the plane reads.
+`hng projects` prints the map: each checkout's state (present, a git tree, whether it carries an
+`AGENTS.md`) and the project and board it declares. `hng projects --json` is the same for a
+script, so an integration reads the mapping instead of carrying board slugs and repo paths of its
+own. `ConcordPlane.project_for()` returns `{"name", "path"}` for a channel — the field an inbound
+channel message will carry once channel ingestion is wired. Today the resolver and its admin
+surface exist; invites, not messages, are what the plane reads.
+
+`hng projects --check` asks the question the map implies, per channel: is the checkout there, is
+the project registered, is there a board and is it bound to that project. It names every missing
+piece and exits 1 if there is one; `--check --json` carries the same verdicts. That read is
+read-only (`$HERMES_HOME`, then `~/.hermes`) and creates nothing — `hng serve` logs the same gaps
+at startup and carries on, because a broken mapping must not stop the gateway reading messages.
+
+By convention a channel bound to a project gets one board, named after the channel, with the
+board's `--default-workdir` set to the checkout. Two channels that share a checkout get two
+queues: a channel is a context, and one queue for two rooms hides whose work is whose.
 
 ### Control pane
 

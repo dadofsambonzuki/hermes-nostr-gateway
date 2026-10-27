@@ -173,6 +173,21 @@ defaults:
   reach: digest(15m)
   authority: none
 
+# Concord: the channel -> work mapping. A channel is a context, not a repository. `path` is
+# the checkout, `project` is the Hermes project (worktree and branch anchoring, per profile)
+# and `board` is the kanban queue the channel's work is filed on: three names, three jobs, none
+# inferred from another. A checkout with no board is manual work; a board without a project is a
+# config error, because nothing anchors the worktree. Nothing is created here -- `hng projects
+# --check` reports what is missing, and startup only logs it.
+#
+# concord:
+#   projects:
+#     - channel: example-channel        # channel name, or its hex id
+#       community: <community id>       # optional; restrict to one community
+#       path: ~/Projects/example        # the checkout
+#       project: example-project        # optional; Hermes project slug
+#       board: example-channel          # optional; kanban board slug
+
 # The control pane: where a confirmation is asked, and whose word needs none. One
 # destination per plane; a plane with no entry is reported as unconfigured rather than
 # guessed. `hng control` prints the resolved pane.

@@ -33,7 +33,7 @@ from .media import MediaError, media_config, resolve_attachment
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
-from .projects import ProjectMap
+from .projects import Project, ProjectMap, checks_for, load_registry
 from .publisher import publish
 from .store import Store, drops_ttl_seconds
 
@@ -558,10 +558,48 @@ def cmd_recent(args) -> int:
     return 0
 
 
+def _projects_line(project: Project) -> str:
+    """Second line of a listing: the state of the checkout, then what drives its work."""
+    state = project.config_error or project.problem or "ok"
+    markers = ", ".join(m for m in ("git" if project.is_git else "",
+                                    "AGENTS.md" if project.has_agents_md else "") if m)
+    driven = f"project={project.project or '-'} board={project.board or '-'}"
+    return f"{state}{' · ' + markers if markers else ''} · {driven}"
+
+
 def cmd_projects(args) -> int:
-    """The channel -> checkout map, and whether each checkout is actually there."""
+    """The channel -> checkout map, and what each channel's work depends on.
+
+    `--check` turns the map into a question: is the checkout there, is the project
+    registered, does the board exist and is it bound to that project? A gap is reported
+    per channel and the exit code says whether there was one -- never a crash, because a
+    broken mapping must not stop the gateway reading messages.
+    """
     cfg = load_config(args.config)
     mapping = ProjectMap.from_config(cfg.get("concord") or {})
+    checking = bool(getattr(args, "check", False))
+    if checking:
+        registry = load_registry()
+        rows = [(project, checks_for(project, registry)) for project in mapping.all()]
+        if args.json:
+            print(json.dumps([dict(project.as_dict(),
+                                   checks=[check.as_dict() for check in checks])
+                              for project, checks in rows], indent=2))
+            return 1 if any(not check.ok for _, checks in rows for check in checks) else 0
+        if not mapping:
+            print("concord.projects is empty: no channel resolves to a checkout")
+            return 0
+        failed = 0
+        for project, checks in rows:
+            print(f"{project.channel}  ({project.community or 'any community'})  "
+                  f"{project.path}")
+            for check in checks:
+                if not check.ok:
+                    failed += 1
+                print(f"  {check.name:<9}{'ok' if check.ok else 'MISSING':<9}{check.detail}")
+        if failed:
+            print(f"{failed} piece(s) missing across {len(mapping)} channel(s)")
+        return 1 if failed else 0
     if args.json:
         print(json.dumps([project.as_dict() for project in mapping.all()], indent=2))
         return 0
@@ -569,12 +607,9 @@ def cmd_projects(args) -> int:
         print("concord.projects is empty: no channel resolves to a checkout")
         return 0
     for project in mapping.all():
-        state = "ok" if project.ok else project.problem
-        markers = ", ".join(m for m in ("git" if project.is_git else "",
-                                       "AGENTS.md" if project.has_agents_md else "") if m)
         print(f"{project.channel:<18} {(project.community[:12] or '(any)'):<14} "
               f"{project.name:<24} {project.path}")
-        print(f"{'':<18} {state}{' · ' + markers if markers else ''}")
+        print(f"{'':<18} {_projects_line(project)}")
     return 0
 
 
@@ -789,6 +824,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p_projects = sub.add_parser("projects", help="channel -> checkout mapping (concord.projects)")
     p_projects.add_argument("--json", action="store_true")
+    p_projects.add_argument("--check", action="store_true",
+                            help="exit 1 unless every declared checkout, project and board "
+                                 "is there")
     p_projects.set_defaults(func=cmd_projects)
 
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
