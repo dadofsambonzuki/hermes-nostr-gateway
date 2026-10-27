@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 
 import nostr_sdk as sdk
 
-from hermes_nostr_gateway import crypto
 from hermes_nostr_gateway.planes.concord import channels as ch
 from hermes_nostr_gateway.planes.concord import read as c
 from hermes_nostr_gateway.planes.concord import write
