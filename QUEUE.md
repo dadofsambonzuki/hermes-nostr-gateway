@@ -36,9 +36,10 @@ the remaining dependency: the binary, the tests that spawn it, and the legacy tr
       that installs or asserts the binary; keep the wheel assertion. Done when: an image
       builds without network access to the nak release and CI is green.
       → PR nevent1qqsxprk29maf84r6yp5e85xmeywwnm4w8z93z3cqgcw4hk6spmrew3spz3mhxue69uhhyetvv9ujumn8d96zuer9wcdzm8f0 (pr/image-and-ci); image built without nak, CI never had one
-- [ ] **5. Delete `transport.legacy`** — remove the flag, its branches, and the `legacy`
+- [x] **5. Delete `transport.legacy`** — remove the flag, its branches, and the `legacy`
       wording in comments and docs. Done when: `grep -rn "legacy" src config.example.yaml
       README.md` returns only NIP-04's "legacy DMs" wording, which is a protocol fact.
+      → PR nevent1qqsycw3wz0f6r44sxtxk2mtkwdtmuzlvvp4vk0xv0qfffdqzyhus6yqpz3mhxue69uhhyetvv9ujumn8d96zuer9wcfsld3s (pr/delete-transport-legacy), cut from the pr/delete-subprocess-transport tip so it diffs as one commit; `NakPublisher` and the `transport:` block are gone, and a stale key is ignored rather than rejected
 
 ## Decisions (do not re-litigate)
 
