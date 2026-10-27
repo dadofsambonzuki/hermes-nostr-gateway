@@ -28,9 +28,10 @@ the remaining dependency: the binary, the tests that spawn it, and the legacy tr
       types. Done when: no `subprocess` import in `relay.py` or `cli.py`, and `hng listen
       --once` works against a relay.
       → PR nevent1qqszuqe49e8ymdj4g85p0nemck8z85rjnn4jr5ldgtjg5tq7q747p5qpz3mhxue69uhhyetvv9ujumn8d96zuer9wcvh4fqj (pr/delete-subprocess-transport); also moved `NakInboxResolver` → `SdkInboxResolver`, the last `nak` child in `src/` outside the publish rollback
-- [ ] **3. Scripts off nak** — `scripts/probe_nip17_conformance.py` (four uses) and
+- [x] **3. Scripts off nak** — `scripts/probe_nip17_conformance.py` (four uses) and
       `scripts/verify_adapter.py` (key generate, publish) use the bindings instead. Done
       when: neither file mentions `nak`, and the probe still runs against a live relay.
+      → PR nevent1qqs205vzfv60pxu3wypuaz4juvmrxu2j5hkp6yl346nwn4yvyqx5hfqpz3mhxue69uhhyetvv9ujumn8d96zuer9wc3dvrze (pr/scripts-off-nak)
 - [ ] **4. Image and CI** — drop the `nak` download from `Dockerfile`; remove any CI step
       that installs or asserts the binary; keep the wheel assertion. Done when: an image
       builds without network access to the nak release and CI is green.
