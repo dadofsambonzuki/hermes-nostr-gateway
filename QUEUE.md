@@ -16,11 +16,12 @@ mark it BLOCKED with the question and DM the operator; move to the next item.
 The daemon and CLI no longer call nak (`fetch.py`, merged as `6b06df1`). These five close
 the remaining dependency: the binary, the tests that spawn it, and the legacy transport.
 
-- [ ] **1. `tests/test_relay.py` without `RelayWorker`** — keep the refusal, read-plan,
+- [x] **1. `tests/test_relay.py` without `RelayWorker`** — keep the refusal, read-plan,
       restricted-relay and store-recording tests; delete the nine that construct the
       subprocess worker (that behaviour now lives in `PoolWorker`, covered by
       `tests/test_pool.py`). Done when: the file imports no worker class and the suite is
       green with no skipped tests.
+      → PR nevent1qqs03kwez4r0hn0cr9jaxy55vy7g3qr0me6u4cne892gpffhk7hq7sgpz3mhxue69uhhyetvv9ujumn8d96zuer9wc4sggu2 (pr/test-relay-no-worker)
 - [ ] **2. Delete the subprocess transport** — move `hng listen` to
       `fetch.fetch_many_blocking` (`--once`) and `fetch.stream_events` (live); delete
       `RelayWorker` and `OneShot`; reduce `relay.py` to `refused_kinds` and the handler
