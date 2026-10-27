@@ -44,7 +44,7 @@ from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
-from .publisher import Publisher, make_publisher, publish
+from .publisher import Publisher, make_publisher
 from .relay import RelayWorker
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
