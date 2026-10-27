@@ -250,8 +250,8 @@ class Gateway:
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
         # Publish transport (plan P2): one `nostr-sdk` client, one signed event per
-        # message, per-relay results. `transport.legacy: true` still keeps the `nak`
-        # children as the rollback for writes; reads have no subprocess path left.
+        # message, per-relay results. It is the only write path; reads have no
+        # subprocess path either, so there is nothing for a flag to select.
         self.publisher: Publisher = make_publisher(cfg, self._secret)
         self.me = self.crypto.our_pubkey()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
@@ -973,8 +973,8 @@ class Gateway:
             "relays_configured": self.relays_configured,
             "planes": self.plane_names(),
             "relays_publish": self.relays_publish,
-            # Which publish transport is running, and how it has fared: `mode: legacy`
-            # is the `nak` rollback, so a status read cannot be mistaken.
+            # Which publish transport is running, and how it has fared: `mode: bindings`
+            # is the in-process client, so a status read cannot be mistaken for a child.
             "publish": self.publisher.stats(),
             "peer_inbox": {
                 "enabled": self.peer_cfg.enabled,

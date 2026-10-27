@@ -1,12 +1,12 @@
 # Publishing: one signed event, one client, per-relay truth
 
-Plan P2. This records what the write path is now, what it was, and how to go back.
+Plan P2. This records what the write path is now, and what it replaced.
 
 ## The decision
 
 Every publish goes through a single `nostr-sdk` `Client` in this process
 (`src/hermes_nostr_gateway/publisher.py`). The per-relay `nak event --auth` children are
-gone from the default path.
+deleted.
 
 The old publisher did not publish; it spawned a signer. Each relay meant a child, so a
 DM to three relays plus the recipient's own inbox relays was up to six processes, each
@@ -14,7 +14,7 @@ carrying our secret in `NOSTR_SECRET_KEY`, each answering NIP-42 on its own, and
 reporting only what its stdout happened to say. A retry was a new child, which is
 exactly the shape that turns "resend the same event" into "sign it again and hope".
 
-| Concern | Legacy (`transport.legacy: true`) | Bindings (default) |
+| Concern | The `nak` child (removed) | Bindings (now) |
 | --- | --- | --- |
 | A send | `nak event --auth` child per relay | `client.send_event(target=relay)` |
 | NIP-42 | `NOSTR_SECRET_KEY` in the child's env | `SignerAuthenticator` over our `Keys`, in-process |
@@ -27,8 +27,8 @@ exactly the shape that turns "resend the same event" into "sign it again and hop
 
 The contract the rest of the gateway sees is unchanged: `publish(event, relays)` returns
 `{relay: (ok, error)}`, keyed by the caller's own relay strings, and the daemon records
-that per relay in `outbox_wraps`. `BindingsPublisher` and `NakPublisher` both satisfy it,
-so `make_publisher()` is the only place that knows which transport is running.
+that per relay in `outbox_wraps`. `BindingsPublisher` is the only implementation;
+`make_publisher()` builds it with `relays.publish` pinned and nothing else to choose.
 
 The event is signed exactly once, upstream, in `crypto.wrap`. The publisher parses it
 (`Event.from_json`), verifies the signature, and sends that object to every relay. A
@@ -61,24 +61,18 @@ for the duration of the send.
 
 ## What is still a subprocess
 
-- **Ad-hoc reads** — none: the kind-3 contact list, the peer kind-10050 inboxes and
-  `hng listen` (both `--once` and live) read through the bindings via `fetch.py`.
-- **`transport.legacy: true`** — the publish rollback, below.
+Nothing. Ad-hoc reads (the kind-3 contact list, the peer kind-10050 inboxes, `hng listen`
+in both `--once` and live modes) read through the bindings via `fetch.py`, and publishing
+runs on the client described above. `ps` on a running gateway shows no `nak` on any config.
 
-So `ps` on a running gateway shows `nak` only when that flag is set, and never on a
-default config.
+## No rollback flag
 
-## Rolling back
-
-```yaml
-transport:
-  legacy: true
-```
-
-That selects `NakPublisher` (`nak event --auth` per relay) and logs a warning at startup.
-It is kept for one release, until a relay that behaves differently under the bindings has
-been compared side by side; the flag will be removed together with the class — and it is
-the same switch the read pool uses when P1 lands, so one line rolls back both transports.
+The subprocess publisher is deleted, so there is nothing for a config line to bring back.
+A relay that behaves differently is diagnosed from `status.publish`: it reports
+`mode: bindings` with per-relay `sent`/`failed` counts and the last error, and the durable
+outbox retries the same signed event when the relay recovers. A stale `transport:` block
+left in an older config file is ignored, not an error — the daemon starts and publishes
+through the client.
 
 ## How it is tested
 
@@ -87,6 +81,7 @@ and answers OK, so the claims are wire facts rather than mocks. It proves that e
 receives the same signed bytes, that a transport failure is retried with a byte-identical
 frame, that a `blocked` rejection is not retried, that a NIP-42 challenge is answered with
 kind 22242 tags for that challenge and relay, that an unverifiable event opens no
-connection, that the relay set is pruned, and that a whole `Gateway.send` DM reaches two
+connection, that the relay set is pruned, that `make_publisher()` ignores a stale
+`transport:` block in an old config, and that a whole `Gateway.send` DM reaches two
 relays with two wraps each while `subprocess.run` and `create_subprocess_exec` raise if
 called.

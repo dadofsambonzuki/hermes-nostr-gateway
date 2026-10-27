@@ -14,18 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import types
 
 import nostr_sdk as sdk
 import pytest
 import websockets
 
 from hermes_nostr_gateway.gateway import Gateway
-from hermes_nostr_gateway.publisher import (
-    BindingsPublisher,
-    NakPublisher,
-    make_publisher,
-)
+from hermes_nostr_gateway.publisher import BindingsPublisher, make_publisher
 
 PEER = "ab" * 32
 
@@ -274,28 +269,17 @@ async def test_no_relays_means_no_client_and_no_send(no_subprocess):
         await publisher.aclose()
 
 
-def test_the_flag_selects_the_bindings_unless_legacy_is_asked_for():
+def test_make_publisher_has_no_transport_switch():
+    """One publisher: the config's publish relays are pinned, a stale flag is ignored."""
     cfg = {"relays": {"publish": ["wss://relay.example"]}}
-    assert isinstance(make_publisher(cfg, "00" * 32), BindingsPublisher)
-    legacy = dict(cfg, transport={"legacy": True})
-    assert isinstance(make_publisher(legacy, "00" * 32), NakPublisher)
+    publisher = make_publisher(cfg, "00" * 32)
+    assert isinstance(publisher, BindingsPublisher)
+    assert publisher.pinned == {"wss://relay.example"}
 
-
-async def test_the_legacy_publisher_still_shells_out_while_it_exists(monkeypatch):
-    """The rollback is a config flag, so `nak` must actually still work behind it."""
-    calls: list[list[str]] = []
-
-    def fake_run(argv, **kwargs):
-        calls.append(argv)
-        return types.SimpleNamespace(stdout="success", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    keys = sdk.Keys.generate()
-    publisher = NakPublisher(keys.secret_key().to_hex())
-    results = await publisher.publish(signed_note(keys), ["wss://relay.example"])
-
-    assert results == {"wss://relay.example": (True, None)}
-    assert calls and calls[0][1:] == ["event", "--auth", "wss://relay.example"]
+    stale = dict(cfg, transport={"legacy": True})
+    rolled = make_publisher(stale, "00" * 32)
+    assert isinstance(rolled, BindingsPublisher), "a deleted transport came back by config"
+    assert rolled.stats()["mode"] == "bindings"
 
 
 async def test_a_gateway_dm_reaches_every_publish_relay_without_a_child(

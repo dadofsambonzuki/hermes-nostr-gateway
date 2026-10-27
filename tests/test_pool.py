@@ -328,12 +328,12 @@ def gateway_cfg(tmp_path, **extra):
     return cfg
 
 
-async def test_the_gateway_wires_one_pool_and_has_no_second_read_transport(
+async def test_the_gateway_wires_one_pool_and_a_stale_flag_cannot_add_a_second(
         tmp_path, monkeypatch):
-    """The pool is the only read path, and `transport.legacy` cannot select another.
+    """The pool is the only read path, and a stale `transport` block cannot select another.
 
-    The flag still rolls *publishing* back to a `nak` child; it must not quietly bring a
-    subprocess read worker back, because there is no longer one to bring back.
+    An older config still carrying `transport: {legacy: true}` must start and behave
+    exactly like a current one: no subprocess worker, no subprocess publisher.
     """
     monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
     monkeypatch.setattr(Gateway, "_setup_marmot", lambda self, _cfg: None)
@@ -367,10 +367,10 @@ async def test_the_gateway_wires_one_pool_and_has_no_second_read_transport(
     built.clear()
     flagged = Gateway(gateway_cfg(tmp_path, transport={"legacy": True}),
                       socket_path=tmp_path / "b.sock")
-    assert flagged.publisher.stats()["mode"] == "legacy", "the flag no longer reaches publishing"
+    assert flagged.publisher.stats()["mode"] == "bindings", "a stale flag selected a publisher"
     await flagged.start()
     try:
-        assert "wss://relay.example.com/chat" in built, "the flag still selected a read transport"
+        assert "wss://relay.example.com/chat" in built, "the pool is the only read transport"
         assert (await flagged.status())["transport"]["mode"] == "pool"
     finally:
         await flagged.stop()

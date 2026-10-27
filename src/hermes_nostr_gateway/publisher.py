@@ -17,9 +17,8 @@ its challenge around the first EVENT and the client answers it in-process; the e
 accepted on the next send. That is why a failed relay is retried once inside the same
 call, and only then left to the durable retry loop.
 
-The `nak` child is kept for one release behind `transport.legacy: true`, so one config
-line rolls publishing back while the bindings path is proven. Reads have no such switch
-left: the pool is the only read transport. Nothing else may use the flag.
+This is the only write path. The `nak event --auth` child is deleted, so there is no
+second publisher for a config flag to select and no rollback to keep in step.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ import asyncio
 import datetime as dt
 import json
 import logging
-import shutil
-import subprocess
 from typing import Any, Iterable, Protocol
 
 import nostr_sdk as sdk
@@ -249,71 +246,14 @@ class BindingsPublisher:
             self._last_used.clear()
 
 
-class NakPublisher:
-    """The `nak event --auth` child per relay -- the rollback, removed next release.
-
-    Selected by `transport.legacy: true`. It is kept only so a relay that behaves
-    differently under the bindings can be compared side by side; new code must not call
-    it, and `tests/test_publisher.py` keeps it honest while it exists.
-    """
-
-    mode = "legacy"
-
-    def __init__(self, secret: str | None = None, *, nak: str | None = None):
-        self._secret = secret
-        self._nak = nak or shutil.which("nak") or "nak"
-        self.sent = 0
-        self.failed = 0
-        self.last_error: str | None = None
-
-    async def warm(self, relays: Iterable[str]) -> None:
-        return None
-
-    async def publish(self, event: dict,
-                      relays: Iterable[str]) -> dict[str, tuple[bool, str | None]]:
-        return await asyncio.get_running_loop().run_in_executor(
-            None, self._publish_blocking, event, list(relays))
-
-    def _publish_blocking(self, event: dict,
-                          relays: list[str]) -> dict[str, tuple[bool, str | None]]:
-        import os
-        payload = json.dumps(event)
-        env = dict(os.environ, **({"NOSTR_SECRET_KEY": self._secret} if self._secret else {}))
-        out: dict[str, tuple[bool, str | None]] = {}
-        for relay in relays:
-            proc = subprocess.run(
-                [self._nak, "event", "--auth", relay], input=payload,
-                capture_output=True, text=True, env=env,
-            )
-            text = (proc.stdout + proc.stderr).lower()
-            ok = "success" in text
-            if ok:
-                self.sent += 1
-                out[relay] = (True, None)
-                continue
-            detail = (proc.stderr or proc.stdout).strip()
-            error = detail.splitlines()[-1][:200] if detail else "no response"
-            self.failed += 1
-            self.last_error = f"{relay}: {error}"[:300]
-            out[relay] = (False, error)
-        return out
-
-    def stats(self) -> dict[str, Any]:
-        return {"mode": self.mode, "relays": 0, "sent": self.sent,
-                "failed": self.failed, "last_error": self.last_error}
-
-    async def aclose(self) -> None:
-        return None
-
-
 def make_publisher(cfg: dict[str, Any], secret: str | None) -> Publisher:
-    """Pick the transport: the bindings, or (one release) the `nak` children."""
-    transport = cfg.get("transport") or {}
+    """Build the publisher: one client, with the configured publish relays pinned.
+
+    There is no transport switch. A `transport` block left in an older config file is
+    ignored -- the `nak` publisher it used to select is deleted -- so an upgrade does not
+    need a config edit before the daemon starts.
+    """
     relays = list((cfg.get("relays") or {}).get("publish") or [])
-    if transport.get("legacy"):
-        log.warning("transport.legacy: publishing through `nak event --auth` children; "
-                    "this path is removed in the next release")
-        return NakPublisher(secret)
     return BindingsPublisher(secret, pinned=relays)
 
 
