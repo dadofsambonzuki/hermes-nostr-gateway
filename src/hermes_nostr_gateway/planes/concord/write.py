@@ -86,6 +86,19 @@ def build_guestbook_join(keys: sdk.Keys, invite: c.Invite, creator_hex: str = ""
             "rumor": rumor, "stream_pk": gk.pk}
 
 
+async def join_guestbook(keys: sdk.Keys, invite: c.Invite) -> dict[str, str]:
+    """Publish the Guestbook join for one invite: `{relay: outcome}`.
+
+    Built and verified before it leaves the process, then published to the community's own
+    relays — the invite arrives in our inbox (CORD-05 §6), but membership is announced
+    where the community reads. One implementation, so a trusted auto-accept, a human's
+    `hng concord <id>` and a retry all publish the same event shape.
+    """
+    built = build_guestbook_join(keys, invite)
+    verify_envelope(built, c.guestbook_key(invite))
+    return await publish(built["wrap"], invite.relays)
+
+
 def verify_envelope(built: dict[str, Any], gk: GroupKey) -> None:
     """Cheap pre-flight: signatures verify and the rumor round-trips out of the wrap."""
     wrap, rumor = built["wrap"], built["rumor"]

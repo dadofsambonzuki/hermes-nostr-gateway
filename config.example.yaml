@@ -192,6 +192,10 @@ defaults:
 # destination per plane; a plane with no entry is reported as unconfigured rather than
 # guessed. `hng control` prints the resolved pane.
 #
+# Concord invites use both halves: an invite from a trusted npub joins its Guestbook
+# straight away, and anyone else's is held with the question posted into `control.concord`
+# (see `hng concord`, and `hng concord <id>` to accept one by hand).
+#
 # control:
 #   concord: concord:<community>:<channel>   # e.g. the #ops channel
 #   nip17: npub1...                          # a DM peer that answers confirmations

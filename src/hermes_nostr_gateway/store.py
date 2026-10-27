@@ -112,6 +112,9 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 CREATE INDEX IF NOT EXISTS profiles_bot ON profiles (bot);
 
+-- An invite is recorded the moment it verifies and is *never* a message. What happened to
+-- it afterwards is a column, not a guess: `held` (recorded, waiting for a human), `joining`
+-- (a Guestbook join is in flight), `joined` (a relay accepted it) or `failed` (none did).
 CREATE TABLE IF NOT EXISTS concord_invites (
     id           TEXT PRIMARY KEY,
     inviter      TEXT NOT NULL,
@@ -119,7 +122,12 @@ CREATE TABLE IF NOT EXISTS concord_invites (
     name         TEXT,
     relays       TEXT,
     bundle       TEXT NOT NULL,
-    received_at  INTEGER NOT NULL
+    received_at  INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'held',
+    why          TEXT,
+    decided_at   INTEGER,
+    decided_by   TEXT,
+    announced_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS attachments (
@@ -183,6 +191,20 @@ _RUMOR_COLUMNS = {
     "digest_batch": "TEXT",
 }
 
+#: The states an invite can be in. `held` is the default, and the truth for every row
+#: recorded before the join path existed: an invite nobody has joined is waiting, not joined.
+INVITE_STATES = ("held", "joining", "joined", "failed")
+
+#: Columns `concord_invites` gained with the join path. Additive, like `_RUMOR_COLUMNS`, so
+#: an existing store keeps its invites and reads them as `held` until something decides one.
+_INVITE_COLUMNS = {
+    "status": "TEXT NOT NULL DEFAULT 'held'",
+    "why": "TEXT",
+    "decided_at": "INTEGER",
+    "decided_by": "TEXT",
+    "announced_at": "INTEGER",
+}
+
 #: How long a drop stays "live" in `drops` and in the status count. Older rows are still
 #: stored and still listed — marked `expired` — because a refusal is evidence: deleting it
 #: would hide that a peer is being turned away, while never ageing it makes last month's
@@ -196,6 +218,14 @@ def drops_ttl_seconds(cfg: dict[str, Any] | None = None) -> int:
     if hours <= 0:
         raise ValueError("drops.ttl_hours must be positive")
     return int(hours * 3600)
+
+
+def _invite_row(row: sqlite3.Row) -> dict[str, Any]:
+    """One stored invite with its JSON columns decoded, as every caller wants it."""
+    item = dict(row)
+    item["bundle"] = json.loads(item.get("bundle") or "{}")
+    item["relays"] = json.loads(item.get("relays") or "[]")
+    return item
 
 
 @dataclass
@@ -359,6 +389,13 @@ class Store:
             " WHERE created_at = 0",
             (int(time.time()),),
         )
+
+        invite_cols = {
+            row["name"] for row in self.db.execute("PRAGMA table_info(concord_invites)")
+        }
+        for name, kind in _INVITE_COLUMNS.items():
+            if name not in invite_cols:
+                self.db.execute(f"ALTER TABLE concord_invites ADD COLUMN {name} {kind}")
 
         self.db.execute(
             "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
@@ -1108,17 +1145,63 @@ class Store:
         )
         return cur.rowcount > 0
 
-    def concord_invites(self, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self.db.execute(
-            "SELECT * FROM concord_invites ORDER BY received_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-        out = []
-        for row in rows:
-            item = dict(row)
-            item["bundle"] = json.loads(item.get("bundle") or "{}")
-            item["relays"] = json.loads(item.get("relays") or "[]")
-            out.append(item)
-        return out
+    def concord_invites(self, limit: int = 20, *,
+                        status: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM concord_invites"
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY received_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = self.db.execute(sql, params).fetchall()
+        return [_invite_row(row) for row in rows]
+
+    def concord_invite(self, ident: str) -> dict[str, Any] | None:
+        """One invite, by its wrap id or by its community id (the newest for that community)."""
+        row = self.db.execute("SELECT * FROM concord_invites WHERE id = ?",
+                              (str(ident),)).fetchone()
+        if row is None:
+            row = self.db.execute(
+                "SELECT * FROM concord_invites WHERE community_id = ?"
+                " ORDER BY received_at DESC LIMIT 1", (str(ident),)
+            ).fetchone()
+        return _invite_row(row) if row is not None else None
+
+    def concord_joined(self, community_id: str) -> bool:
+        """Have we joined this community? Then the next invite needs nobody's word.
+
+        Only `joined` counts: a row left `joining` by a crash says we tried and cannot say
+        the join landed, so the next invite for that community may publish one.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM concord_invites WHERE community_id = ? AND status = 'joined'"
+            " LIMIT 1", (str(community_id),),
+        ).fetchone()
+        return row is not None
+
+    def decide_invite(self, invite_id: str, *, status: str, why: str = "",
+                      decided_by: str = "") -> bool:
+        """Record what happened to an invite: joined, failed, joining or held.
+
+        An update, never an insert: the row is written when the invite verifies, so a
+        decision for an id this store never recorded is a caller's bug and answers False
+        rather than inventing an invite.
+        """
+        if status not in INVITE_STATES:
+            raise ValueError(f"bad invite status: {status!r}")
+        cur = self.db.execute(
+            "UPDATE concord_invites SET status = ?, why = ?, decided_at = ?, decided_by = ?"
+            " WHERE id = ?",
+            (status, why, int(time.time()), decided_by, str(invite_id)),
+        )
+        return cur.rowcount > 0
+
+    def note_invite_announced(self, invite_id: str) -> bool:
+        """The question reached the control pane, so a restart does not ask it again."""
+        cur = self.db.execute("UPDATE concord_invites SET announced_at = ? WHERE id = ?",
+                              (int(time.time()), str(invite_id)))
+        return cur.rowcount > 0
 
     def stats(self) -> dict[str, Any]:
         # A refusal is never "pending delivery": a `reach: drop` row carries no
@@ -1130,7 +1213,9 @@ class Store:
             "     AND COALESCE(reach, '') != 'drop') AS pending,"
             " SUM(blocked_reason IS NOT NULL OR reach = 'drop') AS blocked FROM rumors"
         ).fetchone()
-        invites = self.db.execute("SELECT COUNT(*) AS n FROM concord_invites").fetchone()
+        invites = self.db.execute(
+            "SELECT COUNT(*) AS n, SUM(status = 'held') AS held FROM concord_invites"
+        ).fetchone()
         media = self.db.execute(
             "SELECT COUNT(*) AS n,"
             " COUNT(DISTINCT CASE WHEN local_path IS NOT NULL THEN sha256 END) AS cached"
@@ -1138,7 +1223,8 @@ class Store:
         ).fetchone()
         return {"total": row["total"], "pending": row["pending"] or 0,
                 "blocked": row["blocked"] or 0,
-                "invites": invites["n"], "relays": self.relay_report(),
+                "invites": invites["n"], "invites_held": invites["held"] or 0,
+                "relays": self.relay_report(),
                 "media": {"attachments": media["n"], "cached": media["cached"] or 0}}
 
     # -- digests --------------------------------------------------------
