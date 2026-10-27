@@ -1,0 +1,43 @@
+{
+  "bundle": {
+    "owner": "605635cded992d5d9ab9cd0f3815e149cc71c99451a39c4a6b578a94b874e41f",
+    "owner_salt": "1d59cfd36d3fa21284273ac18c62c3438af44a63046df07fe662d454f8aebb03",
+    "community_id": "dd1babf5ad3f03f5a11881d5d118c98fe579ff08a78f5015f1d2a75773736222",
+    "community_root": "d417c394f294a9ed81f3cf83607761a04d49baab5a606ef9470fe4db24085023",
+    "root_epoch": 0,
+    "control_pk": "13f76e4ba1ca7c109440dd1c19eb7ed9f26ff9968a61b6ad1d1474c8039a50d9",
+    "name": "test-vector",
+    "relays": [
+      "wss://relay.example.invalid"
+    ],
+    "channels": [
+      {
+        "id": "303999ba5e8e6bd56cdd9c19355dd513034e64bebff10eb47106e8dbe4c89d97",
+        "name": "general",
+        "key": "",
+        "epoch": 0
+      }
+    ]
+  },
+  "channel_pk": "5413788e31ed59738021a43a7b32d7283d3d248bf9558fc128c2bdadfe363eee",
+  "invite_wrap": {
+    "kind": 1059,
+    "content": "At0yaHLjgI5cA/tsrVtEiQcLPE9JLeP262RL7sRQKihYGcEfMgrS7srY97od+9H91nW2C2NjItG6Aee1VEv+u0iFq9x1xeM+HToICmKzS64jNUHXy6EIvgvtu1GvARmsp1Hdubyuj4y76t96djq1BqbgrqV7759Pi9EFLfqMcydPOhilbXCfCoMReqyzRMeMAezma8NZgZnWNSvVQjRUCCpdIxhC2U/XIB0/cFT1LBYVZVtt1OprUDouq7yy0ltFTALcrJifA3fyP9Pp7Otb4dnFIAxX+EnFIN7wL089kXe2OKjG4KszT3JKMJPKlGXKf6KcyR8PIRfsa4MytNk4lv7NxspOb3LOH7KwinvF0HAoVm/C5m/dkXSJ3gnlqYfV5pq+QAAM0xPnk66YtMO+C3EZoRlyA1xHT9Vgm+Sij/piysLicxrIyCe05wH2+S6Ea/C9fukXobUbzZxNDgGEhvV49+pwm/yh3nr3xygXTqmfnOm9aq81Qnb9szzFRp4djJDKKEzyauYiZ8XTySiz0QoCML6f/g61YoSBr/KMNXti+0xUAZjAVcMVGed0W/dU0lZiERAO9/iqdewyR6WzQ8682zFbG9zzct7ljnoajq6jF6b69OM9HtlsnVx2pQnDKhHkIxXYO6zJGkZqVoW1AoVEqU5f5lW3/XeknT7OAIn/QpTL1ewvGD4GPahnnPzXiLPPGZalfwj9XQ1C5KnyX5DYnl491hDN+lcyXB5OaVibm7azMGVhFVX1o2j4PbPOmMF29qZD3sGsOMNDXZ8DVBwY9woslP4GDQ6XmP6YIo/P8h37vTj2hYHCDPflt/v+chZRhhcy+S/8Q0CnMdH3EICZlO5kJGobhbAYAkly8DOiHlFABt0+olTbmC2Awpzc+A5u7UapTBamkC42f5D+ksGkVmWggxUjLhSUeGa8o6qdjdntPrrtuGLl+5CpXLxVzFhOT62LYCcvgCfXMBPTeC2EWiFsU8QSLPDs377QmetJQ4U/BcCAT/eIfjBvpcU6UvDGsBK36B2sa79StuOuc8pOL9G8ztjYIOSy3GVgxz6kqTh2cVOswVXGm6pjCt2yp3wzn9FgoK30z7QBHeriEnrjE1FqzKOz3dvLYxLKo52DZe6apCiAIG0o2g+6bK9FxxXrcf/qXQhXLYZHOIwCUtkblvcsVHQ/ix8hy3Feornv8bIYU61lYZU4cV6gs0TPKlwzXYqEh5HEx3aKfuZtquJ28BhIWkZ1gP0mqmd8pd4iZEwD57n1nGO1naEFcFm5Br2xdrTYCssRgdPxR6bBwoVGnmKvT+CqOZjWo5SsBLoKJry+h3XW3QnswVpoMW7DVa6Vdvg/are2xZCQadUNHuzLdru2KLfrzXddfHqMnhRwR08/igJV6j+d0yEwHD+JuHJAkiBryDlqKYSbNxGdzF5d9xjOmUjcmitU+1JnwLY5VwcS7yhFkEwybIZ1q1yCoBRdkdnHq0TrUvgQQA/pcF6aePMr2bFJMNHuO5JktyDvobKmV6+ObDxxTVQraOQoMRlWZcCFHCEUKxW2ud3G4xHcMzQehX/GpDsiYAS7xgPbd1dA3b93K3DUCxXn64Da+OwcWl8yxn6aYSdXgDjM6IOWDcL1rWU0fbQF97nv/G/mHuIMFVexv11GGmifmCs/bh7JUGCqb8eVfXPCDxxVaM/5HAJr+kijb8dn/mSXv/VJLx+8ZUf/7QneNrRlqDLi1BBnWVNNahbx96NqjAFElLf94agSrIqyXn8Mojy/xnj1zAVGUEcdBjVlTkms+jLiJik6Odm1386JJlaxWOeb7zEUB2mkvf2CPEmCcBVItZP59Rd583aVvSKHazhQSVjvTq2RSIesec4pzenXtX2aGgtOoOpcyBbRFq4A9BSZ6Wg2KJJ0PVf+MrstmnoIjGRnzO/XibNic0OTxDgqaLfvN1h/G9S0USsC0BZE5K9MH50jXVtBNXeWw/aa96esLCtebazPJbic/HQ+rOCdhREErYqE9ezUwJ+30fSBnDj1Mwi6ljrcK/v2Uky9NbaEKM+ksJGTp3mRq77dFpmP7eyoML2im9WNKtbq1+HRvmsoebWajJVloPuMDtaOn9sbe7aSUuerNuoQzHC+XppcwCVi/jKssBzKMa1qLJoISOyDotBaunxGKBCl2KFWv+NhYlkgPsEyVmkXV2BU5WbKnmWaSMR3trqn6sN3kNoKnVuJ38tYhODbcEgnbnAy09ZKsW4DJ4G9DvcqAvNhubaTj0ILcLCImSWOQguPiO+lWK2S2HkCCb941Mv8q/QPw1BcGIbTUCyruYg0uF+bKJzsOjLq7KyEmqCmC/j56mDih/br8qn1Tbpf74ePyCW7weCuZqoeqsOAIXT/hNc9azsloGcs3TM9u0A7r+5xv0kwMyHIV8XovGfl3GMUIk9WFJEsUquJiXJZPZQtn9jHRAmnvQjEocWvRgp8x6cdII/ebwYTETWZhYo=",
+    "tags": [
+      [
+        "p",
+        "28edc129534cbe2c19cf9995d4cb4891c7f885bf7d5d7424d910e9530e478dda"
+      ],
+      [
+        "k",
+        "3313"
+      ]
+    ],
+    "created_at": 1793097508,
+    "pubkey": "4b7f9cc928a78d36945b068fa73b35ce8c317c9075de0db2b6c3538b8be9dee7",
+    "id": "36cca955659e0cb1a72c439ee52d86f95da1750e7729d7507a7a7b9c54f3331b",
+    "sig": "c04c2ad84bed26def60bc72e6662fb69da264af8ba731efeb458780e20512442055a39ca7f98bf62681cd75d0169268cc8b1cbf99449ea2bdbb3943d6693ed00"
+  },
+  "recipient_pubkey": "28edc129534cbe2c19cf9995d4cb4891c7f885bf7d5d7424d910e9530e478dda",
+  "recipient_secret": "82b8d60b580a654a85d7a5cda790f827d33befec136d2dfd7a9e8d756ab5e20e"
+}
