@@ -31,6 +31,7 @@ from typing import Any, Iterable, Protocol
 
 import nostr_sdk as sdk
 
+from . import sdkloop
 from .crypto import parse_secret
 
 log = logging.getLogger("hng.publish")
@@ -116,10 +117,12 @@ class BindingsPublisher:
     def _bind_loop(self) -> None:
         """uniffi calls our authenticator from a Rust worker thread, where there is no
         running loop: bind it explicitly or every NIP-42 attempt dies with "no running
-        event loop" and a restricted relay closes the write."""
-        set_loop = getattr(sdk, "uniffi_set_event_loop", None)
-        if set_loop is not None:
-            set_loop(asyncio.get_running_loop())
+        event loop" and a restricted relay closes the write.
+
+        `ensure`, not a bare set: a cold fetch in another thread may have left the
+        process-global binding on a loop it has since closed (see `sdkloop`).
+        """
+        sdkloop.ensure()
 
     async def _ensure(self, relay: str) -> Any:
         """Add and connect a relay once, then reuse its connection."""
@@ -127,6 +130,7 @@ class BindingsPublisher:
         url = self._urls.get(key)
         if url is not None:
             return url
+        sdkloop.ensure()
         url = sdk.RelayUrl.parse(relay)
         self._urls[key] = url
         await self.client.add_relay(url)
@@ -149,6 +153,7 @@ class BindingsPublisher:
 
     async def _send(self, event: sdk.Event, url: Any) -> tuple[bool, str | None]:
         """One send to one relay; the event object is passed straight through."""
+        sdkloop.ensure()
         try:
             out = await self.client.send_event(
                 event, target=sdk.SendEventTarget.to([url]),
@@ -271,4 +276,4 @@ def publish(event: dict, relays: Iterable[str],
         finally:
             await publisher.aclose()
 
-    return asyncio.run(run())
+    return sdkloop.run_isolated(run())
