@@ -153,11 +153,11 @@ rebuild, update the URL and the hash in `requirements.txt` together.
 
 ## Container
 
-`Dockerfile` still installs a pinned `nak`, though nothing in the read or write path
-shells out any more — both run on the `nostr-sdk` client in the process — so no code path
-needs the binary. The image runs as `gateway`,
-UID/GID 1000 by default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)`
-when the host user that owns the mounted files is not 1000.
+`Dockerfile` builds the same package with no external transport binary: reads and
+publishes both run on the `nostr-sdk` client inside the process, so the image downloads
+nothing but Python packages at build time and carries no relay CLI. The image runs as
+`gateway`, UID/GID 1000 by default; build with `--build-arg UID=$(id -u) --build-arg
+GID=$(id -g)` when the host user that owns the mounted files is not 1000.
 
 The read transport — one client, one subscription per filter set, NIP-42 in-process —
 is described in `docs/transport-pool.md`.
