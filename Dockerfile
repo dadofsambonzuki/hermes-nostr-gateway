@@ -5,11 +5,9 @@
 # not a port. Mount it (and the identity secret) from the host.
 FROM python:3.12-slim-bookworm
 
-# nak is the relay transport — every relay worker is a `nak req` child — so it is
-# part of the runtime, not an optional tool. Pinned and hash-checked: a moving
-# `latest` would change the wire behaviour of a daemon with no other client.
-ARG NAK_VERSION=v0.20.6
-ARG NAK_SHA256=b44b36c792fbc3fb73b7ba3bbc94beda2219826271aa8d5f130f569c3817c3b9
+# No transport binary in the image. Reads and publishes both run on the
+# `nostr-sdk` client inside the process, so there is nothing to download at
+# build time and no `curl` in the runtime.
 
 # Match the host user that owns the mounted state directory and secret file.
 # Override when they are not 1000:1000, or the daemon cannot create its socket
@@ -22,12 +20,8 @@ ENV PYTHONUNBUFFERED=1 \
     HNG_CONFIG=/etc/hermes-nostr-gateway/config.yaml
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL -o /usr/local/bin/nak \
-      "https://github.com/fiatjaf/nak/releases/download/${NAK_VERSION}/nak-${NAK_VERSION}-linux-amd64" \
- && echo "${NAK_SHA256}  /usr/local/bin/nak" | sha256sum -c - \
- && chmod 0755 /usr/local/bin/nak
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt pyproject.toml README.md LICENSE ./
