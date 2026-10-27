@@ -277,6 +277,35 @@ returns `{"name", "path"}` for a channel — the field an inbound channel messag
 channel ingestion is wired. Today the resolver and its admin surface exist; invites, not
 messages, are what the plane reads.
 
+### Control pane
+
+Where the gateway asks before it acts, and whose word it takes without asking. One
+destination per plane, so a confirmation goes to the room that job belongs to rather than
+to whichever channel happened to be open:
+
+```yaml
+control:
+  concord: concord:<community>:<channel>   # e.g. the #ops channel
+  nip17: npub1...                          # a DM peer that answers confirmations
+  marmot: <group id>                       # a White Noise group
+  trusted_npubs:                           # trusted in every plane, global list
+    - npub1...
+  planes:
+    concord:
+      trusted_npubs:                       # trusted here as well, not instead
+        - npub1...
+```
+
+- A plane with no destination is reported as `not configured`: a confirmation that cannot
+  be delivered must not be silently dropped, and nothing guesses a default room.
+- A plane's `trusted_npubs` is a **union** with the global list, so adding a key for one
+  plane never removes the keys trusted everywhere.
+- Keys are normalised to hex, so an `npub` in config matches the hex a frame carries; an
+  entry that is not a key is reported at load time rather than ignored.
+- `hng control` prints the resolved pane per plane (and `--json` for a script); the daemon
+  logs the same line at startup.
+
+
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's
