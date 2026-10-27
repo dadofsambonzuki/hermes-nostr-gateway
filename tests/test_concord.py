@@ -168,6 +168,43 @@ def test_invite_wrapper_is_routed_to_concord_and_stored(tmp_path):
         assert store.recent(10) == []
 
 
+def test_a_second_invite_from_the_same_community_is_stored(tmp_path):
+    """A re-invite is how a channel grant arrives, so it must not be swallowed.
+
+    The inner rumor is unsigned and carries no id, so keying the row on it gave every
+    invite the same empty key and `INSERT OR IGNORE` discarded all but the first.
+    """
+    alice, bob = SdkCrypto(sdk.Keys.generate().secret_key().to_hex()), \
+        SdkCrypto(sdk.Keys.generate().secret_key().to_hex())
+    owner = sdk.Keys.parse(alice.keys.secret_key().to_hex())
+    first = make_invite(owner)
+    second = make_invite(owner)
+    # Same community, a second channel granted — the shape of "I added you to Ops".
+    # community_id self-certifies owner+owner_salt, so the salt has to match as well.
+    second.bundle["owner_salt"] = first.bundle["owner_salt"]
+    second.bundle["community_id"] = first.bundle["community_id"]
+    second.bundle["channels"] = [*first.bundle["channels"], *second.bundle["channels"]]
+
+    wraps = [alice.wrap(crypto.build_rumor(alice.our_pubkey(), bob.our_pubkey(),
+                                           json.dumps(inv.bundle), kind=3313),
+                        bob.our_pubkey())
+             for inv in (first, second)]
+
+    with Store(tmp_path / "reinvites.db") as store:
+        plane = Nip17Plane(bob, store, Policy(DROP_ALL),
+                           on_invite=ConcordPlane(store).handle_invite)
+        for wrap in wraps:
+            assert plane.handle("wss://relay.example", wrap) is None
+        # Re-delivery of a wrap already seen is not a second invite.
+        assert plane.handle("wss://relay.example", wraps[1]) is None
+
+        rows = store.concord_invites()
+        assert len(rows) == 2
+        assert {row["id"] for row in rows} == {wrap["id"] for wrap in wraps}
+        granted = {ch["id"] for row in rows for ch in row["bundle"]["channels"]}
+        assert len(granted) == 2  # the union keeps the first invite's grant
+
+
 def test_bad_invite_is_not_stored(tmp_path):
     alice, bob = SdkCrypto(sdk.Keys.generate().secret_key().to_hex()), \
         SdkCrypto(sdk.Keys.generate().secret_key().to_hex())
