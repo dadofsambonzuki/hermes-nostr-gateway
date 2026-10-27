@@ -247,6 +247,32 @@ edition is judged by the sealed actor's rank. A demoted staffer whose Grant revo
 keeps only the ability to publish things everyone drops — which is why a Community that distrusts
 a former staffer rotates the root rather than trusting the fold alone.
 
+### Channel → project mapping
+
+A channel is a context, not a repository. What tells an agent which checkout a channel's work
+belongs to is a lookup the gateway does before it hands over the message:
+
+```yaml
+concord:
+  projects:
+    - channel: Ops                      # channel name, or its hex id
+      path: ~/Projects/hermes-nostr-gateway
+      name: hermes-nostr-gateway        # optional; defaults to the directory name
+      community: f56b6914…              # optional; restrict to one community
+```
+
+- A channel matches on its id or its current name; an id match wins, so renaming a channel in
+  the client does not move its project.
+- An entry with `community` only matches that community; one without matches any.
+- A path that does not exist is kept and reported, never silently ignored: an unmounted or
+  moved checkout is a fact to see, not a config edit to guess at.
+
+`hng projects` prints the map with each checkout's state (present, a git tree, whether it
+carries an `AGENTS.md`); `hng projects --json` is the same for a script. `ConcordPlane.project_for()`
+returns `{"name", "path"}` for a channel — the field an inbound channel message will carry once
+channel ingestion is wired. Today the resolver and its admin surface exist; invites, not
+messages, are what the plane reads.
+
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's

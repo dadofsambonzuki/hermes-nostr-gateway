@@ -45,6 +45,7 @@ from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
+from .projects import ProjectMap
 from .publisher import Publisher, make_publisher
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
@@ -288,7 +289,9 @@ class Gateway:
         }, bot_lookup=self.bots.is_bot, echo_lookup=self._echo_lookup)
         self.cfg_concord = cfg.get("concord") or {}
         self.concord = ConcordPlane(
-            self.store, solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)))
+            self.store,
+            solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)),
+            projects=ProjectMap.from_config(self.cfg_concord))
         #: The channel addresses the concord read workers are subscribed to, and their tasks.
         self._concord_tasks: list[asyncio.Task[None]] = []
         self._concord_authors: tuple[str, ...] = ()

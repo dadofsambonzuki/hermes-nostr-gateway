@@ -12,6 +12,7 @@ import json
 import logging
 from typing import Any, Optional
 
+from ...projects import ProjectMap
 from ...store import Inbound, Store
 from . import read as c
 from .channels import ChannelStream, decides, has_mention
@@ -23,13 +24,26 @@ log = logging.getLogger("hng.plane.concord")
 
 
 class ConcordPlane:
-    def __init__(self, store: Store, *, solo_max_members: int = 2):
+    def __init__(self, store: Store, *, solo_max_members: int = 2,
+                 projects: Optional[ProjectMap] = None):
         self.store = store
         #: A channel this small needs no mention: everything in it is addressed to us.
         self.solo_max_members = max(1, int(solo_max_members))
         self._streams: dict[str, ChannelStream] = {}
         self._keys: dict[str, GroupKey] = {}
         self._members: dict[str, set[str]] = {}
+        #: channel -> checkout map. Optional: with no config nothing resolves, and the
+        #: plane behaves exactly as before.
+        self.projects = projects
+
+    def project_for(self, *, community_id: str = "", channel_id: str = "",
+                    channel_name: str = "") -> Optional[dict[str, Any]]:
+        """The checkout this channel's work belongs to, as the frame field an agent reads."""
+        if self.projects is None:
+            return None
+        project = self.projects.resolve(community_id=community_id, channel_id=channel_id,
+                                        channel_name=channel_name)
+        return {"name": project.name, "path": str(project.path)} if project else None
 
     # -- channel reads --------------------------------------------------
 

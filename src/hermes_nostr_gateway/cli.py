@@ -31,6 +31,7 @@ from .health import (
 from .media import MediaError, media_config, resolve_attachment
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
+from .projects import ProjectMap
 from .publisher import publish
 from .store import Store, drops_ttl_seconds
 
@@ -520,6 +521,26 @@ def cmd_recent(args) -> int:
     return 0
 
 
+def cmd_projects(args) -> int:
+    """The channel -> checkout map, and whether each checkout is actually there."""
+    cfg = load_config(args.config)
+    mapping = ProjectMap.from_config(cfg.get("concord") or {})
+    if args.json:
+        print(json.dumps([project.as_dict() for project in mapping.all()], indent=2))
+        return 0
+    if not mapping:
+        print("concord.projects is empty: no channel resolves to a checkout")
+        return 0
+    for project in mapping.all():
+        state = "ok" if project.ok else project.problem
+        markers = ", ".join(m for m in ("git" if project.is_git else "",
+                                       "AGENTS.md" if project.has_agents_md else "") if m)
+        print(f"{project.channel:<18} {(project.community[:12] or '(any)'):<14} "
+              f"{project.name:<24} {project.path}")
+        print(f"{'':<18} {state}{' · ' + markers if markers else ''}")
+    return 0
+
+
 def cmd_drops(args) -> int:
     """Refused messages: what policy dropped, why, and when — the `drops` op's client."""
     import datetime
@@ -708,6 +729,10 @@ def main(argv: list[str] | None = None) -> int:
     p_media.add_argument("ref", help="the blob's sha256, or the imeta url")
     p_media.add_argument("--json", action="store_true")
     p_media.set_defaults(func=cmd_media)
+
+    p_projects = sub.add_parser("projects", help="channel -> checkout mapping (concord.projects)")
+    p_projects.add_argument("--json", action="store_true")
+    p_projects.set_defaults(func=cmd_projects)
 
     sub.add_parser("replay-skip",
                    help="record a handover: the pending backlog is already answered"
