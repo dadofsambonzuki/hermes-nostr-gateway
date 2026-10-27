@@ -17,9 +17,9 @@ its challenge around the first EVENT and the client answers it in-process; the e
 accepted on the next send. That is why a failed relay is retried once inside the same
 call, and only then left to the durable retry loop.
 
-The `nak` child is kept for one release behind `transport.legacy: true` -- the same flag
-that keeps `relay.RelayWorker` in charge of reads (plan P1) -- so one config line rolls
-both transports back. Nothing else may use it.
+The `nak` child is kept for one release behind `transport.legacy: true`, so one config
+line rolls publishing back while the bindings path is proven. Reads have no such switch
+left: the pool is the only read transport. Nothing else may use the flag.
 """
 
 from __future__ import annotations

@@ -27,16 +27,15 @@ The client gives the same coverage with the socket inside this process:
 
 ## What stays the same
 
-`PoolWorker` exposes `RelayWorker`'s observable surface: `relay`, `purpose`,
-`requested_kinds`, `refused`, `kinds`, `events`, `last_error`, `started_at`,
-`attempts`, `connected_at`, `auth_at`, `last_event_at`, `live_state()`, `run()` and
-`stop()`. `gateway._new_worker()` picks the class from config, so `status`, `health`,
-`_guarded` and the peer-inbox logic do not branch on transport.
+`PoolWorker` exposes the read contract `status`, `health`, `_guarded` and the
+peer-inbox logic all consume: `relay`, `purpose`, `requested_kinds`, `refused`, `kinds`,
+`events`, `last_error`, `started_at`, `attempts`, `connected_at`, `auth_at`,
+`last_event_at`, `live_state()`, `run()` and `stop()`. It is the only read transport, so
+nothing branches on which one is running.
 
 Two additions to `live_state()`: `subscription_id` (how a notification finds its
 worker) and `transport` (`"pool"`), plus `rate_limited_at` when a relay answers a
-CLOSED frame with a 429 or "rate limit". The legacy worker never set those, so their
-absence elsewhere is not ambiguity.
+CLOSED frame with a 429 or "rate limit".
 
 ## One subscription per filter set, not per relay
 
@@ -52,33 +51,29 @@ feed and mentions subscriptions on one relay receive only their own events.
 
 ## What is still a subprocess
 
-- **Publish** (`publisher.py`) — P2 replaces the per-relay `nak event --auth` children.
-- **Bootstrap and ad-hoc fetches** — `Gateway._load_follows()` (one kind-3 lookup at
-  startup, before any worker exists) and `hng --once` / `OneShot` still shell out to
-  `nak`. They are one-shot reads, not workers; moving them is a separate change.
+- **Publish** (`publisher.py`) — the per-relay `nak event --auth` child survives only
+  behind `transport.legacy: true`; the bindings path is the default.
 
-So `ps` on a running gateway shows no `nak req --stream` children; a startup `nak req`
-for the contact list can still appear for a second, and `hng --once` still uses it.
+Nothing else runs a child. The startup contact-list lookup, the peer kind-10050 inbox
+resolver and `hng listen` (both `--once` and live) read through the bindings via
+`fetch.py`, so `ps` on a running gateway shows no `nak` at all on the default config.
 
 ## Rollback
 
-One config line:
+Reads have none: the subprocess worker is deleted (`relay.py` is now the refusal parser
+and the handler types), so there is no second implementation for a flag to select. The
+only transport switch left is publishing's, and it is one config line:
 
 ```yaml
 transport:
   legacy: true
 ```
 
-The subprocess worker code is untouched (`relay.py`), the wiring is shared, and
-`status.transport.mode` says which one is running. The flag is meant to last one
-release: after that the legacy class is deleted.
-
 ## How to verify
 
-- `hng status` → `transport: {mode: pool, subscriptions: N, relays: M, events: …}`;
-  `mode: legacy` means the flag is set somewhere.
-- `ps -ef | grep 'nak req'` while the daemon is up: nothing (outside `hng --once`).
+- `hng status` → `transport: {mode: pool, subscriptions: N, relays: M, events: …}`.
+- `ps -ef | grep nak` while the daemon is up: nothing on a default config.
 - Per-relay event counts and `last_event_at` still arrive per relay, in
   `status.workers[]` and in the `relay_stats` table.
-- A relay that refuses kind 4: `status.relay_stats` carries the same
-  "refuses kind(s) 4; reading 1059" line the legacy path recorded.
+- A relay that refuses kind 4: `status.relay_stats` carries the
+  "refuses kind(s) 4; reading 1059" line the worker recorded.

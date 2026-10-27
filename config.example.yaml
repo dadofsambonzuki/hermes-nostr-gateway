@@ -41,8 +41,8 @@ relays:
 # Transport. The default is the bindings: one `nostr-sdk` client for reads (one
 # subscription per filter set, NIP-42 answered in-process) and for writes (an event signed
 # once and sent per relay, with each relay's answer recorded in `outbox_wraps`).
-# `legacy: true` is the one-release rollback to `nak req --stream` / `nak event --auth`
-# children per relay — it rolls back both directions with one line.
+# `legacy: true` is the one-release rollback for *publishing* to `nak event --auth`
+# children per relay. Reads have no rollback: the pool above is the only read transport.
 transport:
   legacy: false
 

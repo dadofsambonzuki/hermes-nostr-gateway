@@ -185,6 +185,16 @@ async def test_an_event_for_another_subscription_is_not_delivered():
 
 # -- refusals, auth, rate limits -------------------------------------------
 
+def test_only_kinds_the_worker_asked_for_are_recorded_as_refused():
+    """A relay complaining about someone else's filter must not narrow ours."""
+    pool = RelayPool(SECRET, client=FakeClient())
+    worker = make_worker(pool)
+
+    assert worker.note_refusals("CLOSED: kind not allowed: 7") == set()
+    assert worker.refused == set()
+    assert worker.kinds == DM_KINDS
+
+
 async def test_a_refused_kind_is_dropped_and_the_worker_resubscribes_for_the_rest():
     client = FakeClient()
     pool = RelayPool(SECRET, client=client)
@@ -318,49 +328,49 @@ def gateway_cfg(tmp_path, **extra):
     return cfg
 
 
-async def test_gateway_wires_the_pool_by_default_and_nak_children_only_on_the_flag(
+async def test_the_gateway_wires_one_pool_and_has_no_second_read_transport(
         tmp_path, monkeypatch):
+    """The pool is the only read path, and `transport.legacy` cannot select another.
+
+    The flag still rolls *publishing* back to a `nak` child; it must not quietly bring a
+    subprocess read worker back, because there is no longer one to bring back.
+    """
     monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
     monkeypatch.setattr(Gateway, "_setup_marmot", lambda self, _cfg: None)
-    built: list[tuple[str, str]] = []
+    built: list[str] = []
 
-    def make_fake(name):
-        class FakeWorker:
-            def __init__(self, *args, **kwargs):
-                self.relay = args[1] if name == "pool" else args[0]
-                self.kinds = kwargs.get("kinds", ())
-                built.append((name, self.relay))
-                self.events, self.last_error, self.purpose = 0, None, "dm"
-                self._stop = asyncio.Event()
+    class FakeWorker:
+        def __init__(self, _pool, relay, _me, **kwargs):
+            self.relay = relay
+            self.kinds = kwargs.get("kinds", ())
+            built.append(relay)
+            self.events, self.last_error, self.purpose = 0, None, "dm"
+            self._stop = asyncio.Event()
 
-            async def run(self, _handler):
-                await self._stop.wait()
+        async def run(self, _handler):
+            await self._stop.wait()
 
-            def stop(self):
-                self._stop.set()
+        def stop(self):
+            self._stop.set()
 
-        return FakeWorker
-
-    monkeypatch.setattr(gateway_mod, "PoolWorker", make_fake("pool"))
-    monkeypatch.setattr(gateway_mod, "RelayWorker", make_fake("legacy"))
+    monkeypatch.setattr(gateway_mod, "PoolWorker", FakeWorker)
 
     gateway = Gateway(gateway_cfg(tmp_path), socket_path=tmp_path / "a.sock")
-    assert gateway.pool is not None and not gateway.legacy_transport
+    assert gateway.pool is not None
     await gateway.start()
     try:
-        assert ("pool", "wss://relay.example.com/chat") in built
-        assert not any(name == "legacy" for name, _ in built)
+        assert "wss://relay.example.com/chat" in built
         assert (await gateway.status())["transport"]["mode"] == "pool"
     finally:
         await gateway.stop()
 
     built.clear()
-    legacy = Gateway(gateway_cfg(tmp_path, transport={"legacy": True}),
-                     socket_path=tmp_path / "b.sock")
-    assert legacy.pool is None and legacy.legacy_transport
-    await legacy.start()
+    flagged = Gateway(gateway_cfg(tmp_path, transport={"legacy": True}),
+                      socket_path=tmp_path / "b.sock")
+    assert flagged.publisher.stats()["mode"] == "legacy", "the flag no longer reaches publishing"
+    await flagged.start()
     try:
-        assert ("legacy", "wss://relay.example.com/chat") in built
-        assert (await legacy.status())["transport"]["mode"] == "legacy"
+        assert "wss://relay.example.com/chat" in built, "the flag still selected a read transport"
+        assert (await flagged.status())["transport"]["mode"] == "pool"
     finally:
-        await legacy.stop()
+        await flagged.stop()
