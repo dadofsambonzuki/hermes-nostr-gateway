@@ -131,9 +131,9 @@ def secret_from(cfg: dict[str, Any]) -> str:
 
 
 def _decode_npub(npub: str) -> str:
-    import subprocess
-    out = subprocess.run(["nak", "decode", npub], capture_output=True, text=True).stdout.strip()
-    return out or npub
+    from .fetch import hex_of
+
+    return hex_of(npub)
 
 
 def normalise_groups(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -165,10 +165,9 @@ def build(cfg: dict[str, Any]) -> tuple[SdkCrypto, Store, Policy, Nip17Plane]:
 
 
 def to_hex(who: str) -> str:
-    if who.startswith("npub"):
-        import subprocess
-        return subprocess.run(["nak", "decode", who], capture_output=True, text=True).stdout.strip()
-    return who
+    from .fetch import hex_of
+
+    return hex_of(who)
 
 
 def print_message(msg, as_json: bool) -> None:
@@ -255,24 +254,13 @@ def cmd_listen(args) -> int:
 
 
 def recipient_relays(cfg: dict[str, Any], peer: str) -> list[str]:
-    import subprocess
+    from .fetch import fetch_first_blocking
+
     relays = list(cfg["relays"].get("publish", []))
-    try:
-        out = subprocess.run(
-            ["nak", "req", "-k", "10050", "-a", peer, "-l", "1", *relays[:2]],
-            capture_output=True, text=True, timeout=25,
-        ).stdout
-        for line in out.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            event = json.loads(line)
-            for tag in event.get("tags", []):
-                if tag and tag[0] == "relay" and tag[1] not in relays:
-                    relays.append(tag[1])
-            break
-    except Exception:  # noqa: BLE001 - absence of 10050 is not fatal
-        pass
+    event = fetch_first_blocking(relays=relays[:2], kinds=[10050], author=peer)
+    for tag in (event or {}).get("tags", []):
+        if tag and tag[0] == "relay" and len(tag) > 1 and tag[1] not in relays:
+            relays.append(tag[1])
     return relays[:6]
 
 

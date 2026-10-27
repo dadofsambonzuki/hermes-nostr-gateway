@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import yaml
 
-from .bots import BotRegistry, nak_fetcher
+from .bots import BotRegistry, kind0_fetcher
 from .crypto import SdkCrypto
 from .health import (
     DEFAULT_PENDING_STALE_MINUTES,
@@ -276,7 +276,7 @@ class Gateway:
         # because the policy asks it on every decision; its fetch resolves the publish
         # set lazily, so a relay list that is parsed a few lines below is still the one
         # used at fetch time.
-        self.bots = BotRegistry(self.store, fetcher=nak_fetcher(lambda: self.relays_publish))
+        self.bots = BotRegistry(self.store, fetcher=kind0_fetcher(lambda: self.relays_publish))
         groups = normalise_groups(cfg)
         self.policy = Policy({
             "groups": groups,
@@ -495,22 +495,14 @@ class Gateway:
 
     def _load_follows(self) -> tuple[str, ...]:
         """Our kind-3 contact list: what 'feeds' means, as opposed to the firehose."""
-        import json as _json
-        import subprocess
-        try:
-            out = subprocess.run(
-                ["nak", "req", "-k", "3", "-a", self.me, "-l", "1", *self.relays_publish[:2]],
-                capture_output=True, text=True, timeout=20,
-            ).stdout
-            for line in out.splitlines():
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                tags = _json.loads(line).get("tags", [])
-                return tuple(sorted({t[1] for t in tags if t and t[0] == "p"}))
-        except Exception:  # noqa: BLE001 - no contact list means no feed workers
-            pass
-        return ()
+        from .fetch import fetch_first_blocking
+
+        publish = list((self.cfg.get("relays") or {}).get("publish") or [])
+        event = fetch_first_blocking(relays=publish[:2], kinds=[3], author=self.me)
+        if not event:
+            return ()
+        return tuple(sorted({tag[1] for tag in event.get("tags", [])
+                             if tag and tag[0] == "p" and len(tag) > 1}))
 
     def _note_refusal(self, relay: str, dropped: set[int],
                       remaining: tuple[int, ...], error: str | None) -> None:
@@ -901,32 +893,20 @@ class Gateway:
         return dict(zip(labels, sent, strict=True))
 
     def _recipient_relays(self, peer: str) -> list[str]:
-        import json as _json
-        import subprocess
+        from .fetch import fetch_first_blocking
+
         relays = list(self.relays_publish)
-        try:
-            out = subprocess.run(
-                ["nak", "req", "-k", "10050", "-a", peer, "-l", "1", *relays[:2]],
-                capture_output=True, text=True, timeout=25,
-            ).stdout
-            for line in out.splitlines():
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                for tag in _json.loads(line).get("tags", []):
-                    if tag and tag[0] == "relay" and tag[1] not in relays:
-                        relays.append(tag[1])
-                break
-        except Exception:  # noqa: BLE001 - no 10050 just means the floor set
-            pass
+        event = fetch_first_blocking(relays=relays[:2], kinds=[10050], author=peer)
+        for tag in (event or {}).get("tags", []):
+            if tag and tag[0] == "relay" and len(tag) > 1 and tag[1] not in relays:
+                relays.append(tag[1])
         return relays[:6]
 
     @staticmethod
     def _hex(who: str) -> str:
-        if who.startswith("npub"):
-            import subprocess
-            return subprocess.run(["nak", "decode", who], capture_output=True, text=True).stdout.strip()
-        return who
+        from .fetch import hex_of
+
+        return hex_of(who)
 
     # -- retry ----------------------------------------------------------
     async def _retry_loop(self, every: int = 300) -> None:

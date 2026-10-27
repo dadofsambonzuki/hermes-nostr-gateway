@@ -87,51 +87,25 @@ def profile_name(event: dict[str, Any]) -> str | None:
     return None
 
 
-def nak_kind0(pubkey: str, relays: Sequence[str], *, timeout: float = 10.0) -> dict | None:
-    """One kind-0 event for `pubkey`, from the first relay that has it.
+def kind0_event(pubkey: str, relays: Sequence[str], *, timeout: float = 8.0) -> dict | None:
+    """One kind-0 event for `pubkey`, through the bindings.
 
-    `nak req -l 1` exits on the first match, so this is one short-lived child per peer
-    we have never met — the same shape as the kind-3 and kind-10050 lookups the gateway
-    already makes. Nothing on the message path runs this twice for one peer: the answer
-    is cached in memory and in the store.
+    Cold path: once per peer we have never met, cached in memory and in the store, so a
+    message never pays for this twice. It used to be a `nak req -l 1` child per peer; the
+    query is identical and the binary is gone.
     """
-    nak = shutil.which("nak") or "nak"
-    wanted = pubkey.strip().lower()
-    for relay in [url for url in relays if url][:2]:
-        try:
-            out = subprocess.run(
-                [nak, "req", "-k", "0", "-a", wanted, "-l", "1", relay],
-                capture_output=True, text=True, timeout=timeout,
-            ).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        for line in (out or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if int(event.get("kind") or -1) == 0 and str(
-                    event.get("pubkey") or "").lower() == wanted:
-                return event
-    return None
+    from .fetch import fetch_first_blocking
+
+    return fetch_first_blocking(relays=[url for url in relays if url][:2], kinds=[0],
+                                author=pubkey, limit=1, timeout=timeout)
 
 
-def nak_fetcher(relays: Callable[[], Sequence[str]], *, timeout: float = 10.0
-                ) -> Callable[[str], dict | None]:
-    """Bind the kind-0 fetch to a relay list that is resolved when it is called.
+def kind0_fetcher(relays: Callable[[], Sequence[str]], *, timeout: float = 8.0
+                  ) -> Callable[[str], dict | None]:
+    """Bind the kind-0 fetch to a relay list resolved at call time."""
 
-    The gateway knows its publish set only after the policy is built, and a test wants
-    to avoid the network entirely; a callable keeps both honest.
-    """
     def fetch(pubkey: str) -> dict | None:
-        try:
-            urls = list(relays())
-        except Exception:  # noqa: BLE001 - a bad relay list is not a message failure
-            return None
-        return nak_kind0(pubkey, urls, timeout=timeout)
+        return kind0_event(pubkey, list(relays()), timeout=timeout)
 
     return fetch
 
