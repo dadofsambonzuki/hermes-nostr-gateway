@@ -622,6 +622,121 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def _read_relays(cfg: dict[str, Any]) -> list[str]:
+    """`relays.read` as plain URLs: the default read set for the PR half of the bridge."""
+    out: list[str] = []
+    for entry in (cfg.get("relays") or {}).get("read") or []:
+        url = entry.get("url") if isinstance(entry, dict) else entry
+        if url:
+            out.append(str(url))
+    return out
+
+
+def cmd_ngit(args) -> int:
+    """The ngit bridge: one sync pass, or one answer to a held issue."""
+    cfg = load_config(args.config)
+    if args.ngit_cmd == "answer":
+        return cmd_ngit_answer(cfg, args)
+    return cmd_ngit_sync(cfg, args)
+
+
+def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
+    """One pass over a channel's repo: issues become work, PR news goes to the channel.
+
+    Everything that identifies this box comes from configuration: the conversation names
+    the channel, `concord.projects` resolves it to a checkout and a board, `ngit.assignee`
+    says who a ready task is dispatched to, and the control pane says whose issue is work.
+    """
+    from dataclasses import replace
+
+    from . import ngit as bridge
+    from .gateway import default_socket_path
+    from .kanban import Anchor, Board, BoardError
+    from .projects import hermes_home
+
+    ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
+    assignee = str(args.assignee or ngit_cfg.assignee or "").strip()
+    if not assignee:
+        print("ngit: set ngit.assignee (the profile a ready task is dispatched to) "
+              "or pass --assignee", file=sys.stderr)
+        return 2
+    try:
+        target = bridge.resolve_target(cfg, channel=args.channel, repo=args.repo,
+                                       board=args.board)
+    except bridge.NgitError as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return 2
+    checkout = bridge.Ngit(target.repo)
+    repository = checkout.repository()
+    target = replace(target, address=repository.address)
+
+    home = hermes_home()
+    try:
+        board = Board(bridge.board_path(target.board, home=home))
+    except BoardError as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return 2
+    anchor = Anchor.for_board(home, target.board)
+    crypto, store, _policy, _plane = build(cfg)
+    ngit_cfg = replace(ngit_cfg, assignee=assignee)
+    prs = None
+    note = ""
+    if ngit_cfg.prs:
+        if not target.address:
+            note = "this checkout has no NIP-34 address: PRs are not announced"
+        else:
+            # An explicit `ngit.relays` is the operator's choice; otherwise the repository
+            # announcement's own relay hints, then the gateway's read set, which is where a
+            # repo that predates the hints still publishes.
+            relays = ngit_cfg.relays or tuple(dict.fromkeys(
+                (*repository.relays, *_read_relays(cfg))))[:8]
+            if not relays:
+                note = "no relays to read PRs from (ngit.relays or relays.read): " \
+                       "PRs are not announced"
+            else:
+                prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
+    notifier = bridge.DaemonNotifier(
+        args.socket or cfg.get("socket") or default_socket_path())
+    sync = bridge.Sync(
+        store=store, board=board, control=ControlConfig.from_config(cfg.get("control")),
+        config=ngit_cfg, target=target,
+        issues=checkout.issues, detail=checkout.detail,
+        prs=prs.events if prs is not None else None, notify=notifier, anchor=anchor)
+    try:
+        report = sync.run(since=args.since, recreate=args.recreate, dry_run=args.dry_run)
+    finally:
+        board.close()
+    if note:
+        report.notes.append(note)
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        for line in report.lines():
+            print(line)
+    return 1 if report.errors else 0
+
+
+def cmd_ngit_answer(cfg: dict[str, Any], args) -> int:
+    """A yes or a no for an issue held for a human: the decision, recorded on the task."""
+    from . import ngit as bridge
+
+    crypto, store, _policy, _plane = build(cfg)
+    try:
+        result = bridge.answer(
+            store, ControlConfig.from_config(cfg.get("control")), ref=args.ref,
+            yes=bool(args.yes), by=args.by, reason=args.reason or "")
+    except bridge.NgitError as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif result.get("changed"):
+        print(f"{result['task']}: {result['status']} ({result['issue']} by {result['by']})")
+    else:
+        print(f"{result['task']}: unchanged ({result.get('note') or result['status']})")
+    return 0
+
+
 def cmd_control(args) -> int:
     """Where a confirmation goes per plane, and who is trusted enough not to need one."""
     cfg = load_config(args.config)
@@ -911,6 +1026,41 @@ def main(argv: list[str] | None = None) -> int:
                             help="exit 1 unless every declared checkout, project and board "
                                  "is there")
     p_projects.set_defaults(func=cmd_projects)
+
+    p_ngit = sub.add_parser("ngit", help="ngit bridge: issues as work, PRs signalled in the channel")
+    ngit_sub = p_ngit.add_subparsers(dest="ngit_cmd", required=True)
+
+    p_ngit_sync = ngit_sub.add_parser("sync", help="one pass: issues in, PR news out")
+    p_ngit_sync.add_argument("--channel", required=True,
+                             help="the channel's conversation, concord:<community>:<channel>")
+    p_ngit_sync.add_argument("--repo", default=None,
+                             help="checkout override (default: the mapping's path)")
+    p_ngit_sync.add_argument("--board", default=None,
+                             help="board slug override (default: the mapping's board)")
+    p_ngit_sync.add_argument("--assignee", default=None,
+                             help="profile a ready task is dispatched to (default: ngit.assignee)")
+    p_ngit_sync.add_argument("--since", type=int, default=None,
+                             help="epoch floor for PR events (default: the stored cursor)")
+    p_ngit_sync.add_argument("--recreate", action="store_true",
+                             help="recreate a task that was deleted by hand")
+    p_ngit_sync.add_argument("--dry-run", action="store_true",
+                             help="report what would happen; write nothing, send nothing")
+    p_ngit_sync.add_argument("--socket", default=None, help="daemon socket override")
+    p_ngit_sync.add_argument("--json", action="store_true")
+    p_ngit_sync.set_defaults(func=cmd_ngit)
+
+    p_ngit_answer = ngit_sub.add_parser(
+        "answer", help="yes or no for an issue held for a human")
+    p_ngit_answer.add_argument("ref", help="the task id, or the issue's nevent")
+    verdict = p_ngit_answer.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--yes", action="store_true", help="queue it: the task becomes ready")
+    verdict.add_argument("--no", dest="no", action="store_true",
+                         help="leave it out: the task stays blocked")
+    p_ngit_answer.add_argument("--by", required=True,
+                               help="npub of the person answering (must be trusted)")
+    p_ngit_answer.add_argument("--reason", default="", help="why, for a no")
+    p_ngit_answer.add_argument("--json", action="store_true")
+    p_ngit_answer.set_defaults(func=cmd_ngit)
 
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
     p_control.add_argument("--json", action="store_true")
