@@ -8,6 +8,13 @@ taken responsibility for a message.
 Trust is not decided here. The gateway attaches `authority` to every message; the
 adapter mirrors it into `source.role_authorized`, so a stranger's DM reaches the agent
 as data and never as instructions.
+
+A blocking approval prompt is the one exception to "the adapter never decides": the host
+posts it with `metadata={"is_approval_prompt": True}` and blocks the agent thread, so the
+message id it was given is remembered here and a NIP-25 reaction on that message — from the
+conversation it was sent to — resolves the same queue the typed `/approve` and `/deny`
+commands do. Nothing else about the gate changes: a reaction that cannot be matched to a
+prompt, from anyone else, or with an emoji that is not a decision leaves the gate blocked.
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ import asyncio
 import json
 import logging
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,7 +48,46 @@ MEDIA_TIMEOUT_S = 30.0
 #: default); this is the agent-side ceiling on what one message may put in front of the model.
 MAX_ATTACHMENTS = 4
 
+#: Approval prompts remembered for a reaction. The newest gate is the one on screen; an
+#: unbounded map would grow an id per prompt for the life of the process.
+MAX_TRACKED_APPROVALS = 20
+
+#: NIP-25 reaction content → the choice `resolve_gateway_approval` takes. Deliberately only
+#: these: a reaction that is not an answer ("🔥", "😂") must leave the gate exactly as it was,
+#: and `session` is not offered because a tap cannot carry the "for this session" intent a
+#: typed `/approve session` states explicitly.
+REACTION_CHOICES = {
+    "\U0001f44d": "once",   # 👍
+    "+": "once",            # NIP-25's original "like"
+    "\u2764": "once",       # ❤, with or without the U+FE0F presentation selector
+    "\u2705": "once",       # ✅
+    "\U0001f44e": "deny",   # 👎
+    "-": "deny",
+}
+
 logger = logging.getLogger(__name__)
+
+
+def reaction_choice(content: str) -> Optional[str]:
+    """The approval choice a reaction makes, or None when it is not a decision.
+
+    Clients disagree about the presentation selector (`❤️` is U+2764 U+FE0F, `❤` is U+2764)
+    and some keyboards add a space; none of that is a different answer.
+    """
+    return REACTION_CHOICES.get((content or "").replace("\ufe0f", "").strip())
+
+
+def is_reaction_frame(frame: dict[str, Any]) -> bool:
+    """True when *frame* is a NIP-25 reaction rather than chat.
+
+    The daemon routes an inner kind 7 through the NIP-17 plane as an ordinary message frame
+    (with `reply_to` naming the reacted-to rumor), and the spec's own `reaction` frame says
+    the same thing in its own shape. Both are accepted: a reaction must never reach the agent
+    as a message, whichever shape the daemon sends.
+    """
+    if frame.get("type") == "reaction":
+        return True
+    return frame.get("type") == "message" and frame.get("kind") == 7
 
 
 def _extra(config: Any) -> dict[str, Any]:
@@ -157,6 +203,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # restarted) must be acknowledged again, never answered twice — the gateway's
         # replay window is a safety net, and this is the consumer's half of at-least-once.
         self._delivered_ids: deque[str] = deque(maxlen=512)
+        # Approval prompts this adapter delivered, newest last: event id → (chat_id,
+        # session_key). A reaction on one of these is a decision about that gate.
+        self._approval_prompts: OrderedDict[str, tuple[str, str]] = OrderedDict()
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -247,6 +296,114 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     or _extra(getattr(self, "_config", None)).get("control_channel") or "").split(",")
                    if p.strip()}
         return bool(target) and target in allowed | {self._control_chat()}
+
+    # -- approval reactions ---------------------------------------------
+    def _approvals(self) -> OrderedDict[str, tuple[str, str]]:
+        """Prompt id → (chat_id, session_key) for gates a reaction can still answer."""
+        tracked = getattr(self, "_approval_prompts", None)
+        if tracked is None:  # an adapter built by __new__ in a test or a wrapper
+            tracked = self._approval_prompts = OrderedDict()
+        return tracked
+
+    def _remember_approval_prompt(self, message_id: str, chat_id: str, session_key: str) -> None:
+        """Remember a delivered prompt, keeping only the newest few."""
+        if not message_id:
+            return
+        tracked = self._approvals()
+        tracked[message_id] = (chat_id.lower(), session_key)
+        tracked.move_to_end(message_id)
+        while len(tracked) > MAX_TRACKED_APPROVALS:
+            tracked.popitem(last=False)
+
+    def _session_key_for_chat(self, chat_id: str) -> str:
+        """The session key this chat's gates are registered under.
+
+        Built by Hermes' own key builder — the same call the gateway makes for an inbound
+        source — so it carries the profile namespace rather than a hand-written
+        `agent:main:…` guess that only matches a single-profile gateway. A build that fails
+        returns "" and the reaction is left unmatched: no key, no resolve.
+        """
+        build = getattr(self, "build_source", None)
+        key_of = getattr(self, "_source_session_key", None)
+        if not (callable(build) and callable(key_of)):
+            return ""
+        try:
+            return str(key_of(build(chat_id=chat_id, chat_type="dm", user_id=chat_id)))
+        except Exception:  # noqa: BLE001 - an unmatched reaction is safe; a wrong key is not
+            logger.debug("nostr: no session key for %s", _short(chat_id), exc_info=True)
+            return ""
+
+    def _resolve_approval(self, session_key: str, choice: str) -> int:
+        """Resolve the pending gate for *session_key*; 0 when it cannot be pinned down.
+
+        Zero is the safe answer at every step: no session key, no pending approval, or more
+        than one waiting (a reaction names a message, not a queue position, and resolving the
+        oldest would approve whatever was asked first — a different command).
+        """
+        if not session_key:
+            logger.warning("nostr reaction ignored: no session key for that conversation")
+            return 0
+        try:
+            from tools.approval import list_gateway_approvals, resolve_gateway_approval
+        except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
+            logger.warning("nostr reaction ignored: tools.approval is not importable here")
+            return 0
+        try:
+            pending = list_gateway_approvals(session_key) or []
+        except Exception:  # noqa: BLE001 - never let a reaction break the reader loop
+            logger.warning("nostr reaction ignored: the approval queue could not be read",
+                           exc_info=True)
+            return 0
+        if len(pending) != 1:
+            logger.warning("nostr reaction ignored: %d approvals are pending for that session",
+                           len(pending))
+            return 0
+        request_id = str(pending[0].get("request_id") or "") or None
+        try:
+            count = resolve_gateway_approval(session_key, choice, request_id=request_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("nostr reaction could not resolve the approval: %s", exc, exc_info=True)
+            return 0
+        if count:
+            logger.info("nostr reaction resolved %d approval(s) as %s", count, choice)
+        return int(count or 0)
+
+    async def _deliver_reaction(self, frame: dict[str, Any], message_id: str) -> None:
+        """Answer an approval prompt with a reaction, and never with an agent run.
+
+        A reaction is not chat. `👍` on a prompt is the decision `/approve` types; a reaction
+        on anything else, from anyone but the conversation the prompt went to, or with an
+        emoji that is not an answer is dropped — and the ack is unconditional, so the gateway
+        never replays a reaction into the agent as a message.
+        """
+        sender = str(frame.get("sender") or frame.get("from") or "").strip().lower()
+        target = str(frame.get("reply_to") or frame.get("target_rumor_id") or "")
+        content = str(frame.get("content") or frame.get("emoji") or "")
+        tracked = self._approvals()
+        entry = tracked.get(target) if target else None
+        if entry is None:
+            logger.debug("nostr reaction from %s ignored: not an approval prompt",
+                         _short(sender))
+            await self._ack(message_id)
+            return
+        chat_id, session_key = entry
+        if sender != chat_id:
+            # Only the conversation the prompt was sent to may answer it: anyone else's
+            # reaction is an opinion about a message, not a decision about our gate.
+            logger.warning("nostr reaction ignored: %s is not the prompt's recipient",
+                           _short(sender))
+            await self._ack(message_id)
+            return
+        choice = reaction_choice(content)
+        if choice is None:
+            logger.debug("nostr reaction %r is not an approval decision", content[:8])
+            await self._ack(message_id)
+            return
+        # One reaction answers one prompt, once: a stale 👍 must never resolve the next gate
+        # this session happens to open.
+        del tracked[target]
+        self._resolve_approval(session_key or self._session_key_for_chat(chat_id), choice)
+        await self._ack(message_id)
 
     # -- attachments ----------------------------------------------------
     async def _blob(self, digest: str, message_id: str) -> dict[str, Any]:
@@ -348,7 +505,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                         frame = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if frame.get("type") == "message":
+                    if frame.get("type") == "reaction":
+                        # A reaction is a decision on a prompt, never chat (see §approval
+                        # reactions): handle it before anything can turn it into a run.
+                        await self._deliver_reaction(frame, frame.get("id") or "")
+                    elif frame.get("type") == "message":
                         await self._deliver(frame)
                     elif frame.get("type") == "blocked":
                         # Warnings, never user-visible chat (spec §11.6). A blocked
@@ -393,6 +554,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 
     async def _deliver(self, frame: dict[str, Any]) -> None:
         message_id = frame.get("id") or ""
+        if is_reaction_frame(frame):
+            # A kind-7 rumor rides the NIP-17 plane's ordinary message frame, but it is an
+            # answer to a prompt, not something a person said: it must never start a turn.
+            await self._deliver_reaction(frame, message_id)
+            return
         if is_digest_frame(frame):
             await self._deliver_digest(frame, message_id)
             return
@@ -529,7 +695,16 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         if not frame.get("ok"):
             return SendResult(success=False, error=json.dumps(frame.get("errors") or {})[:300],
                               raw_response=frame, retryable=True)
-        return SendResult(success=True, message_id=frame.get("message_id"), raw_response=frame)
+        result = SendResult(success=True, message_id=frame.get("message_id"), raw_response=frame)
+        if (metadata or {}).get("is_approval_prompt"):
+            # The host blocks the agent thread until this gate is answered, and the typed
+            # commands are not the only way in: remember which message carried the prompt so
+            # a reaction on it can resolve the same queue. Only a send that actually landed
+            # is remembered — a prompt nobody received must not be answerable.
+            self._remember_approval_prompt(
+                result.message_id or "", str(chat_id or "").strip(),
+                self._session_key_for_chat(str(chat_id or "").strip()))
+        return result
 
     async def _request(self, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
         reader, writer = await asyncio.open_unix_connection(str(self._socket))

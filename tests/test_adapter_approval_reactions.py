@@ -1,0 +1,318 @@
+"""Approvals answered by a reaction: a 👍/👎 on the prompt resolves the gate.
+
+The host posts a blocking approval prompt through `adapter.send(..., metadata=
+{"is_approval_prompt": True})` and waits; the typed `/approve` / `/deny` path is not the only
+way in when the message is in a chat the recipient can react to. What is under test here is
+only the adapter's half: remember the prompt's message id, decide whether an arriving kind-7
+reaction is an *answer*, and resolve exactly that one gate through `tools.approval`.
+
+`tools.approval` is faked: the real queue belongs to the host process, and its own tests own
+it. The fake keeps the two calls the adapter makes and records what it was asked to resolve.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from collections import OrderedDict, deque
+
+import pytest
+
+import adapter_harness as harness
+
+adapter = harness.load_adapter("nostr_adapter_approval")
+
+PEER = "ab" * 32
+OTHER = "cd" * 32
+PROMPT_ID = "e" * 64
+REACTION_ID = "f" * 64
+SESSION = f"agent:main:nostr:dm:{PEER}"
+
+
+class FakeApprovals:
+    """`tools.approval` as the adapter uses it: a read of the queue, then one resolve."""
+
+    def __init__(self):
+        self.pending: list[dict] = []
+        self.resolved: list[tuple[str, str, str | None]] = []
+
+    def list_gateway_approvals(self, session_key: str) -> list[dict]:
+        return [dict(entry) for entry in self.pending if entry.get("session_key") == session_key]
+
+    def resolve_gateway_approval(self, session_key: str, choice: str,
+                                 request_id: str | None = None, **_kwargs) -> int:
+        for entry in list(self.pending):
+            if entry.get("session_key") != session_key:
+                continue
+            if request_id and entry.get("request_id") != request_id:
+                continue
+            self.pending.remove(entry)
+            self.resolved.append((session_key, choice, entry.get("request_id")))
+            return 1
+        return 0
+
+
+@pytest.fixture
+def approvals(monkeypatch):
+    """Stand in for the host's approval module inside the shared process."""
+    fake = FakeApprovals()
+    module = types.ModuleType("tools.approval")
+    module.list_gateway_approvals = fake.list_gateway_approvals
+    module.resolve_gateway_approval = fake.resolve_gateway_approval
+    tools = sys.modules.get("tools") or types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools)
+    monkeypatch.setitem(sys.modules, "tools.approval", module)
+    monkeypatch.setattr(tools, "approval", module, raising=False)
+    return fake
+
+
+def _adapter():
+    """A bare adapter with the two host hooks the session key is built from."""
+    inst = adapter.NostrGatewayAdapter.__new__(adapter.NostrGatewayAdapter)
+    inst.platform = "nostr"
+    inst._peers = {PEER}
+    inst._delivered_ids = deque(maxlen=512)
+    inst._approval_prompts = OrderedDict()
+    inst._home_hex = ""
+    inst._config = None
+    inst.acked = []
+    inst.delivered = []
+    inst.next_id = PROMPT_ID
+    # Hermes' base adapter: build_source() plus the same key builder the gateway uses.
+    inst.build_source = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    inst._source_session_key = lambda source: f"agent:main:nostr:dm:{source.chat_id}"
+
+    async def _request(payload, timeout=30.0):
+        if payload.get("op") == "ack":
+            inst.acked.extend(payload.get("ids") or [])
+            return {"type": "ok", "ok": True}
+        return {"type": "delivery", "ok": True, "message_id": inst.next_id}
+
+    async def handle_message(event):
+        inst.delivered.append(event)
+
+    inst._request = _request
+    inst.handle_message = handle_message
+    return inst
+
+
+async def _send_prompt(inst, message_id: str = PROMPT_ID, chat_id: str = PEER):
+    inst.next_id = message_id
+    return await inst.send(chat_id, "Run this command?\n\n/approve or /deny",
+                           metadata={"is_approval_prompt": True})
+
+
+def _reaction(content="\U0001f44d", target=PROMPT_ID, sender=PEER, rumor_id=REACTION_ID):
+    """The frame the NIP-17 plane builds for an inner kind-7 rumor."""
+    return {"type": "message", "plane": "nip17", "id": rumor_id, "sender": sender,
+            "conversation": sender, "kind": 7, "created_at": 1761400000, "content": content,
+            "reply_to": target, "reach": "immediate", "authority": "instructions"}
+
+
+def _pending(fake, *entries):
+    """Queue gates in the fake: one by default, or the ones named."""
+    for position, entry in enumerate(entries or ({},)):
+        fake.pending.append({"session_key": entry.get("session_key", SESSION),
+                             "request_id": entry.get("request_id", f"req-{position}"),
+                             "command": entry.get("command", "rm -rf /tmp/x")})
+
+
+async def test_thumbs_up_resolves_once(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d"))
+
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+    assert inst.delivered == []          # a reaction is never an agent turn
+    assert inst.acked == [REACTION_ID]   # ... and is acknowledged, so it cannot replay
+
+
+async def test_thumbs_down_resolves_deny(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44e"))
+
+    assert approvals.resolved == [(SESSION, "deny", "req-0")]
+    assert inst.delivered == []
+
+
+@pytest.mark.parametrize("emoji", ["+", "\u2705", "\u2764", "\u2764\ufe0f", " \U0001f44d "])
+async def test_the_other_yes_reactions_approve_once(approvals, emoji):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction(emoji))
+
+    assert approvals.resolved == [(SESSION, "once", "req-0")], emoji
+
+
+async def test_a_reaction_on_a_different_message_is_ignored(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d", target="9" * 64))
+
+    assert approvals.resolved == []
+    assert approvals.pending, "the gate must still be waiting"
+    assert inst.acked == [REACTION_ID]
+
+
+async def test_a_reaction_from_another_author_is_ignored(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d", sender=OTHER))
+
+    assert approvals.resolved == []
+    # A stranger's reaction neither answers the gate nor destroys the prompt's mapping:
+    # the recipient can still answer it afterwards.
+    await inst._deliver(_reaction("\U0001f44d", rumor_id="f" * 63 + "1"))
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+
+async def test_an_emoji_that_is_not_a_decision_is_ignored(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f525"))  # 🔥
+
+    assert approvals.resolved == []
+    await inst._deliver(_reaction("\U0001f44d", rumor_id="f" * 63 + "2"))
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+
+async def test_a_reaction_with_no_prompt_resolves_nothing(approvals):
+    inst = _adapter()
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d"))
+
+    assert approvals.resolved == []
+    assert approvals.pending
+
+
+async def test_one_reaction_answers_a_prompt_only_once(approvals):
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+    await inst._deliver(_reaction("\U0001f44d"))
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+    # The next gate this session opens must not be approved by a stale tap on the last one.
+    _pending(approvals, {"request_id": "req-later"})
+    await inst._deliver(_reaction("\U0001f44d", rumor_id="f" * 63 + "3"))
+
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+    assert approvals.pending
+
+
+async def test_two_waiting_approvals_are_not_guessed_between(approvals):
+    """A reaction names a message, not a queue position: with two gates waiting, refuse."""
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals, {"request_id": "req-0"}, {"request_id": "req-1"})
+
+    await inst._deliver(_reaction("\U0001f44d"))
+
+    assert approvals.resolved == []
+    assert len(approvals.pending) == 2
+
+
+async def test_no_session_key_means_no_resolve(approvals):
+    """Without Hermes' key builder there is no key to resolve under — and no guess."""
+    inst = _adapter()
+    del inst.build_source
+    del inst._source_session_key
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver(_reaction("\U0001f44d"))
+
+    assert approvals.resolved == []
+
+
+async def test_without_an_approval_module_nothing_is_resolved(monkeypatch):
+    inst = _adapter()
+    await _send_prompt(inst)
+    monkeypatch.setitem(sys.modules, "tools.approval", None)  # import raises, queue unknown
+
+    await inst._deliver(_reaction("\U0001f44d"))  # must not raise into the reader loop
+
+    assert inst.delivered == []
+    assert inst.acked == [REACTION_ID]
+
+
+async def test_send_remembers_an_approval_prompt_by_its_message_id(approvals):
+    inst = _adapter()
+    result = await _send_prompt(inst)
+
+    assert result.success
+    assert inst._approval_prompts[PROMPT_ID] == (PEER, SESSION)
+
+
+async def test_send_does_not_remember_ordinary_messages(approvals):
+    inst = _adapter()
+    inst.next_id = "m-1"
+    await inst.send(PEER, "morning — sit rep please")
+
+    assert PROMPT_ID not in inst._approval_prompts
+    assert list(inst._approval_prompts) == []
+
+
+async def test_a_prompt_that_failed_to_send_is_not_answerable(approvals):
+    inst = _adapter()
+
+    async def _refused(payload, timeout=30.0):
+        return {"type": "delivery", "ok": False, "errors": {"wss://relay.example": "closed"}}
+
+    inst._request = _refused
+    result = await inst.send(PEER, "Run this command?", metadata={"is_approval_prompt": True})
+
+    assert not result.success
+    assert list(inst._approval_prompts) == []
+
+
+async def test_only_the_newest_prompts_are_remembered(approvals):
+    inst = _adapter()
+    ids = [f"{n:064x}" for n in range(1, adapter.MAX_TRACKED_APPROVALS + 6)]
+    for message_id in ids:
+        await _send_prompt(inst, message_id=message_id)
+
+    assert len(inst._approval_prompts) == adapter.MAX_TRACKED_APPROVALS
+    assert ids[-1] in inst._approval_prompts
+    assert ids[0] not in inst._approval_prompts
+
+    _pending(approvals)
+    await inst._deliver(_reaction("\U0001f44d", target=ids[0]))
+    assert approvals.resolved == []      # too old to accept a reaction
+    await inst._deliver(_reaction("\U0001f44d", target=ids[-1], rumor_id="f" * 63 + "4"))
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+
+async def test_the_documented_reaction_frame_is_accepted_too(approvals):
+    """Spec §5's `reaction` frame carries the same decision as a kind-7 message frame."""
+    inst = _adapter()
+    await _send_prompt(inst)
+    _pending(approvals)
+
+    await inst._deliver({"type": "reaction", "plane": "nip17", "id": REACTION_ID,
+                         "target_rumor_id": PROMPT_ID, "from": PEER,
+                         "emoji": "\U0001f44d", "created_at": 1761400001})
+
+    assert approvals.resolved == [(SESSION, "once", "req-0")]
+    assert inst.acked == [REACTION_ID]
+
+
+def test_reactions_are_recognised_by_shape():
+    assert adapter.is_reaction_frame(_reaction())
+    assert adapter.is_reaction_frame({"type": "reaction", "id": "x"})
+    assert not adapter.is_reaction_frame({"type": "message", "kind": 14})
+    assert not adapter.is_reaction_frame({"type": "blocked", "kind": 7})

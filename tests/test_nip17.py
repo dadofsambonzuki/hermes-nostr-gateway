@@ -109,3 +109,23 @@ def test_reply_threading_is_preserved(store):
     plane = build(store, {"w1": rumor("r1", PEER, eid="parent")})
     msg = plane.handle("relay", wrap("w1"))
     assert msg.reply_to == "parent"
+
+
+def test_a_reaction_reaches_the_adapter_with_its_target_author_and_emoji(store):
+    """A NIP-25 reaction is routed as kind 7, and the frame must carry all three fields.
+
+    The Hermes adapter answers an approval prompt from a reaction on it, so it reads the
+    target out of `reply_to`, the author out of `sender` and the answer out of `content`.
+    A plane change that dropped any of them would disable the reaction path silently: the
+    reaction would arrive as an unattributable message instead.
+    """
+    plane = build(store, {"w1": rumor("r1", PEER, kind=7, content="\U0001f44d",
+                                      eid="target-rumor")})
+    msg = plane.handle("relay", wrap("w1"))
+    assert msg is not None
+    frame = msg.to_frame()
+    assert frame["type"] == "message"
+    assert frame["kind"] == 7
+    assert frame["reply_to"] == "target-rumor"
+    assert frame["sender"] == PEER
+    assert frame["content"] == "\U0001f44d"
