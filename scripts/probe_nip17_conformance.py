@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NIP-17 conformance probes — the traps the retired phase-0 wrapper pinned down.
 
-`nip17_wrapper.py` was a `nak`-driven spike whose job was to prove the NIP-17 wire path
+`nip17_wrapper.py` was a throwaway spike whose job was to prove the NIP-17 wire path
 before the gateway existed. `hng send` / `hng listen` and the daemon replaced it, but its
 findings are protocol rules, not spike trivia: they are encoded in spec §4 and §7, and this
 script makes them executable. Retiring the wrapper then retires code, not coverage.
@@ -20,8 +20,9 @@ Exit status is 0 only when every probe passes.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import datetime as dt
 import json
-import subprocess
 import sys
 import tempfile
 import time
@@ -254,15 +255,36 @@ def run_offline(stream=None) -> int:
     return 0 if failures == 0 else 1
 
 
-def _read_back(relay: str, peer_hex: str, wrap_id: str, timeout: int = 30) -> dict | None:
-    """Read the wrap the way a client would, with the filter that client would use."""
-    proc = subprocess.run(
-        ["nak", "req", "-k", "1059", "-p", peer_hex, "-i", wrap_id, "-l", "1", relay],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    for line in proc.stdout.splitlines():
-        if line.strip().startswith("{"):
-            return json.loads(line)
+async def _read_back(relay: str, peer_hex: str, wrap_id: str,
+                     timeout: int = 30) -> dict | None:
+    """Read the wrap the way a client would, with the filter that client would use.
+
+    Kind, the recipient's `#p` and the wrap's own id: a relay that never kept the wrap
+    answers nothing rather than substituting a neighbour. One short-lived client, closed
+    in every path — the read a client makes, through the binding the gateway reads with.
+    """
+    client = sdk.Client()
+    try:
+        await client.add_relay(sdk.RelayUrl.parse(relay))
+        await client.connect()
+        filt = (sdk.Filter()
+                .kinds([sdk.Kind(1059)])
+                .ids([sdk.EventId.parse(wrap_id)])
+                .custom_tag(sdk.SingleLetterTag.from_byte(ord("p")), peer_hex))
+        events = await asyncio.wait_for(
+            client.fetch_events(sdk.ReqTarget.auto([filt]),
+                                dt.timedelta(seconds=timeout)),
+            timeout + 2)
+        for event in events:
+            try:
+                return json.loads(event.as_json())
+            except Exception:  # noqa: BLE001 - an unreadable shape is a miss, not a crash
+                continue
+    finally:
+        try:
+            await client.shutdown()
+        except Exception:  # noqa: BLE001 - a closed client must not mask the answer
+            pass
     return None
 
 
@@ -271,9 +293,13 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
 
     Deliberately not addressed to the household identity: a probe should not leave an
     unknown-sender DM in the live inbox for the digest to pick up.
+
+    Send and read back on one event loop. uniffi's futures belong to the loop that was
+    running when the client was made, so a second `asyncio.run` for the readback raises
+    "attached to a different loop", and a closed loop keeps throwing after every callback.
     """
     from hermes_nostr_gateway.cli import load_config, secret_from
-    from hermes_nostr_gateway.publisher import publish
+    from hermes_nostr_gateway.publisher import BindingsPublisher
 
     cfg = load_config(config)
     identity_secret = secret_from(cfg)
@@ -284,7 +310,25 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
     targets = relays or list(cfg["relays"]["publish"])[:3]
     print(f"live: {me.our_pubkey()[:12]}… -> throwaway {peer.our_pubkey()[:12]}… via {targets}")
 
-    results = publish(wrap, targets, secret=identity_secret)
+    async def roundtrip() -> tuple[dict[str, tuple[bool, str | None]],
+                                   dict[str, tuple[dict | None, str | None]]]:
+        set_loop = getattr(sdk, "uniffi_set_event_loop", None)
+        if set_loop is not None:
+            set_loop(asyncio.get_running_loop())
+        publisher = BindingsPublisher(identity_secret)
+        try:
+            results = await publisher.publish(wrap, targets)
+        finally:
+            await publisher.aclose()
+        read: dict[str, tuple[dict | None, str | None]] = {}
+        for relay in [relay for relay, (ok, _) in results.items() if ok]:
+            try:
+                read[relay] = (await _read_back(relay, peer.our_pubkey(), wrap["id"]), None)
+            except Exception as exc:  # noqa: BLE001 - report, do not crash the run
+                read[relay] = (None, str(exc))
+        return results, read
+
+    results, read = asyncio.run(roundtrip())
     accepted = [relay for relay, (ok, _) in results.items() if ok]
     for relay, (ok, error) in results.items():
         print(f"  publish  {relay}  {'ok' if ok else 'FAILED'}" + (f": {error}" if error else ""))
@@ -294,10 +338,9 @@ def live_probe(config: str | None, relays: list[str], text: str) -> int:
 
     retained = 0
     for relay in accepted:
-        try:
-            event = _read_back(relay, peer.our_pubkey(), wrap["id"])
-        except Exception as exc:  # noqa: BLE001 - report, do not crash the run
-            print(f"  readback {relay}  error: {exc}")
+        event, error = read.get(relay, (None, "no readback attempted"))
+        if error:
+            print(f"  readback {relay}  error: {error}")
             continue
         if not event:
             print(f"  readback {relay}  not retained (a publish receipt is not retention)")
