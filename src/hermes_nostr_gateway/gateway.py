@@ -295,10 +295,16 @@ class Gateway:
         #: Where a confirmation may be asked, and whose word needs none. Config only:
         #: the plane that needs it says so through `self.control`, never a hard-coded key.
         self.control = ControlConfig.from_config(cfg.get("control"))
+        #: Channel -> checkout, plus the project and board that drive its work when it
+        #: declares them. Validation is `hng projects --check`; here a gap is only logged,
+        #: because a broken mapping must never stop the gateway reading messages.
+        self.projects = ProjectMap.from_config(self.cfg_concord)
+        for mapped, gap in self.projects.gaps():
+            log.warning("concord project %r: %s %s", mapped.channel, gap.name, gap.detail)
         self.concord = ConcordPlane(
             self.store,
             solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)),
-            projects=ProjectMap.from_config(self.cfg_concord))
+            projects=self.projects)
         #: The channel addresses the concord read workers are subscribed to, and their tasks.
         self._concord_tasks: list[asyncio.Task[None]] = []
         self._concord_authors: tuple[str, ...] = ()
