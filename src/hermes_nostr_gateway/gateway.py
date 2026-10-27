@@ -44,6 +44,7 @@ from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
+from .projects import ProjectMap
 from .publisher import Publisher, make_publisher
 from .relay import RelayWorker
 from .server import SocketServer
@@ -285,7 +286,9 @@ class Gateway:
             "rate_limit": cfg.get("rate_limit"),
             "bots": cfg.get("bots"),
         }, bot_lookup=self.bots.is_bot, echo_lookup=self._echo_lookup)
-        self.concord = ConcordPlane(self.store)
+        self.concord = ConcordPlane(
+            self.store,
+            projects=ProjectMap.from_config(cfg.get("concord") or {}))
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
                                 on_invite=self.concord.handle_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
