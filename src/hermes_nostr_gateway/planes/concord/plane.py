@@ -4,14 +4,22 @@ Spec §14: inner kind 3313 shares the kind-1059 wrapper with DMs, so it must be
 routed by *inner* kind. A Concord invite is not chat and must never reach the
 agent as a message or trigger a run; this plane verifies the bundle, persists it,
 and leaves joining to an explicit call.
+
+Whether that call happens without asking is the control pane's question, and this plane
+answers it (`invite_verdict`): an inviter in `control.trusted_npubs`, global or the plane's
+own list, joins on their word. Anyone else's invite is held until a human accepts it.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
+import nostr_sdk as sdk
+
+from ...control import ControlConfig
 from ...projects import ProjectMap
 from ...store import Inbound, Store
 from . import read as c
@@ -23,9 +31,35 @@ from .read import Invite, open_wrap, verify_bundle
 log = logging.getLogger("hng.plane.concord")
 
 
+def npub_of(pubkey_hex: str) -> str:
+    """`npub…` for a hex key, or the hex as given when it is not one.
+
+    A human checking a trust decision compares config (`npub…`) with what the invite
+    carries (hex), so the prompt shows both rather than making them convert.
+    """
+    text = str(pubkey_hex or "").strip()
+    try:
+        return sdk.PublicKey.parse(text).to_bech32()
+    except Exception:  # noqa: BLE001 - a bad key is worth showing, not raising for
+        return text or "(none)"
+
+
+@dataclass(frozen=True)
+class InviteVerdict:
+    """Whether an invite joins on the inviter's word, and why.
+
+    `why` is stored with the invite and shown to the operator, so it says what decided it
+    ("in control.trusted_npubs", "a human decides") rather than only that something did.
+    """
+
+    accept: bool
+    why: str
+
+
 class ConcordPlane:
     def __init__(self, store: Store, *, solo_max_members: int = 2,
-                 projects: Optional[ProjectMap] = None):
+                 projects: Optional[ProjectMap] = None,
+                 control: Optional[ControlConfig] = None):
         self.store = store
         #: A channel this small needs no mention: everything in it is addressed to us.
         self.solo_max_members = max(1, int(solo_max_members))
@@ -38,6 +72,9 @@ class ConcordPlane:
         #: channel -> checkout map. Optional: with no config nothing resolves, and the
         #: plane behaves exactly as before.
         self.projects = projects
+        #: Where a confirmation goes and who needs none. Optional, and the safe default:
+        #: with no control config nobody is trusted, so every invite waits for a human.
+        self.control = control
 
     def project_for(self, *, community_id: str = "", channel_id: str = "",
                     channel_name: str = "") -> Optional[dict[str, Any]]:
@@ -152,6 +189,21 @@ class ConcordPlane:
         return msg if self.store.add(msg) else None
 
     # -- invites --------------------------------------------------------
+
+    def invite_verdict(self, invite: Invite) -> InviteVerdict:
+        """Join this invite on the inviter's word, or hold it for a human's.
+
+        Trust is the *inviter's* key: the bundle self-certifies the owner, but who put the
+        wrap in our inbox is the sender, and that is the key `control.trusted_npubs` names.
+        With no control config nobody is trusted, so every invite waits — the same rule an
+        empty list states, with no second config surface to keep in step.
+        """
+        who = str(invite.inviter or "")
+        if self.control is None:
+            return InviteVerdict(False, "no control pane configured: a human decides")
+        if self.control.is_trusted(who, plane="concord"):
+            return InviteVerdict(True, f"inviter {who[:12]}... is in control.trusted_npubs")
+        return InviteVerdict(False, f"inviter {who[:12]}... is not in control.trusted_npubs")
 
     def handle_invite(self, relay: str, rumor: dict[str, Any],
                       wrapper_id: str = "") -> Optional[Invite]:

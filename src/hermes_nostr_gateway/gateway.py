@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import nostr_sdk as sdk
 import yaml
@@ -36,7 +36,7 @@ from .planes import nip04
 from .planes.concord import write as concord_write
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.concord.channels import stream_key as concord_stream_key
-from .planes.concord.plane import ConcordPlane
+from .planes.concord.plane import ConcordPlane, InviteVerdict, npub_of
 from .planes.marmot import (
     MarmotControl,
     MarmotError,
@@ -54,6 +54,9 @@ from .publisher import Publisher, make_publisher
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
 from .writer import StoreWriter
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    from .planes.concord.read import Invite
 
 log = logging.getLogger("hng.gateway")
 
@@ -273,6 +276,11 @@ class Gateway:
         #: Frames waiting on their row to be committed. Tracked so `stop()` can let them
         #: finish instead of closing the store underneath them.
         self._deliveries: set[asyncio.Task[None]] = set()
+        #: Invite decisions waiting on a relay write: a join accepted before `stop()` must
+        #: finish or be reported, not vanish with the process. The lock is created on the
+        #: loop that first needs it — see `invite_lock`.
+        self._invites: set[asyncio.Task[Any]] = set()
+        self._invite_lock: asyncio.Lock | None = None
         # Media (spec §4b): attachments are recorded with the message and fetched only
         # when the adapter asks, so this is configuration plus a cache — nothing here
         # touches the network at startup.
@@ -304,12 +312,13 @@ class Gateway:
         self.concord = ConcordPlane(
             self.store,
             solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)),
-            projects=self.projects)
+            projects=self.projects,
+            control=self.control)
         #: The channel addresses the concord read workers are subscribed to, and their tasks.
         self._concord_tasks: list[asyncio.Task[None]] = []
         self._concord_authors: tuple[str, ...] = ()
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
-                                on_invite=self.concord.handle_invite)
+                                on_invite=self._on_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
         # The Marmot plane proxies wn-agent rather than speaking MLS: it attaches
         # only when opted in *and* that daemon is reachable (see _setup_marmot).
@@ -534,6 +543,171 @@ class Gateway:
             except Exception:  # noqa: BLE001 - a refresh must never take the daemon down
                 log.exception("concord refresh failed")
 
+    # -- invites: join on a trusted word, hold for a human ----------------
+
+    def _on_invite(self, relay: str, rumor: dict[str, Any],
+                   wrapper_id: str = "") -> Invite | None:
+        """The NIP-17 invite sink: verify and record here, decide on a task of our own.
+
+        `handle_invite` is synchronous because it runs inside a relay worker's read
+        callback, and a join is a relay write: it waits for a task so nothing blocks the
+        worker, and so a slow relay cannot make one invite delay the next message.
+        """
+        invite = self.concord.handle_invite(relay, rumor, wrapper_id)
+        if invite is None:
+            return None
+        try:
+            task = asyncio.create_task(self._decide_invite_quietly(invite))
+        except RuntimeError:
+            # Recorded with no loop (a CLI, a test): the invite exists and nothing joins.
+            log.warning("concord invite %s...: recorded with no loop to decide it",
+                        invite.wrap_id[:12])
+            return invite
+        self._invites.add(task)
+        task.add_done_callback(self._invites.discard)
+        return invite
+
+    async def _decide_invite_quietly(self, invite: Invite) -> None:
+        """A background decision must not die as an exception nobody collected."""
+        try:
+            await self.decide_invite(invite)
+        except Exception:  # noqa: BLE001 - one invite must never take the daemon down
+            log.exception("concord invite %s...: the decision failed", invite.wrap_id[:12])
+
+    @property
+    def invite_lock(self) -> asyncio.Lock:
+        """One invite decision at a time: a re-invite must not publish a second join.
+
+        A single owner action mints one invite per room, so a burst of invites for one
+        community arrives together; the check for "already joined" and the publish have to
+        be one step or every one of them publishes a join. The publish is inside the lock,
+        so a slow relay delays the next invite — never a relay worker or a message. Created
+        lazily because the lock binds to the loop that uses it, and the gateway is built off
+        the loop.
+        """
+        if self._invite_lock is None:
+            self._invite_lock = asyncio.Lock()
+        return self._invite_lock
+
+    async def decide_invite(self, invite: Invite) -> dict[str, Any]:
+        """Accept this invite, or hold it and ask: the one place an invite becomes a join.
+
+        Returns the same frame the CLI prints, so a caller sees the words the daemon acted
+        on: `status` is `joined`, `held` or `failed`, and `why` says what decided it.
+        """
+        community = invite.community_id.hex()
+        async with self.invite_lock:
+            if self.store.concord_joined(community):
+                self._record_decision(invite, status="joined",
+                                      why="already a member of this community",
+                                      decided_by="auto")
+                log.info("concord invite %s...: already a member of %s...",
+                         invite.wrap_id[:12], community[:12])
+                return {**self._invite_base(invite), "status": "joined", "ok": True,
+                        "why": "already a member of this community"}
+            row = self.store.concord_invite(invite.wrap_id) or {}
+            if row.get("announced_at"):
+                # The same wrap reaches us from every relay that carries it: the question
+                # is already in the pane, and asking it twice would train people to ignore
+                # it. The row keeps the reason it was held.
+                log.info("concord invite %s...: already asked in the control pane",
+                         invite.wrap_id[:12])
+                return {**self._invite_base(invite), "status": "held", "announced": True,
+                        "why": str(row.get("why") or "")}
+            verdict = self.concord.invite_verdict(invite)
+            if verdict.accept:
+                return await self._join_invite(invite, verdict)
+            return await self._hold_invite(invite, verdict)
+
+    async def _join_invite(self, invite: Invite, verdict: InviteVerdict) -> dict[str, Any]:
+        """Publish the Guestbook join, and write down every way it can end.
+
+        The row reads `joining` before the publish: a process that dies mid-write leaves
+        "we tried, outcome unknown" rather than an accepted invite that still looks held.
+        """
+        self._record_decision(invite, status="joining", why=verdict.why, decided_by="auto")
+        try:
+            results = await concord_write.join_guestbook(self.crypto.keys, invite)
+        except Exception as exc:  # noqa: BLE001 - a failed join is a state, not a crash
+            log.exception("concord invite %s...: join failed", invite.wrap_id[:12])
+            self._record_decision(invite, status="failed",
+                                  why=f"join raised {type(exc).__name__}: {exc}"[:300],
+                                  decided_by="auto")
+            return {**self._invite_base(invite), "status": "failed", "ok": False,
+                    "why": verdict.why, "error": str(exc)[:300]}
+        ok = any(outcome == "ok" for outcome in results.values())
+        refused = {relay: outcome for relay, outcome in results.items() if outcome != "ok"}
+        why = verdict.why if ok else "no relay accepted the join: " + ", ".join(
+            f"{relay} ({outcome})" for relay, outcome in refused.items())[:240]
+        self._record_decision(invite, status="joined" if ok else "failed", why=why,
+                              decided_by="auto")
+        log.info("concord invite %s...: %r %s (%d/%d relay(s) ok)", invite.wrap_id[:12],
+                 str(invite.bundle.get("name") or ""), "joined" if ok else "NOT joined",
+                 sum(1 for outcome in results.values() if outcome == "ok"), len(results))
+        return {**self._invite_base(invite), "status": "joined" if ok else "failed",
+                "ok": ok, "why": why, "relays": results, "errors": refused}
+
+    async def _hold_invite(self, invite: Invite, verdict: InviteVerdict) -> dict[str, Any]:
+        """Keep the invite, and ask a human in the control pane — the only other answer."""
+        self._record_decision(invite, status="held", why=verdict.why)
+        log.info("concord invite %s...: held (%s)", invite.wrap_id[:12], verdict.why)
+        destination = self.control.target("concord")
+        if not destination:
+            # A confirmation that cannot be delivered must not read as one that was.
+            log.warning("concord invite %s... is held and there is nowhere to ask: set "
+                        "control.concord to a channel, or accept it with `hng concord %s`",
+                        invite.wrap_id[:12], invite.wrap_id)
+            return {**self._invite_base(invite), "status": "held", "announced": False,
+                    "why": verdict.why, "error": "no control destination"}
+        frame = await self._send_concord(destination, self._invite_prompt(invite, verdict),
+                                         None, None)
+        announced = bool(frame.get("ok"))
+        if announced:
+            self.store.note_invite_announced(invite.wrap_id)
+        else:
+            log.warning("concord invite %s... is held but the control pane did not take "
+                        "the question: %s", invite.wrap_id[:12],
+                        frame.get("error") or frame.get("errors") or "unknown error")
+        return {**self._invite_base(invite), "status": "held", "announced": announced,
+                "why": verdict.why, "asked": destination,
+                "error": "" if announced else str(frame.get("error") or "not announced")}
+
+    def _invite_prompt(self, invite: Invite, verdict: InviteVerdict) -> str:
+        """The question a human answers in the control pane.
+
+        Names the inviter, the community, its channels and the exact command that accepts
+        it: a prompt nobody can act on is the same as no prompt at all.
+        """
+        bundle = invite.bundle
+        names = [f"#{channel.get('name') or channel.get('id') or '?'}"
+                 for channel in bundle.get("channels") or []]
+        shown = ", ".join(names[:8])
+        if len(names) > 8:
+            shown += f", +{len(names) - 8} more"
+        return "\n".join([
+            "Concord invite held: nothing joins until someone says yes.",
+            f"community: {bundle.get('name') or '(unnamed)'}"
+            f" ({invite.community_id.hex()})",
+            f"inviter:   {npub_of(invite.inviter)} ({invite.inviter})",
+            f"channels:  {len(names)} ({shown or 'none granted'})",
+            f"relays:    {', '.join(invite.relays)}",
+            f"why held:  {verdict.why}",
+            f"accept:    hng concord {invite.wrap_id}",
+        ])
+
+    def _invite_base(self, invite: Invite) -> dict[str, Any]:
+        return {"type": "concord_invite", "id": invite.wrap_id,
+                "inviter": invite.inviter,
+                "community": invite.community_id.hex(),
+                "name": str(invite.bundle.get("name") or "")}
+
+    def _record_decision(self, invite: Invite, *, status: str, why: str,
+                         decided_by: str = "") -> None:
+        if not self.store.decide_invite(invite.wrap_id, status=status, why=why,
+                                        decided_by=decided_by):
+            log.warning("concord invite %s...: no stored row for the %s decision",
+                        invite.wrap_id[:12], status)
+
     async def start(self) -> None:
         await self.server.start()
         self._started_at = time.time()
@@ -753,13 +927,16 @@ class Gateway:
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("workers did not unwind in 6s; stopping anyway")
         # A frame already accepted must reach the adapter: it is only waiting on its
-        # flush, so let it finish while the server and the writer are both still up.
-        if self._deliveries:
+        # flush, so let it finish while the server and the writer are both still up. An
+        # invite decision is the same: its join is a publish, and dropping it would leave
+        # an accepted invite recorded as held.
+        pending = [*self._deliveries, *self._invites]
+        if pending:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*list(self._deliveries), return_exceptions=True), 5)
+                    asyncio.gather(*pending, return_exceptions=True), 5)
             except (asyncio.TimeoutError, TimeoutError):
-                log.warning("delivery tasks did not finish in 5s; stopping anyway")
+                log.warning("delivery and invite tasks did not finish in 5s; stopping anyway")
         if self.pool is not None:
             await self.pool.stop()
         await self.server.stop()
@@ -1174,6 +1351,7 @@ class Gateway:
             "drops": {**self.store.drop_counts(self.drops_ttl_seconds),
                       "ttl_hours": self.drops_ttl_seconds / 3600},
             "invites": stats["invites"],
+            "invites_held": stats["invites_held"],
             "media": {
                 "enabled": self.media_cfg.enabled,
                 "servers": list(self.media_cfg.servers),

@@ -164,7 +164,15 @@ def build(cfg: dict[str, Any]) -> tuple[SdkCrypto, Store, Policy, Nip17Plane]:
         echo_lookup=lambda peer, since: [row["content"] or ""
                                          for row in store.recent_outbound(peer, since)],
     )
-    return crypto, store, policy, Nip17Plane(crypto, store, policy)
+    # `hng listen` records a verified invite exactly as the daemon does, and decides
+    # nothing: a join is a relay write, and the control pane in front of it lives in the
+    # daemon (`decide_invite`) or in `hng concord <id>`. Without this the invites a
+    # one-shot listener saw would be dropped unrecorded.
+    from .planes.concord.plane import ConcordPlane
+
+    concord = ConcordPlane(store, control=ControlConfig.from_config(cfg.get("control")))
+    return crypto, store, policy, Nip17Plane(crypto, store, policy,
+                                             on_invite=concord.handle_invite)
 
 
 def to_hex(who: str) -> str:
@@ -402,6 +410,7 @@ def cmd_status(args) -> int:
             "blocked": stats["blocked"],
             "drops": drops,
             "invites": stats["invites"],
+            "invites_held": stats["invites_held"],
             "media": stats.get("media") or {},
             "wraps": store.wrap_counts(),
             "relays": [verdict.as_dict() for verdict in verdicts],
@@ -415,7 +424,7 @@ def cmd_status(args) -> int:
           f"{stats['blocked']} blocked)")
     print(f"drops:    {drops['total']} refused ({drops['live']} live, "
           f"{drops['expired']} expired; ttl {drops['ttl_hours']:.0f}h)")
-    print(f"invites:  {stats['invites']} concord invite(s)")
+    print(f"invites:  {stats['invites']} concord invite(s), {stats['invites_held']} held")
     media = stats.get("media") or {}
     print(f"media:    {media.get('attachments', 0)} attachment(s), "
           f"{media.get('cached', 0)} cached")
@@ -633,6 +642,80 @@ def cmd_control(args) -> int:
     return 0
 
 
+def cmd_concord(args) -> int:
+    """Concord invites: what is held, and accepting one (the human's yes).
+
+    `hng concord` lists what this gateway recorded, with the state each invite is in.
+    `hng concord <id>` publishes the Guestbook join the daemon would have published for a
+    trusted inviter, so an invite held for a human can be released without editing config
+    or waiting for the daemon to restart. Both read and write the same row, so the daemon's
+    next refresh sees the community as joined.
+    """
+    from .planes.concord import read as concord_read
+    from .planes.concord import write as concord_write
+
+    cfg = load_config(args.config)
+    crypto, store, _policy, _plane = build(cfg)
+    if not args.invite:
+        return list_invites(store, args)
+
+    row = store.concord_invite(args.invite)
+    if row is None:
+        print(f"no invite {args.invite!r}: `hng concord` lists what this gateway holds",
+              file=sys.stderr)
+        return 1
+    label = row["name"] or row["community_id"][:12] + "..."
+    if row["status"] == "joined" or store.concord_joined(row["community_id"]):
+        print(f"{label}: already joined (invite {row['id']})")
+        return 0
+    invite = concord_read.Invite(bundle=row["bundle"], inviter=row["inviter"],
+                                 relay="", wrap_id=row["id"])
+    try:
+        results = asyncio.run(concord_write.join_guestbook(crypto.keys, invite))
+    except Exception as exc:  # noqa: BLE001 - report, do not traceback at an operator
+        store.decide_invite(row["id"], status="failed",
+                            why=f"join raised {type(exc).__name__}: {exc}"[:300],
+                            decided_by="cli")
+        print(f"{label}: join FAILED ({type(exc).__name__}: {exc})"[:300], file=sys.stderr)
+        return 1
+    ok = any(outcome == "ok" for outcome in results.values())
+    store.decide_invite(row["id"], status="joined" if ok else "failed",
+                        why="accepted by hand" if ok else "no relay accepted the join",
+                        decided_by="cli")
+    if args.json:
+        print(json.dumps({"id": row["id"], "community": row["community_id"],
+                          "name": row["name"], "status": "joined" if ok else "failed",
+                          "relays": results}, indent=2))
+        return 0 if ok else 1
+    for relay, outcome in results.items():
+        print(f"    {relay}: {outcome}")
+    print(f"{label}: {'joined' if ok else 'FAILED'}")
+    return 0 if ok else 1
+
+
+def list_invites(store: Store, args) -> int:
+    rows = store.concord_invites(args.limit, status="held" if args.held else None)
+    if args.json:
+        # The bundle is key material, not a listing's business: every other field is.
+        print(json.dumps({"invites": [
+            {key: value for key, value in row.items() if key != "bundle"} for row in rows
+        ]}, indent=2))
+        return 0
+    if not rows:
+        print("no concord invites recorded")
+        return 0
+    held = sum(1 for row in rows if row["status"] == "held")
+    print(f"{len(rows)} concord invite(s), {held} held")
+    for row in rows:
+        print(f"  {row['status']:<8} {row['name'] or '(unnamed)'}  {row['id']}")
+        print(f"           community {row['community_id']}  from {row['inviter']}")
+        if row.get("why"):
+            print(f"           {row['why']}")
+        if row["status"] == "held":
+            print(f"           accept: hng concord {row['id']}")
+    return 0
+
+
 def cmd_drops(args) -> int:
     """Refused messages: what policy dropped, why, and when — the `drops` op's client."""
     import datetime
@@ -832,6 +915,16 @@ def main(argv: list[str] | None = None) -> int:
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
     p_control.add_argument("--json", action="store_true")
     p_control.set_defaults(func=cmd_control)
+
+    p_concord = sub.add_parser(
+        "concord", help="concord invites: what is held, and accepting one")
+    p_concord.add_argument("invite", nargs="?", default=None,
+                           help="invite id (or community id) to accept; omit to list")
+    p_concord.add_argument("--held", action="store_true",
+                           help="list only the invites waiting for a human")
+    p_concord.add_argument("-n", "--limit", type=int, default=20)
+    p_concord.add_argument("--json", action="store_true")
+    p_concord.set_defaults(func=cmd_concord)
 
     sub.add_parser("replay-skip",
                    help="record a handover: the pending backlog is already answered"

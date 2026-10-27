@@ -233,6 +233,29 @@ It is in production use, not experimental: it runs wherever this gateway runs, a
 same relays as every other plane. `status`, the startup log and `hng status` report it as one
 of the attached planes like any other.
 
+### Joining a community: a trusted word, or a human's
+
+An invite is verified and recorded the moment it arrives, and then something has to decide
+whether this gateway joins. That decision is the control pane's `trusted_npubs` and nothing
+else — no second list to keep in step:
+
+- an inviter in `control.trusted_npubs` (the global list, or the `concord` plane's own list,
+  which is a union) is accepted: the gateway publishes the Guestbook join and records
+  `joined`;
+- anyone else's invite is **held**: nothing joins, and the question — who invited, which
+  community, which channels, and the exact command that accepts it — is posted into
+  `control.concord`, which is how `#ops` receives it. With no `control.concord` destination
+  the invite is still held and the daemon logs that there is nowhere to ask, because a
+  confirmation that cannot be delivered must not look like one that was.
+
+Nothing joins silently. Every invite row carries its state (`held`, `joining`, `joined`,
+`failed`), who decided it (`auto` for a trusted inviter, `cli` for a human), why, and
+whether the question reached the control pane. `hng concord` lists them and `hng status`
+counts the held ones; `hng concord <invite-id>` is the human's yes, publishing the same
+Guestbook join the daemon would have published and recording it as `cli`. A re-invite for a
+community this gateway has already joined (one owner action mints one invite per room) is
+recorded as joined without publishing a second join.
+
 ### Writing to the Control Plane
 
 Reading the Control Plane takes only the `community_root` every member holds. Writing takes the
@@ -332,6 +355,8 @@ control:
   entry that is not a key is reported at load time rather than ignored.
 - `hng control` prints the resolved pane per plane (and `--json` for a script); the daemon
   logs the same line at startup.
+- Concord invites use both halves: a trusted inviter's invite joins without asking, anyone
+  else's is held and posted into `control.concord` for a human (see *Joining a community*).
 
 
 ## Relays and kinds
