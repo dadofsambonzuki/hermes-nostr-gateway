@@ -58,7 +58,7 @@ goes stale between commits.
 - **Hermes plugin** — `integrations/hermes-plugin/` (manifest, adapter, `register(ctx)` shim), kept
   in step with the live copy under `~/.hermes/plugins/nostr/`.
 - **Publish path** — [`docs/publish.md`](docs/publish.md): one signed event sent per relay
-  through the bindings client, what the retry guarantees, and the `transport.legacy` rollback.
+  through the bindings client, and what the retry guarantees.
 - **Queue gate** — `scripts/queue_next.py` and `deploy/queue-gate.sh`: the cron queue worker's
   monitor source, so an idle tick costs no agent run (see "Working the queue" below).
 - **Prior art** — `wn-agent`/mdk and Armada, credited below.
@@ -153,15 +153,14 @@ rebuild, update the URL and the hash in `requirements.txt` together.
 
 ## Container
 
-`Dockerfile` builds the same package with a pinned `nak`. Nothing in the default read or
-write path shells out — reads and writes both run on the `nostr-sdk` client in the process
-— so `nak` is in the image only for the `transport.legacy: true` publish rollback, which
-the next change removes. The image runs as `gateway`,
+`Dockerfile` still installs a pinned `nak`, though nothing in the read or write path
+shells out any more — both run on the `nostr-sdk` client in the process — so no code path
+needs the binary. The image runs as `gateway`,
 UID/GID 1000 by default; build with `--build-arg UID=$(id -u) --build-arg GID=$(id -g)`
 when the host user that owns the mounted files is not 1000.
 
-The read transport — one client, one subscription per filter set, NIP-42 in-process, and
-the `transport.legacy: true` rollback — is described in `docs/transport-pool.md`.
+The read transport — one client, one subscription per filter set, NIP-42 in-process —
+is described in `docs/transport-pool.md`.
 
 There is no network listener, so the socket is published through a volume, not a port:
 
@@ -229,10 +228,10 @@ of the attached planes like any other.
 One subscription per relay, because each extra connection counts against the relay's
 connection limiter. A Nostr filter is all-or-nothing at the relay, though: a REQ naming a kind
 the relay refuses is closed whole (`filter validation failed: kind not allowed: 4`), so a relay
-that rejects legacy kind 4 would otherwise lose its kind-1059 DMs along with it. Hence a kind
+that rejects NIP-04 kind 4 would otherwise lose its kind-1059 DMs along with it. Hence a kind
 set per relay:
 
-- the default DM subscription is `1059` + legacy `4`;
+- the default DM subscription is `1059` + NIP-04 `4`;
 - `relays.read` may pin a relay's set — `- {url: wss://relay.example, kinds: [1059]}` — for a
   relay that refuses a kind rather than for one that simply has less traffic;
 - if a relay still refuses a kind at runtime, the worker drops that kind and resubscribes
@@ -304,9 +303,9 @@ What that buys beyond one less process per message per relay:
 - `status.publish` names the transport (`mode: bindings`) and counts what it has sent and
   what failed.
 
-`transport.legacy: true` selects the old `nak event --auth` child per relay. It is the
-publish rollback, kept for one release and then deleted. Reads have no such switch any
-more: the read pool is the only transport. The design and the wire-level tests are in
+Every publish goes through that client, in this process. There is no second publisher and
+no config flag that selects one: the per-relay `nak event --auth` child is deleted, along
+with the read-side `nak` workers before it. The design and the wire-level tests are in
 [`docs/publish.md`](docs/publish.md).
 
 ## Marmot: one socket, one owner

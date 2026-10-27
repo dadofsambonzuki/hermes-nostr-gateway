@@ -1,6 +1,6 @@
 # The read transport: one client, one subscription per filter set
 
-Plan P1. This records what the read path is now, what it was, and how to go back.
+Plan P1. This records what the read path is now, and what it replaced.
 
 ## The decision
 
@@ -16,7 +16,7 @@ stop timeout was a real risk.
 
 The client gives the same coverage with the socket inside this process:
 
-| Concern | Legacy (`transport.legacy: true`) | Pool (default) |
+| Concern | The old `nak` child (removed) | Pool (now) |
 | --- | --- | --- |
 | One relay's socket | `nak` child, one per subscription | one `Client`, one connection per relay |
 | NIP-42 | `NOSTR_SECRET_KEY` in the child's env | `SignerAuthenticator` over our `Keys`, in-process |
@@ -51,23 +51,17 @@ feed and mentions subscriptions on one relay receive only their own events.
 
 ## What is still a subprocess
 
-- **Publish** (`publisher.py`) — the per-relay `nak event --auth` child survives only
-  behind `transport.legacy: true`; the bindings path is the default.
-
-Nothing else runs a child. The startup contact-list lookup, the peer kind-10050 inbox
-resolver and `hng listen` (both `--once` and live) read through the bindings via
-`fetch.py`, so `ps` on a running gateway shows no `nak` at all on the default config.
+Nothing, for reads or writes. Publishing runs on a `nostr-sdk` client in this process
+(`publisher.py`), and the startup contact-list lookup, the peer kind-10050 inbox resolver
+and `hng listen` (both `--once` and live) read through the bindings via `fetch.py`, so
+`ps` on a running gateway shows no `nak` at all.
 
 ## Rollback
 
-Reads have none: the subprocess worker is deleted (`relay.py` is now the refusal parser
-and the handler types), so there is no second implementation for a flag to select. The
-only transport switch left is publishing's, and it is one config line:
-
-```yaml
-transport:
-  legacy: true
-```
+There is none: the subprocess workers are deleted (`relay.py` is now the refusal parser
+and the handler types, `publisher.py` has one implementation), so there is no second
+implementation for a flag to select. A stale `transport:` block in an older config file
+is ignored.
 
 ## How to verify
 

@@ -200,7 +200,7 @@ def cmd_listen(args) -> int:
     crypto, store, policy, plane = build(cfg)
     secret = secret_from(cfg)
     # `relays.read` may pin a per-relay kind set ({url, kinds}); listen only speaks
-    # NIP-17, so the pin is respected but legacy kind 4 is not a listen default.
+    # NIP-17, so the pin is respected but NIP-04 kind 4 is not a listen default.
     relays, relay_kinds = relay_read_plan(cfg)
 
     def kinds_for(relay: str) -> tuple[int, ...]:

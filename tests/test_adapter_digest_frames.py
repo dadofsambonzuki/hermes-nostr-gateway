@@ -96,8 +96,8 @@ def test_a_digest_frame_is_delivered_not_rejected(monkeypatch):
 def test_the_frames_own_sender_is_what_the_harness_rejects():
     """Guard against a vacuous test: the frame's literal sender fails the same gate."""
     frame = _digest_frame()
-    legacy = Kw(source=Kw(user_id=frame["sender"]))
-    assert not _harness_admits(legacy, {OWNER, PEER})
+    message_only = Kw(source=Kw(user_id=frame["sender"]))
+    assert not _harness_admits(message_only, {OWNER, PEER})
 
 
 def test_digest_content_is_data_and_cannot_be_instructions(monkeypatch):

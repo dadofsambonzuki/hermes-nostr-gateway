@@ -270,13 +270,14 @@ async def test_subscribe_replays_digest_and_ack_uses_frame(tmp_path):
         await srv.stop()
 
 
-async def test_legacy_adapter_acks_a_digest_by_frame_id_and_reconnect_replays_nothing(tmp_path):
+async def test_message_only_adapter_acks_a_digest_by_frame_id_and_reconnect_replays_nothing(
+        tmp_path):
     """Done-condition for the digest contract: an adapter that knows only
     `type: message` receives the digest, acks its `id`, and a reconnect is quiet."""
     from hermes_nostr_gateway.store import Inbound, Store
 
     me, peer = "aa" * 32, "bb" * 32
-    store = Store(tmp_path / "legacy.db", identity=me)
+    store = Store(tmp_path / "compat.db", identity=me)
     for i in range(2):
         assert store.add(Inbound(
             id=f"r{i}", wrapper_id=f"w{i}", sender=peer, kind=14, created_at=100 + i,
@@ -287,10 +288,10 @@ async def test_legacy_adapter_acks_a_digest_by_frame_id_and_reconnect_replays_no
     sent = store.seal_digests(now=160)[0]
     assert sent["type"] == "message" and sent["plane"] == "digest"
 
-    srv = SocketServer(tmp_path / "legacy.sock", StoreHandler(store))
+    srv = SocketServer(tmp_path / "compat.sock", StoreHandler(store))
     await srv.start()
     try:
-        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "legacy.sock"))
+        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "compat.sock"))
         writer.write(b'{"op":"subscribe"}\n')
         await writer.drain()
         assert json.loads(await asyncio.wait_for(reader.readline(), 2))["type"] == "subscribed"
@@ -305,7 +306,7 @@ async def test_legacy_adapter_acks_a_digest_by_frame_id_and_reconnect_replays_no
         writer.close()
         await writer.wait_closed()
 
-        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "legacy.sock"))
+        reader, writer = await asyncio.open_unix_connection(str(tmp_path / "compat.sock"))
         writer.write(b'{"op":"subscribe"}\n')
         await writer.drain()
         assert json.loads(await asyncio.wait_for(reader.readline(), 2))["type"] == "subscribed"

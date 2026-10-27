@@ -38,7 +38,7 @@ PEER2 = "c" * 64
 # -- fixtures and fakes -----------------------------------------------------
 
 def gateway_config(tmp_path, *, read=(), publish=(), groups=None, peer_inbox=None,
-                   whitenoise=None, transport=None) -> dict:
+                   whitenoise=None) -> dict:
     secret_file = tmp_path / "secret.json"
     secret_file.write_text(
         json.dumps({"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()})
@@ -56,8 +56,6 @@ def gateway_config(tmp_path, *, read=(), publish=(), groups=None, peer_inbox=Non
         "defaults": {},
         "marmot": {"enabled": False},
     }
-    if transport is not None:
-        cfg["transport"] = transport
     if whitenoise:
         cfg["whitenoise"] = list(whitenoise)
     return cfg

@@ -730,7 +730,7 @@ class Store:
     def mark_delivered(self, ids: list[str]) -> None:
         """Mark individual rumors delivered, and whole digest batches when the id is one.
 
-        A legacy adapter knows only ``type: message`` and acks ``id``; for a digest frame
+        An adapter that knows only ``type: message`` acks ``id``; for a digest frame
         that id is ``digests.id``, so the batch is the unit of delivery. The batch row is
         closed only once every ``batched`` rumor in it is delivered — a partial id-level
         ack leaves it open, so replay can still offer what is left. A second ack is a

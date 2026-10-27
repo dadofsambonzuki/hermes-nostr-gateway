@@ -224,7 +224,7 @@ are additive:
 }
 ```
 
-`id` is `digests.id`, so an adapter can ack the whole frame with the legacy `ack(ids)` form.
+`id` is `digests.id`, so an adapter can ack the whole frame with the `ack(ids)` form.
 `delivered` is `len(items)` capped at `top_n` (default 5); `count` is `item_count`;
 `truncated` means `delivered < count - dropped`. `content` is rendered at delivery and again
 at replay by joining the rumors named in `top_ids` — `digests` itself stores ids only, never
