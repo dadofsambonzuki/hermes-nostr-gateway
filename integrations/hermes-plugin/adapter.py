@@ -136,6 +136,33 @@ def is_control_text(text: str) -> bool:
     return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
 
 
+# A message can arrive with a `mode`: the gateway has already read two prefixes (`/queue
+# <text>`, `/guide <text>`), stripped them, and — only for a sender its policy judged able to
+# instruct — recorded which one the sender asked for. Hermes has the same two behaviours as
+# its own commands, and owns the machinery behind them (`display.busy_input_mode`), so this
+# adapter re-addresses the words to those rather than implementing a second queue:
+#
+#   /queue  hold the message and run it as its own turn when the current one finishes
+#   /steer  inject it into the run that is already going, after its next tool call
+#
+# Both commands degrade to a plain turn when nothing is running (Hermes strips the command
+# and sends the payload), which is exactly what a `/guide` finding no turn should do. The
+# adapter never decides whether a sender may use them: `mode` is only ever set behind the
+# gateway's policy, and a frame without it is delivered exactly as it always was.
+_MODE_COMMAND = {"queue": "/queue", "guide": "/steer"}
+
+
+def directed_text(frame: dict[str, Any], text: str) -> str:
+    """*text*, prefixed with the Hermes command that carries out the frame's `mode`.
+
+    A mode with no words is not a command: the gateway only sets one on a message that had a
+    payload, but a frame whose text did not survive (an attachment with no caption) must
+    arrive as the attachment, not as a bare `/queue` Hermes would answer with a usage hint.
+    """
+    command = _MODE_COMMAND.get(str(frame.get("mode") or ""), "")
+    return f"{command} {text}" if command and text.strip() else text
+
+
 # A digest is the gateway batching many low-priority items into one frame. It has no human
 # author, so the frame carries the literal `sender`/`conversation` "digest" — not a pubkey.
 # Hermes admits an inbound by sender identity (`NOSTR_ALLOWED_USERS`), so a frame signed
@@ -593,7 +620,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # because a turn that begins without the picture cannot go back for it. A refusal is
         # named in the text rather than dropped — an image the agent cannot see must not read
         # as a message that never had one.
-        text = frame.get("content") or ""
+        text = directed_text(frame, frame.get("content") or "")
         media_urls: list[str] = []
         media_types: list[str] = []
         kinds: list[str] = []

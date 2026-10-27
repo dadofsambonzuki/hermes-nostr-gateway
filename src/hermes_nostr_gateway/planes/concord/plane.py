@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import nostr_sdk as sdk
 
+from ... import addressing
 from ...control import ControlConfig
 from ...projects import ProjectMap
 from ...store import Inbound, Store
@@ -161,25 +162,29 @@ class ConcordPlane:
         text = rumor.get("content") or ""
         mentioned = has_mention(text, tags, me_hex, me_npub)
         members = self.member_count(stream.community_id)
-        addressing, note = decides(stream, mentioned=mentioned, members=members,
-                                   solo_max=self.solo_max_members)
-        decision = policy.decide(sender=sender, kind=9, mention=addressing, dm=False,
-                                 event_id=rumor.get("id"), text=text)
+        mention_flag, note = decides(stream, mentioned=mentioned, members=members,
+                                     solo_max=self.solo_max_members)
+        # The policy reads the words, not a leading `/queue`/`/guide`: see addressing.py.
+        _, words = addressing.split(text)
+        decision = policy.decide(sender=sender, kind=9, mention=mention_flag, dm=False,
+                                 event_id=rumor.get("id"), text=words)
         if decision.duplicate:
             return None
+        mode, content = addressing.resolve(text, decision)
         msg = Inbound(
             id=str(rumor.get("id") or wrapper_id),
             wrapper_id=wrapper_id,
             sender=sender,
             kind=int(rumor.get("kind", 9)),
             created_at=int(rumor.get("created_at") or 0),
-            content=text,
+            content=content,
             # One conversation per channel, so an agent's history is per channel and not
             # per member — the point of a project room.
             conversation=stream.chat_id,
             reply_to=next((t[1] for t in tags if t and t[0] == "e"), None),
             plane="concord",
             reach=decision.reach,
+            mode=mode,
             authority=decision.authority,
             rule=decision.rule,
             why="; ".join(part for part in (decision.why, note) if part),

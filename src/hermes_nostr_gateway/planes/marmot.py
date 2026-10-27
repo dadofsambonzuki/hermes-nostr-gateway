@@ -33,6 +33,7 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
+from .. import addressing
 from ..policy import Policy
 from ..store import Inbound, Store
 
@@ -394,27 +395,33 @@ class MarmotPlane:
             return None
         if sender_block.get("is_self") or sender == self.account_id_hex:
             return None
+        text = str(message.get("text") or "")
+        # A leading `/queue` or `/guide` is a routing request, not words for the policy's
+        # echo and quota checks to weigh (addressing.py).
+        _, words = addressing.split(text)
         decision = self.policy.decide(
             sender=sender,
             kind=APP_MESSAGE_KIND,
             mention=bool(event.get("mentions_self")),
             dm=bool(self._direct.get(group)),
             event_id=message_id,
-            text=str(message.get("text") or ""),
+            text=words,
         )
         if decision.duplicate:
             return None
+        mode, content = addressing.resolve(text, decision)
         inbound = Inbound(
             id=message_id,
             wrapper_id=message_id,
             sender=sender,
             kind=APP_MESSAGE_KIND,
             created_at=int(message.get("recorded_at") or 0),
-            content=str(message.get("text") or ""),
+            content=content,
             conversation=group,
             reply_to=_reply_target(event, message),
             plane="marmot",
             reach=decision.reach,
+            mode=mode,
             authority=decision.authority,
             rule=decision.rule,
             why=decision.why,
