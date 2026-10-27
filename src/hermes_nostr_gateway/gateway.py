@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+import nostr_sdk as sdk
 import yaml
 
 from .bots import BotRegistry, kind0_fetcher
@@ -255,6 +256,7 @@ class Gateway:
         # as the rollback — the same flag that keeps `relay.RelayWorker` on reads.
         self.publisher: Publisher = make_publisher(cfg, self._secret)
         self.me = self.crypto.our_pubkey()
+        self.me_npub = sdk.PublicKey.parse(self.me).to_bech32()
         store_path = Path(os.path.expanduser(cfg.get("store", "gateway.db")))
         store_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(store_path, identity=self.me)
@@ -285,7 +287,12 @@ class Gateway:
             "rate_limit": cfg.get("rate_limit"),
             "bots": cfg.get("bots"),
         }, bot_lookup=self.bots.is_bot, echo_lookup=self._echo_lookup)
-        self.concord = ConcordPlane(self.store)
+        self.cfg_concord = cfg.get("concord") or {}
+        self.concord = ConcordPlane(
+            self.store, solo_max_members=int(self.cfg_concord.get("solo_max_members", 2)))
+        #: The channel addresses the concord read workers are subscribed to, and their tasks.
+        self._concord_tasks: list[asyncio.Task[None]] = []
+        self._concord_authors: tuple[str, ...] = ()
         self.plane = Nip17Plane(self.crypto, self.store, self.policy,
                                 on_invite=self.concord.handle_invite)
         self.nip01 = Nip01Plane(self.store, self.policy, self.me, feed_rules(cfg.get("feeds")))
@@ -449,6 +456,75 @@ class Gateway:
         log.info("marmot plane via %s (account %s…)", socket, account[:12])
 
     # -- lifecycle ------------------------------------------------------
+    async def refresh_concord(self) -> int:
+        """Re-read each community's channels and members, and republish the watched set.
+
+        Concord is read under keys, not under an address: the channel list and the roster live
+        on the Control plane and Guestbook, both of which only need the `community_root` in the
+        invite. So the plane learns its streams here, and the workers subscribe by author
+        (the stream addresses) rather than by `#p` — a channel wrap is not addressed to us.
+        """
+        from .planes.concord import read as concord_read
+
+        by_community: dict[str, list[dict[str, Any]]] = {}
+        for row in self.store.concord_invites(50):
+            by_community.setdefault(row["community_id"], []).append(row)
+
+        watched = 0
+        for community_id, rows in by_community.items():
+            bundle = dict(rows[0]["bundle"])
+            # One owner action mints one invite per room, so union the grants across them.
+            grants: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                for channel in row["bundle"].get("channels") or []:
+                    if channel.get("id"):
+                        grants.setdefault(channel["id"], channel)
+            if grants:
+                bundle["channels"] = list(grants.values())
+            invite = concord_read.Invite(bundle=bundle, inviter=rows[0]["inviter"],
+                                         relay="", wrap_id=rows[0]["id"])
+            try:
+                community = await concord_read.load_community(invite)
+                members = await concord_read.read_guestbook(invite)
+            except Exception as exc:  # noqa: BLE001 - one dead community is not the daemon
+                log.warning("concord: cannot refresh %s…: %s", community_id[:12], exc)
+                continue
+            fresh = self.concord.set_streams(invite, community.channels,
+                                             {m.pubkey for m in members})
+            watched += len(fresh)
+        await self._sync_concord_workers()
+        log.info("concord: %d channel stream(s) watched across %d community(ies)",
+                 watched, len(by_community))
+        return watched
+
+    async def _sync_concord_workers(self) -> None:
+        """(Re)start a read worker per relay for the channel addresses the plane knows."""
+        addresses = tuple(sorted({stream.address for stream in self.concord.channels()}))
+        if addresses == self._concord_authors:
+            return
+        for task in self._concord_tasks:
+            task.cancel()
+        self._concord_tasks = []
+        self._concord_authors = addresses
+        if not addresses:
+            return
+        for relay in self.relays_read:
+            worker = self._new_worker(relay, kinds=(1059,), authors=addresses,
+                                      purpose="concord")
+            self.workers.append(worker)
+            self._concord_tasks.append(asyncio.create_task(self._guarded(worker)))
+        log.info("concord: subscribed %d relay(s) for %d channel stream(s)",
+                 len(self.relays_read), len(addresses))
+
+    async def _concord_refresh_loop(self) -> None:
+        minutes = max(1, int((self.cfg_concord.get("refresh_minutes") or 10)))
+        while True:
+            await asyncio.sleep(minutes * 60)
+            try:
+                await self.refresh_concord()
+            except Exception:  # noqa: BLE001 - a refresh must never take the daemon down
+                log.exception("concord refresh failed")
+
     async def start(self) -> None:
         await self.server.start()
         self._started_at = time.time()
@@ -456,6 +532,13 @@ class Gateway:
         # and the commit happens on the writer's thread.
         await self.store_writer.start()
         self.store.attach_writer(self.store_writer)
+        # Concord: learn the channel streams before the relay workers are built, so the very
+        # first subscription already carries their addresses.
+        try:
+            await asyncio.wait_for(self.refresh_concord(), timeout=30)
+        except Exception:  # noqa: BLE001 - a slack relay must not delay the daemon
+            log.warning("concord: initial refresh did not finish in 30s", exc_info=True)
+        self._tasks.append(asyncio.create_task(self._concord_refresh_loop()))
         # The publish set is known up front: connect it once, rather than paying a
         # handshake per relay on the first message.
         await self.publisher.warm(self.relays_publish)
@@ -713,7 +796,13 @@ class Gateway:
             self.bots.ingest(event)
             return
         if kind == 1059:
-            msg = self.plane.handle(relay, event)
+            # A channel wrap's author is the channel's stream address, not a peer key. The
+            # Concord plane knows those addresses; anything else on 1059 is a DM.
+            if self.concord.stream_for(event.get("pubkey", "")) is not None:
+                msg = self.concord.handle_channel(relay, event, self.policy,
+                                                  me_hex=self.me, me_npub=self.me_npub)
+            else:
+                msg = self.plane.handle(relay, event)
         elif kind == 4:
             msg = self._handle_nip04(relay, event)
         else:
