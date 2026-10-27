@@ -1,6 +1,6 @@
 """Inbound media end to end: an `imeta` claim becomes verified bytes on disk.
 
-The acceptance criterion this file exists for (QUEUE.md, M3): an inbound DM with an
+The acceptance criterion this file exists for (plan v2, M3): an inbound DM with an
 attachment yields bytes the adapter can read, and an oversized or unknown blob is
 refused with a named reason. The Blossom server here is a real HTTP server on loopback,
 because a mocked transport cannot prove a download cap: the cap has to be enforced while
