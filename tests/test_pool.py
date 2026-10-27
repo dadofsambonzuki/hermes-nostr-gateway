@@ -185,6 +185,16 @@ async def test_an_event_for_another_subscription_is_not_delivered():
 
 # -- refusals, auth, rate limits -------------------------------------------
 
+def test_only_kinds_the_worker_asked_for_are_recorded_as_refused():
+    """A relay complaining about someone else's filter must not narrow ours."""
+    pool = RelayPool(SECRET, client=FakeClient())
+    worker = make_worker(pool)
+
+    assert worker.note_refusals("CLOSED: kind not allowed: 7") == set()
+    assert worker.refused == set()
+    assert worker.kinds == DM_KINDS
+
+
 async def test_a_refused_kind_is_dropped_and_the_worker_resubscribes_for_the_rest():
     client = FakeClient()
     pool = RelayPool(SECRET, client=client)
