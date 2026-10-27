@@ -21,7 +21,9 @@ INVITE_KINDS = {3313}
 ROUTED_KINDS = DM_KINDS | INVITE_KINDS
 
 # An unwrapped invite rumor goes here; the Concord plane owns parsing and storage.
-InviteSink = Callable[[str, dict], object]
+# The gift wrap's own id comes with it: the inner rumor is unsigned and has no id, so the
+# wrapper is the only stable identity an invite has (and the row's primary key).
+InviteSink = Callable[[str, dict, str], object]
 
 
 class Crypto(Protocol):
@@ -62,7 +64,7 @@ class Nip17Plane:
             # Concord plane, which verifies and records it.
             if self.on_invite is not None:
                 try:
-                    self.on_invite(relay, rumor)
+                    self.on_invite(relay, rumor, wrapper_id)
                 except Exception:  # noqa: BLE001 - a bad invite must not kill the relay
                     log.exception("concord invite sink failed")
             return None
