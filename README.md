@@ -223,6 +223,30 @@ It is in production use, not experimental: it runs wherever this gateway runs, a
 same relays as every other plane. `status`, the startup log and `hng status` report it as one
 of the attached planes like any other.
 
+### Writing to the Control Plane
+
+Reading the Control Plane takes only the `community_root` every member holds. Writing takes the
+staff-held `control_root`, because the plane's wraps are signed by a keypair derived from it: a
+member-signed wrap fails the address check and is dropped by relays and readers alike
+(CORD-02 §2/§5). A staff Grant delivers that secret in its `control_wrap` — `epoch_be[8] ‖
+control_root[32]`, NIP-44 under the granter↔member pairwise key, base64 — and it is adopted only
+if it derives the `control_pk` the invite names for that epoch, so a stale secret fails closed
+instead of minting wraps nobody can open.
+
+`planes/concord/control.py` implements the write side: `parse_control_wrap` →
+`check_control_root` → `build_channel`, with `verify_edition` proving the wrap verifies at the
+plane's address and that the plaintext seal round-trips the rumor before anything is published.
+An edition is a kind-3308 rumor in a kind-20014 **plaintext** seal — the rumor's serialized JSON
+as the seal's content, which is what lets a compaction re-wrap the signed rumor with its
+signature intact — and it carries `vsk` (entity type), `eid`, `ev`, and, when the actor is not
+the owner, a `vac` citing the Grant edition whose rank the action claims (entity, version, and
+`edition_hash` over the content as published).
+
+Authority is still the Roster, not the key: holding `control_root` is a flood gate, and every
+edition is judged by the sealed actor's rank. A demoted staffer whose Grant revoked their Roles
+keeps only the ability to publish things everyone drops — which is why a Community that distrusts
+a former staffer rotates the root rather than trusting the fold alone.
+
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's
