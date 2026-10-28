@@ -287,8 +287,9 @@ class RelayPool:
         # uniffi invokes our async signer from a Rust worker thread, where
         # `asyncio.get_running_loop()` does not exist: bind the loop explicitly or every
         # NIP-42 attempt dies with "no running event loop" and a restricted relay closes
-        # the subscription as unauthenticated.
-        sdkloop.ensure()
+        # the subscription as unauthenticated. Declaring it as the *home* loop also gives
+        # concurrent one-shot loops something correct to restore to (see sdkloop.restore).
+        sdkloop.set_home()
         self.started_at = self.started_at or time.time()
         self._pump = asyncio.create_task(self._pump_notifications())
         await self._started.wait()

@@ -32,6 +32,11 @@ _BINDINGS = getattr(sdk, "nostr_sdk", sdk)
 
 T = TypeVar("T")
 
+#: The daemon's own loop, declared once at pump start. One-shot loops hand the binding back
+#: to this rather than to whatever they found, because "whatever they found" can be another
+#: one-shot's loop that is already closing.
+_HOME: Any = None
+
 
 def _set(loop: Any) -> None:
     """Point the bindings at `loop` (None means 'no global: use the running loop')."""
@@ -53,10 +58,27 @@ def bind(loop: asyncio.AbstractEventLoop | None = None) -> Any:
 
 
 def restore(previous: Any) -> None:
-    """Put back a binding from `bind`, dropping it if that loop has since closed."""
+    """Put back a binding from `bind`, falling back to the daemon's loop.
+
+    A one-shot loop must not leave the process unbound: the bindings resolve futures on the
+    global from a Rust worker thread, where there is no running loop to fall back to, so
+    restoring `None` turns into "no running event loop" on the next NIP-42 attempt — and
+    that is permanent, because every following attempt inherits the same `None`. Prefer the
+    home loop whenever the saved binding is gone or closed.
+    """
     if previous is not None and previous.is_closed():
         previous = None
+    if previous is None:
+        home = _HOME
+        previous = home if home is not None and not home.is_closed() else None
     _set(previous)
+
+
+def set_home(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Declare the daemon's loop as the binding and the fallback for one-shot restores."""
+    global _HOME
+    _HOME = loop if loop is not None else asyncio.get_running_loop()
+    _set(_HOME)
 
 
 @contextlib.contextmanager
