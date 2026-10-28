@@ -111,9 +111,11 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
   `review_provider` on the channel's `concord.projects` entry beats it for that channel
   alone; unset everywhere means the assignee profile's model.
 - A kind-1631 event for a PR this bridge announced posts one follow-up, `merged as <commit>`
-  (the `merge-commit` tag, or the first `applied-as-commits` value when a merge commit was
-  not named), and completes the review task with a comment naming the merge. A merge that
-  arrives for a task already completed is a no-op: nothing is written twice.
+  (NIP-34's `merge-commit` tag, or `merge-commit-id` — the spelling ngit 3.0.4 actually
+  publishes, one oid for a merge commit and every commit the push added for a fast-forward —
+  or the first `applied-as-commits` value when the proposal was applied as patches), and
+  completes the review task with a comment naming the merge. A merge that arrives for a task
+  already completed is a no-op: nothing is written twice.
 - A PR first seen *already* applied gets one message, the merged line — not a fake "ready for
   review" followed by a merge, and not a replay of history. There is nothing to review, so no
   task is made.

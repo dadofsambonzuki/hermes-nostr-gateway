@@ -69,6 +69,13 @@ KIND_ISSUE_COMMENT = 1622
 KIND_PR = 1618
 KIND_APPLIED = 1631
 
+#: How a kind-1631 names the commit(s) it landed, most specific first. NIP-34 spells a merge
+#: `merge-commit`; ngit 3.0.4 writes `merge-commit-id` instead -- one oid for a merge commit,
+#: every commit the push added for a fast-forward -- so both are read. An applied patch (no
+#: merge commit exists) carries `applied-as-commits` and is the fallback.
+MERGE_COMMIT_TAGS = ("merge-commit", "merge-commit-id")
+APPLIED_COMMIT_TAG = "applied-as-commits"
+
 #: The plane whose trusted list decides an issue's author. Concord, because that is the
 #: plane a channel belongs to; `trusted_in` unions it with the global list.
 TRUSTED_PLANE = "concord"
@@ -434,13 +441,22 @@ def pull_request_from_event(event: dict[str, Any]) -> PullRequest:
 
 def merge_from_event(event: dict[str, Any]) -> Optional[Merge]:
     """A kind-1631 that refers to a PR. Resolved issues come through here too; the caller
-    only asks about PR ids it already knows, so an issue's resolution cannot post a merge."""
+    only asks about PR ids it already knows, so an issue's resolution cannot post a merge.
+
+    The commit comes from whichever spelling the publisher used: NIP-34's `merge-commit` or
+    ngit's `merge-commit-id`. Only when neither names one is `applied-as-commits` read, which
+    is what a proposal applied as patches carries -- there is no merge commit to name then.
+    """
     pr_id = _root_id(event)
     if not event_hex(pr_id):
         return None
-    commit = _tag(event, "merge-commit")
+    commit = ""
+    for name in MERGE_COMMIT_TAGS:
+        commit = _tag(event, name)
+        if commit:
+            break
     if not commit:
-        applied = _tags(event, "applied-as-commits")
+        applied = _tags(event, APPLIED_COMMIT_TAG)
         commit = applied[0] if applied else ""
     return Merge(pr_id=event_hex(pr_id), commit=commit,
                  created_at=int(event.get("created_at") or 0))
