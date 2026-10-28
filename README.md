@@ -374,11 +374,18 @@ never announced posts one "merged" line rather than replaying history. Closing a
 Nostr does not close the task; the bridge imports open issues and narrates PRs, and a board's
 lifecycle stays the board's.
 
-State lives in the gateway store (`ngit_links`, `ngit_comments`, `ngit_cursors`): what each
-event became, which comments are already on the task, and how far each repo has been read. A
-task deleted by hand keeps its `deleted` link, so the next sync does not silently recreate it;
-pass `--recreate` when you want it back. `ngit.max_new` (default 20) spreads a backlog over
-polls instead of filling the board and the channel in one pass. See
+Channel messages are queued before they are sent (`ngit_outbox`) and marked sent only when the
+daemon took them, so a gateway busy with a turn delays a notice instead of losing it: the pass
+reports it pending and the next pass delivers it. Each notice carries a stable idempotency key,
+and the daemon answers a repeated one with the message it already published — a retry after a
+lost acknowledgement cannot post twice.
+
+State lives in the gateway store (`ngit_links`, `ngit_comments`, `ngit_cursors`,
+`ngit_outbox`): what each event became, which comments are already on the task, how far each
+repo has been read, and which notices are still waiting for the daemon. A task deleted by hand
+keeps its `deleted` link, so the next sync does not silently recreate it; pass `--recreate`
+when you want it back. `ngit.max_new` (default 20) spreads a backlog over polls instead of
+filling the board and the channel in one pass. See
 [docs/ngit-bridge.md](docs/ngit-bridge.md) for the config, the cron shape and the recovery
 paths.
 

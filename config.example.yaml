@@ -233,7 +233,7 @@ defaults:
 #   prs: true                    # announce kind-1618 PRs and kind-1631 merges
 #   priority: 0                  # task priority for anything the bridge creates
 #   max_new: 20                  # new tasks per poll; the rest wait for the next one
-#   max_prs: 10                  # PR messages per poll; the rest wait for the next one
+#   max_prs: 10                  # notices decided on, and handed to the daemon, per poll
 
 # The control pane: where a confirmation is asked, and whose word needs none. One
 # destination per plane; a plane with no entry is reported as unconfigured rather than

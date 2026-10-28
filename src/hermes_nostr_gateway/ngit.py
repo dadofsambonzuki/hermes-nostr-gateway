@@ -21,6 +21,11 @@ id and the lifecycle the bridge reached, plus a per-repo high-water mark so a po
 for what is new. A task deleted by hand leaves its `deleted` link behind, so the next sync
 does not silently recreate it; `--recreate` is how an operator asks for it back.
 
+A PR notice is queued before it is posted and marked sent only when the daemon took it, so a
+poll that is cut off mid-send (a turn holds the daemon past the socket timeout) leaves the
+notice `pending` rather than lost. Each notice carries an idempotency key, which is what makes
+retrying it safe: the daemon answers a repeated key with the message it already published.
+
 Nothing about a particular box is compiled in: the repo path, board slug, conversation and
 trusted npubs all arrive from configuration, and the one thing read from the checkout is the
 repository's own NIP-34 address.
@@ -61,7 +66,7 @@ TRUSTED_PLANE = "concord"
 
 #: States a link can hold. `held` means the question has not reached the channel yet (a
 #: retry is correct); `asked` means it did (asking again is not). For a PR, `pending` is the
-#: same idea: it is known, the channel message has not been confirmed yet.
+#: same idea: it is known, and its notice is either queued or posted but not yet confirmed.
 ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted"})
 PR_STATES = frozenset({"pending", "signalled", "merged"})
 
@@ -69,13 +74,28 @@ PR_STATES = frozenset({"pending", "signalled", "merged"})
 #: the link table, not the cursor, is what stops a replayed event being reported twice.
 CURSOR_OVERLAP_S = 300
 
+#: How long one notice waits for the daemon. A turn can hold the daemon for longer than a
+#: socket round trip takes, so the timeout is generous -- but it still has to end: the notice
+#: is queued, and giving up on it is what lets the poll finish and the next one retry.
+NOTIFY_TIMEOUT_S = 20.0
+
 
 class NgitError(RuntimeError):
     """A sync or an answer cannot proceed; the message says what the operator must fix."""
 
 
 class NotifyError(RuntimeError):
-    """The channel message did not reach the daemon, so it never reached the channel."""
+    """The daemon was asked and refused, or could not be reached at all: a message that will
+    not land until something is fixed."""
+
+
+class NotifyBusy(NotifyError):
+    """The daemon did not answer in time, which is what a running turn looks like from here.
+
+    It is not a failure: the notice stays queued and the next poll tries again. Telling the
+    two apart is what lets a busy gateway be a quiet delay instead of an error every ten
+    minutes in the cron log.
+    """
 
 
 # -- what the bridge reads ---------------------------------------------------
@@ -158,8 +178,9 @@ class BridgeConfig:
     #: open relay) is spread over polls instead of filling the board and the channel in one
     #: go; nothing is dropped, and the report says how much is still waiting.
     max_new: int = 20
-    #: How many PR messages one poll may post. The first run (or a catch-up after downtime)
-    #: must not dump a month of merged PRs into a channel; the rest follow on later polls.
+    #: How many channel notices one poll may decide on -- and, separately, how many queued
+    #: ones it may hand to the daemon. The first run (or a catch-up after downtime) must not
+    #: dump a month of merged PRs into a channel; the rest follow on later polls.
     max_prs: int = 10
 
     @classmethod
@@ -201,7 +222,7 @@ class Report:
         "would_post": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
-        "would_post": 0})
+        "pending": 0, "would_post": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -214,6 +235,12 @@ class Report:
         note = f"message not delivered: {reason}"
         if note not in self.errors:
             self.errors.append(note)
+
+    def delivery_pending(self, reason: str) -> None:
+        """A notice the daemon has not taken yet: queued, not lost, and not an error."""
+        note = f"queued for the next pass ({reason})"
+        if note not in self.notes:
+            self.notes.append(note)
 
     def as_dict(self) -> dict[str, Any]:
         return {"channel": self.channel, "repo": self.repo, "board": self.board,
@@ -234,6 +261,8 @@ class Report:
                    + (f", {i['would_create']} would be created" if self.dry_run else ""))
         out.append(f"prs:     {p['seen']} seen, {p['signalled']} signalled,"
                    f" {p['merged']} merged, {p['existing']} known"
+                   + (f", {p['pending']} pending (queued for the next pass)"
+                      if p["pending"] else "")
                    + (f", {p['deferred']} waiting for the next poll" if p["deferred"] else "")
                    + (f", {p['would_post']} would be posted" if self.dry_run else ""))
         out.append(f"posted:  {self.posted} channel message(s)"
@@ -523,26 +552,44 @@ class DaemonNotifier:
     The daemon already holds the community and the channel keys; a one-shot CLI would have
     to derive both again. `send` is the same op a reply takes, so a bridge message is
     published as us, verified, and recorded in the store like any other.
+
+    Two failures are told apart, because they mean different things to the caller. A daemon
+    that does not answer in time is busy -- a turn holds it -- and the notice can wait. A
+    daemon that is not there, or that says no, will say no again, and the operator has to
+    hear about it.
     """
 
-    def __init__(self, socket_path: str | Path, *, timeout: float = 8.0):
+    def __init__(self, socket_path: str | Path, *, timeout: float = NOTIFY_TIMEOUT_S):
         self.socket_path = Path(socket_path)
         self.timeout = timeout
 
-    def __call__(self, conversation: str, text: str) -> None:
+    def __call__(self, conversation: str, text: str, key: str = "") -> None:
         from .server import request
 
+        frame: dict[str, Any] = {"op": "send", "to": conversation, "text": text}
+        if key:
+            # The correlation id is the idempotency key: the daemon answers a repeated one
+            # with the message it already published, so a retry after a lost acknowledgement
+            # cannot post the notice twice.
+            frame["id"] = key
+
         def call() -> dict[str, Any]:
-            return asyncio.run(request(self.socket_path,
-                                       {"op": "send", "to": conversation, "text": text},
-                                       timeout=self.timeout))
+            return asyncio.run(request(self.socket_path, frame, timeout=self.timeout))
 
         try:
-            frame = _in_thread_if_running(call)
-        except (OSError, ConnectionError, TimeoutError, ValueError) as exc:
+            reply = _in_thread_if_running(call)
+        except TimeoutError as exc:
+            raise NotifyBusy(
+                f"the daemon did not answer within {self.timeout:g}s") from exc
+        except ConnectionError as exc:
+            # The daemon took the request and closed without answering: it restarted, or the
+            # handler died. The message may or may not have gone out -- the key settles
+            # that on the retry.
+            raise NotifyBusy(f"the daemon closed the connection ({exc})") from exc
+        except (OSError, ValueError) as exc:
             raise NotifyError(f"the daemon did not answer ({exc})") from exc
-        if frame.get("type") == "error" or not frame.get("ok"):
-            raise NotifyError(str(frame.get("error") or "the send was refused")[:200])
+        if reply.get("type") == "error" or not reply.get("ok"):
+            raise NotifyError(str(reply.get("error") or "the send was refused")[:200])
 
 
 def _in_thread_if_running(call: Callable[[], Any]) -> Any:
@@ -644,14 +691,25 @@ def board_path(slug: str, *, home: str | Path | None = None) -> Path:
 IssueSource = Callable[[], list[Issue]]
 DetailSource = Callable[[Issue], Issue]
 PrSource = Callable[[int], tuple[list[PullRequest], list[Merge]]]
-Notifier = Callable[[str, str], None]
+#: `notify(conversation, text, key)`: post one channel message, and let the daemon answer a
+#: repeated `key` with the message it already published instead of posting it twice.
+Notifier = Callable[[str, str, str], None]
+
+
+def notice_state(kind: int, notice: str) -> str:
+    """The link state a notice earns once the daemon has taken it."""
+    if int(kind) == KIND_PR:
+        return "merged" if notice == "merged" else "signalled"
+    return "asked" if notice == "question" else "ready"
 
 
 class Sync:
     """One pass over a channel's repo: issues in, PR news out.
 
     Every collaborator is injected, so the tests drive the whole state machine without a
-    relay, a daemon or an `ngit` child process, and the real ones are thin.
+    relay, a daemon or an `ngit` child process, and the real ones are thin. The one thing
+    that is not injected is the queue: a notice is written down before it is sent, and the
+    record only moves when the daemon says it took it.
     """
 
     def __init__(self, *, store: Store, board: Board, control: ControlConfig,
@@ -685,9 +743,13 @@ class Sync:
                 report.errors.append(f"issues: {exc}")
         if self.config.prs and self.prs is not None:
             try:
-                self._pull_requests(report, since=since, dry_run=dry_run)
+                self._read_prs(report, since=since, dry_run=dry_run)
             except NgitError as exc:
                 report.errors.append(f"prs: {exc}")
+        # Delivery is its own step, after both directions have decided what to say: what is
+        # in the queue is what gets sent, whether it was decided this pass or three passes
+        # ago, and the relay being down cannot hold a queued notice back.
+        self._deliver(report, dry_run=dry_run)
         return report
 
     # -- issues ----------------------------------------------------------
@@ -749,8 +811,10 @@ class Sync:
             return "would_create"
         if recreated:
             # The task is new, so the comments have to be copied again: the old rows point
-            # at a task that no longer exists.
+            # at a task that no longer exists. Its notice too -- the new message names the
+            # new task id, and the old one must not be taken for a duplicate of it.
             self.store.ngit_forget_comments(key, issue.hex)
+            self.store.ngit_notice_forget(key, issue.hex)
         task_id = self.board.create(
             title=issue.subject, body=task_body(issue, self.target),
             assignee=self.config.assignee, status=status,
@@ -765,26 +829,29 @@ class Sync:
         report.issues["ready" if trusted else "held"] += 1
         self._comments(issue, task_id, report, dry_run=dry_run)
         if trusted:
-            self._post(notice_message(issue, task_id), report, dry_run=dry_run)
+            if dry_run:
+                report.issues["would_post"] += 1
+            else:
+                self._enqueue(KIND_ISSUE, issue.hex, "issue",
+                              notice_message(issue, task_id))
         else:
             self._ask(issue, task_id, report, dry_run=dry_run)
         return "created"
 
     def _ask(self, issue: Issue, task_id: str, report: Report, *, dry_run: bool) -> bool:
-        """Claim the question, post it, and only keep the claim when it landed."""
-        key = self.target.key
+        """Queue the question and leave the link `held` until the daemon takes it.
+
+        `held` is the honest state while the question is unsent: the task is blocked either
+        way, and the next pass asks again. The link only becomes `asked` in `_deliver`, so a
+        question the channel never saw is never recorded as asked. The notice carries an
+        idempotency key, so asking twice cannot put two questions in the channel.
+        """
         if dry_run:
             report.issues["would_post"] += 1
             return False
-        self.store.ngit_link_state(key, KIND_ISSUE, issue.hex, "asked")
-        if not self._post(question_message(issue, task_id, self.target, self.config.assignee),
-                          report, dry_run=dry_run):
-            # Nothing reached the channel, so the next sync may ask: exactly one question,
-            # eventually, and never two.
-            self.store.ngit_link_state(key, KIND_ISSUE, issue.hex, "held")
-            report.errors.append(f"question for {issue.id} not delivered; the task stays held")
-            return False
-        log.info("ngit: asked about %s (task %s)", issue.id, task_id)
+        self._enqueue(KIND_ISSUE, issue.hex, "question",
+                      question_message(issue, task_id, self.target, self.config.assignee))
+        self.store.ngit_link_state(self.target.key, KIND_ISSUE, issue.hex, "held")
         return True
 
     def _comments(self, ref: Issue, task_id: str, report: Report, *, dry_run: bool) -> None:
@@ -809,55 +876,68 @@ class Sync:
 
     # -- pull requests ---------------------------------------------------
 
-    def _pull_requests(self, report: Report, *, since: int | None, dry_run: bool) -> None:
+    def _read_prs(self, report: Report, *, since: int | None, dry_run: bool) -> None:
+        """Decide what the channel should hear about, and queue it.
+
+        Deciding and sending are separate on purpose: a poll's job is to get the news into
+        the queue, and the queue survives the poll. That is what lets the cursor move past
+        events whose notice has not gone out yet -- the notice is not lost, it is waiting.
+        """
         if self.prs is None:
             raise NgitError("no PR source configured")
         start = self._since(since)
         prs, merges = self.prs(start)
-        newest = start
         applied = {merge.pr_id: merge for merge in merges}
         budget = max(1, int(self.config.max_prs or 1))
+        if not dry_run:
+            self._requeue_stranded(report)
+        #: Events this poll dealt with (reported, queued, or deliberately passed over), and
+        #: ones it only saw. The cursor may move past the first set and never the second.
+        settled: list[int] = []
+        deferred: list[int] = []
 
         for pr in sorted(prs, key=lambda p: (p.created_at, p.id)):
-            newest = max(newest, pr.created_at)
             report.prs["seen"] += 1
             link = self.store.ngit_link(self.target.key, KIND_PR, pr.id)
             if link is not None and link["state"] != "pending":
                 report.prs["existing"] += 1
+                settled.append(pr.created_at)
+                continue
+            if self.store.ngit_notice_queued(self.target.key, pr.id):
+                # Decided on an earlier pass and still waiting for the daemon. The queue is
+                # the record now, so deciding again would only risk a second notice.
+                settled.append(pr.created_at)
                 continue
             if budget <= 0:
                 # Nothing is forgotten: it is reported as deferred and picked up next poll.
                 report.prs["deferred"] += 1
+                deferred.append(pr.created_at)
                 continue
             merge = applied.get(pr.id)
             text = merged_message(pr, merge) if merge is not None else ready_message(pr)
+            budget -= 1
+            settled.append(pr.created_at)
             if dry_run:
                 report.prs["would_post"] += 1
-                budget -= 1
                 continue
-            budget -= 1
-            if link is None:
-                # `pending` is a claim, not a report: it is what lets a send that failed
-                # (or was interrupted) be retried next poll instead of vanishing.
-                self.store.ngit_link_save(
-                    self.target.key, KIND_PR, pr.id, board=self.target.board,
-                    state="pending",
-                    detail={"nevent": pr.nevent, "subject": pr.subject,
-                            "author": pr.author, "branch": pr.branch})
-            if not self._post(text, report, dry_run=dry_run):
-                continue
-            state = "merged" if merge is not None else "signalled"
-            self.store.ngit_link_state(self.target.key, KIND_PR, pr.id, state)
-            report.prs["merged" if state == "merged" else "signalled"] += 1
+            # `pending` is the lifecycle of a notice that has not been confirmed yet; the row
+            # is its claim, and only a daemon receipt moves the link past it.
+            self.store.ngit_link_save(
+                self.target.key, KIND_PR, pr.id, board=self.target.board, state="pending",
+                detail={"nevent": pr.nevent, "subject": pr.subject,
+                        "author": pr.author, "branch": pr.branch})
+            self._enqueue(KIND_PR, pr.id, "merged" if merge is not None else "ready", text)
 
         for merge in sorted(merges, key=lambda m: (m.created_at, m.pr_id)):
-            newest = max(newest, merge.created_at)
             link = self.store.ngit_link(self.target.key, KIND_PR, merge.pr_id)
             if link is None or link["state"] == "merged":
                 # A merge for a PR this bridge never announced is not replayed into the
                 # channel; it narrates what it watched, not the repository's history.
+                settled.append(merge.created_at)
                 continue
             if budget <= 0:
+                report.prs["deferred"] += 1
+                deferred.append(merge.created_at)
                 continue
             known = next((pr for pr in prs if pr.id == merge.pr_id), None)
             note = _detail(link)
@@ -867,47 +947,123 @@ class Sync:
                                     subject=str(note.get("subject") or ""),
                                     branch=str(note.get("branch") or ""), nevent=nevent)
             text = merged_message(known, merge, nevent)
+            budget -= 1
+            settled.append(merge.created_at)
             if dry_run:
                 report.prs["would_post"] += 1
-                budget -= 1
                 continue
-            budget -= 1
-            if self._post(text, report, dry_run=dry_run):
-                self.store.ngit_link_state(self.target.key, KIND_PR, merge.pr_id, "merged")
-                report.prs["merged"] += 1
+            self._enqueue(KIND_PR, merge.pr_id, "merged", text)
 
-        # The cursor is a promise that everything before it has been dealt with. Advancing
-        # it past a deferred PR (or one whose message never landed) would skip that PR for
-        # ever, so it only moves when this poll left nothing behind.
-        if not dry_run and newest > start and not report.prs["deferred"] and not report.failed:
-            self.store.ngit_set_cursor(self.target.key, "prs",
-                                       max(0, newest - CURSOR_OVERLAP_S))
+        # The cursor promises that everything before it has been dealt with. A queued notice
+        # counts: it is durable, and the next poll delivers it. A deferred event does not --
+        # it was seen and not decided on -- so the cursor stops short of the earliest one and
+        # the next poll reads it again.
+        if not dry_run and settled:
+            edge = min(max(settled), *deferred) if deferred else max(settled)
+            if edge - CURSOR_OVERLAP_S > start:
+                self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
 
     def _since(self, override: int | None) -> int:
+        """Where this poll starts reading.
+
+        A cursor that was deleted is a reset, not a first run: starting from the lookback
+        floor would announce a week of PRs the channel never heard about, one burst per
+        poll. A reset starts from now -- the bridge narrates what it watches, and it starts
+        watching now. A repo it has never read keeps the configured floor, which is what an
+        operator asking for history gets.
+        """
         if override is not None:
             return max(0, int(override))
         stored = self.store.ngit_cursor(self.target.key, "prs")
         if stored and str(stored).isdigit():
             return int(stored)
+        now = int(self._now())
+        if self.store.ngit_watched(self.target.key):
+            return max(0, now - CURSOR_OVERLAP_S)
         hours = max(0, int(self.config.lookback_hours or 0))
-        return max(0, int(self._now()) - hours * 3600) if hours else 0
+        return max(0, now - hours * 3600) if hours else 0
 
-    # -- posting ---------------------------------------------------------
+    # -- the queue -------------------------------------------------------
 
-    def _post(self, text: str, report: Report, *, dry_run: bool) -> bool:
-        if dry_run:
-            report.prs["would_post"] += 1
-            return False
-        if self.notify is None:
-            report.delivery_failed("no channel notifier configured")
-            return False
-        try:
-            self.notify(self.target.conversation, text)
-        except NotifyError as exc:
-            report.delivery_failed(str(exc))
-            return False
-        report.posted += 1
-        return True
+    def _enqueue(self, kind: int, source_id: str, notice: str, text: str) -> bool:
+        """Write a notice down before it is sent.
+
+        A merge supersedes a review line that has not gone out yet: telling the channel a PR
+        is ready for review after it has already merged is noise, and the review line never
+        landed, so nothing is being hidden.
+        """
+        if notice == "merged":
+            self.store.ngit_notice_drop(self.target.key, source_id)
+        return self.store.ngit_notice_put(
+            self.target.key, kind, source_id, notice,
+            conversation=self.target.conversation, text=text)
+
+    def _requeue_stranded(self, report: Report) -> None:
+        """Make a notice again for a PR whose link says `pending` and whose queue row is gone.
+
+        `pending` is a promise that the queue holds the notice. If a pass died between
+        writing the link and queueing the notice, nothing does -- and because the cursor
+        already moved past that PR, no later poll would see it. The link's own note has
+        everything the message needs.
+        """
+        for link in self.store.ngit_stranded(self.target.key, KIND_PR):
+            note = _detail(link)
+            subject = str(note.get("subject") or "")
+            if not subject:
+                continue
+            pr = PullRequest(id=str(link["source_id"]), author=str(note.get("author") or ""),
+                             subject=subject, branch=str(note.get("branch") or ""),
+                             nevent=str(note.get("nevent") or ""))
+            if self._enqueue(KIND_PR, pr.id, "ready", ready_message(pr)):
+                log.warning("ngit: requeued a notice for PR %s that had none", pr.id[:12])
+                report.notes.append(f"requeued a notice for PR {pr.id[:12]}")
+
+    def _deliver(self, report: Report, *, dry_run: bool) -> None:
+        """Hand the queue to the daemon and say how many notices are still waiting.
+
+        The count is what "pending" means in the report: notices the channel has not been
+        told about yet, which the next pass will try again.
+        """
+        repo = self.target.key
+        if not dry_run:
+            if self.notify is None:
+                report.delivery_failed("no channel notifier configured")
+            else:
+                self._drain(report, self.notify)
+        report.prs["pending"] = self.store.ngit_notice_count(repo, kind=KIND_PR)
+
+    def _drain(self, report: Report, notify: Notifier) -> None:
+        """One notice at a time, in the order they were decided.
+
+        A daemon that does not answer stops the drain. It has already ignored one notice for
+        the whole timeout, so the rest are safer queued than each costing another timeout;
+        the pass reports how many are waiting, and the next one tries again. A refusal stops
+        it too, because it will be refused the same way, and the operator needs one error
+        rather than one per notice.
+
+        Each attempt carries the notice row's own id as its idempotency key, so a retry is
+        the same message to the daemon -- and a notice queued again after a task was
+        recreated is a different one.
+        """
+        repo = self.target.key
+        for row in self.store.ngit_notice_due(repo, max(1, int(self.config.max_prs or 1))):
+            key = f"ngit:{row['id']}:{str(row['source_id'])[:12]}:{row['notice']}"
+            try:
+                notify(row["conversation"], row["text"], key)
+            except NotifyBusy as exc:
+                self.store.ngit_notice_failed(repo, row["source_id"], row["notice"], str(exc))
+                report.delivery_pending(str(exc))
+                break
+            except NotifyError as exc:
+                self.store.ngit_notice_failed(repo, row["source_id"], row["notice"], str(exc))
+                report.delivery_failed(str(exc))
+                break
+            state = notice_state(row["kind"], row["notice"])
+            self.store.ngit_notice_sent(repo, row["kind"], row["source_id"], row["notice"],
+                                        state=state)
+            report.posted += 1
+            if int(row["kind"]) == KIND_PR:
+                report.prs["merged" if state == "merged" else "signalled"] += 1
 
 
 def _detail(link: dict[str, Any]) -> dict[str, Any]:

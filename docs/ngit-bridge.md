@@ -42,10 +42,11 @@ Cron, per channel, on the host that holds the checkout and the gateway:
 */10 * * * *  cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel> --json >> /var/log/hng-ngit.log 2>&1
 ```
 
-Exit code 0 means every message reached the channel; 1 means something did not and the report
-says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the bridge
-did not touch anything. `--dry-run` reports what would happen and writes nothing — the first
-run against a live channel should be one.
+Exit code 0 means every message reached the channel **or is queued and waiting for the daemon**
+(the report says which); 1 means something was refused or could not be read, and the report
+says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the
+bridge did not touch anything. `--dry-run` reports what would happen and writes nothing — the
+first run against a live channel should be one.
 
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
 stable; `hng ngit sync` is the smallest thing that is useful today and does not block that.
@@ -62,9 +63,10 @@ stable; `hng ngit sync` is the smallest thing that is useful today and does not 
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming
-  the issue, the author, the nevent, the task and what a `yes` would do. The question is claimed
-  in `ngit_links` before it is posted and released again if the send fails, so it is asked once
-  when the channel is reachable and retried when it was not.
+  the issue, the author, the nevent, the task and what a `yes` would do. The question is queued
+  and the link stays `held` until the daemon takes it, so it is asked once when the channel is
+  reachable and retried when it was not — and the idempotency key stops a retry becoming a
+  second question.
 - `max_new` bounds how many tasks one poll creates; the rest are counted as deferred and picked
   up by the next poll. A backlog or a spam run cannot fill the board and the channel at once.
 
@@ -95,13 +97,40 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 - A merge for a PR the bridge never announced posts nothing: the bridge narrates what it
   watched, it does not dump the past into a channel.
 - The author is named in every message, including PRs this gateway opened itself.
-- A message that could not be delivered leaves the link `pending` and is retried on the next
-  poll; a delivered one moves to `signalled` (or `merged`), which is what stops a retry
-  double-posting a message that did land.
-- `max_prs` bounds how many PR messages one poll posts. The first run, or a catch-up after a
-  long outage, must not dump a month of merges into a channel; the remainder is counted as
-  deferred and picked up on later polls. The cursor only advances when a poll left nothing
-  deferred or undelivered, so a backlog cannot be stepped over.
+- `max_prs` bounds both halves of a poll: how many new notices it decides on, and how many
+  queued ones it hands to the daemon. The first run, or a catch-up after a long outage, must
+  not dump a month of merges into a channel; the remainder is counted as deferred and picked
+  up on later polls.
+
+## Delivery: decide, queue, then record
+
+A poll decides what the channel should hear, writes each notice into `ngit_outbox`, and only
+then hands it to the daemon. The record moves when the daemon says it took the message, not
+before:
+
+- **A busy daemon is a delay.** A running turn holds the daemon past the 20s socket timeout.
+  That is `NotifyBusy`, not an error: the notice stays queued, the pass reports it as `pending`
+  and exits 0, and the next pass delivers it. A refusal — no channel, no keys — is an error,
+  because the next pass would hear the same thing; the notice still stays queued, so fixing the
+  cause delivers it.
+- **One timeout per pass.** The drain stops at the first notice the daemon did not take: it has
+  already ignored one for the whole timeout, so the rest wait rather than each costing another.
+- **A retry cannot double-post.** Every queued notice has its own idempotency key — the queue
+  row's id, sent as the `send` op's `id`. The daemon records the key against the message it
+  published, so a notice that landed but lost its acknowledgement is answered with that message
+  rather than posted again. The same mechanism covers the issue notice and the question, which
+  is why `held` (not `asked`) is the state until the question is delivered.
+- **A merge supersedes an unsent review line.** If the PR merged before its review message went
+  out, the queued line is replaced: the channel is not told a PR is ready for review after it
+  has merged, and nothing that landed is hidden.
+- **The cursor follows the queue, not the daemon.** It advances past an event whose notice is
+  queued — the queue is durable — and stops short of one that was only deferred. A poll that
+  reads nothing new still delivers what the queue holds: delivery does not depend on the relay
+  window.
+- **A reset starts from now.** If `ngit_cursors` loses a repo's cursor it was deleted by hand,
+  and reading from `lookback_hours` would replay a week of PRs into the channel in bursts. The
+  bridge starts from `now` (minus the 5-minute overlap) instead. A repo it has never read keeps
+  the configured floor.
 
 Messages go through the daemon's existing `send` op, so they are published as the gateway's
 identity with the same signing, NIP-42 and recording as any other reply. There is no second
@@ -113,21 +142,31 @@ In the gateway store (`store.py`):
 
 - `ngit_links` — `(repo, kind, source event id) -> task id, board, state, note`. States:
   `ready`, `held`, `asked`, `authorised`, `declined`, `deleted` for issues; `pending`,
-  `signalled`, `merged` for PRs.
+  `signalled`, `merged` for PRs. `pending` means the notice is not confirmed; `asked` is written
+  only once the question reached the channel.
 - `ngit_comments` — which comment has been copied onto which task.
 - `ngit_cursors` — the last event time each repo's PR poll reached, with a 5-minute overlap so
   clock skew cannot skip an event; the link table, not the cursor, prevents a duplicate.
+- `ngit_outbox` — one row per notice (`issue`, `question`, `ready`, `merged`), `queued` until the
+  daemon took it and `sent` after, with an attempt count and the last error.
+- `send_keys` — the daemon's receipts: which idempotency key produced which message.
 
 Recovery:
 
 - **A task deleted by hand** keeps its `deleted` link. The next sync reports it and does not
   recreate it. `--recreate` creates a new task and updates the link.
-- **The daemon was down** when a question was due: the link stays `held`, the error is reported,
-  and the next sync asks. Nothing was lost and nothing was asked twice.
-- **A relay read fails**: PRs are reported as an error and issues still import. The cursor is
-  only advanced by events actually read.
+- **The daemon was busy or down** when a notice was due: the notice is queued, the report says
+  how many are waiting, and the next pass delivers them in order. Nothing was lost and nothing
+  was asked twice.
+- **A `pending` PR with no notice in the queue** — a pass that died between writing the link and
+  queueing the notice — is noticed on the next pass: the notice is made again from the link's own
+  note (subject, author, branch, nevent) and the report says so. Without that, the cursor having
+  moved past the PR would leave it stuck.
+- **A relay read fails**: PRs are reported as an error and issues still import; the queue is
+  still drained, so a notice already decided on is not held back by the relay.
 - **Catch-up after downtime**: the cursor is where the last successful poll ended, so the next
-  poll reads the gap; events already linked are not reported again.
+  poll reads the gap; events already linked are not reported again, and notices already queued
+  are delivered from the queue.
 
 ## Not in this bridge
 
