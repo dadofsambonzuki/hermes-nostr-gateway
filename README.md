@@ -22,7 +22,12 @@ has to know which protocol a message arrived on. When it is finished, this is wh
   not obey. Sender trust is decided once, centrally, not per transport.
 - **One adapter.** `integrations/hermes-plugin/` maps frames onto Hermes' platform contract and
   maps `authority` onto `source.role_authorized`, so an untrusted sender can reach the agent as
-  text and never as a command.
+  text and never as a command. It also owns the outbound replay guard: Hermes' delivery ledger
+  re-sends a reply it could not prove landed, wrapped in a `♻️ Recovered reply` marker, so the
+  adapter remembers what it actually put on the wire and drops an identical send to the same
+  chat — inside a window (`NOSTR_DEDUPE_WINDOW_S`, default 60s) for ordinary chat, and for good
+  for a marker-wrapped redelivery. A reply that may never have left is never recorded, so a
+  genuinely lost one is still redelivered exactly once.
 - **Durability by default.** A message is stored before it is delivered, re-offered if the
   adapter never acknowledged it, and retried per relay by republishing the *same* signed event —
   re-wrapping would change its id and show the peer a duplicate. Writes are batched onto a

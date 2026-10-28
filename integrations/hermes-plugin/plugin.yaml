@@ -20,6 +20,9 @@ optional_env:
   - name: NOSTR_ALLOW_ALL_USERS
     description: "When true, accept Nostr messages from any sender; the gateway still applies its own policy"
     password: false
+  - name: NOSTR_DEDUPE_WINDOW_S
+    description: "Seconds inside which an identical send to the same chat is treated as a replay and dropped (default 60; 0 disables the windowed rule)"
+    password: false
 license: MIT
 tags:
   - nostr
@@ -34,3 +37,7 @@ config_schema:
     type: string
     default: ""
     description: Default Nostr peer pubkey for home and cron delivery
+  dedupe_window_s:
+    type: number
+    default: 60
+    description: Seconds inside which an identical send to the same chat is dropped as a replay (0 disables the windowed rule)

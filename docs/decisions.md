@@ -36,3 +36,21 @@ experimental in docs, leave it out of the health frame, or make its tests opt-in
 Why: it runs in production for this gateway and carries real community traffic. A flag that
 defaults off means the plane is only exercised by whoever remembers to set it, and "experimental"
 in a doc is how a supported transport quietly stops being maintained.
+
+## A replayed reply is stopped at the adapter, not by disabling recovery
+
+The Hermes adapter suppresses an identical send to the same chat, and keeps Hermes' recovery
+path intact. A recovered redelivery (Hermes wraps it in a `♻️ Recovered reply` marker) is allowed
+exactly once and never a second time; an ordinary identical send is allowed again after a window
+(`NOSTR_DEDUPE_WINDOW_S`, default 60s, 0 disables the windowed rule).
+
+Why: both ends of the send path are honestly at-least-once — the daemon can publish a reply
+whose answer frame never came back, so Hermes is right to keep the delivery obligation and retry
+it. Turning recovery off would trade a visible duplicate for a silently lost reply, and every
+retry re-enters the same path, so the only place that can tell "already on the wire" from "never
+sent" is the side that writes it. A send whose outcome is unknown (socket error, timeout, daemon
+error) is never recorded: suppressing the retry of a reply that may never have left is the loss
+this is meant to prevent. The refusal path keeps `success=True` for the same reason — it is
+Hermes' "decided, do not retry" outcome, while `success=False` puts the text back into the
+delivery ledger's retry sweeps, which is the loop being closed — and the refusal is remembered
+for the window so a recovery replay of it is not attempted again.

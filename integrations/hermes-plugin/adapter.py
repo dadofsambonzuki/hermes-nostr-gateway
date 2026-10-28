@@ -9,6 +9,11 @@ Trust is not decided here. The gateway attaches `authority` to every message; th
 adapter mirrors it into `source.role_authorized`, so a stranger's DM reaches the agent
 as data and never as instructions.
 
+Delivery is at-least-once in both directions: Hermes' ledger re-sends a reply it could not
+prove landed, and the daemon can have published one whose reply frame never arrived. So the
+adapter remembers what it has actually put on the wire and drops an identical send to the
+same chat instead of letting a replay publish the same reply twice.
+
 A blocking approval prompt is the one exception to "the adapter never decides": the host
 posts it with `metadata={"is_approval_prompt": True}` and blocks the agent thread, so the
 message id it was given is remembered here and a NIP-25 reaction on that message — from the
@@ -20,12 +25,14 @@ prompt, from anyone else, or with an emoji that is not a decision leaves the gat
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import time
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -181,6 +188,150 @@ def media_note(code: str) -> str:
     return f"[attachment not delivered: {code}]"
 
 
+# -- replay suppression ----------------------------------------------------------
+# The send path is at-least-once from both ends, so something has to make a replay
+# harmless. Hermes' delivery ledger re-sends a reply it could not prove landed, wrapped in
+# this marker; the daemon can also have published a send whose reply frame never reached
+# this process, which is why the ledger is right to keep the row. The adapter is the one
+# place that sees every attempt, so it remembers what it actually put on the wire and drops
+# an identical send to the same chat: within a window for ordinary chat, and forever for a
+# marker-wrapped redelivery, whose own text says it has already been attempted once.
+#
+# The window is a dial, not a constant: identical text twice is indistinguishable from a
+# replay, and a deployment whose agent legitimately repeats a one-word answer has to be able
+# to widen or disable it (`NOSTR_DEDUPE_WINDOW_S`, config `dedupe_window_s`; 0 disables the
+# windowed rule and leaves only the recovered-reply one).
+RECOVERY_MARKER = "\u267b\ufe0f Recovered reply"
+DEFAULT_DEDUPE_WINDOW_S = 60.0
+#: (chat, body hash) pairs remembered per process. A burst cannot grow the map for the life
+#: of the gateway; the oldest entry is the one whose replay would already be stale.
+MAX_DEDUPE_ENTRIES = 256
+
+
+def is_recovery_send(content: str) -> bool:
+    """True when Hermes wrapped *content* as an already-attempted redelivery."""
+    return (content or "").lstrip().startswith(RECOVERY_MARKER)
+
+
+def reply_body(content: str) -> str:
+    """The reply a send carries, with any Hermes recovery marker removed.
+
+    The marker is a header line, then a blank line, then the original text. Dedupe compares
+    bodies, so a recovered redelivery of a reply this process already delivered matches the
+    delivery that came before it instead of looking like new content.
+    """
+    text = content or ""
+    stripped = text.lstrip()
+    if not stripped.startswith(RECOVERY_MARKER):
+        return text
+    _, separator, rest = stripped.partition("\n\n")
+    if separator:
+        return rest
+    # A marker with no blank line: treat everything after its first line as the body.
+    _, newline, rest = stripped.partition("\n")
+    return rest if newline else ""
+
+
+def dedupe_window_seconds(config: Any) -> float:
+    """The configured replay window, in seconds. 0 means the windowed rule is off."""
+    raw = os.environ.get("NOSTR_DEDUPE_WINDOW_S")
+    if raw is None or not str(raw).strip():
+        raw = _extra(config).get("dedupe_window_s")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_DEDUPE_WINDOW_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("nostr dedupe window %r is not a number; using %.0fs",
+                       raw, DEFAULT_DEDUPE_WINDOW_S)
+        return DEFAULT_DEDUPE_WINDOW_S
+    return max(0.0, value)
+
+
+class DeliveryDedupe:
+    """What this process has already put on the wire, per (chat, reply body).
+
+    Three states per key: ``sending`` (a send is in flight), ``sent`` (the daemon took it) and
+    ``refused`` (the adapter declined to address the chat). A claim is taken **before** the
+    first await, so two identical sends racing each other cannot both reach the daemon — that
+    race is the shape of the five-way replay, since each attempt looks new until it settles.
+
+    What each state suppresses:
+
+    - ``sending``: an identical send while the first is in flight (a duplicate by construction).
+      A claim older than a send timeout is stale — a crashed or hung attempt must not wedge the
+      chat forever — and is treated as unknown, i.e. allowed through.
+    - ``sent``: an identical send inside the window; and a marker-wrapped redelivery of that
+      body at any age, because the body already landed once.
+    - ``refused``: an identical send inside the window only. A refusal is a fact about the
+      destinations this process knows, and a peer that writes in becomes addressable, so it is
+      not remembered as permanent the way a delivery is.
+
+    A send whose outcome is unknown (socket error, timeout, daemon error) is never recorded:
+    suppressing the retry of a reply that may never have left would lose it.
+    """
+
+    def __init__(self, window_s: float = DEFAULT_DEDUPE_WINDOW_S,
+                 max_entries: int = MAX_DEDUPE_ENTRIES,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.window_s = max(0.0, float(window_s))
+        self.max_entries = max(1, int(max_entries))
+        self._clock = clock
+        self._entries: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @staticmethod
+    def _key(chat_id: str, body: str) -> tuple[str, str]:
+        return ((chat_id or "").strip().lower(),
+                hashlib.sha256((body or "").encode("utf-8")).hexdigest())
+
+    def _stale_after(self) -> float:
+        """How long an unsettled claim may sit before it stops blocking the chat."""
+        return max(self.window_s, SEND_TIMEOUT_S)
+
+    def claim(self, chat_id: str, body: str, *, recovered: bool) -> Optional[str]:
+        """Reserve this send, or return why it is a replay that must not be sent."""
+        key = self._key(chat_id, body)
+        now = self._clock()
+        entry = self._entries.get(key)
+        if entry is not None:
+            state, stamp = entry
+            age = now - stamp
+            if state == "sending" and age <= self._stale_after():
+                reason = "an identical send is already in flight"
+            elif state == "sent" and (recovered or (self.window_s > 0 and age <= self.window_s)):
+                reason = f"identical content was delivered {age:.0f}s ago"
+            elif state == "refused" and self.window_s > 0 and age <= self.window_s:
+                reason = f"identical content was refused {age:.0f}s ago"
+            else:
+                reason = ""
+            if reason:
+                self._entries.move_to_end(key)
+                return reason
+        self._entries[key] = ("sending", now)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+        return None
+
+    def settle(self, chat_id: str, body: str, *, delivered: bool) -> None:
+        """Record how a claimed send (or a refusal) ended."""
+        key = self._key(chat_id, body)
+        self._entries[key] = ("sent" if delivered else "refused", self._clock())
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+    def release(self, chat_id: str, body: str) -> None:
+        """Drop a claim whose outcome is unknown, so a retry is not suppressed."""
+        key = self._key(chat_id, body)
+        entry = self._entries.get(key)
+        if entry is not None and entry[0] == "sending":
+            del self._entries[key]
+
+
 class NostrGatewayAdapter(BasePlatformAdapter):
     """One reader connection (subscribe) and a short-lived connection per send."""
 
@@ -206,6 +357,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Approval prompts this adapter delivered, newest last: event id → (chat_id,
         # session_key). A reaction on one of these is a decision about that gate.
         self._approval_prompts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # What this process has already delivered, so a replayed reply (Hermes' recovery
+        # path, a retried send, a racing duplicate) is not published a second time.
+        self._delivery_dedupe = DeliveryDedupe(dedupe_window_seconds(config))
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -262,6 +416,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             return False
         return (target == self._home_chat() or target == self._control_chat()
                 or target in self._peers)
+
+    def _dedupe(self) -> DeliveryDedupe:
+        """This process' replay memory (an adapter built by __new__ in a test has none yet)."""
+        memory = getattr(self, "_delivery_dedupe", None)
+        if memory is None:
+            memory = self._delivery_dedupe = DeliveryDedupe(
+                dedupe_window_seconds(getattr(self, "_config", None)))
+        return memory
 
     def _control_chat(self) -> str:
         """An npub explicitly nominated to receive control notices (a control plane).
@@ -682,28 +844,71 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if is_control_text(content) and not self._control_allowed(chat_id):
             logger.debug("nostr send skipped: Hermes control notice, not a message")
-            return SendResult(success=True, raw_response={"skipped": "control_notice"})
+            return SendResult(success=True, raw_response={"skipped": "control_notice",
+                                                          "delivered": False})
+        # Compare the reply itself, not the wrapper: a recovered redelivery carries the text
+        # the first attempt carried, and that is what may already have been delivered.
+        body = reply_body(content)
+        recovered = is_recovery_send(content)
+        # An approval prompt is never deduped. Two identical "allow this command?" gates are
+        # two different questions (each answerable by a reaction, each tracked under its own
+        # message id), and dropping the second would leave the host blocked on a prompt the
+        # human never saw. The gate owns its own replay semantics; this guard is for chat.
+        prompt = bool((metadata or {}).get("is_approval_prompt"))
+        memory = None if prompt else self._dedupe()
+        if memory is not None:
+            duplicate = memory.claim(chat_id, body, recovered=recovered)
+            if duplicate:
+                # Checked before the address check: a refusal this process already recorded is
+                # a replay too, and re-entering it is how the recovery path produced five rows.
+                # Not a failure: the content is settled, so Hermes must record this attempt as
+                # such rather than retrying it again.
+                logger.warning("nostr send suppressed as a replay: %s (%s)",
+                               _short(str(chat_id or "")), duplicate)
+                return SendResult(success=True, retryable=False,
+                                  raw_response={"skipped": "duplicate", "delivered": False,
+                                                "reason": duplicate})
         if not self._may_address(chat_id):
             # A misdirected notice is as bad as a control string: never invent a
-            # destination. Report success so Hermes does not retry it forever.
+            # destination. `success=True` is deliberate — it is Hermes' "decided, do not
+            # retry" outcome (its own silence-narration filter returns the same shape),
+            # while `success=False` would hand the text back to the delivery ledger's retry
+            # sweeps, which is the replay this guard exists to stop. `delivered: False`
+            # keeps the outcome from reading as a delivery, and the refusal is remembered
+            # so a recovered redelivery of the same text is not attempted again inside the
+            # window.
             logger.warning("nostr send refused: %s is neither the home channel nor a peer "
                            "that has written here", _short(str(chat_id or "")))
-            return SendResult(success=True, raw_response={"skipped": "unknown_destination"})
+            if memory is not None:
+                memory.settle(chat_id, body, delivered=False)
+            return SendResult(success=True, retryable=False,
+                              raw_response={"skipped": "unknown_destination",
+                                            "delivered": False})
         try:
             frame = await self._request(
                 {"op": "send", "to": chat_id, "text": content, "reply_to": reply_to},
                 timeout=SEND_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 - report as a send failure
+            if memory is not None:
+                memory.release(chat_id, body)
             logger.warning("nostr send failed: %s", exc)
             return SendResult(success=False, error=str(exc)[:300], retryable=True)
         if frame.get("type") == "error":
+            if memory is not None:
+                memory.release(chat_id, body)
             return SendResult(success=False, error=str(frame.get("error"))[:300])
         if not frame.get("ok"):
+            # The daemon answered but no relay took it: the outcome is not a delivery, so a
+            # retry must be allowed to carry the same text again.
+            if memory is not None:
+                memory.release(chat_id, body)
             return SendResult(success=False, error=json.dumps(frame.get("errors") or {})[:300],
                               raw_response=frame, retryable=True)
+        if memory is not None:
+            memory.settle(chat_id, body, delivered=True)
         result = SendResult(success=True, message_id=frame.get("message_id"), raw_response=frame)
-        if (metadata or {}).get("is_approval_prompt"):
+        if prompt:
             # The host blocks the agent thread until this gate is answered, and the typed
             # commands are not the only way in: remember which message carried the prompt so
             # a reaction on it can resolve the same queue. Only a send that actually landed
