@@ -147,7 +147,7 @@ socket 0600, directory 0700. No TCP in v1; no HTTP.
 | `identities.list` | — | `npub`, transports, relay counts |
 | `status` | — | version, uptime, queue depth, per-relay state, allowlist size |
 | `health` | `quiet_minutes?`, `pending_stale_minutes?` | per plane: last event + age, pending, blocked, degraded + reasons; relay totals; one `summary` line |
-| `send` | `identity`, `to`, `text`, `transport=auto`, `reply_to?`, `attachments?: [{path, alt?}]` | `rumor_id`, `event_ids`, `relays_ok[]`, `relays_failed[]`, `sent_at`, `attachments[]` |
+| `send` | `identity`, `to`, `text`, `transport=auto`, `reply_to?`, `attachments?: [{path, alt?}]`, `route?` | `rumor_id`, `event_ids`, `relays_ok[]`, `relays_failed[]`, `sent_at`, `attachments[]`, `route?` |
 | `react` | `identity`, `to`, `rumor_id`, `emoji="+"` | `reaction_rumor_id`, per-relay results |
 | `media.get` | `identity`, `sha256` or `url` (or `rumor_id`) | `path`, `mime`, `size`, verified `sha256`, `cached` |
 | `history` | `identity`, `peer`, `limit`, `before?` | messages, newest first |
@@ -161,12 +161,21 @@ Server frames:
 ```
 {"type":"message","cursor":41,"identity":"npub1…","from":"npub1…","transport":"nip17",
  "text":"…","created_at":1792…,"reply_to":null,"rumor_id":"…","received_at":1792…,
- "attachments":[{"url":"https://…","mime":"image/jpeg","size":123456,"sha256":"…","status":"available"}]}
+ "attachments":[{"url":"https://…","mime":"image/jpeg","size":123456,"sha256":"…","status":"available"}],
+ "route":{"provider":"…","model":"…","key":"MODEL_KEY","rule":"channel","why":"…"}}
 {"type":"reaction","cursor":42,"target_rumor_id":"…","from":"npub1…","emoji":"🔥","resolved":true}
 {"type":"blocked","from":"npub1…","reason":"not_allowlisted","rumor_id":"…"}
 {"type":"delivery","rumor_id":"…","ok":true,"relays_ok":["wss://…"]}
 {"type":"status","relays":{…},"queue_depth":0}
 ```
+
+`route` is present only when `routing` is configured, and carries **names**: `provider` and
+`model` for the turn, and `key` naming the environment (or `.env`) entry to read — never its value.
+`rule` says which rule won (`channel`, `plane`, `default`) and `why` says what it beat. The adapter
+reports the route it ran on with its `send`, and that reply (`{"route":{…}}` on the `delivery`
+frame, and on the stored row) is the audit trail. A route that cannot be honoured is a `blocked`
+frame with `reason: route_key_missing` or `route_unresolved`, never a message: see
+docs/decisions.md.
 
 Text is capped at 8 KB inbound and outbound; larger is truncated with `"truncated":true`
 rather than dropped, so the agent can still see that something arrived.
@@ -301,6 +310,11 @@ Written as a contract the daemon enforces, not advice for callers:
    `handle_message`, so the turn starts with the file on disk — and never for a `blocked`
    frame or a digest batch;
 6. surface `blocked`/`delivery` frames as warnings, never as user-visible chat.
+7. when a `message` frame carries a `route`, honour it: read the credential it names at the moment
+   the turn runs, hand the route to the host on the event, and report back with the `send` which
+   route the turn actually ran on. A route it cannot honour (`route_key_missing`,
+   `route_unresolved`) is a turn that does not happen — never a fallback to another credential —
+   and the frame is left unacknowledged so it is offered again once the route can be honoured.
 
 A refusal is part of the contract, not an error to swallow: the adapter passes the code to
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an

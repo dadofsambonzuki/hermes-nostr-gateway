@@ -19,7 +19,7 @@ class FakeHandler:
     async def status(self):
         return {"identity": "me", "rumors": 1}
 
-    async def send(self, *, to, text, reply_to, cid):
+    async def send(self, *, to, text, reply_to, cid, route=None):
         return {"type": "delivery", "id": cid, "ok": True, "message_id": "r1"}
 
     def history(self, limit):

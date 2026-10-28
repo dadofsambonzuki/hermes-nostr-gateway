@@ -148,6 +148,70 @@ def is_digest_frame(frame: dict[str, Any]) -> bool:
     return frame.get("plane") == "digest" or frame.get("sender") == "digest"
 
 
+# -- routing --------------------------------------------------------------------
+# The gateway decides which provider, model and credential a conversation's turn asks for, and
+# says so on the frame: `route` carries names only, and `key` is the *name* of a variable. The
+# value is read here, at the moment the turn is about to run, and is never logged, never kept on
+# the event and never echoed back. A route that cannot be honoured refuses the turn rather than
+# running it on some other model or another channel's key — the gateway keeps the message
+# unacknowledged and replays it once the route can be honoured.
+#
+# Hermes' own provider resolution is not touched here (applying a provider per turn is the
+# host's change, not the transport's): the adapter hands the route to the host on the event so
+# it can be applied and audited, and reports back what it ran on.
+def env_value(name: str, env_file: str = "") -> str:
+    """The value of *name* from the environment, else from *env_file*; "" when absent."""
+    if not name:
+        return ""
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    if not env_file:
+        return ""
+    try:
+        with open(env_file, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, raw = line.partition("=")
+                if key.strip().removeprefix("export ").strip() == name:
+                    raw = raw.strip()
+                    quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\""
+                    return raw[1:-1] if quoted else raw
+    except OSError:
+        return ""
+    return ""
+
+
+def route_for_turn(frame: dict[str, Any]) -> tuple[Optional[dict[str, str]], str]:
+    """`(route, refusal)` for one inbound frame.
+
+    No `route` field means routing is not configured, and the host's own model applies —
+    `(None, "")`. A route the gateway could not resolve is `(None, reason)`: the turn must not
+    run, and the caller leaves the frame unacknowledged so it is offered again later.
+    """
+    raw = frame.get("route")
+    if not isinstance(raw, dict) or not raw:
+        return None, ""
+    if raw.get("error"):
+        return None, str(f"{raw.get('error')}: {raw.get('detail') or ''}").strip(": ")
+    route = {name: str(raw.get(name) or "") for name in
+             ("provider", "model", "key", "rule", "why")}
+    key = route["key"]
+    if key and not env_value(key, str(raw.get("env_file") or "")):
+        return None, f"${key} is not set, and the turn will not borrow another key"
+    return route, ""
+
+
+def route_note(route: dict[str, str]) -> str:
+    """One line naming what the turn is running on, for the audit log. Never a value."""
+    served = f"{route.get('provider') or '?'}/{route.get('model') or '?'}"
+    key = f" key ${route['key']}" if route.get("key") else ""
+    rule = f" via {route['rule']}" if route.get("rule") else ""
+    return f"{served}{key}{rule}"
+
+
 # -- attachments ----------------------------------------------------------------
 # The gateway records the sender's NIP-92 `imeta` claims with the message and downloads
 # nothing on receipt; `media.get` is the one verified way to turn a claim into bytes. Hermes
@@ -206,6 +270,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Approval prompts this adapter delivered, newest last: event id → (chat_id,
         # session_key). A reaction on one of these is a decision about that gate.
         self._approval_prompts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        #: conversation → the route its last delivered turn ran on, so the reply can report it
+        #: back for the audit trail. Bounded: a busy gateway hears from many peers.
+        self._routes: OrderedDict[str, dict[str, str]] = OrderedDict()
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -493,6 +560,24 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             kinds.append(result["kind"])
         return paths, mimes, kinds, refused
 
+    # -- routing --------------------------------------------------------
+    def _remember_route(self, conversation: str, route: dict[str, str]) -> None:
+        """Keep the route this conversation's turn ran on, for the reply to report back."""
+        key = (conversation or "").strip().lower()
+        if not key or not route:
+            return
+        routes = getattr(self, "_routes", None)
+        if routes is None:  # built by `__new__` in a test or a wrapper
+            routes = self._routes = OrderedDict()
+        routes[key] = route
+        routes.move_to_end(key)
+        while len(routes) > 200:
+            routes.popitem(last=False)
+
+    def _route_for_chat(self, chat_id: str) -> Optional[dict[str, str]]:
+        """The route the last turn in this conversation ran on, or None when unrouted."""
+        return (getattr(self, "_routes", None) or {}).get((chat_id or "").strip().lower())
+
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
         backoff = 1.0
@@ -588,6 +673,16 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             logger.debug("nostr inbound skipped: control notice from %s", _short(sender))
             await self._ack(message_id)
             return
+        # Where this turn is meant to run, before anything is downloaded for it: a route that
+        # cannot be honoured is not a turn, and an unacknowledged frame is offered again once
+        # the key is there (`hng route` says which rule and which variable).
+        route, refusal = route_for_turn(frame)
+        if refusal:
+            logger.error("nostr turn not run for %s: %s", _short(sender), refusal)
+            return
+        if route:
+            self._remember_route(conversation, route)
+            logger.info("nostr turn for %s on %s", _short(sender), route_note(route))
         authoritative = frame.get("authority") == "instructions"
         # Attachments before the event: the agent's turn starts with the file already on disk,
         # because a turn that begins without the picture cannot go back for it. A refusal is
@@ -630,6 +725,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            # The route the gateway resolved travels with the event, so the host can apply it
+            # per turn and audit it. Names only: the credential itself was read above and goes
+            # nowhere near a frame, a log line or this metadata.
+            metadata=dict({"nostr_route": route} if route else {}),
         )
         await self.handle_message(event)
         # Record before the ack: if the ack fails and the gateway replays the frame,
@@ -690,10 +789,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                            "that has written here", _short(str(chat_id or "")))
             return SendResult(success=True, raw_response={"skipped": "unknown_destination"})
         try:
-            frame = await self._request(
-                {"op": "send", "to": chat_id, "text": content, "reply_to": reply_to},
-                timeout=SEND_TIMEOUT_S,
-            )
+            payload: dict[str, Any] = {"op": "send", "to": chat_id, "text": content,
+                                       "reply_to": reply_to}
+            route = self._route_for_chat(chat_id)
+            if route:
+                # Report the route this conversation's turn ran on, so the reply row records
+                # what was used rather than what the gateway meant. Names only, never a value.
+                payload["route"] = route
+            frame = await self._request(payload, timeout=SEND_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001 - report as a send failure
             logger.warning("nostr send failed: %s", exc)
             return SendResult(success=False, error=str(exc)[:300], retryable=True)

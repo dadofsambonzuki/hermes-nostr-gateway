@@ -359,6 +359,71 @@ control:
   else's is held and posted into `control.concord` for a human (see *Joining a community*).
 
 
+## Routing a turn: provider, model and key
+
+Without configuration every turn runs on whatever the agent is configured with. A `routing` block
+lets one conversation ask for a specific provider, model and credential instead: a cheap model for
+a noisy feed, a stronger one for a work channel, a dedicated key so one channel's usage is
+accountable.
+
+```yaml
+routing:
+  models:                                        # the catalogue: the only model names usable here
+    - model-a
+    - model-b
+  default: {provider: provider-a, model: model-a, key: GATEWAY_MODEL_KEY}
+  planes:
+    concord: {provider: provider-a, model: model-b, key: CONCORD_MODEL_KEY}
+    nip17: {provider: provider-a, model: model-a}   # no key: the agent's own credential
+  channels:                                      # Concord only: a channel id, or its current name
+    - community: <community id>                  # optional; restrict the rule to one community
+      channel: <channel id or name>
+      provider: provider-b
+      model: model-b
+      key: WORK_CHANNEL_KEY
+  # env_file: ~/.config/hermes-nostr-gateway/.env   # default: a .env beside the config
+```
+
+Precedence is **channel > plane > default**, and it is total: `routing.default` is required once
+the block exists, so every conversation resolves to exactly one rule and nothing falls through to
+a guess. A channel rule matches on id before name, so renaming a channel keeps its route.
+
+- `key` is the **name** of an environment variable (or of an entry in `routing.env_file`), never a
+  value. It is read when the turn is about to run and never logged, never put in a frame and never
+  in an error. A rule that looks like it holds a token is refused at load *without echoing it*. A
+  name that cannot be read fails the turn; it never borrows another rule's credential.
+- `routing.models` is the catalogue. A rule naming a model that is not in it is a load error, not a
+  fallback: a turn billed to the wrong model is worse than a start that stops. `hng serve` refuses
+  such a block (exit 2); `hng route --check` reports the same problems without starting anything.
+- A channel rule naming a channel the gateway does not hold is **unresolved**, not the plane's
+  route. A route is configuration, not protocol: deleting a channel does not rewrite the file, so
+  the stale entry is what has to show. (`--check` names it.)
+
+`hng route` prints the table with each rule's provider, model, key name and whether that key is
+set. `hng route <conversation>` answers the question behind a wrong-looking answer — which rule won,
+what it beat, and whether the key it names is there:
+
+```
+$ hng route concord:<community>:<channel id>
+concord:<community>:<channel id>  (concord)
+  provider   provider-b
+  model      model-b
+  key        $WORK_CHANNEL_KEY (set)
+  rule       channel rule routing.channels[0] beats routing.planes.concord and routing.default
+```
+
+The route travels on the inbound frame (`route`: provider, model, the key's *name*, and which rule
+won), so the adapter knows what the turn asks for before it runs. A route the gateway cannot honour
+becomes a `blocked` frame with `reason: route_key_missing` or `route_unresolved` — never a message,
+because a turn that silently runs on another model or another account is the failure this exists to
+prevent — and the row stays unacknowledged, so the turn runs once the key is exported or the stale
+entry corrected. The adapter hands the route to the host on the event, reads the credential itself,
+and reports the route it used on its `send`: the reply's row and the `delivery` frame carry it, so
+`hng recent` shows which provider and model actually answered. Applying a provider *inside* the
+agent is Hermes' resolution and stays there; this is the gateway deciding what to ask for.
+See `docs/decisions.md`, "A route travels on the frame".
+
+
 ## Relays and kinds
 
 One subscription per relay, because each extra connection counts against the relay's

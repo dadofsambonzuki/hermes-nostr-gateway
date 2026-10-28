@@ -51,6 +51,7 @@ from .policy import Policy
 from .pool import PoolWorker, RelayPool
 from .projects import ProjectMap
 from .publisher import Publisher, make_publisher
+from .routing import Resolution, load_router, reported_route
 from .server import SocketServer
 from .store import Store, drops_ttl_seconds
 from .writer import StoreWriter
@@ -248,10 +249,15 @@ class Gateway:
     )
 
     def __init__(self, cfg: dict[str, Any], *, socket_path: str | Path | None = None,
-                 peer_resolver: InboxResolver | None = None):
+                 peer_resolver: InboxResolver | None = None,
+                 config_path: str | Path | None = None):
         from .cli import normalise_groups, secret_from
 
         self.cfg = cfg
+        # Before anything is opened: a routing block that cannot be honoured would send a turn
+        # to a model or an account nobody chose, so it is a reason not to start at all (the
+        # same rule as Marmot ownership below).
+        self.routing = load_router(cfg.get("routing"), config_path=config_path)
         # Before the secret is read and before any store or socket is opened: a
         # configuration that would deliver every Marmot message twice is not a
         # process to start and then warn about.
@@ -952,9 +958,43 @@ class Gateway:
         await self._stopping.wait()
 
     # -- inbound --------------------------------------------------------
-    @staticmethod
-    def frame_for(msg: Any) -> dict[str, Any]:
-        """A message frame, or a `blocked` frame when policy refused it.
+    def route_for(self, plane: str, conversation: str = "") -> Resolution:
+        """The route a conversation's turn is asked to use — never a credential.
+
+        The Concord channel list is consulted only once the plane has learned it: before the
+        first refresh the list is empty because nothing has been asked yet, not because every
+        channel is gone, and a route that may be fine must not be refused on a not-yet.
+        """
+        if not self.routing:
+            return Resolution(rule="none")
+        known = self.concord.channels() if self.concord.refreshed else None
+        return self.routing.resolve(plane, conversation, known_channels=known)
+
+    def _routed(self, frame: dict[str, Any], *, plane: str, conversation: str) -> dict[str, Any]:
+        """A message frame carrying the route its turn is asked to use, or a refusal instead.
+
+        A route that cannot be honoured is not a message: handing the agent a turn with a
+        provider nobody chose (or a key that is not there, so the process quietly uses another)
+        is the silent substitution this block exists to prevent. It becomes a `blocked` frame —
+        stored, logged, visible — and the row stays unacknowledged, so the turn runs once the
+        route can be honoured: a key exported, or a stale channel entry corrected.
+        """
+        if not self.routing:
+            return frame
+        resolution = self.route_for(plane, conversation)
+        if resolution.error:
+            log.error("no route for %s %s: %s (%s)", plane, conversation or "(none)",
+                      resolution.error, resolution.detail)
+            return {"type": "blocked", "plane": plane,
+                    "from": frame.get("sender") or frame.get("from") or "",
+                    "reason": resolution.error, "why": resolution.detail,
+                    "rumor_id": frame.get("id")}
+        routed = dict(frame)
+        routed["route"] = resolution.to_frame()
+        return routed
+
+    def frame_for(self, msg: Any) -> dict[str, Any]:
+        """A message frame, or a `blocked` frame when policy refused it or it cannot be routed.
 
         A blocked message is still stored (see §13.3) but must never look like chat:
         the adapter turns `type: message` into an agent run, and a `drop` reach used
@@ -968,7 +1008,7 @@ class Gateway:
                 "reason": msg.blocked_reason or "not_allowlisted",
                 "rumor_id": msg.id,
             }
-        return msg.to_frame()
+        return self._routed(msg.to_frame(), plane=msg.plane, conversation=msg.conversation)
 
     def _echo_lookup(self, peer: str, since: int) -> list[str]:
         """Our own text to one peer since `since` — evidence for the echo rule.
@@ -1079,13 +1119,17 @@ class Gateway:
 
     # -- outbound -------------------------------------------------------
     async def send(self, *, to: str, text: str, reply_to: str | None = None,
-                   cid: str | None = None) -> dict[str, Any]:
+                   cid: str | None = None, route: Any = None) -> dict[str, Any]:
         target = str(to or "").strip()
+        # What the adapter says the turn ran on, trimmed to names. It goes on the reply's row
+        # and back in the reply, so the audit trail is the route that was used rather than the
+        # one the daemon hoped for. Never a credential: see routing.reported_route.
+        reported = reported_route(route)
         if is_concord_conversation(target):
             # A message read in a channel is answered in that channel: the conversation it
             # was stored under already names the room, so a reply must never become a DM to
             # whoever happened to speak there.
-            return await self._send_concord(target, text, reply_to, cid)
+            return await self._send_concord(target, text, reply_to, cid, reported)
         explicit_marmot = target.lower().startswith("marmot:")
         if self.marmot_resolver is None:
             # An explicit Marmot target with no plane attached must say so: falling
@@ -1119,19 +1163,21 @@ class Gateway:
         peer_ok = any(ok for ok, _ in results["peer"].values())
         if peer_ok:
             # Record what we sent, so history is not one-sided and an answer can be
-            # traced back to the message that prompted it.
+            # traced back to the message that prompted it. `route` is what the adapter says
+            # the turn ran on: the reply carries the audit trail, not the queue.
             from .store import Inbound as _Inbound
             self.store.add(_Inbound(
                 id=rumor["id"], wrapper_id=wraps["peer"]["id"], sender=self.me,
                 kind=int(rumor.get("kind", 14)), created_at=int(rumor.get("created_at", 0)),
                 content=text, conversation=peer, reply_to=reply_to, plane="nip17",
                 reach="sent", authority="self", rule="outbound", why="sent by us",
+                route=reported or None,
             ))
             # The row is queued, so `mark_delivered` has nothing to update until the
             # writer commits it: flush first, or our own message comes back as pending.
             await self.store.flush()
             self.store.mark_delivered([rumor["id"]])
-        return {
+        delivery = {
             "type": "delivery",
             "id": cid,
             "ok": peer_ok,
@@ -1139,9 +1185,12 @@ class Gateway:
             "relays": {label: {r: ok for r, (ok, _) in v.items()} for label, v in results.items()},
             "errors": {r: e for label, v in results.items() for r, (ok, e) in v.items() if not ok},
         }
+        if reported:
+            delivery["route"] = reported
+        return delivery
 
     async def _send_concord(self, conversation: str, text: str, reply_to: str | None,
-                            cid: str | None) -> dict[str, Any]:
+                            cid: str | None, route: dict[str, str] | None = None) -> dict[str, Any]:
         """Publish a message back into the Concord channel a conversation came from.
 
         The plane is the index, not the sender: it says which invite and channel the
@@ -1179,19 +1228,22 @@ class Gateway:
                 kind=int(rumor.get("kind", 9)), created_at=int(rumor.get("created_at", 0)),
                 content=text, conversation=stream.chat_id, reply_to=reply_to,
                 plane="concord", reach="sent", authority="self", rule="outbound",
-                why="sent by us",
+                why="sent by us", route=route or None,
             ))
             # Queued through the writer, so flush before marking it delivered or our own
             # message sits in `pending` as if it never went out.
             await self.store.flush()
             self.store.mark_delivered([str(rumor["id"])])
-        return {
+        delivery = {
             "type": "delivery", "id": cid, "ok": ok, "conversation": stream.chat_id,
             "message_id": str(rumor["id"]),
             "relays": {"channel": {relay: outcome == "ok" for relay, outcome in results.items()}},
             "errors": {relay: outcome for relay, outcome in results.items()
                        if outcome != "ok"},
         }
+        if route:
+            delivery["route"] = route
+        return delivery
 
     def _quote_for(self, reply_to: str | None) -> tuple[str, str] | None:
         """`(wrap id, author)` for the message a reply answers, or None when it answers none.
@@ -1485,7 +1537,12 @@ class Gateway:
             # adapter sees a photo it can no longer ask for.
             if row.get("attachments"):
                 frame["attachments"] = row["attachments"]
-            frames.append(frame)
+            # And the same route: a replayed turn must run on the provider it was asked for,
+            # not on whatever the agent happens to be configured with. Routing is decided
+            # again here rather than stored, so a key exported since the first attempt is
+            # what the retry uses.
+            frames.append(self._routed(frame, plane=row["plane"],
+                                       conversation=row["conversation"]))
         return frames
 
     def replay_skip(self) -> dict[str, Any]:

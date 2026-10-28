@@ -75,6 +75,10 @@ class ConcordPlane:
         #: Where a confirmation goes and who needs none. Optional, and the safe default:
         #: with no control config nobody is trusted, so every invite waits for a human.
         self.control = control
+        #: Set once the channel list has been read at least once. Routing asks for it before
+        #: a route for a channel can be trusted: an empty list is "not asked yet" until then,
+        #: and "this channel is gone" afterwards.
+        self.refreshed = False
 
     def project_for(self, *, community_id: str = "", channel_id: str = "",
                     channel_name: str = "") -> Optional[dict[str, Any]]:
@@ -100,6 +104,9 @@ class ConcordPlane:
                 invite, stream.channel_id, None if channel is None else channel.key,
                 None if channel is None else channel.epoch)
         self._members[invite.community_id.hex()] = set(members)
+        # From here on an empty channel list means the community has no readable channel, not
+        # that nothing has been read yet — routing depends on the difference.
+        self.refreshed = True
         # Remember the invite the channels came from: a reply is addressed by conversation
         # alone, and the bundle is where its relays and root live.
         self._invites[invite.community_id.hex()] = invite
