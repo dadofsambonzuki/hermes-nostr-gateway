@@ -35,19 +35,37 @@ from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .projects import Project, ProjectMap, checks_for, load_registry
 from .publisher import publish
+from .routing import (
+    KnownChannel,
+    Route,
+    Router,
+    conversation_plane,
+    known_channels_from_invites,
+)
 from .store import Store, drops_ttl_seconds
 
 DEFAULT_CONFIG = Path("config.yaml")
 
 
-def load_config(path: str | None = None) -> dict[str, Any]:
-    candidates = [path, os.environ.get("HNG_CONFIG"), str(DEFAULT_CONFIG),
-                  str(Path.home() / ".config/hermes-nostr-gateway/config.yaml")]
-    for candidate in candidates:
+def resolve_config_path(path: str | None = None) -> Path | None:
+    """The file `load_config` would read, so a caller can name it back to the operator.
+
+    Routing needs it: `routing.env_file` defaults to a `.env` beside the config, and an error
+    has to say which file it looked in.
+    """
+    for candidate in (path, os.environ.get("HNG_CONFIG"), str(DEFAULT_CONFIG),
+                      str(Path.home() / ".config/hermes-nostr-gateway/config.yaml")):
         if candidate and Path(candidate).exists():
-            with open(candidate) as fh:
-                return yaml.safe_load(fh) or {}
-    raise SystemExit("no config found: pass --config or create config.yaml")
+            return Path(candidate)
+    return None
+
+
+def load_config(path: str | None = None) -> dict[str, Any]:
+    found = resolve_config_path(path)
+    if found is None:
+        raise SystemExit("no config found: pass --config or create config.yaml")
+    with open(found) as fh:
+        return yaml.safe_load(fh) or {}
 
 
 def read_secret_file(path: str | Path) -> str:
@@ -562,8 +580,12 @@ def cmd_recent(args) -> int:
     crypto, store, policy, plane = build(cfg)
     for row in reversed(store.recent(args.number)):
         direction = "out" if row["authority"] == "self" else "in "
+        # The route column is the audit trail: on a reply, the provider/model the adapter says
+        # the turn ran on. Names only — there is no credential in a row.
+        route = row.get("route") or {}
+        served = f"  [{route.get('provider')}/{route.get('model')}]" if route.get("model") else ""
         print(f"[{row['created_at']}] {direction} {row['sender'][:10]}… {row['reach']:<9} "
-              f"{(row['content'] or '')[:90]}")
+              f"{(row['content'] or '')[:90]}{served}")
     return 0
 
 
@@ -620,6 +642,112 @@ def cmd_projects(args) -> int:
               f"{project.name:<24} {project.path}")
         print(f"{'':<18} {_projects_line(project)}")
     return 0
+
+
+def _stored_concord_channels(cfg: dict[str, Any]) -> list[KnownChannel] | None:
+    """The channels the stored Concord invites grant, or None when there is nothing to read.
+
+    `hng route` has no live plane, so this reads the same grants the daemon's refresh unions
+    from. None means "cannot say", which skips the existence check rather than refusing a
+    route on a guess.
+    """
+    path = Path(os.path.expanduser(str(cfg.get("store") or "gateway.db")))
+    if not path.exists():
+        return None
+    store = Store(path)
+    try:
+        rows = store.concord_invites(limit=50)
+    finally:
+        store.close()
+    return known_channels_from_invites(rows) or None
+
+
+def cmd_route(args) -> int:
+    """Which provider, model and key a conversation's turn uses, and which rule decided it.
+
+    `hng route` prints the table; `hng route <conversation>` answers the question an operator
+    actually has when a channel's answers come out on the wrong model — which rule won, what it
+    beat, and whether the key it names can be read. `--check` is the load gate: non-zero when
+    the block cannot be used at all, plus any channel rule that names a channel this gateway
+    does not hold (the stale entry a fallback would otherwise hide).
+    """
+    cfg = load_config(args.config)
+    router = Router.from_config(cfg.get("routing"), config_path=resolve_config_path(args.config))
+    conversation = (args.conversation or "").strip()
+    plane = (args.plane or conversation_plane(conversation)).strip().lower()
+    known = _stored_concord_channels(cfg) if router.channels else None
+
+    if args.check:
+        if not router.configured:
+            print("routing is not configured: every turn uses the agent's own model and "
+                  "credential")
+            return 0
+        problems = list(router.problems)
+        unchecked = bool(router.channels) and known is None
+        if unchecked:
+            print("routing: no stored Concord invite, so channel rules were not checked "
+                  "against a channel list", file=sys.stderr)
+        elif known is not None:
+            problems.extend(router.channel_problems(known))
+        if args.json:
+            print(json.dumps({"problems": problems, "ok": not problems,
+                              "channels_checked": not unchecked,
+                              "env_file": router.env_file}, indent=2))
+        else:
+            for problem in problems:
+                print(f"config: {problem}", file=sys.stderr)
+            if not problems:
+                also = "" if unchecked else (
+                    ", and every channel rule names a channel this gateway holds")
+                print(f"routing loads: every rule names a model in routing.models{also}")
+        return 1 if problems else 0
+
+    if not conversation:
+        if args.json:
+            print(json.dumps(_routing_table(router), indent=2))
+        else:
+            for line in router.describe():
+                print(line)
+        return 0 if router.usable else 1
+
+    resolution = router.resolve(plane, conversation, known_channels=known)
+    if args.json:
+        print(json.dumps({"conversation": conversation, "plane": plane,
+                          **resolution.as_dict()}, indent=2))
+        return 0 if resolution.ok else 1
+    print(f"{conversation}  ({plane or 'unknown plane'})")
+    if resolution.error:
+        print(f"  UNRESOLVED {resolution.error}: {resolution.detail}")
+        if resolution.why:
+            print(f"  rule       {resolution.why}")
+        return 1
+    route = resolution.route
+    if route is None:  # unreachable: an error already returned above
+        print("  UNRESOLVED: no route")
+        return 1
+    print(f"  provider   {route.provider}")
+    print(f"  model      {route.model}")
+    key_text = f"${route.key}" if route.key else "(none: the agent's own)"
+    print(f"  key        {key_text}  {'set' if route.key_available() else 'NOT SET'}")
+    print(f"  rule       {resolution.why}")
+    return 0
+
+
+def _routing_table(router: Router) -> dict[str, Any]:
+    """The table as data: every rule, with whether its key can be read. Never a value."""
+    def rule(route: Route) -> dict[str, Any]:
+        return {**route.as_dict(), "key_present": route.key_available()}
+
+    return {
+        "configured": router.configured,
+        "usable": router.usable,
+        "problems": list(router.problems),
+        "env_file": router.env_file,
+        "default": rule(router.default) if router.default else None,
+        "planes": {plane: rule(r) for plane, r in router.planes.items()},
+        "channels": [{"community": c.community, "channel": c.channel,
+                      "origin": c.origin, **rule(c.route)} for c in router.channels],
+    }
 
 
 def cmd_control(args) -> int:
@@ -800,16 +928,24 @@ def cmd_serve(args) -> int:
     import signal
 
     from .gateway import Gateway, MarmotOwnershipError
+    from .routing import RoutingConfigError
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     cfg = load_config(args.config)
     try:
-        gw = Gateway(cfg, socket_path=args.socket)
+        gw = Gateway(cfg, socket_path=args.socket,
+                     config_path=resolve_config_path(args.config))
     except MarmotOwnershipError as exc:
         # The guard working, not a crash: one line with both ways out, and a non-zero
         # exit so systemd records a failed start instead of a daemon that runs wrong.
         print(f"refusing to start: {exc}", file=sys.stderr)
+        return 2
+    except RoutingConfigError as exc:
+        # A turn routed by a rule that cannot be honoured is a run on the wrong model or
+        # the wrong account, so this is also a start that must not happen. `hng route
+        # --check` reports the same problems without starting anything.
+        print(f"refusing to start: routing: {exc}", file=sys.stderr)
         return 2
 
     async def run() -> None:
@@ -911,6 +1047,18 @@ def main(argv: list[str] | None = None) -> int:
                             help="exit 1 unless every declared checkout, project and board "
                                  "is there")
     p_projects.set_defaults(func=cmd_projects)
+
+    p_route = sub.add_parser("route", help="which provider, model and key a turn uses")
+    p_route.add_argument("conversation", nargs="?", default="",
+                         help="a conversation: concord:<community>:<channel>, a peer hex/npub, "
+                              "or marmot:<group>; omit for the whole table")
+    p_route.add_argument("--plane", default="",
+                         help="ask for a plane directly (nip17, nip04, nip01, concord, marmot)")
+    p_route.add_argument("--check", action="store_true",
+                         help="exit 1 unless every rule can be loaded and every channel rule "
+                              "names a channel this gateway holds")
+    p_route.add_argument("--json", action="store_true")
+    p_route.set_defaults(func=cmd_route)
 
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
     p_control.add_argument("--json", action="store_true")

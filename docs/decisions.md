@@ -36,3 +36,41 @@ experimental in docs, leave it out of the health frame, or make its tests opt-in
 Why: it runs in production for this gateway and carries real community traffic. A flag that
 defaults off means the plane is only exercised by whoever remembers to set it, and "experimental"
 in a doc is how a supported transport quietly stops being maintained.
+
+## A route travels on the frame
+
+Which provider, model and credential a turn asks for is decided by the gateway and carried on the
+inbound `message` frame (`route`), not fetched by the adapter with a second socket op.
+
+Why: the gateway already knows the conversation when it builds the frame, a route is a property of
+the *inbound* message, and a replayed message has to be routed the same way as the first attempt.
+A `route` op would be a second place where conversation-to-route is computed, and it would have to
+agree with the frame under a race the frame cannot have — the route and the message arrive
+together or not at all. The cost is that the adapter must read the credential itself; it gets the
+variable's *name* and the `.env` path, never the value.
+
+What the gateway does not do is apply the route: Hermes' provider resolution is out of scope here,
+so the adapter hands the route to the host on the event (`metadata.nostr_route`) and reports back
+what it ran on, rather than reimplementing model selection.
+
+## A route names a credential, never holds one
+
+`key:` in a routing rule is the name of an environment variable or `.env` entry. The value is read
+when the turn is about to run, and never written to a frame, a log line, a stored row or an error.
+A rule naming a long token instead of a name is refused at load *without echoing it*, because an
+error string is one of the places a pasted secret ends up.
+
+Why: a config is copied between hosts and pasted into issues, and a config that can hold a key is
+a config that will. A name that cannot be read fails the turn — it never falls back to another
+rule's credential, because one channel's usage billed to another's account is worse than a turn
+that does not happen.
+
+## A channel rule for a channel that no longer exists is unresolved
+
+Concord channel routes resolve on the channel id (or its current name) among the channels the
+gateway actually holds. A rule naming a channel that is not there resolves to *unresolved*, never
+to the plane's route. `hng route --check` reports the same entry as a problem.
+
+Why: a route is configuration, not protocol. Deleting a channel does not rewrite this file, so a
+stale entry silently falling back to the plane's model is exactly the shape of bug nobody finds:
+the room's answers are on a model chosen for background traffic, and the config says otherwise.

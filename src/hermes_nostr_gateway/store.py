@@ -189,6 +189,9 @@ _RUMOR_COLUMNS = {
     "digest_rule": "TEXT",
     "digest_state": "TEXT",
     "digest_batch": "TEXT",
+    #: The provider/model a turn was asked for, as JSON: names only, never a credential. On a
+    #: reply row it is what the adapter reported using, which is the audit trail.
+    "route": "TEXT",
 }
 
 #: The states an invite can be in. `held` is the default, and the truth for every row
@@ -228,6 +231,16 @@ def _invite_row(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
+def _json_or_none(raw: Any) -> Any:
+    """A JSON column as the object it holds, or None when it is empty or unreadable."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class Inbound:
     id: str
@@ -251,6 +264,9 @@ class Inbound:
     digest_batch: str | None = None
     #: NIP-92 `imeta` metadata, in tag order. Claims only: the hash gates the fetch.
     attachments: list[dict[str, Any]] | None = None
+    #: The provider/model a turn is asked to use, names only (`key` is a variable's name).
+    #: On a reply row: what the adapter reported the turn actually used.
+    route: dict[str, Any] | None = None
 
     def to_frame(self) -> dict[str, Any]:
         frame = {
@@ -708,12 +724,13 @@ class Store:
                     "INSERT OR IGNORE INTO rumors (id, wrapper_id, sender, kind, created_at,"
                     " conversation, content, reply_to, plane, reach, authority, rule, why,"
                     " received_at, cursor, digest_rule, digest_state, digest_batch,"
-                    " blocked_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " blocked_reason, route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
                         msg.conversation, msg.content, msg.reply_to, msg.plane,
                         msg.reach, msg.authority, msg.rule, msg.why, stamp,
                         cursor, digest_rule, digest_state, None, msg.blocked_reason,
+                        json.dumps(msg.route) if msg.route else None,
                     ),
                 )
                 if cur.rowcount == 0:
@@ -974,6 +991,10 @@ class Store:
             "SELECT * FROM rumors ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         items = [dict(r) for r in rows]
+        # `route` is stored as JSON text; a reader wants the mapping, not a string that has to
+        # be decoded again in every caller (history, `hng recent`, a future status frame).
+        for item in items:
+            item["route"] = _json_or_none(item.get("route"))
         if with_attachments:
             self._with_attachments(items)
         return items

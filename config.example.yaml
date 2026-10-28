@@ -188,6 +188,35 @@ defaults:
 #       project: example-project        # optional; Hermes project slug
 #       board: example-channel          # optional; kanban board slug
 
+# Who answers, and on what account (see docs/decisions.md, "A route travels on the frame").
+# Ordinary turns run on whatever Hermes is configured with; a route lets one
+# conversation ask for a specific provider, model and credential instead -- a cheap model for a
+# noisy feed, a stronger one for a work channel, a dedicated key so one channel's usage is
+# accountable. Precedence is channel > plane > default, and `hng route` prints which rule won.
+#
+# `key` is the NAME of an environment variable (or of an entry in `routing.env_file`), never a
+# value: it is read at the moment the turn runs, and a name that cannot be read fails the turn
+# rather than falling back to another rule's credential. `routing.models` is the catalogue, so a
+# typo is a load error instead of a turn on the wrong model. A block that cannot be loaded stops
+# `hng serve` (like a Marmot ownership clash); `hng route --check` reports the same problems
+# without starting anything.
+#
+# routing:
+#   models:                            # required once routing is configured
+#     - model-a
+#     - model-b
+#   default: {provider: provider-a, model: model-a, key: GATEWAY_MODEL_KEY}
+#   planes:
+#     concord: {provider: provider-a, model: model-b, key: CONCORD_MODEL_KEY}
+#     nip17: {provider: provider-a, model: model-a}   # no key: the agent's own credential
+#   channels:                          # Concord only: a channel id (or its current name)
+#     - community: <community id>      # optional; restrict the rule to one community
+#       channel: <channel id or name>
+#       provider: provider-b
+#       model: model-b
+#       key: WORK_CHANNEL_KEY
+#   # env_file: ~/.config/hermes-nostr-gateway/.env   # default: a .env beside this file
+
 # The control pane: where a confirmation is asked, and whose word needs none. One
 # destination per plane; a plane with no entry is reported as unconfigured rather than
 # guessed. `hng control` prints the resolved pane.
