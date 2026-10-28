@@ -183,8 +183,8 @@ at the same moment:
 ```
 
 Its health is the pass's report: exit 0 when every message was delivered or queued for the daemon,
-1 when something was refused or could not be read, 2 when the configuration is wrong and the pass
-touched nothing. `--dry-run` reports what would happen and writes nothing.
+1 when something was refused, unreadable or could not be filed, 2 when the configuration is wrong
+and the pass touched nothing. `--dry-run` reports what would happen and writes nothing.
 
 The rest answer one question each: `hng recent`, `hng drops`, `hng listen --once`,
 `hng send --to <conversation> --text <text>`, `hng media <sha256|url>`, `hng policy-test`,
