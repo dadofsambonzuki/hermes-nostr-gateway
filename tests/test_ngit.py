@@ -78,7 +78,8 @@ CREATE TABLE tasks (
     tenant TEXT, result TEXT, idempotency_key TEXT,
     consecutive_failures INTEGER NOT NULL DEFAULT 0, worker_pid INTEGER,
     last_failure_error TEXT, current_run_id INTEGER,
-    block_kind TEXT, block_recurrences INTEGER NOT NULL DEFAULT 0
+    block_kind TEXT, block_recurrences INTEGER NOT NULL DEFAULT 0,
+    model_override TEXT, provider_override TEXT
 );
 CREATE TABLE task_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -151,7 +152,7 @@ class Harness:
         self.repo.mkdir(exist_ok=True)
         self.target = ngit.Target(conversation=f"concord:{COMMUNITY}:{CHANNEL}",
                                   repo=self.repo, board=BOARD, project=PROJECT,
-                                  address=ADDRESS)
+                                  address=ADDRESS, default_branch="master")
 
     def detail(self, ref: ngit.Issue) -> ngit.Issue:
         self.detail_calls.append(ref.hex)
@@ -633,6 +634,317 @@ def test_the_first_poll_has_a_lookback_floor(harness):
     before = int(time.time())
     harness.sync()
     assert before - 24 * 3600 - 2 <= harness.since_seen[0] <= before - 24 * 3600 + 2
+
+
+# -- a PR lands with a review task --------------------------------------------
+
+def review_tasks(harness) -> list[dict]:
+    return [task for task in harness.tasks()
+            if str(task["idempotency_key"] or "").startswith("ngit:pr:")]
+
+
+def test_a_new_pr_gets_one_review_task_and_one_message(harness):
+    pr = make_pr("a7")
+    harness.prs_data = ([pr], [])
+
+    report = harness.sync()
+
+    tasks = review_tasks(harness)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["idempotency_key"] == f"ngit:pr:{pr.id}"
+    assert task["title"] == f"Review PR {pr.id[:8]}: {pr.subject}"
+    assert task["status"] == "ready"
+    assert task["assignee"] == "default"
+    # The body names the PR and where it comes from, so a worker needs nothing else.
+    for expected in (pr.id, pr.nevent, ADDRESS, pr.author, pr.branch, "master"):
+        assert expected in task["body"], expected
+    # ... and carries the brief: read the diff, run the gates, report, never merge.
+    assert "ngit pr checkout" in task["body"]
+    assert "git diff master...HEAD" in task["body"]
+    assert "ruff check" in task["body"] and "pytest" in task["body"]
+    assert "Do not merge" in task["body"]
+    # One message, and it names the task instead of describing it twice.
+    assert len(harness.messages) == 1
+    text = harness.messages[0][1]
+    assert "ready for review" in text and pr.nevent in text
+    assert f"review task {task['id']}" in text
+    assert report.prs["signalled"] == 1 and report.prs["tasks"] == 1
+    assert report.errors == []
+    # The link points at the task, which is what a merge later closes.
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"] == task["id"]
+
+
+def test_a_second_pass_makes_neither_a_task_nor_a_message(harness):
+    pr = make_pr("a7")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    tasks, messages = harness.tasks(), list(harness.messages)
+
+    report = harness.sync()
+
+    assert harness.tasks() == tasks
+    assert harness.messages == messages
+    assert report.prs["tasks"] == 0 and report.posted == 0
+
+
+def test_the_review_task_goes_to_the_review_profile_and_priority(home, store):
+    pr = make_pr("b3")
+    made = Harness(home, store, prs=([pr], []))
+    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
+                                    review_assignee="reviewer", priority=7)
+    try:
+        made.sync()
+        task = review_tasks(made)[0]
+        assert task["assignee"] == "reviewer"
+        assert task["priority"] == 7
+    finally:
+        made.close()
+
+
+def test_review_model_rides_on_the_task_without_a_second_profile(home, store):
+    pr = make_pr("b4")
+    made = Harness(home, store, prs=([pr], []))
+    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
+                                    review_model="big-model",
+                                    review_provider="big-provider")
+    try:
+        made.sync()
+        task = review_tasks(made)[0]
+        # The dispatcher's own per-task routing: the same columns `kanban set-model` writes.
+        assert task["model_override"] == "big-model"
+        assert task["provider_override"] == "big-provider"
+        # Still the same profile: the model is the task's, not a second install's.
+        assert task["assignee"] == "default"
+    finally:
+        made.close()
+
+
+def test_without_review_model_the_task_runs_on_the_profile_model(harness):
+    pr = make_pr("b5")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task = review_tasks(harness)[0]
+    assert not task["model_override"]
+    assert not task["provider_override"]
+
+
+def test_review_config_defaults_and_a_provider_with_no_model():
+    default = ngit.BridgeConfig.from_config({})
+    assert default.review_assignee == "default"
+    assert default.review_model == "" and default.review_provider == ""
+    assert default.reviews is True
+
+    chosen = ngit.BridgeConfig.from_config(
+        {"review_assignee": "reviewer", "review_model": "m", "review_provider": "p"})
+    assert (chosen.review_assignee, chosen.review_model, chosen.review_provider) == (
+        "reviewer", "m", "p")
+
+    # A provider alone would be read as a model and quietly change nothing.
+    stray = ngit.BridgeConfig.from_config({"review_provider": "p"})
+    assert stray.review_provider == ""
+
+
+def test_a_channel_entry_can_pick_its_own_review_model(harness):
+    """The channel's own `review_model` beats the bridge block: a channel is the context."""
+    from dataclasses import replace as dataclass_replace
+
+    pr = make_pr("c5")
+    harness.prs_data = ([pr], [])
+    harness.target = dataclass_replace(harness.target, review_model="channel-model",
+                                       review_provider="channel-prov")
+    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
+                                       review_model="bridge-model",
+                                       review_provider="bridge-prov")
+
+    harness.sync()
+
+    task = review_tasks(harness)[0]
+    assert task["model_override"] == "channel-model"
+    assert task["provider_override"] == "channel-prov"
+
+
+def test_a_project_entry_carries_its_review_model_onto_the_target(tmp_path):
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    cfg = {"concord": {"projects": [
+        {"channel": CHANNEL, "path": str(repo), "project": PROJECT, "board": BOARD,
+         "review_model": "entry-model", "review_provider": "entry-prov"},
+        {"channel": "other-channel", "path": str(repo), "project": PROJECT, "board": BOARD,
+         "review_provider": "provider-with-no-model"},
+    ]}}
+
+    target = ngit.resolve_target(cfg, channel=f"concord:{COMMUNITY}:{CHANNEL}")
+    assert (target.review_model, target.review_provider) == ("entry-model", "entry-prov")
+
+    # A provider with no model is not a pair: it is dropped rather than paired with a model
+    # it does not belong to.
+    other = ngit.resolve_target(cfg, channel="other-channel")
+    assert (other.review_model, other.review_provider) == ("", "")
+
+
+def test_a_merge_completes_the_review_task(harness):
+    pr = make_pr("b6", created_at=1000)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task = review_tasks(harness)[0]
+
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1100)
+    harness.prs_data = ([pr], [merge])
+    report = harness.sync()
+
+    done = harness.task(task["id"])
+    assert done["status"] == "done" and done["completed_at"]
+    assert "merged as " + "d" * 40 in str(done["result"])
+    comment = [c["body"] for c in harness.comments(task["id"])][-1]
+    assert "merged as " + "d" * 40 in comment and pr.subject in comment
+    # The merge line is still posted, and the task did not cost it.
+    assert len(harness.messages) == 2
+    assert "merged as " + "d" * 40 in harness.messages[1][1]
+    assert report.prs["merged"] == 1
+
+    # A merge that arrives for a task already completed is a no-op.
+    before = [c["body"] for c in harness.comments(task["id"])]
+    harness.sync()
+    assert len(harness.messages) == 2
+    assert [c["body"] for c in harness.comments(task["id"])] == before
+    assert harness.task(task["id"])["status"] == "done"
+
+
+def test_a_merge_that_could_not_close_the_task_closes_it_on_the_next_poll(harness):
+    pr = make_pr("c4", created_at=1000)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task = review_tasks(harness)[0]
+
+    real_complete = harness.board.complete
+    failures = {"left": 1}
+
+    def flaky_complete(task_id, **kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise ngit.BoardError("could not write to the board: database is locked")
+        return real_complete(task_id, **kwargs)
+
+    harness.board.complete = flaky_complete
+    merge = ngit.Merge(pr_id=pr.id, commit="f" * 40, created_at=1100)
+    harness.prs_data = ([pr], [merge])
+
+    first = harness.sync()
+    # The channel still gets the merge line; the failure is reported, not swallowed.
+    assert "merged as " + "f" * 40 in harness.messages[-1][1]
+    assert first.prs["review_errors"] == 1
+    assert any("database is locked" in error for error in first.errors)
+    assert harness.task(task["id"])["status"] != "done"
+
+    second = harness.sync()
+    assert second.prs["review_errors"] == 0
+    assert harness.task(task["id"])["status"] == "done"
+    # ... and the merge line was not posted a second time.
+    assert sum("merged as" in text for _, text in harness.messages) == 1
+
+
+def test_a_pr_first_seen_merged_gets_one_message_and_no_review_task(harness):
+    pr = make_pr("b7", created_at=1000)
+    merge = ngit.Merge(pr_id=pr.id, commit="e" * 40, created_at=1050)
+    harness.prs_data = ([pr], [merge])
+
+    harness.sync()
+
+    # There is nothing to review: it is already merged, and nobody is asked to restate it.
+    assert review_tasks(harness) == []
+    assert len(harness.messages) == 1
+    assert "merged as " + "e" * 40 in harness.messages[0][1]
+
+
+def test_a_task_that_cannot_be_made_still_posts_the_notice(home, store):
+    pr = make_pr("b8")
+    made = Harness(home, store, prs=([pr], []))
+    real_create = made.board.create
+    failures = {"left": 1}
+
+    def flaky_create(**kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise ngit.BoardError("could not create a task on /boards/x: database is locked")
+        return real_create(**kwargs)
+
+    made.board.create = flaky_create
+    try:
+        report = made.sync()
+
+        # The channel still hears about the PR, and why no task came with it.
+        assert len(made.messages) == 1
+        text = made.messages[0][1]
+        assert "ready for review" in text and pr.nevent in text
+        assert "no review task" in text and "database is locked" in text
+        assert review_tasks(made) == []
+        assert report.prs["review_errors"] == 1
+        assert any("database is locked" in error for error in report.errors)
+        # Nothing was stepped over: the cursor may not move past a PR still missing its task.
+        assert made.store.ngit_cursor(ADDRESS, "prs") is None
+
+        # The next poll makes the task -- and does not repeat the message it already sent.
+        again = made.sync()
+        assert len(made.messages) == 1
+        task = review_tasks(made)[0]
+        assert again.prs["tasks"] == 1 and again.prs["review_errors"] == 0
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"] == task["id"]
+    finally:
+        made.close()
+
+
+def test_a_dry_run_writes_no_review_task(harness):
+    pr = make_pr("c2")
+    harness.prs_data = ([pr], [])
+
+    harness.sync(dry_run=True)
+
+    assert harness.tasks() == []
+    assert harness.messages == []
+
+
+def test_reviews_can_be_turned_off_without_losing_the_pr_message(home, store):
+    pr = make_pr("c3")
+    made = Harness(home, store, prs=([pr], []))
+    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    try:
+        made.sync()
+        assert review_tasks(made) == []
+        assert len(made.messages) == 1
+        assert "ready for review" in made.messages[0][1]
+    finally:
+        made.close()
+
+
+def test_board_task_done_is_written_once(home):
+    board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
+    try:
+        task_id = board.create(title="Review PR", body="", assignee="default",
+                               status="ready")
+        assert board.complete(task_id, author="ngit", comment="merged as abc") is True
+        row = board.task(task_id)
+        assert row["status"] == "done" and row["completed_at"] and row["result"]
+        assert [c["body"] for c in board.comments(task_id)] == ["merged as abc"]
+
+        assert board.complete(task_id, author="ngit", comment="merged again") is False
+        assert [c["body"] for c in board.comments(task_id)] == ["merged as abc"]
+    finally:
+        board.close()
+
+
+def test_default_branch_comes_from_the_checkout(tmp_path):
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    # What a clone knows: the remote's HEAD names the branch PRs target.
+    subprocess.run(["git", "-C", str(repo), "symbolic-ref", "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk"], check=True)
+    assert ngit.default_branch(repo) == "trunk"
+
+
+def test_default_branch_says_nothing_where_git_cannot(tmp_path):
+    assert ngit.default_branch(tmp_path) == ""
 
 
 # -- the board anchor ---------------------------------------------------------

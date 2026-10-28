@@ -131,12 +131,18 @@ class Board:
 
     def create(self, *, title: str, body: str, assignee: str, status: str,
                idempotency_key: str = "", created_by: str = "ngit",
-               anchor: Optional[Anchor] = None, priority: int = 0) -> str:
+               anchor: Optional[Anchor] = None, priority: int = 0,
+               model_override: str = "", provider_override: str = "") -> str:
         """Insert one task and return its id.
 
         A task that already carries this idempotency key is returned instead of duplicated,
         which is what makes a re-poll harmless. Status is written as given: the dispatcher
         claims `ready` ones, and a `blocked` task is waiting for a human, not for a crash.
+
+        `model_override` / `provider_override` are the board's own per-task routing (the
+        columns `hermes kanban set-model` writes): the dispatcher runs that task on another
+        model without a second profile. They are only written when asked for, so a board
+        from before per-task routing still takes an issue.
         """
         key = (idempotency_key or "").strip()
         if key:
@@ -158,26 +164,81 @@ class Board:
             project_id = spot.project_id
         block_kind = "needs_input" if status == BLOCKED else None
 
+        row: dict[str, Any] = {
+            "id": None, "title": title.strip()[:500], "body": body,
+            "assignee": assignee or None, "status": status, "priority": int(priority or 0),
+            "created_by": created_by, "created_at": now, "workspace_kind": workspace_kind,
+            "workspace_path": None, "branch_name": None, "project_id": project_id,
+            "idempotency_key": key or None, "block_kind": block_kind,
+        }
+        model = str(model_override or "").strip()
+        if model:
+            row["model_override"] = model
+            row["provider_override"] = str(provider_override or "").strip() or None
+        statement = (f"INSERT INTO tasks ({', '.join(row)})"
+                     f" VALUES ({', '.join(['?'] * len(row))})")
+
         for _ in range(2):
             task_id = new_task_id()
-            path = workspace_path.format(id=task_id) if workspace_path else None
-            this_branch = branch_name(spot.slug, task_id, title) if spot.worktree else None
+            row["id"] = task_id
+            row["workspace_path"] = (workspace_path.format(id=task_id)
+                                     if workspace_path else None)
+            row["branch_name"] = (branch_name(spot.slug, task_id, title)
+                                  if spot.worktree else None)
             try:
-                self.db.execute(
-                    "INSERT INTO tasks (id, title, body, assignee, status, priority,"
-                    " created_by, created_at, workspace_kind, workspace_path, branch_name,"
-                    " project_id, idempotency_key, block_kind)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (task_id, title.strip()[:500], body, assignee or None, status,
-                     int(priority or 0), created_by, now, workspace_kind, path,
-                     this_branch, project_id, key or None, block_kind),
-                )
+                self.db.execute(statement, tuple(row.values()))
             except sqlite3.IntegrityError:
                 continue
+            except sqlite3.Error as exc:
+                # A locked or read-only board is the operator's to fix; it is a BoardError
+                # so the caller can report it and still do the other half of its work.
+                raise BoardError(f"could not create a task on {self.path}: {exc}") from exc
             self._event(task_id, "created", {"assignee": assignee or None, "status": status,
                                             "source": created_by, "workspace_kind": workspace_kind})
             return task_id
         raise BoardError("could not allocate a task id")
+
+    def complete(self, task_id: str, *, author: str = "ngit", comment: str = "",
+                 result: str = "") -> bool:
+        """`done`, with the reason written in the same transaction.
+
+        False when the task was already done (or archived), so a second sighting of the same
+        merge closes nothing twice and writes no second comment. Like `release`, the status
+        and the line that explains it are one write: a completion nobody can account for is
+        the silent action this file exists to avoid.
+
+        The claim columns are cleared because the task is finished: a dispatcher that woke
+        up to a `done` task must not find it still claimed.
+        """
+        now = int(time.time())
+        summary = (result or comment).strip()[:2000]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self.db.execute(
+                "UPDATE tasks SET status = ?, completed_at = ?, result = ?,"
+                " claim_lock = NULL, claim_expires = NULL, current_run_id = NULL,"
+                " consecutive_failures = 0"
+                " WHERE id = ? AND status NOT IN ('done', 'archived')",
+                (DONE, now, summary or None, str(task_id)),
+            )
+            if cur.rowcount != 1:
+                self.db.execute("ROLLBACK")
+                return False
+            if comment:
+                self.db.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at)"
+                    " VALUES (?,?,?,?)", (str(task_id), author or "ngit", comment, now))
+            self.db.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (str(task_id), None, "completed",
+                 json.dumps({"result_len": len(summary), "summary": summary[:200],
+                             "by": author or "ngit"}, separators=(",", ":")), now))
+            self.db.execute("COMMIT")
+            return True
+        except sqlite3.Error:
+            self.db.execute("ROLLBACK")
+            raise
 
     def comment(self, task_id: str, author: str, body: str) -> int:
         """Append one comment. Raises when the task is gone, so a caller cannot write

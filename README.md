@@ -342,8 +342,8 @@ second table of board slugs and repo paths:
 ```
 inbound   kind-1621 issue    -> a task on the channel's board
           kind-1622 comment  -> a task comment, in the order the issue carries them
-outbound  kind-1618 PR       -> one "ready for review" message in the channel
-          kind-1631 applied  -> one "merged as <commit>" follow-up
+outbound  kind-1618 PR       -> one "ready for review" message and one review task
+          kind-1631 applied  -> one "merged as <commit>" follow-up, closing that task
 ```
 
 ```bash
@@ -370,9 +370,15 @@ restart does not forget it and a re-poll does not ask twice.
 
 A PR signal names the author every time, including when this gateway opened it, and each PR
 is reported once: `ngit_links` dedupes by PR id, and a merge that arrives for a PR the bridge
-never announced posts one "merged" line rather than replaying history. Closing an issue on
-Nostr does not close the task; the bridge imports open issues and narrates PRs, and a board's
-lifecycle stays the board's.
+never announced posts one "merged" line rather than replaying history. A PR also carries a
+**review task** (`ngit:pr:<event id>`) so "should this merge" has an answer on the board
+rather than in scrollback: the body names the PR, its branches and the brief — read the
+diff, run `ruff check` and `pytest`, report a verdict with reasons, never merge — and the
+merge message closes that task. `ngit.review_model` (with `ngit.review_provider`) — or a
+`review_model` on the channel's `concord.projects` entry, which beats it — puts the task on
+a stronger model through the board's own per-task override, without a second profile.
+Closing an issue on Nostr does not close the task; the bridge imports open issues and
+narrates PRs, and a board's lifecycle stays the board's.
 
 State lives in the gateway store (`ngit_links`, `ngit_comments`, `ngit_cursors`): what each
 event became, which comments are already on the task, and how far each repo has been read. A
