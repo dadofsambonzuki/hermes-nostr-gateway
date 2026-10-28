@@ -17,6 +17,10 @@ the wrong tree.
 ```yaml
 ngit:
   assignee: default        # the profile a task created from an issue is dispatched to
+  reviews: true            # a PR also gets a review task (never a merge)
+  review_assignee: default # the profile that review task is dispatched to
+  # review_model: ...      # run the review on another model, via the task's own override
+  # review_provider: ...   # that model's provider (only read alongside review_model)
   # relays:                # where 1618/1631 events are read; default: the repository
   #   - wss://relay.example # announcement's own relay hints, then relays.read
   lookback_hours: 168      # the first poll's floor; 0 reads everything the relay will give
@@ -42,10 +46,11 @@ Cron, per channel, on the host that holds the checkout and the gateway:
 */10 * * * *  cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel> --json >> /var/log/hng-ngit.log 2>&1
 ```
 
-Exit code 0 means every message reached the channel; 1 means something did not and the report
-says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the bridge
-did not touch anything. `--dry-run` reports what would happen and writes nothing — the first
-run against a live channel should be one.
+Exit code 0 means every message reached the channel **or is queued and waiting for the daemon**
+(the report says which); 1 means something was refused or could not be read, and the report
+says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the
+bridge did not touch anything. `--dry-run` reports what would happen and writes nothing — the
+first run against a live channel should be one.
 
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
 stable; `hng ngit sync` is the smallest thing that is useful today and does not block that.
@@ -62,9 +67,10 @@ stable; `hng ngit sync` is the smallest thing that is useful today and does not 
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming
-  the issue, the author, the nevent, the task and what a `yes` would do. The question is claimed
-  in `ngit_links` before it is posted and released again if the send fails, so it is asked once
-  when the channel is reachable and retried when it was not.
+  the issue, the author, the nevent, the task and what a `yes` would do. The question is queued
+  and the link stays `held` until the daemon takes it, so it is asked once when the channel is
+  reachable and retried when it was not — and the idempotency key stops a retry becoming a
+  second question.
 - `max_new` bounds how many tasks one poll creates; the rest are counted as deferred and picked
   up by the next poll. A backlog or a spam run cannot fill the board and the channel at once.
 
@@ -84,24 +90,80 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 
 ## Outbound: PRs signalled for review
 
-- A kind-1618 event posts one message: the PR's subject, its author npub, the branch, and the
-  nevent — "ready for review". Deduped by PR id (`ngit_links`), so the same PR is never
-  announced twice, including across the cursor's overlap.
-- A kind-1631 event for a PR this bridge announced posts one follow-up: `merged as <commit>`,
-  using the `merge-commit` tag (or the first `applied-as-commits` value when a merge commit was
-  not named).
+- A kind-1618 event posts one message — the PR's subject, its author npub, the branch and the
+  nevent, "ready for review" — and creates one **review task** on the board, keyed
+  `ngit:pr:<event id>`. Deduped by PR id (`ngit_links`), so the same PR is never announced
+  twice, and the idempotency key means a re-poll cannot make a second task either.
+- The task is titled `Review PR <first 8 of the event id>: <subject>` and its body names the
+  PR's event id and nevent, the repository address, the author, the source branch
+  (`branch-name`) and the target branch — NIP-34 carries no target tag, so it is the
+  checkout's default branch, read from git. The brief: check the proposal out
+  (`ngit pr checkout <nevent>`), read the diff, run the repository's gates (`ruff check`,
+  `pytest`), report a verdict with reasons. **It never merges**: merging is the operator's,
+  or a follow-up task.
+- The notice names the task (`review task <id>`) instead of a second message announcing it.
+  One PR, one channel event.
+- `ngit.review_assignee` (default `default`) is the profile the task is dispatched to and
+  `ngit.priority` its priority. `ngit.review_model` (and optionally `ngit.review_provider`)
+  is written to the task's own `model_override` / `provider_override` — the columns
+  `hermes kanban set-model` writes and the dispatcher already honours — so review can run on
+  a stronger model than routine work without a second profile. A `review_model` /
+  `review_provider` on the channel's `concord.projects` entry beats it for that channel
+  alone; unset everywhere means the assignee profile's model.
+- A kind-1631 event for a PR this bridge announced posts one follow-up, `merged as <commit>`
+  (the `merge-commit` tag, or the first `applied-as-commits` value when a merge commit was
+  not named), and completes the review task with a comment naming the merge. A merge that
+  arrives for a task already completed is a no-op: nothing is written twice.
 - A PR first seen *already* applied gets one message, the merged line — not a fake "ready for
-  review" followed by a merge, and not a replay of history.
+  review" followed by a merge, and not a replay of history. There is nothing to review, so no
+  task is made.
+- The two halves fail independently. A task that cannot be made (a locked board, a missing
+  database) still gets the PR its notice, with `no review task: <why>` as the last line; the
+  cursor does not move past it, so a later poll makes the task and posts nothing — the
+  channel is not told twice. A message that cannot be delivered leaves the link `pending`
+  and is retried, task and all, on the next poll.
 - A merge for a PR the bridge never announced posts nothing: the bridge narrates what it
   watched, it does not dump the past into a channel.
 - The author is named in every message, including PRs this gateway opened itself.
-- A message that could not be delivered leaves the link `pending` and is retried on the next
-  poll; a delivered one moves to `signalled` (or `merged`), which is what stops a retry
-  double-posting a message that did land.
-- `max_prs` bounds how many PR messages one poll posts. The first run, or a catch-up after a
-  long outage, must not dump a month of merges into a channel; the remainder is counted as
-  deferred and picked up on later polls. The cursor only advances when a poll left nothing
-  deferred or undelivered, so a backlog cannot be stepped over.
+- `max_prs` bounds both halves of a poll: how many new notices it decides on, and how many
+  queued ones it hands to the daemon. The first run, or a catch-up after a long outage, must
+  not dump a month of merges into a channel; the remainder is counted as deferred and picked
+  up on later polls.
+
+## Delivery: decide, queue, then record
+
+A poll decides what the channel should hear, writes each notice into `ngit_outbox`, and only
+then hands it to the daemon. The record moves when the daemon says it took the message, not
+before:
+
+- **A busy daemon is a delay.** A running turn holds the daemon past the 20s socket timeout.
+  That is `NotifyBusy`, not an error: the notice stays queued, the pass reports it as `pending`
+  and exits 0, and the next pass delivers it. A refusal — no channel, no keys — is an error,
+  because the next pass would hear the same thing; the notice still stays queued, so fixing the
+  cause delivers it.
+- **One timeout per pass.** The drain stops at the first notice the daemon did not take: it has
+  already ignored one for the whole timeout, so the rest wait rather than each costing another.
+- **A retry cannot double-post.** Every queued notice has its own idempotency key — the queue
+  row's id, sent as the `send` op's `id`. The daemon records the key against the message it
+  published, so a notice that landed but lost its acknowledgement is answered with that message
+  rather than posted again. The same mechanism covers the issue notice and the question, which
+  is why `held` (not `asked`) is the state until the question is delivered.
+- **A merge supersedes an unsent review line.** If the PR merged before its review message went
+  out, the queued line is replaced: the channel is not told a PR is ready for review after it
+  has merged, and nothing that landed is hidden.
+- **The cursor follows the queue, not the daemon.** It advances past an event whose notice is
+  queued — the queue is durable — and stops short of one that was only deferred. A poll that
+  reads nothing new still delivers what the queue holds: delivery does not depend on the relay
+  window.
+- **A reset starts from now.** If `ngit_cursors` loses a repo's cursor it was deleted by hand,
+  and reading from `lookback_hours` would replay a week of PRs into the channel in bursts. The
+  bridge starts from `now` (minus the 5-minute overlap) instead. A repo it has never read keeps
+  the configured floor.
+- `max_prs` bounds how many PRs one poll announces (message *and* task). The first run, or a
+  catch-up after a long outage, must not dump a month of merges into a channel; the
+  remainder is counted as deferred and picked up on later polls. The cursor only advances
+  when a poll left nothing deferred, undelivered or without its task, so a backlog cannot be
+  stepped over.
 
 Messages go through the daemon's existing `send` op, so they are published as the gateway's
 identity with the same signing, NIP-42 and recording as any other reply. There is no second
@@ -113,27 +175,45 @@ In the gateway store (`store.py`):
 
 - `ngit_links` — `(repo, kind, source event id) -> task id, board, state, note`. States:
   `ready`, `held`, `asked`, `authorised`, `declined`, `deleted` for issues; `pending`,
-  `signalled`, `merged` for PRs.
+  `signalled`, `merged` for PRs. `pending` means the notice is not confirmed; `asked` is written
+  only once the question reached the channel.
+  `signalled`, `merged` for PRs. A PR's row carries the review task's id, which is what a
+  merge completes; its `note` keeps the PR's nevent, subject, author and branches so a later
+  poll can act on a merge whose event it no longer carries.
 - `ngit_comments` — which comment has been copied onto which task.
 - `ngit_cursors` — the last event time each repo's PR poll reached, with a 5-minute overlap so
   clock skew cannot skip an event; the link table, not the cursor, prevents a duplicate.
+- `ngit_outbox` — one row per notice (`issue`, `question`, `ready`, `merged`), `queued` until the
+  daemon took it and `sent` after, with an attempt count and the last error.
+- `send_keys` — the daemon's receipts: which idempotency key produced which message.
 
 Recovery:
 
 - **A task deleted by hand** keeps its `deleted` link. The next sync reports it and does not
   recreate it. `--recreate` creates a new task and updates the link.
-- **The daemon was down** when a question was due: the link stays `held`, the error is reported,
-  and the next sync asks. Nothing was lost and nothing was asked twice.
-- **A relay read fails**: PRs are reported as an error and issues still import. The cursor is
-  only advanced by events actually read.
+- **The daemon was busy or down** when a notice was due: the notice is queued, the report says
+  how many are waiting, and the next pass delivers them in order. Nothing was lost and nothing
+  was asked twice.
+- **A `pending` PR with no notice in the queue** — a pass that died between writing the link and
+  queueing the notice — is noticed on the next pass: the notice is made again from the link's own
+  note (subject, author, branch, nevent) and the report says so. Without that, the cursor having
+  moved past the PR would leave it stuck.
+- **A relay read fails**: PRs are reported as an error and issues still import; the queue is
+  still drained, so a notice already decided on is not held back by the relay.
 - **Catch-up after downtime**: the cursor is where the last successful poll ended, so the next
-  poll reads the gap; events already linked are not reported again.
+  poll reads the gap; events already linked are not reported again, and notices already queued
+  are delivered from the queue.
 
 ## Not in this bridge
 
 - Publishing status events from the board back to Nostr (a task completing does not close or
   apply the issue). The mapping is one-way for status on purpose: the board's lifecycle is the
   board's, and a status event is a public statement someone should choose.
+- Merging. A review task ends with a verdict and a comment on the task; the merge is the
+  operator's (`ngit pr merge`), and the bridge only watches for the status event it produces.
+- Retrofitting review tasks for PRs announced before this bridge made them. A PR already
+  `signalled` with no task stays that way: the channel was told what happened at the time, and
+  a change of behaviour is not a reason to rewrite it.
 - PR revisions (kind 1619), drafts (1633) and labelling: the channel gets one signal per PR and
   one per merge.
 - Any per-issue visibility rule. A private repository keeps everything derived from it private;

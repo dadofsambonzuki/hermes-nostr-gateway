@@ -1016,7 +1016,8 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
         return 2
     checkout = bridge.Ngit(target.repo)
     repository = checkout.repository()
-    target = replace(target, address=repository.address)
+    target = replace(target, address=repository.address,
+                     default_branch=bridge.default_branch(target.repo))
 
     home = hermes_home()
     try:
