@@ -954,11 +954,16 @@ class Gateway:
     # -- inbound --------------------------------------------------------
     @staticmethod
     def frame_for(msg: Any) -> dict[str, Any]:
-        """A message frame, or a `blocked` frame when policy refused it.
+        """A message frame, a `reaction` frame, or a `blocked` frame when policy refused it.
 
         A blocked message is still stored (see §13.3) but must never look like chat:
         the adapter turns `type: message` into an agent run, and a `drop` reach used
         to ride that path silently. `blocked` carries the reason and no content.
+
+        A channel's kind-7 reaction arrives here as a `ChannelReaction`, which brings its
+        own `type: reaction` frame and has no row behind it: the plane never stores one, so
+        there is nothing to look up and nothing to replay — the adapter either matches it to
+        a gate it is holding or drops it.
         """
         if msg.reach == "drop" or msg.blocked_reason:
             return {

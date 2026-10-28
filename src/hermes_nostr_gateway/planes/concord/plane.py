@@ -30,6 +30,12 @@ from .read import Invite, open_wrap, verify_bundle
 
 log = logging.getLogger("hng.plane.concord")
 
+#: Inner kinds that are chat on a channel stream. Replies (1111) are read as messages.
+CHAT_KINDS = (9, 1111)
+#: NIP-25 reaction. It shares the channel and the wrapper with chat, but it is an answer
+#: to a message, never a message: it must not run the instruction path or wake an agent.
+REACTION_KIND = 7
+
 
 def npub_of(pubkey_hex: str) -> str:
     """`npub…` for a hex key, or the hex as given when it is not one.
@@ -54,6 +60,51 @@ class InviteVerdict:
 
     accept: bool
     why: str
+
+
+@dataclass(frozen=True)
+class ChannelReaction:
+    """A NIP-25 reaction read in a channel: an answer to a message, never a message.
+
+    Deliberately not an `Inbound`: a reaction has no row, no cursor and no digest window.
+    The adapter matches `target` against the approval prompt it posted and resolves that one
+    gate — or drops the frame, which is why a reaction on anything else costs nothing here.
+    The gateway turns this into a `reaction` frame (spec §5); `reach` exists so the daemon's
+    single emission test says yes, and is never anything but immediate.
+    """
+
+    id: str
+    sender: str
+    #: The rumor this reaction answers: a prompt's own rumor id when it is an approval.
+    target: str
+    emoji: str
+    conversation: str
+    created_at: int = 0
+    #: What the reactor may do in this room, from the policy. The adapter is the one that
+    #: decides an author may resolve a gate; this only states the rule's answer.
+    authority: str = "none"
+    why: str = ""
+    reach: str = "immediate"
+    blocked_reason: Optional[str] = None
+
+    def to_frame(self) -> dict[str, Any]:
+        """The `reaction` frame of spec §5, with the author's policy answer attached.
+
+        `from`/`emoji`/`target_rumor_id` are the spec's names; the adapter accepts those or
+        the message frame's `sender`/`content`/`reply_to`, so either shape reaches a gate.
+        """
+        return {
+            "type": "reaction",
+            "plane": "concord",
+            "id": self.id,
+            "from": self.sender,
+            "conversation": self.conversation,
+            "target_rumor_id": self.target,
+            "emoji": self.emoji,
+            "authority": self.authority,
+            "created_at": self.created_at,
+            "why": self.why,
+        }
 
 
 class ConcordPlane:
@@ -134,13 +185,19 @@ class ConcordPlane:
         return None
 
     def handle_channel(self, relay: str, wrap: dict[str, Any], policy: Any,
-                       *, me_hex: str, me_npub: str) -> Optional[Inbound]:
-        """A wrap on a channel stream -> a stored Inbound, or None.
+                       *, me_hex: str, me_npub: str) -> Optional[Inbound | ChannelReaction]:
+        """A wrap on a channel stream -> a stored Inbound, a ChannelReaction, or None.
 
         Delivery: a message names us, or the channel is small enough that a mention would be
         ceremony (`solo_max_members`, default: us and one other). Both cases are presented to
         the policy as a mention, so the same allowlist rules govern a channel as a DM — the
         difference is only what counts as being addressed.
+
+        A kind-7 reaction shares that stream and wrapper and is routed here too, but it is
+        never chat: it returns a `ChannelReaction` for the gateway to emit as a `reaction`
+        frame, with no row, no policy delivery decision and no agent turn. The wrapper id is
+        claimed before either branch, so a relay's replay of a reaction cannot answer the same
+        gate twice — the same guard a message gets.
         """
         stream = self.stream_for(wrap.get("pubkey", ""))
         if stream is None:
@@ -152,7 +209,8 @@ class ConcordPlane:
             rumor = open_wrap(self._keys[stream.address], wrap)
         except (ConcordError, ValueError, KeyError):
             return None
-        if int(rumor.get("kind", 0)) not in (9, 1111):
+        kind = int(rumor.get("kind", 0))
+        if kind not in (*CHAT_KINDS, REACTION_KIND):
             return None
         sender = str(rumor.get("pubkey") or "")
         if not sender or sender == me_hex:
@@ -163,6 +221,9 @@ class ConcordPlane:
         members = self.member_count(stream.community_id)
         addressing, note = decides(stream, mentioned=mentioned, members=members,
                                    solo_max=self.solo_max_members)
+        if kind == REACTION_KIND:
+            return self._reaction(stream, rumor, wrapper_id, policy, sender=sender,
+                                  addressing=addressing, note=note)
         decision = policy.decide(sender=sender, kind=9, mention=addressing, dm=False,
                                  event_id=rumor.get("id"), text=text)
         if decision.duplicate:
@@ -171,7 +232,7 @@ class ConcordPlane:
             id=str(rumor.get("id") or wrapper_id),
             wrapper_id=wrapper_id,
             sender=sender,
-            kind=int(rumor.get("kind", 9)),
+            kind=kind,
             created_at=int(rumor.get("created_at") or 0),
             content=text,
             # One conversation per channel, so an agent's history is per channel and not
@@ -187,6 +248,35 @@ class ConcordPlane:
             interval_s=decision.interval_s,
         )
         return msg if self.store.add(msg) else None
+
+    def _reaction(self, stream: ChannelStream, rumor: dict[str, Any], wrapper_id: str,
+                  policy: Any, *, sender: str, addressing: bool,
+                  note: str) -> Optional[ChannelReaction]:
+        """A kind-7 rumor as a frame, or None when it answers nothing.
+
+        Three things have to survive the trip to the adapter: the target (`e` — for a prompt,
+        the id the adapter tracked it under), the author, and what that author may do here.
+        Authority is asked of the same rules a message from them in this room would match:
+        answering a gate is an instruction, and a reaction carries no reach of its own.
+        An emoji that is not a decision never gets that far — the adapter owns that set, and
+        this plane must not second-guess it or filter the frame out.
+        """
+        tags = rumor.get("tags") or []
+        target = next((t[1] for t in tags
+                       if isinstance(t, list) and len(t) > 1 and t[0] == "e"), None)
+        if not target:
+            return None                      # a reaction with nothing to answer
+        return ChannelReaction(
+            id=str(rumor.get("id") or wrapper_id),
+            sender=sender,
+            target=str(target),
+            emoji=str(rumor.get("content") or ""),
+            conversation=stream.chat_id,
+            created_at=int(rumor.get("created_at") or 0),
+            authority=policy.authority_for(sender=sender, kind=9, mention=addressing,
+                                           dm=False),
+            why=note,
+        )
 
     # -- invites --------------------------------------------------------
 

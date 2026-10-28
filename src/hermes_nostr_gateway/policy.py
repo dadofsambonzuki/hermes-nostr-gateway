@@ -271,6 +271,27 @@ class Policy:
             return sorted(named)[0]
         return "unknown"
 
+    def _match(self, *, group: str, kind: int, mention: bool, dm: bool) -> "_Rule | None":
+        """The first rule matching this event, or None when only `defaults` apply."""
+        return next(
+            (rule for rule in self._rules
+             if rule.matches(group=group, kind=kind, mention=mention, dm=dm)),
+            None,
+        )
+
+    def authority_for(self, *, sender: str, kind: int, mention: bool = False,
+                      dm: bool = False) -> str:
+        """What *sender* may do with an event of this kind here: `instructions` or `none`.
+
+        A reaction never reaches the agent as a message, but it can answer a gate, and that
+        question — may this author instruct in this conversation? — is the same one a
+        message asks. Only the attention half is skipped: `reach`, rule quotas and the
+        per-sender bucket decide whether something is shown, not whether its author may
+        instruct, and a read-only probe must not spend a delivery's allowance to ask.
+        """
+        rule = self._match(group=self.group_of(sender), kind=kind, mention=mention, dm=dm)
+        return rule.authority if rule is not None else self.default.authority
+
     # -- decision -------------------------------------------------------
     def decide(
         self,
@@ -285,11 +306,7 @@ class Policy:
         now = self._clock()
         group = self.group_of(sender)
         bot = self._is_bot(sender)
-        matched = next(
-            (rule for rule in self._rules
-             if rule.matches(group=group, kind=kind, mention=mention, dm=dm)),
-            None,
-        )
+        matched = self._match(group=group, kind=kind, mention=mention, dm=dm)
 
         # Dedupe first: the same event arriving on a second relay or a second plane
         # is one delivery, and must not burn a rate token or turn into a blocked replay.

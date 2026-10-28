@@ -131,6 +131,13 @@ forwarding). One tag per attachment:
   author>, sealed and wrapped exactly like a kind 14. Stored against the target and matched on
   receive; a reaction to a rumor we do not hold is stored unresolved rather than dropped.
   Un-reaction is a kind 5 deletion targeting the reaction's own rumor id, inside a wrap.
+  In a **Concord channel** the same kind 7 rides that channel's own wrap (inner kinds `9`,
+  `1111` and `7` are read), so it is routed by inner kind like everything else — but it is
+  never chat: it becomes a `reaction` frame carrying `from`, `target_rumor_id`, `emoji` and
+  the author's `authority` (the answer the policy rules give them for a message in that room),
+  and **no row is written**. A tap that answers a gate is not a message, and a channel's
+  history stays its chat; a replay of the same wrap is still refused, because the wrapper id
+  is claimed before the kind is known.
 - **Receipts stay out of scope:** they leak presence and no v1 caller needs them.
 
 ---
