@@ -112,6 +112,26 @@ def test_per_sender_bucket_degrades_to_blocked(clock):
     assert p.decide(sender="npub1loud", kind=1, event_id="later").reach == "immediate"
 
 
+def test_authority_for_answers_without_delivering_anything(clock):
+    """A reaction asks who may instruct here; asking must not cost a delivery."""
+    cfg = {"groups": {"family": [FAM]},
+           "policies": [{"name": "family-mentions",
+                         "match": {"group": "family", "kinds": [1], "mention": True},
+                         "reach": "immediate", "authority": "instructions"}],
+           "defaults": {"reach": "immediate", "authority": "none"},
+           "rate_limit": {"burst": 1, "per_hour": 30}}
+    p = Policy(cfg, clock=clock)
+
+    assert p.authority_for(sender=FAM, kind=1, mention=True) == "instructions"
+    assert p.authority_for(sender=FAM, kind=1, mention=False) == "none"
+    assert p.authority_for(sender=STRANGER, kind=1, mention=True) == "none"
+
+    # Read-only: the one token is still there, so the family member's first message is
+    # delivered rather than refused as over the limit.
+    d = p.decide(sender=FAM, kind=1, mention=True, event_id="first")
+    assert d.reach == "immediate" and not d.duplicate
+
+
 def test_bucket_is_per_sender_and_duplicates_do_not_burn_tokens(clock):
     cfg = {"policies": [], "defaults": {"reach": "immediate"},
            "rate_limit": {"burst": 2, "per_hour": 30}}

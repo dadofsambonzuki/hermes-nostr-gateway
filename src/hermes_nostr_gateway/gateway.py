@@ -971,11 +971,16 @@ class Gateway:
         return self.routing.resolve(plane, conversation, known_channels=known)
 
     def frame_for(self, msg: Any) -> dict[str, Any]:
-        """A message frame, or a `blocked` frame when policy refused it or it cannot be routed.
+        """A message frame, a `reaction` frame, or a `blocked` frame when policy refused it.
 
         A blocked message is still stored (see §13.3) but must never look like chat:
         the adapter turns `type: message` into an agent run, and a `drop` reach used
         to ride that path silently. `blocked` carries the reason and no content.
+
+        A channel's kind-7 reaction arrives here as a `ChannelReaction`, which brings its
+        own `type: reaction` frame and has no row behind it: the plane never stores one, so
+        there is nothing to look up and nothing to replay — the adapter either matches it to
+        a gate it is holding or drops it.
         """
         if msg.reach == "drop" or msg.blocked_reason:
             return {
@@ -985,7 +990,8 @@ class Gateway:
                 "reason": msg.blocked_reason or "not_allowlisted",
                 "rumor_id": msg.id,
             }
-        return self._routed(msg.to_frame(), plane=msg.plane, conversation=msg.conversation)
+        return self._routed(msg.to_frame(), plane=getattr(msg, "plane", ""),
+                            conversation=msg.conversation)
 
     def _echo_lookup(self, peer: str, since: int) -> list[str]:
         """Our own text to one peer since `since` — evidence for the echo rule.
@@ -1032,9 +1038,9 @@ class Gateway:
         in a task, never in the read callback, so the loop stays free. Rows that arrive
         while the flush runs are committed by the next one.
         """
-        task = asyncio.create_task(self._deliver(self._routed(
-            self.frame_for(msg), plane=msg.plane, conversation=msg.conversation,
-            sender=msg.sender, message_id=msg.id)))
+        # `frame_for` already carries the route and the profile, or the refusal: routing a
+        # second time here would resolve the same rule twice and lose the first answer.
+        task = asyncio.create_task(self._deliver(self.frame_for(msg)))
         self._deliveries.add(task)
         task.add_done_callback(self._deliveries.discard)
 
