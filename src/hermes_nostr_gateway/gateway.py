@@ -1146,8 +1146,34 @@ class Gateway:
         return msg if self.store.add(msg) else None
 
     # -- outbound -------------------------------------------------------
+
     async def send(self, *, to: str, text: str, reply_to: str | None = None,
                    cid: str | None = None, route: Any = None) -> dict[str, Any]:
+        """Send one message, once per correlation id.
+
+        `cid` is the caller's idempotency key as well as the id echoed back: a caller that
+        has to survive a lost acknowledgement (the ngit bridge does -- its poll can be cut
+        off by a turn before the reply arrives) sends the same id again, and gets the
+        message it already published instead of a second copy. The Marmot plane has always
+        treated `cid` this way; the store now remembers the answer for every plane, so the
+        retry is decided here rather than by whichever transport happens to be underneath.
+        """
+        prior = self.store.send_key(str(cid or ""))
+        if prior is not None:
+            log.info("send: %s already posted as %s; not publishing again",
+                     str(cid)[:60], str(prior.get("message_id"))[:16])
+            return {"type": "delivery", "id": cid, "ok": True, "deduped": True,
+                    "message_id": prior["message_id"],
+                    "conversation": prior.get("conversation") or str(to or "")}
+        frame = await self._dispatch_send(to=to, text=text, reply_to=reply_to, cid=cid,
+                                          route=route)
+        if cid and frame.get("ok") and frame.get("message_id"):
+            self.store.note_send_key(str(cid), str(frame["message_id"]),
+                                     str(frame.get("conversation") or to or ""))
+        return frame
+
+    async def _dispatch_send(self, *, to: str, text: str, reply_to: str | None = None,
+                             cid: str | None = None, route: Any = None) -> dict[str, Any]:
         target = str(to or "").strip()
         # What the adapter says the turn ran on, trimmed to names. It goes on the reply's row
         # and back in the reply, so the audit trail is the route that was used rather than the

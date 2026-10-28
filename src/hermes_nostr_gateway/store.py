@@ -173,6 +173,36 @@ CREATE TABLE IF NOT EXISTS ngit_cursors (
     PRIMARY KEY (repo, stream)
 );
 
+-- Notices the bridge has decided to post, and has not had confirmed yet. The queue is what
+-- makes a busy daemon a delay instead of a loss: a poll hands a notice over, and anything
+-- the daemon did not take stays `queued` for the next one. One row per PR and notice, so
+-- deciding the same thing twice cannot queue it twice.
+CREATE TABLE IF NOT EXISTS ngit_outbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo         TEXT NOT NULL,
+    kind         INTEGER NOT NULL,  -- 1621 issue, 1618 pull request
+    source_id    TEXT NOT NULL,   -- the event id, hex
+    notice       TEXT NOT NULL,   -- 'issue', 'question', 'ready' or 'merged'
+    conversation TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'queued',   -- 'queued' until the daemon takes it
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    UNIQUE (repo, source_id, notice)
+);
+
+-- A caller's idempotency key -> the message it posted. `send` records one when it is given
+-- a key and answers a repeat with that message id instead of publishing again: a caller
+-- that lost the acknowledgement cannot turn its retry into a second message in the channel.
+CREATE TABLE IF NOT EXISTS send_keys (
+    key          TEXT PRIMARY KEY,
+    message_id   TEXT NOT NULL,
+    conversation TEXT,
+    created_at   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS attachments (
     rumor_id   TEXT NOT NULL,
     position   INTEGER NOT NULL,
@@ -1393,6 +1423,142 @@ class Store:
             " ON CONFLICT(repo, stream) DO UPDATE SET value = excluded.value,"
             " updated_at = excluded.updated_at",
             (str(repo), str(stream), str(value), int(time.time())),
+        )
+
+    # -- the ngit outbox -------------------------------------------------
+
+    def ngit_notice_put(self, repo: str, kind: int, source_id: str, notice: str, *,
+                        conversation: str, text: str) -> bool:
+        """Queue one notice. False when it was already queued or already sent: deciding
+        the same thing twice must not put it in the channel twice."""
+        now = int(time.time())
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO ngit_outbox (repo, kind, source_id, notice, conversation,"
+            " text, state, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
+            (str(repo), int(kind), str(source_id), str(notice), str(conversation), str(text),
+             now, now),
+        )
+        return cur.rowcount > 0
+
+    def ngit_notice_due(self, repo: str, limit: int) -> list[dict[str, Any]]:
+        """Queued notices in the order they were decided, oldest first."""
+        rows = self.db.execute(
+            "SELECT * FROM ngit_outbox WHERE repo = ? AND state = 'queued'"
+            " ORDER BY id ASC LIMIT ?", (str(repo), max(0, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def ngit_notice_queued(self, repo: str, source_id: str) -> bool:
+        """Whether this event still has a notice waiting for the daemon."""
+        row = self.db.execute(
+            "SELECT 1 FROM ngit_outbox WHERE repo = ? AND source_id = ? AND state = 'queued'"
+            " LIMIT 1", (str(repo), str(source_id)),
+        ).fetchone()
+        return row is not None
+
+    def ngit_stranded(self, repo: str, kind: int) -> list[dict[str, Any]]:
+        """Links that say `pending` with no notice anywhere: the queue lost the row, so the
+        notice has to be made again or the event is stuck for ever."""
+        rows = self.db.execute(
+            "SELECT l.* FROM ngit_links l WHERE l.repo = ? AND l.kind = ? AND l.state = 'pending'"
+            " AND NOT EXISTS (SELECT 1 FROM ngit_outbox o"
+            "                 WHERE o.repo = l.repo AND o.source_id = l.source_id)",
+            (str(repo), int(kind)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def ngit_notice_count(self, repo: str, *, kind: int | None = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM ngit_outbox WHERE repo = ? AND state = 'queued'"
+        args: list[Any] = [str(repo)]
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(int(kind))
+        row = self.db.execute(sql, args).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def ngit_watched(self, repo: str) -> bool:
+        """Whether the bridge has dealt with this repo before.
+
+        A cursor missing from a repo the bridge has already written to was deleted by hand:
+        that is a reset, and starting it from the lookback floor would announce a week of
+        PRs the channel never heard about. A repo with nothing in it has never been read,
+        and there the configured floor is what an operator asked for.
+        """
+        for table in ("ngit_links", "ngit_outbox"):
+            row = self.db.execute(
+                f"SELECT 1 FROM {table} WHERE repo = ? LIMIT 1", (str(repo),)).fetchone()
+            if row is not None:
+                return True
+        return False
+
+    def ngit_notice_sent(self, repo: str, kind: int, source_id: str, notice: str, *,
+                         state: str) -> None:
+        """The daemon took the notice: record the receipt and move the link together.
+
+        One transaction, because a receipt with a link that still says `pending` is a row
+        the next poll would try to queue again, and the unique key would silently refuse it.
+        """
+        now = int(time.time())
+        with self.db:
+            self.db.execute(
+                "UPDATE ngit_outbox SET state = 'sent', attempts = attempts + 1,"
+                " error = NULL, updated_at = ? WHERE repo = ? AND source_id = ? AND notice = ?",
+                (now, str(repo), str(source_id), str(notice)),
+            )
+            self.db.execute(
+                "UPDATE ngit_links SET state = ?, updated_at = ?"
+                " WHERE repo = ? AND kind = ? AND source_id = ?",
+                (str(state), now, str(repo), int(kind), str(source_id)),
+            )
+
+    def ngit_notice_failed(self, repo: str, source_id: str, notice: str, error: str) -> int:
+        """Count one attempt that did not land and remember why. The row stays queued."""
+        cur = self.db.execute(
+            "UPDATE ngit_outbox SET attempts = attempts + 1, error = ?, updated_at = ?"
+            " WHERE repo = ? AND source_id = ? AND notice = ?",
+            (str(error)[:300], int(time.time()), str(repo), str(source_id), str(notice)),
+        )
+        return cur.rowcount
+
+    def ngit_notice_drop(self, repo: str, source_id: str) -> int:
+        """Forget this PR's unsent notices: a merge makes an unsent review line redundant."""
+        cur = self.db.execute(
+            "DELETE FROM ngit_outbox WHERE repo = ? AND source_id = ? AND state = 'queued'",
+            (str(repo), str(source_id)),
+        )
+        return cur.rowcount
+
+    def ngit_notice_forget(self, repo: str, source_id: str) -> int:
+        """Drop every notice for one event, sent or not.
+
+        A task recreated by hand is a different task with a different id, so the notice that
+        named the old one has to go: leaving the receipt behind would make the new notice a
+        duplicate of a message about something that no longer exists.
+        """
+        cur = self.db.execute(
+            "DELETE FROM ngit_outbox WHERE repo = ? AND source_id = ?",
+            (str(repo), str(source_id)),
+        )
+        return cur.rowcount
+
+    # -- send idempotency -------------------------------------------------
+
+    def send_key(self, key: str) -> dict[str, Any] | None:
+        """The message a caller's idempotency key already produced, if it produced one."""
+        if not key:
+            return None
+        row = self.db.execute("SELECT * FROM send_keys WHERE key = ?", (str(key),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def note_send_key(self, key: str, message_id: str, conversation: str = "") -> None:
+        """Remember that this key posted that message, so a repeat of the request is a
+        repeat of the answer rather than a second message."""
+        if not key or not message_id:
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO send_keys (key, message_id, conversation, created_at)"
+            " VALUES (?,?,?,?)",
+            (str(key), str(message_id), str(conversation), int(time.time())),
         )
 
     def stats(self) -> dict[str, Any]:

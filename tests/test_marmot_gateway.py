@@ -133,6 +133,33 @@ async def test_send_op_routes_a_marmot_target_through_wn_agent(tmp_path, no_nak)
         await agent.stop()
 
 
+async def test_a_repeated_correlation_id_publishes_nothing_new(tmp_path, no_nak):
+    """A lost acknowledgement must not become a second message.
+
+    The ngit bridge sends a notice with a stable id; if the reply is lost to a timeout it
+    sends the same id again, and the daemon answers with the message it already published.
+    """
+    agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
+    gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
+                                                   "socket": str(agent.path),
+                                                   "account_id_hex": ACCOUNT}))
+    try:
+        await gateway.start()
+        frame = {"op": "send", "to": f"marmot:{GROUP}", "text": "PR is ready",
+                 "id": "ngit:pr:abc:ready"}
+        first = await call(gateway.socket_path, frame)
+        again = await call(gateway.socket_path, frame)
+
+        sent = [r for r in agent.requests if r.get("type") == "send_final"]
+        assert len(sent) == 1
+        assert first["ok"] is True and first.get("deduped") is None
+        assert again["ok"] is True and again["deduped"] is True
+        assert again["message_id"] == first["message_id"]
+    finally:
+        await gateway.stop()
+        await agent.stop()
+
+
 async def test_a_bare_group_id_is_also_a_marmot_target(tmp_path, no_nak):
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,

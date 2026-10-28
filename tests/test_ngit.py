@@ -6,8 +6,10 @@ Placeholders only: keys, channel ids, repo names and board slugs here are invent
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -146,7 +148,7 @@ class Harness:
             {"trusted_npubs": [npub(key) for key in trusted]})
         self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0)
         self.anchor = anchor
-        self.notifier = notifier or (lambda who, text: self.messages.append((who, text)))
+        self.notifier = notifier or (lambda who, text, key="": self.messages.append((who, text)))
         self.repo = home.parent / "checkout"
         self.repo.mkdir(exist_ok=True)
         self.target = ngit.Target(conversation=f"concord:{COMMUNITY}:{CHANNEL}",
@@ -249,7 +251,7 @@ def test_question_is_retried_when_the_channel_was_unreachable(home, store):
     issue = make_issue("b3", author=STRANGER_HEX)
     failures = {"left": 1}
 
-    def flaky(who, text):
+    def flaky(who, text, key=""):
         if failures["left"]:
             failures["left"] -= 1
             raise ngit.NotifyError("the daemon is not running")
@@ -486,6 +488,10 @@ def test_recreate_brings_a_deleted_task_back(harness):
     assert len(tasks) == 1 and tasks[0]["id"] != task_id
     # The new task carries the issue's history again, not a record of a task that is gone.
     assert [c["body"] for c in harness.comments(tasks[0]["id"])] == ["Same here."]
+    # And its own notice: the first one named a task that no longer exists.
+    assert len(harness.messages) == 2
+    assert tasks[0]["id"] in harness.messages[1][1]
+    assert task_id not in harness.messages[1][1]
 
 
 def test_only_max_new_issues_are_created_per_poll(home, store):
@@ -515,12 +521,12 @@ def test_only_max_prs_are_announced_per_poll(home, store):
         first = made.sync()
         assert first.prs["signalled"] == 2
         assert first.prs["deferred"] == 1
-        # A deferred PR is not behind the cursor: the next poll must still see it.
-        assert made.store.ngit_cursor(ADDRESS, "prs") is None
+        # The cursor stops short of the deferred PR, so the next poll still reads it.
+        assert made.store.ngit_cursor(ADDRESS, "prs") == str(1001 - ngit.CURSOR_OVERLAP_S)
         second = made.sync()
         assert second.prs["signalled"] == 1
         assert len(made.messages) == 3
-        assert made.store.ngit_cursor(ADDRESS, "prs") is not None
+        assert made.store.ngit_cursor(ADDRESS, "prs") == str(1002 - ngit.CURSOR_OVERLAP_S)
     finally:
         made.close()
 
@@ -590,7 +596,7 @@ def test_a_pr_signal_that_could_not_be_sent_is_retried_once(home, store):
     pr = make_pr("b2")
     failures = {"left": 1}
 
-    def flaky(who, text):
+    def flaky(who, text, key=""):
         if failures["left"]:
             failures["left"] -= 1
             raise ngit.NotifyError("the daemon is not running")
@@ -605,6 +611,254 @@ def test_a_pr_signal_that_could_not_be_sent_is_retried_once(home, store):
         assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "signalled"
         # The failed attempt sent nothing, so the retry is the first message that landed.
         assert second.posted == 1
+    finally:
+        made.close()
+
+
+# -- the outbox: a busy daemon is a delay, not a loss -------------------------
+
+class Recorder:
+    """A channel that can be busy or refuse, so a pass can be driven through both.
+
+    `busy` is how many sends go unanswered (a turn holds the daemon); `fail` is an exception
+    every send raises until it is cleared. What it *took* is `messages`, and `keys` is what
+    the daemon would have deduplicated on.
+    """
+
+    def __init__(self, *, busy: int = 0, fail: Exception | None = None):
+        self.messages: list[tuple[str, str]] = []
+        self.keys: list[str] = []
+        self.attempts = 0
+        self.busy = busy
+        self.fail = fail
+
+    def __call__(self, who: str, text: str, key: str = "") -> None:
+        self.attempts += 1
+        self.keys.append(key)
+        if self.busy:
+            self.busy -= 1
+            raise ngit.NotifyBusy("the daemon did not answer within 20s")
+        if self.fail is not None:
+            raise self.fail
+        self.messages.append((who, text))
+
+
+def test_a_busy_daemon_leaves_the_notice_queued_without_an_error(home, store):
+    """The acceptance case: a turn holds the daemon, and the notice waits instead of dying."""
+    pr = make_pr("d1", created_at=5000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        busy = made.sync()
+        assert busy.posted == 0
+        assert busy.prs["pending"] == 1
+        # A busy daemon is not an outage: the notice is queued, so nothing was lost.
+        assert busy.errors == [] and busy.failed == 0
+        assert any("queued for the next pass" in note for note in busy.notes)
+        assert channel.messages == []
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "pending"
+
+        quiet = made.sync()
+        assert quiet.posted == 1
+        assert quiet.prs["signalled"] == 1
+        assert quiet.prs["pending"] == 0
+        assert quiet.errors == []
+        assert len(channel.messages) == 1 and pr.subject in channel.messages[0][1]
+
+        again = made.sync()
+        assert again.posted == 0
+        assert again.prs["existing"] == 1
+        assert len(channel.messages) == 1
+    finally:
+        made.close()
+
+
+def test_a_retry_carries_the_same_key_so_a_landed_notice_is_not_reposted(home, store):
+    """The daemon may have posted it and lost the acknowledgement: the key is what stops
+    the retry becoming a second message."""
+    pr = make_pr("d2", created_at=5000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        made.sync()
+        made.sync()
+        assert len(channel.keys) == 2
+        assert channel.keys[0] == channel.keys[1]
+        # The key names the queued notice, so the daemon's receipt can be traced back to it.
+        assert channel.keys[0].startswith("ngit:")
+        assert pr.id[:12] in channel.keys[0]
+    finally:
+        made.close()
+
+
+def test_a_queued_notice_is_delivered_when_the_relay_has_nothing_new(home, store):
+    """The cursor moves past a PR whose notice is only queued: the queue, not the relay
+    window, is what a later pass delivers from."""
+    pr = make_pr("d5", created_at=5000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        first = made.sync()
+        assert first.prs["pending"] == 1
+        assert made.store.ngit_cursor(ADDRESS, "prs") == str(5000 - ngit.CURSOR_OVERLAP_S)
+
+        made.prs_data = ([], ())
+        second = made.sync()
+        assert made.since_seen[-1] == 5000 - ngit.CURSOR_OVERLAP_S
+        assert second.posted == 1 and second.prs["pending"] == 0
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "signalled"
+        assert len(channel.messages) == 1
+    finally:
+        made.close()
+
+
+def test_a_busy_pass_waits_on_one_notice_and_leaves_the_rest(home, store):
+    """Three notices, one timeout: the daemon has already ignored one for the whole
+    timeout, so the others stay queued rather than each costing another."""
+    prs = [make_pr(f"e{index}", created_at=1000 + index) for index in range(3)]
+    channel = Recorder(busy=99)
+    made = Harness(home, store, prs=(prs, ()), notifier=channel)
+    try:
+        report = made.sync()
+        assert channel.attempts == 1
+        assert report.prs["pending"] == 3
+        assert report.errors == []
+    finally:
+        made.close()
+
+
+def test_a_merge_supersedes_a_review_line_that_never_went_out(home, store):
+    pr = make_pr("d4", created_at=1000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], []), notifier=channel)
+    try:
+        made.sync()
+        assert made.store.ngit_notice_count(ADDRESS, kind=ngit.KIND_PR) == 1
+
+        merge = ngit.Merge(pr_id=pr.id, commit="a" * 40, created_at=1100)
+        made.prs_data = ([pr], [merge])
+        report = made.sync()
+
+        assert report.prs["merged"] == 1
+        assert len(channel.messages) == 1
+        assert "merged as " + "a" * 40 in channel.messages[0][1]
+        assert "ready for review" not in channel.messages[0][1]
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "merged"
+    finally:
+        made.close()
+
+
+def test_a_refusal_is_an_error_and_the_notice_is_retried_after_the_fix(home, store):
+    pr = make_pr("d6", created_at=5000)
+    channel = Recorder(fail=ngit.NotifyError("no readable Concord channel for 'concord:x:y'"))
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        refused = made.sync()
+        assert refused.failed == 1 and refused.errors
+        assert "not delivered" in refused.errors[0]
+        assert refused.prs["pending"] == 1
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "pending"
+
+        channel.fail = None
+        fixed = made.sync()
+        assert fixed.posted == 1 and fixed.errors == []
+        assert len(channel.messages) == 1
+    finally:
+        made.close()
+
+
+def test_a_busy_daemon_does_not_lose_an_issue_notice(home, store):
+    """The same rule on the inbound half: the task is created, and its notice waits."""
+    issue = make_issue("d7")
+    channel = Recorder(busy=1)
+    made = Harness(home, store, issues=[issue], notifier=channel)
+    made.details = {issue.hex: issue}
+    try:
+        first = made.sync()
+        assert first.issues["created"] == 1
+        assert first.errors == []
+        assert channel.messages == []
+
+        second = made.sync()
+        assert second.posted == 1
+        assert len(channel.messages) == 1
+        assert "->" in channel.messages[0][1]
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_ISSUE, issue.hex)["state"] == "ready"
+    finally:
+        made.close()
+
+
+def test_a_relay_failure_does_not_hold_back_a_queued_notice(home, store):
+    """Delivery is its own step: a relay that will not answer cannot keep a notice back."""
+    pr = make_pr("d9", created_at=5000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        made.sync()
+
+        def broken(since):
+            raise ngit.NgitError("relay read failed")
+
+        made.prs = broken
+        report = made.sync()
+
+        assert "prs: relay read failed" in report.errors
+        assert report.posted == 1 and len(channel.messages) == 1
+        assert report.prs["pending"] == 0
+    finally:
+        made.close()
+
+
+def test_a_dry_run_reports_the_queue_and_posts_nothing(home, store):
+    pr = make_pr("da", created_at=5000)
+    channel = Recorder(busy=1)
+    made = Harness(home, store, prs=([pr], ()), notifier=channel)
+    try:
+        made.sync()
+        report = made.sync(dry_run=True)
+        assert report.posted == 0
+        assert report.prs["pending"] == 1
+        assert channel.messages == []
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "pending"
+        # A dry run leaves the queue as it found it.
+        assert made.store.ngit_notice_count(ADDRESS, kind=ngit.KIND_PR) == 1
+    finally:
+        made.close()
+
+
+def test_a_pending_link_with_no_notice_is_requeued(home, store):
+    """`pending` with nothing in the queue is a promise no pass could keep: make it again."""
+    pr = make_pr("db", created_at=5000)
+    channel = Recorder()
+    made = Harness(home, store, prs=((), ()), notifier=channel)
+    try:
+        made.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, board=BOARD, state="pending",
+                                  detail={"nevent": pr.nevent, "subject": pr.subject,
+                                          "author": pr.author, "branch": pr.branch})
+        report = made.sync()
+
+        assert report.posted == 1
+        assert len(channel.messages) == 1 and pr.subject in channel.messages[0][1]
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "signalled"
+        assert any("requeued" in note for note in report.notes)
+    finally:
+        made.close()
+
+
+def test_a_deleted_cursor_starts_from_now_not_from_the_lookback(home, store):
+    """A reset must not replay a week of PRs into the channel."""
+    made = Harness(home, store, prs=([make_pr("d8", created_at=5000)], ()))
+    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=168)
+    try:
+        made.sync()
+        before = int(time.time())
+        assert before - 168 * 3600 - 2 <= made.since_seen[0] <= before - 168 * 3600 + 2
+
+        made.store.db.execute("DELETE FROM ngit_cursors WHERE repo = ? AND stream = 'prs'",
+                              (ADDRESS,))
+        made.prs_data = ([], ())
+        made.sync()
+        assert before - ngit.CURSOR_OVERLAP_S - 2 <= made.since_seen[-1] <= before + 2
     finally:
         made.close()
 
@@ -633,6 +887,107 @@ def test_the_first_poll_has_a_lookback_floor(harness):
     before = int(time.time())
     harness.sync()
     assert before - 24 * 3600 - 2 <= harness.since_seen[0] <= before - 24 * 3600 + 2
+
+
+# -- the notifier: what a busy daemon looks like from here --------------------
+
+class FakeDaemon:
+    """A socket that answers like a daemon: busy (holds), refusing, or working, in turn."""
+
+    def __init__(self, path: Path, *, holds: list[float] | None = None,
+                 replies: list[dict | None] | None = None):
+        self.path = Path(path)
+        self.holds = list(holds or [])
+        self.replies = list(replies or [])
+        self.requests: list[dict] = []
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "FakeDaemon":
+        self._listener.bind(str(self.path))
+        self._listener.listen(4)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return self
+
+    def _serve(self) -> None:
+        """One thread an accept: a held request must not block the next one."""
+        for index in range(max(len(self.holds), len(self.replies)) or 1):
+            conn, _ = self._listener.accept()
+            threading.Thread(target=self._handle, args=(conn, index), daemon=True).start()
+
+    def _handle(self, conn: socket.socket, index: int) -> None:
+        try:
+            self.requests.append(json.loads(conn.recv(1 << 16).decode().strip()))
+            hold = self.holds[index] if index < len(self.holds) else 0.0
+            if hold:
+                time.sleep(hold)
+            reply = self.replies[index] if index < len(self.replies) else None
+            if reply is not None:
+                conn.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:
+            pass          # the caller gave up first, which is the point of a hold
+        finally:
+            conn.close()
+
+
+def test_a_daemon_that_does_not_answer_is_busy_not_a_failure(tmp_path):
+    """A turn holds the daemon; the timeout has to read as `busy` or every turn is an outage."""
+    daemon = FakeDaemon(tmp_path / "busy.sock", holds=[1.0]).start()
+    with pytest.raises(ngit.NotifyBusy) as caught:
+        ngit.DaemonNotifier(daemon.path, timeout=0.2)("concord:ab:cd", "notice", "ngit:7")
+    assert "did not answer" in str(caught.value)
+
+
+def test_a_missing_daemon_is_a_failure_not_a_delay(tmp_path):
+    with pytest.raises(ngit.NotifyError) as caught:
+        ngit.DaemonNotifier(tmp_path / "absent.sock", timeout=0.2)("concord:ab:cd", "notice")
+    assert not isinstance(caught.value, ngit.NotifyBusy)
+
+
+def test_a_refusal_carries_what_the_daemon_said(tmp_path):
+    daemon = FakeDaemon(tmp_path / "no.sock",
+                        replies=[{"type": "error", "error": "no readable Concord channel"}]).start()
+    with pytest.raises(ngit.NotifyError) as caught:
+        ngit.DaemonNotifier(daemon.path, timeout=2.0)("concord:ab:cd", "notice")
+    assert "no readable Concord channel" in str(caught.value)
+
+
+def test_the_notice_key_travels_as_the_frame_id(tmp_path):
+    """The daemon dedupes on the frame's `id`; the bridge has to put the key there."""
+    daemon = FakeDaemon(tmp_path / "ok.sock",
+                        replies=[{"type": "delivery", "ok": True, "message_id": "r1"}]).start()
+    ngit.DaemonNotifier(daemon.path, timeout=2.0)("concord:ab:cd", "notice", "ngit:7:abcdef:ready")
+    assert daemon.requests == [{"op": "send", "to": "concord:ab:cd", "text": "notice",
+                                "id": "ngit:7:abcdef:ready"}]
+
+
+def test_the_acceptance_run_against_a_real_socket(home, store, tmp_path):
+    """Busy mid-turn, then quiet: one pending notice, one delivery, then nothing.
+
+    The same three passes as the Recorder test, but through the real notifier and a real
+    socket, because the classification of a timeout is the part that was wrong.
+    """
+    pr = make_pr("dc", created_at=5000)
+    daemon = FakeDaemon(tmp_path / "live.sock", holds=[0.6, 0.0],
+                        replies=[None, {"type": "delivery", "ok": True,
+                                        "message_id": "r1"}]).start()
+    made = Harness(home, store, prs=([pr], ()),
+                   notifier=ngit.DaemonNotifier(daemon.path, timeout=0.2))
+    try:
+        busy = made.sync()
+        assert busy.posted == 0 and busy.prs["pending"] == 1 and busy.errors == []
+
+        quiet = made.sync()
+        assert quiet.posted == 1 and quiet.prs["signalled"] == 1
+
+        again = made.sync()
+        assert again.posted == 0 and again.prs["existing"] == 1
+        # Two sends in three passes, and the retry carried the first one's key.
+        assert len(daemon.requests) == 2
+        assert daemon.requests[0]["id"] == daemon.requests[1]["id"]
+    finally:
+        made.close()
 
 
 # -- the board anchor ---------------------------------------------------------
