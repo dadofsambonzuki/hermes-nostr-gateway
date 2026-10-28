@@ -59,12 +59,15 @@ def _client(secret: str | None = None) -> sdk.Client:
 
 
 def _filter(kinds: Sequence[int], author: str | None, limit: int | None,
-            p_tag: str | None = None, since: int | None = None) -> sdk.Filter:
-    """One filter: the kinds, an optional author, `#p`, cap and `since` floor.
+            p_tag: str | None = None, since: int | None = None,
+            a_tag: str | None = None) -> sdk.Filter:
+    """One filter: the kinds, an optional author, `#p`, `#a`, cap and `since` floor.
 
     A limit of 0 or None is omitted rather than sent as `limit: 0`: a live subscription
     wants everything from now on, and some relays read an explicit zero as "nothing".
     `since` is epoch seconds and is what keeps a reconnect from replaying history.
+    `a_tag` is NIP-34's addressable-event filter: a repo's issues and PRs are found by the
+    repository announcement address, not by an author who may be any contributor.
     """
     filt = sdk.Filter().kinds([sdk.Kind(int(kind)) for kind in kinds])
     if limit:
@@ -73,6 +76,8 @@ def _filter(kinds: Sequence[int], author: str | None, limit: int | None,
         filt = filt.since(sdk.Timestamp.from_secs(int(since)))
     if p_tag:
         filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord("p")), p_tag)
+    if a_tag:
+        filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord("a")), a_tag)
     if author:
         filt = filt.author(sdk.PublicKey.parse(hex_of(author)))
     return filt
@@ -140,6 +145,7 @@ def fetch_first_blocking(**kwargs: Any) -> dict[str, Any] | None:
 async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str | None = None,
                      limit: int = 200, since: int | None = None,
                      timeout: float = 12.0, p_tag: str | None = None,
+                     a_tag: str | None = None,
                      secret: str | None = None) -> list[dict[str, Any]]:
     """Every event matching the filter, from every relay given (deduped by id)."""
     urls = [str(url) for url in relays if url]
@@ -154,7 +160,7 @@ async def fetch_many(*, relays: Iterable[str], kinds: Sequence[int], author: str
             except Exception:  # noqa: BLE001
                 continue
         await client.connect()
-        filt = _filter(kinds, author, limit, p_tag, since)
+        filt = _filter(kinds, author, limit, p_tag, since, a_tag)
         events = await asyncio.wait_for(
             client.fetch_events(sdk.ReqTarget.auto([filt]), dt.timedelta(seconds=timeout)),
             timeout + 2)

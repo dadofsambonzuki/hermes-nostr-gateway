@@ -130,6 +130,46 @@ CREATE TABLE IF NOT EXISTS concord_invites (
     announced_at INTEGER
 );
 
+-- The ngit bridge: what one Nostr issue or PR event became, and how far a repo has been
+-- read. `state` is the bridge's lifecycle, not a task's status -- a `deleted` row is what
+-- stops a hand-deleted task being recreated, and `asked` is what stops a question being
+-- asked twice. `detail` is the bridge's own note about the source, as JSON.
+CREATE TABLE IF NOT EXISTS ngit_links (
+    repo       TEXT NOT NULL,     -- the repo's NIP-34 address, or its path when it has none
+    kind       INTEGER NOT NULL,  -- 1621 issue, 1618 pull request
+    source_id  TEXT NOT NULL,     -- the source event id, hex
+    task_id    TEXT,
+    board      TEXT,
+    state      TEXT NOT NULL,
+    detail     TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, kind, source_id)
+);
+CREATE INDEX IF NOT EXISTS ngit_links_task ON ngit_links (task_id);
+CREATE INDEX IF NOT EXISTS ngit_links_source ON ngit_links (kind, source_id);
+
+-- One row per comment already copied onto a task, so a re-poll appends each exactly once
+-- and in the order the issue carries them.
+CREATE TABLE IF NOT EXISTS ngit_comments (
+    repo       TEXT NOT NULL,
+    source_id  TEXT NOT NULL,
+    comment_id TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, source_id, comment_id)
+);
+
+-- Per repo and stream, the last event time a poll reached: a poll asks only for what is
+-- newer, and a catch-up after downtime does not re-read a week of history.
+CREATE TABLE IF NOT EXISTS ngit_cursors (
+    repo       TEXT NOT NULL,
+    stream     TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, stream)
+);
+
 CREATE TABLE IF NOT EXISTS attachments (
     rumor_id   TEXT NOT NULL,
     position   INTEGER NOT NULL,
@@ -1237,6 +1277,112 @@ class Store:
         cur = self.db.execute("UPDATE concord_invites SET announced_at = ? WHERE id = ?",
                               (int(time.time()), str(invite_id)))
         return cur.rowcount > 0
+
+    # -- the ngit bridge -------------------------------------------------
+
+    def ngit_link(self, repo: str, kind: int, source_id: str) -> dict[str, Any] | None:
+        """What this issue or PR became, or None when the bridge has never seen it."""
+        row = self.db.execute(
+            "SELECT * FROM ngit_links WHERE repo = ? AND kind = ? AND source_id = ?",
+            (str(repo), int(kind), str(source_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def ngit_link_for_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM ngit_links WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (str(task_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def ngit_link_for_source(self, kind: int, source_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM ngit_links WHERE kind = ? AND source_id = ?"
+            " ORDER BY updated_at DESC LIMIT 1", (int(kind), str(source_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def ngit_link_save(self, repo: str, kind: int, source_id: str, *, state: str,
+                       task_id: str | None = None, board: str = "",
+                       detail: dict[str, Any] | None = None) -> None:
+        """Record the link, or move an existing one to a new state.
+
+        A new row keeps the state it is given; an existing row only has its state and note
+        replaced when one is supplied, so a caller that knows the task id cannot lose it.
+        """
+        now = int(time.time())
+        note = json.dumps(detail, separators=(",", ":"), sort_keys=True) if detail else None
+        existing = self.ngit_link(repo, kind, source_id)
+        if existing is None:
+            self.db.execute(
+                "INSERT INTO ngit_links (repo, kind, source_id, task_id, board, state,"
+                " detail, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(repo), int(kind), str(source_id), task_id, board or None, str(state),
+                 note, now, now),
+            )
+            return
+        self.db.execute(
+            "UPDATE ngit_links SET state = ?, task_id = COALESCE(?, task_id),"
+            " board = COALESCE(NULLIF(?, ''), board),"
+            " detail = COALESCE(?, detail), updated_at = ?"
+            " WHERE repo = ? AND kind = ? AND source_id = ?",
+            (str(state), task_id, board, note, now, str(repo), int(kind), str(source_id)),
+        )
+
+    def ngit_link_state(self, repo: str, kind: int, source_id: str, state: str) -> bool:
+        cur = self.db.execute(
+            "UPDATE ngit_links SET state = ?, updated_at = ?"
+            " WHERE repo = ? AND kind = ? AND source_id = ?",
+            (str(state), int(time.time()), str(repo), int(kind), str(source_id)),
+        )
+        return cur.rowcount > 0
+
+    def ngit_comment_seen(self, repo: str, source_id: str, comment_id: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM ngit_comments WHERE repo = ? AND source_id = ? AND comment_id = ?",
+            (str(repo), str(source_id), str(comment_id)),
+        ).fetchone()
+        return row is not None
+
+    def ngit_note_comment(self, repo: str, source_id: str, comment_id: str,
+                          task_id: str) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO ngit_comments (repo, source_id, comment_id, task_id,"
+            " created_at) VALUES (?,?,?,?,?)",
+            (str(repo), str(source_id), str(comment_id), str(task_id), int(time.time())),
+        )
+        return cur.rowcount > 0
+
+    def ngit_comment_count(self, repo: str, source_id: str) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) AS n FROM ngit_comments WHERE repo = ? AND source_id = ?",
+            (str(repo), str(source_id)),
+        ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def ngit_forget_comments(self, repo: str, source_id: str) -> int:
+        """Drop the copied-comment record for one issue: its task was recreated, so the
+        comments have to be copied onto the new one."""
+        cur = self.db.execute(
+            "DELETE FROM ngit_comments WHERE repo = ? AND source_id = ?",
+            (str(repo), str(source_id)),
+        )
+        return cur.rowcount
+
+    def ngit_cursor(self, repo: str, stream: str) -> str | None:
+        row = self.db.execute(
+            "SELECT value FROM ngit_cursors WHERE repo = ? AND stream = ?",
+            (str(repo), str(stream)),
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def ngit_set_cursor(self, repo: str, stream: str, value: str | int) -> None:
+        self.db.execute(
+            "INSERT INTO ngit_cursors (repo, stream, value, updated_at) VALUES (?,?,?,?)"
+            " ON CONFLICT(repo, stream) DO UPDATE SET value = excluded.value,"
+            " updated_at = excluded.updated_at",
+            (str(repo), str(stream), str(value), int(time.time())),
+        )
 
     def stats(self) -> dict[str, Any]:
         # A refusal is never "pending delivery": a `reach: drop` row carries no

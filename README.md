@@ -333,6 +333,55 @@ By convention a channel bound to a project gets one board, named after the chann
 board's `--default-workdir` set to the checkout. Two channels that share a checkout get two
 queues: a channel is a context, and one queue for two rooms hides whose work is whose.
 
+### ngit: issues as work, PRs in the channel
+
+A channel's checkout is usually also a NIP-34 repository, where its issues and pull requests
+live on Nostr. `hng ngit sync` runs the bridge in both directions off that *one* mapping — no
+second table of board slugs and repo paths:
+
+```
+inbound   kind-1621 issue    -> a task on the channel's board
+          kind-1622 comment  -> a task comment, in the order the issue carries them
+outbound  kind-1618 PR       -> one "ready for review" message in the channel
+          kind-1631 applied  -> one "merged as <commit>" follow-up
+```
+
+```bash
+hng ngit sync --channel concord:<community>:<channel>          # repo and board from the mapping
+hng ngit sync --channel ... --repo ~/Projects/example --board example-channel   # explicit
+```
+
+An issue from a **trusted npub** (`control.trusted_npubs`, or the concord plane's own list)
+becomes a task `ready` for the dispatcher, and the channel gets one notice line,
+`issue <nevent> -> <task id>`. Any other author is held: the task is created `blocked` and
+one question is posted into the channel with the issue, the author and what a `yes` would do.
+A stranger cannot put work in the queue by filing an issue, and nobody's issue is worked
+silently. The answer is a verb, not a memory:
+
+```bash
+hng ngit answer <task-id|nevent> --yes --by <trusted npub>    # -> ready, with an audit comment
+hng ngit answer <task-id|nevent> --no  --by <trusted npub> --reason "not our roadmap"
+```
+
+A `no` leaves the task blocked with the reason recorded, and the issue is never asked about
+again. Only a trusted npub can answer: the person who filed the issue does not thereby get to
+authorise it. The question is durable state — the blocked task plus a `ngit_links` row — so a
+restart does not forget it and a re-poll does not ask twice.
+
+A PR signal names the author every time, including when this gateway opened it, and each PR
+is reported once: `ngit_links` dedupes by PR id, and a merge that arrives for a PR the bridge
+never announced posts one "merged" line rather than replaying history. Closing an issue on
+Nostr does not close the task; the bridge imports open issues and narrates PRs, and a board's
+lifecycle stays the board's.
+
+State lives in the gateway store (`ngit_links`, `ngit_comments`, `ngit_cursors`): what each
+event became, which comments are already on the task, and how far each repo has been read. A
+task deleted by hand keeps its `deleted` link, so the next sync does not silently recreate it;
+pass `--recreate` when you want it back. `ngit.max_new` (default 20) spreads a backlog over
+polls instead of filling the board and the channel in one pass. See
+[docs/ngit-bridge.md](docs/ngit-bridge.md) for the config, the cron shape and the recovery
+paths.
+
 ### Control pane
 
 Where the gateway asks before it acts, and whose word it takes without asking. One

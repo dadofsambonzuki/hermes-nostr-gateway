@@ -141,6 +141,16 @@ class Registry:
     def project(self, slug: str) -> Optional[dict[str, Any]]:
         return self.projects.get((slug or "").strip().lower())
 
+    def by_id(self, ident: str) -> Optional[dict[str, Any]]:
+        """The project with this id, for a board that records the link from its own side."""
+        wanted = str(ident or "").strip()
+        if not wanted:
+            return None
+        for record in self.projects.values():
+            if str(record.get("id") or "") == wanted:
+                return record
+        return None
+
     def board(self, slug: str) -> Optional[dict[str, Any]]:
         """The board's own record, or None when the board is not there."""
         name = (slug or "").strip()

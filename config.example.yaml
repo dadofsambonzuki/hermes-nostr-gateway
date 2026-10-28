@@ -216,6 +216,24 @@ defaults:
 #       model: model-b
 #       key: WORK_CHANNEL_KEY
 #   # env_file: ~/.config/hermes-nostr-gateway/.env   # default: a .env beside this file
+# The ngit bridge: the same channel mapping, used in both directions. Issues on the channel's
+# repository become tasks on its board; PRs on that repository are announced in the channel.
+# `hng ngit sync --channel <conversation>` resolves the repo and the board from concord.projects.
+# An issue from a trusted npub (control.trusted_npubs, or the concord plane's own list) is
+# queued ready and the channel gets one notice; any other author is held blocked and the
+# channel is asked once, and `hng ngit answer <task> --yes|--no --by <npub>` decides it.
+# See docs/ngit-bridge.md.
+#
+# ngit:
+#   assignee: default            # profile a task created from an issue is dispatched to
+#   relays:                      # where 1618/1631 events are read; default: relays.read
+#     - wss://relay.example
+#   lookback_hours: 168          # the first poll's floor (0 = everything the relay gives)
+#   issues: true                 # import kind-1621 issues
+#   prs: true                    # announce kind-1618 PRs and kind-1631 merges
+#   priority: 0                  # task priority for anything the bridge creates
+#   max_new: 20                  # new tasks per poll; the rest wait for the next one
+#   max_prs: 10                  # PR messages per poll; the rest wait for the next one
 
 # The control pane: where a confirmation is asked, and whose word needs none. One
 # destination per plane; a plane with no entry is reported as unconfigured rather than

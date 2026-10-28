@@ -113,3 +113,26 @@ this is meant to prevent. The refusal path keeps `success=True` for the same rea
 Hermes' "decided, do not retry" outcome, while `success=False` puts the text back into the
 delivery ledger's retry sweeps, which is the loop being closed — and the refusal is remembered
 for the window so a recovery replay of it is not attempted again.
+## An issue is a dedupe key, not an identity
+
+The ngit bridge keys a task on the issue's event id (`ngit:issue:<id>`) so a re-poll cannot
+duplicate it. That key is idempotency, not a one-to-one relationship: a task cites the issues it
+came from as provenance, one issue may produce several tasks, and a task with no issue is
+ordinary. The strong link is task-to-PR — one task, one PR, because every change lands as a PR —
+and that link is not this bridge's to invent.
+
+Why: a one-to-one mirror makes the board a copy of the issue tracker, and then every internal
+piece of work (a gate, a refactor, a follow-up) needs a fake issue to exist. The idempotency key
+is the only thing the bridge actually needs from the issue, and it already has it.
+
+## An unrecognised issue author is asked about, never queued
+
+An issue from a trusted npub becomes a `ready` task. Any other author gets a `blocked` task and
+one question in the channel; a trusted npub answers with `hng ngit answer`. The question is
+durable state, not a live turn's memory.
+
+Why: NIP-34 relays are open, so anyone can write to a repository's issue stream. If filing an
+issue were enough to put work in the queue, the queue would be writable by strangers, and if the
+bridge silently ignored them, a real report from a new contributor would vanish. Holding it and
+asking a person is the only option that is neither.
+

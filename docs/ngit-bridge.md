@@ -1,0 +1,140 @@
+# The ngit bridge
+
+Issues on a channel's repository become work on that channel's board; its pull requests are
+announced in the channel. One mapping, used in both directions.
+
+## Configuration
+
+The channel already resolves to a checkout, a project and a board (`concord.projects`, see the
+README). The bridge reads that same map: `--channel` names the conversation, the entry supplies
+the rest. Because a cron job has nothing but the conversation string, the entry it matches must
+be keyed by the conversation's channel id (hex) or by the whole conversation
+(`channel: concord:<community>:<channel>`); a friendly name cannot be turned back into an id
+without the client. `--repo` and `--board` override a single run and never replace the mapping —
+a channel with no entry is an error, because a bridge that guessed a checkout would file work in
+the wrong tree.
+
+```yaml
+ngit:
+  assignee: default        # the profile a task created from an issue is dispatched to
+  # relays:                # where 1618/1631 events are read; default: the repository
+  #   - wss://relay.example # announcement's own relay hints, then relays.read
+  lookback_hours: 168      # the first poll's floor; 0 reads everything the relay will give
+  issues: true             # import kind-1621 issues
+  prs: true                # announce kind-1618 PRs and kind-1631 merges
+  priority: 0              # task priority for anything the bridge creates
+  max_new: 20              # new tasks per poll; the rest wait for the next one
+  max_prs: 10              # PR messages per poll; the rest wait for the next one
+```
+
+Trusted authors are the control pane's (`control.trusted_npubs` unioned with
+`control.planes.concord.trusted_npubs`). With no trusted npubs configured every issue is held,
+which is the safe default: a person is asked, not guessed.
+
+The repository address is read from the checkout itself (`ngit repo --json`, the kind-30617
+coordinate). Nothing about a particular box is compiled in.
+
+## Running it
+
+Cron, per channel, on the host that holds the checkout and the gateway:
+
+```cron
+*/10 * * * *  cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel> --json >> /var/log/hng-ngit.log 2>&1
+```
+
+Exit code 0 means every message reached the channel; 1 means something did not and the report
+says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the bridge
+did not touch anything. `--dry-run` reports what would happen and writes nothing — the first
+run against a live channel should be one.
+
+The better long-term shape is a live subscription off the daemon's read path, once the daemon is
+stable; `hng ngit sync` is the smallest thing that is useful today and does not block that.
+
+## Inbound: issues as work
+
+- A kind-1621 issue becomes a task with the issue's subject as its title and its body, author
+  npub and nevent in the description. The idempotency key is `ngit:issue:<event id>`, so a
+  re-poll cannot create a second task for the same issue.
+- The issue id is a **dedupe key, not an identity**. A human may file a second task for the same
+  issue; the bridge only refuses to duplicate its own.
+- A kind-1622 comment becomes a task comment, in `created_at` order, once (tracked per comment
+  id). A comment added later is appended; nothing is rewritten.
+- A trusted author's issue is created `ready` and the channel gets one notice,
+  `issue <nevent> -> <task id>`.
+- Any other author's issue is created `blocked` and the channel gets exactly one question naming
+  the issue, the author, the nevent, the task and what a `yes` would do. The question is claimed
+  in `ngit_links` before it is posted and released again if the send fails, so it is asked once
+  when the channel is reachable and retried when it was not.
+- `max_new` bounds how many tasks one poll creates; the rest are counted as deferred and picked
+  up by the next poll. A backlog or a spam run cannot fill the board and the channel at once.
+
+## Answering a held issue
+
+```bash
+hng ngit answer <task-id|nevent> --yes --by <npub>
+hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
+```
+
+- Only a trusted npub (the control pane's, for the concord plane) can answer: filing an issue
+  does not authorise it.
+- A `yes` promotes `blocked -> ready` and writes an audit comment naming the npub and the time;
+  the link state becomes `authorised`. Answering again changes nothing.
+- A `no` leaves the task blocked, records the reason as a comment, and marks the link
+  `declined` so the issue is never asked about again.
+
+## Outbound: PRs signalled for review
+
+- A kind-1618 event posts one message: the PR's subject, its author npub, the branch, and the
+  nevent — "ready for review". Deduped by PR id (`ngit_links`), so the same PR is never
+  announced twice, including across the cursor's overlap.
+- A kind-1631 event for a PR this bridge announced posts one follow-up: `merged as <commit>`,
+  using the `merge-commit` tag (or the first `applied-as-commits` value when a merge commit was
+  not named).
+- A PR first seen *already* applied gets one message, the merged line — not a fake "ready for
+  review" followed by a merge, and not a replay of history.
+- A merge for a PR the bridge never announced posts nothing: the bridge narrates what it
+  watched, it does not dump the past into a channel.
+- The author is named in every message, including PRs this gateway opened itself.
+- A message that could not be delivered leaves the link `pending` and is retried on the next
+  poll; a delivered one moves to `signalled` (or `merged`), which is what stops a retry
+  double-posting a message that did land.
+- `max_prs` bounds how many PR messages one poll posts. The first run, or a catch-up after a
+  long outage, must not dump a month of merges into a channel; the remainder is counted as
+  deferred and picked up on later polls. The cursor only advances when a poll left nothing
+  deferred or undelivered, so a backlog cannot be stepped over.
+
+Messages go through the daemon's existing `send` op, so they are published as the gateway's
+identity with the same signing, NIP-42 and recording as any other reply. There is no second
+transport.
+
+## State and recovery
+
+In the gateway store (`store.py`):
+
+- `ngit_links` — `(repo, kind, source event id) -> task id, board, state, note`. States:
+  `ready`, `held`, `asked`, `authorised`, `declined`, `deleted` for issues; `pending`,
+  `signalled`, `merged` for PRs.
+- `ngit_comments` — which comment has been copied onto which task.
+- `ngit_cursors` — the last event time each repo's PR poll reached, with a 5-minute overlap so
+  clock skew cannot skip an event; the link table, not the cursor, prevents a duplicate.
+
+Recovery:
+
+- **A task deleted by hand** keeps its `deleted` link. The next sync reports it and does not
+  recreate it. `--recreate` creates a new task and updates the link.
+- **The daemon was down** when a question was due: the link stays `held`, the error is reported,
+  and the next sync asks. Nothing was lost and nothing was asked twice.
+- **A relay read fails**: PRs are reported as an error and issues still import. The cursor is
+  only advanced by events actually read.
+- **Catch-up after downtime**: the cursor is where the last successful poll ended, so the next
+  poll reads the gap; events already linked are not reported again.
+
+## Not in this bridge
+
+- Publishing status events from the board back to Nostr (a task completing does not close or
+  apply the issue). The mapping is one-way for status on purpose: the board's lifecycle is the
+  board's, and a status event is a public statement someone should choose.
+- PR revisions (kind 1619), drafts (1633) and labelling: the channel gets one signal per PR and
+  one per merge.
+- Any per-issue visibility rule. A private repository keeps everything derived from it private;
+  the bridge carries no second set of rules.
