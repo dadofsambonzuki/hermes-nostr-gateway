@@ -6,8 +6,16 @@ the same lookup serves the inbound and the outbound half of this module:
 
     inbound   kind-1621 issue    -> a task on the channel's board
               kind-1622 comment  -> a task comment, in the order the issue carries them
-    outbound  kind-1618 PR       -> one "ready for review" message in the channel
-              kind-1631 applied  -> one "merged as <commit>" follow-up
+    outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
+                                   review task on that board (a verdict, never a merge:
+                                   merging is the operator's)
+              kind-1631 applied  -> one "merged as <commit>" follow-up, which also closes
+                                   the review task
+
+A review task is a task like any other, except that it may be worked by a stronger model:
+`ngit.review_model` is written to the task's `model_override` (the column
+`hermes kanban set-model` uses), which the dispatcher already honours. That is how review
+runs on a different model without a second profile.
 
 Authorisation is the control pane's. An issue from a trusted npub (`control.trusted_npubs`
 or the concord plane's own list) is queued `ready`; any other author is held `blocked` and
@@ -38,6 +46,7 @@ import concurrent.futures
 import datetime as dt
 import json
 import logging
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
@@ -128,7 +137,7 @@ class Issue:
 
 @dataclass(frozen=True)
 class PullRequest:
-    """A kind-1618 event, reduced to what the channel message needs."""
+    """A kind-1618 event, reduced to what the channel message and the review task need."""
 
     id: str            # event id, hex
     author: str        # npub
@@ -136,6 +145,8 @@ class PullRequest:
     branch: str = ""
     created_at: int = 0
     nevent: str = ""
+    #: The tip commit the `c` tag names, when the event carries one.
+    commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,6 +168,13 @@ class Target:
     project: str = ""
     #: The repo's NIP-34 address (`30617:<hex>:<identifier>`), or "" for a plain checkout.
     address: str = ""
+    #: The branch a PR targets: the checkout's own. A kind-1618 event names its source
+    #: branch and no target, so this is what a review task says the diff is against.
+    default_branch: str = ""
+    #: This channel's review model, from its `concord.projects` entry. Beats the bridge's
+    #: own `ngit.review_model`; empty means the bridge's, then the profile's.
+    review_model: str = ""
+    review_provider: str = ""
 
     @property
     def key(self) -> str:
@@ -169,6 +187,10 @@ class BridgeConfig:
     """The `ngit:` block. Defaults are the safe ones: nothing is trusted, nothing is sent."""
 
     assignee: str = ""
+    reviews: bool = True
+    review_assignee: str = "default"
+    review_model: str = ""
+    review_provider: str = ""
     relays: tuple[str, ...] = ()
     lookback_hours: int = 168
     issues: bool = True
@@ -194,8 +216,19 @@ class BridgeConfig:
         if not isinstance(relays, (list, tuple)):
             relays = []
         cleaned = tuple(str(url).strip() for url in relays if str(url or "").strip())
+        review_model = str(block.get("review_model") or "").strip()
+        review_provider = str(block.get("review_provider") or "").strip()
+        if review_provider and not review_model:
+            # The dispatcher resolves a provider only alongside a model; a provider alone
+            # would be read as one and quietly change nothing.
+            log.warning("ngit: review_provider is set without review_model; ignoring it")
+            review_provider = ""
         return cls(
             assignee=str(block.get("assignee") or "").strip(),
+            reviews=bool(block.get("reviews", True)),
+            review_assignee=str(block.get("review_assignee") or "default").strip(),
+            review_model=review_model,
+            review_provider=review_provider,
             relays=cleaned,
             lookback_hours=int(block.get("lookback_hours", 168) or 0),
             issues=bool(block.get("issues", True)),
@@ -222,7 +255,7 @@ class Report:
         "would_post": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
-        "pending": 0, "would_post": 0})
+        "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -263,6 +296,8 @@ class Report:
                    f" {p['merged']} merged, {p['existing']} known"
                    + (f", {p['pending']} pending (queued for the next pass)"
                       if p["pending"] else "")
+                   + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
+                   + (f", {p['review_errors']} review failure(s)" if p["review_errors"] else "")
                    + (f", {p['deferred']} waiting for the next poll" if p["deferred"] else "")
                    + (f", {p['would_post']} would be posted" if self.dry_run else ""))
         out.append(f"posted:  {self.posted} channel message(s)"
@@ -393,6 +428,7 @@ def pull_request_from_event(event: dict[str, Any]) -> PullRequest:
         branch=_tag(event, "branch-name"),
         created_at=int(event.get("created_at") or 0),
         nevent=nevent_of(event),
+        commit=_tag(event, "c"),
     )
 
 
@@ -621,9 +657,65 @@ def question_message(issue: Issue, task_id: str, target: Target, assignee: str) 
     ])
 
 
-def ready_message(pr: PullRequest) -> str:
+def ready_message(pr: PullRequest, *, review_task: str = "", problem: str = "") -> str:
+    """The one message a new PR gets: what it is, where to read it, who reviews it.
+
+    The review task is named here rather than in a second message: a PR is one event in the
+    channel, and a reader who wants to know who is looking at it should not have to find a
+    second post. When no task could be made the message says so, and why.
+    """
     where = f" on {pr.branch}" if pr.branch else ""
-    return f'PR "{pr.subject}" by {pr.author}{where} - ready for review\n{pr.nevent}'
+    lines = [f'PR "{pr.subject}" by {pr.author}{where} - ready for review', pr.nevent]
+    if review_task:
+        lines.append(f"review task {review_task}")
+    elif problem:
+        lines.append(f"no review task: {problem}")
+    return "\n".join(lines)
+
+
+def review_title(pr: PullRequest) -> str:
+    """The title: short enough to scan in a column, exact enough to know which PR it is."""
+    return f"Review PR {pr.id[:8]}: {pr.subject}"
+
+
+def review_body(pr: PullRequest, target: Target) -> str:
+    """What a reviewer needs to judge this PR, and the one thing they must not do.
+
+    The brief is the point of the task: "should this merge" answered with reasons, on the
+    record, instead of in the channel's scrollback. Merging is left out on purpose -- it is
+    the operator's decision, and a reviewed PR is evidence for it, not the decision itself.
+    """
+    source = pr.branch or "(the PR names no branch)"
+    into = target.default_branch
+    against = into or "(the repository's default branch)"
+    steps = [
+        f"1. Check the proposal out: `ngit pr checkout {pr.nevent or pr.id}`",
+        f"   then read it against {against}:"
+        f" `git diff {into or '<target>'}...HEAD` (or `git log -p {into or '<target>'}..HEAD`).",
+        "2. Run the repository's own gates from that tree: `ruff check` and `pytest`. Say",
+        "   what ran and what it printed, including anything that was already failing.",
+        "3. Report a verdict with reasons on this task -- merge, or changes needed -- and",
+        "   say what the gates could not catch: behaviour, tests that do not exercise the",
+        "   change, and anything the PR leaves out.",
+    ]
+    return "\n".join([
+        f'PR "{pr.subject}" by {pr.author}',
+        "",
+        f"PR:         {pr.id}",
+        f"nevent:     {pr.nevent}",
+        f"Repository: {target.address or target.repo}",
+        f"Author:     {pr.author}",
+        f"Source:     {source}",
+        f"Target:     {against}",
+        *([f"Tip:        {pr.commit}"] if pr.commit else []),
+        "",
+        "---",
+        "",
+        "Review this PR and report a verdict. Do not merge it: merging is the operator's,",
+        "or a follow-up task. This task ends with a verdict, not a merge.",
+        "",
+        *steps,
+    ])
 
 
 def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> str:
@@ -679,11 +771,33 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     if not slug:
         raise NgitError(f"channel {project.channel!r} declares no board: set `board:` on its"
                         " concord.projects entry or pass --board")
-    return Target(conversation=conversation, repo=path, board=slug, project=project.project)
+    return Target(conversation=conversation, repo=path, board=slug, project=project.project,
+                  review_model=project.review_model, review_provider=project.review_provider)
 
 
 def board_path(slug: str, *, home: str | Path | None = None) -> Path:
     return board_dir(hermes_home(home), slug) / "kanban.db"
+
+
+def default_branch(repo: Path) -> str:
+    """The branch this checkout's PRs target, from git rather than from the event.
+
+    NIP-34's kind 1618 names the *source* branch (`branch-name`) and has no target tag, so
+    the target is the repository's default -- what `ngit pr merge` falls back to. `origin/HEAD`
+    answers it for a clone; a checkout that has no remote HEAD answers with the branch it has
+    out. Empty when neither answers, and the review task then says so instead of guessing.
+    """
+    for args in (["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                 ["symbolic-ref", "--short", "HEAD"]):
+        try:
+            done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                                  text=True, timeout=10.0)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        name = (done.stdout or "").strip()
+        if done.returncode == 0 and name:
+            return name[len("origin/"):] if name.startswith("origin/") else name
+    return ""
 
 
 # -- the sync -----------------------------------------------------------------
@@ -901,6 +1015,9 @@ class Sync:
             link = self.store.ngit_link(self.target.key, KIND_PR, pr.id)
             if link is not None and link["state"] != "pending":
                 report.prs["existing"] += 1
+                # A link from before review tasks existed still gets one, without a
+                # second notice: the message it already has is the record.
+                self._late_review_task(pr, link, report, dry_run=dry_run)
                 settled.append(pr.created_at)
                 continue
             if self.store.ngit_notice_queued(self.target.key, pr.id):
@@ -914,23 +1031,31 @@ class Sync:
                 deferred.append(pr.created_at)
                 continue
             merge = applied.get(pr.id)
-            text = merged_message(pr, merge) if merge is not None else ready_message(pr)
             budget -= 1
             settled.append(pr.created_at)
             if dry_run:
                 report.prs["would_post"] += 1
                 continue
+            # The task first, the message second: the message names it. A board that cannot
+            # be written must not cost the channel its notice, so the failure comes back as
+            # a line in the notice and is retried -- without a second message -- later.
+            task_id, problem = ("", "")
+            if merge is None and self.config.reviews:
+                task_id, problem = self._review_task(pr, report, dry_run=dry_run)
+            text = (merged_message(pr, merge) if merge is not None
+                    else ready_message(pr, review_task=task_id, problem=problem))
             # `pending` is the lifecycle of a notice that has not been confirmed yet; the row
-            # is its claim, and only a daemon receipt moves the link past it.
+            # is its claim, and only a daemon receipt moves the link past it. The review
+            # outcome is written here, with the claim: saving the link again afterwards would
+            # drop `task_error` and lose the retry that makes the task.
             self.store.ngit_link_save(
                 self.target.key, KIND_PR, pr.id, board=self.target.board, state="pending",
-                detail={"nevent": pr.nevent, "subject": pr.subject,
-                        "author": pr.author, "branch": pr.branch})
+                task_id=task_id or None, detail=pr_detail(pr, task_error=problem))
             self._enqueue(KIND_PR, pr.id, "merged" if merge is not None else "ready", text)
 
         for merge in sorted(merges, key=lambda m: (m.created_at, m.pr_id)):
             link = self.store.ngit_link(self.target.key, KIND_PR, merge.pr_id)
-            if link is None or link["state"] == "merged":
+            if link is None:
                 # A merge for a PR this bridge never announced is not replayed into the
                 # channel; it narrates what it watched, not the repository's history.
                 settled.append(merge.created_at)
@@ -945,7 +1070,8 @@ class Sync:
             if known is None and note.get("subject"):
                 known = PullRequest(id=merge.pr_id, author=str(note.get("author") or ""),
                                     subject=str(note.get("subject") or ""),
-                                    branch=str(note.get("branch") or ""), nevent=nevent)
+                                    branch=str(note.get("branch") or ""), nevent=nevent,
+                                    commit=str(note.get("commit") or ""))
             text = merged_message(known, merge, nevent)
             budget -= 1
             settled.append(merge.created_at)
@@ -953,15 +1079,108 @@ class Sync:
                 report.prs["would_post"] += 1
                 continue
             self._enqueue(KIND_PR, merge.pr_id, "merged", text)
+            # The merge closes the loop: the review task is done, with the merge named on it.
+            # A task already completed is a no-op, and this runs even for a link already
+            # `merged`, so one that could not be closed on a locked board closes later.
+            if known is not None:
+                self._close_review(known, merge, link, report, dry_run=dry_run)
 
         # The cursor promises that everything before it has been dealt with. A queued notice
         # counts: it is durable, and the next poll delivers it. A deferred event does not --
         # it was seen and not decided on -- so the cursor stops short of the earliest one and
-        # the next poll reads it again.
-        if not dry_run and settled:
+        # the next poll reads it again. A review task that could not be made holds the cursor
+        # for the same reason: the retry is what makes the task, not a later event.
+        if not dry_run and settled and not report.prs["review_errors"] and not report.failed:
             edge = min(max(settled), *deferred) if deferred else max(settled)
             if edge - CURSOR_OVERLAP_S > start:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
+
+    def _review_model(self) -> tuple[str, str]:
+        """The (model, provider) a review task carries: the channel's entry, then the block.
+
+        A `concord.projects` entry's own `review_model` wins, because a channel is where a
+        different kind of work lives; `ngit.review_model` is the default for every channel.
+        Empty means the assignee profile's model, which is what the dispatcher does anyway.
+        """
+        if self.target.review_model:
+            return self.target.review_model, self.target.review_provider
+        return self.config.review_model, self.config.review_provider
+
+    def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool) -> tuple[str, str]:
+        """One review task for this PR, or the reason there is none.
+
+        Keyed `ngit:pr:<event id>`, so a re-poll, a retry after a failed send and a retry
+        after a failed create all land on the same task. Never raises: the caller still has
+        a channel message to post, and "no task because ..." is a better message than none.
+        """
+        if dry_run:
+            return "", ""
+        key = f"ngit:pr:{pr.id}"
+        model, provider = self._review_model()
+        try:
+            existing = self.board.by_idempotency(key)
+            if existing is not None:
+                return str(existing["id"]), ""
+            task_id = self.board.create(
+                title=review_title(pr), body=review_body(pr, self.target),
+                assignee=self.config.review_assignee or "default", status="ready",
+                idempotency_key=key, anchor=self.anchor, priority=self.config.priority,
+                model_override=model, provider_override=provider)
+        except (BoardError, sqlite3.Error) as exc:
+            report.prs["review_errors"] += 1
+            report.errors.append(f"review task for PR {pr.id[:8]}: {exc}")
+            log.warning("ngit: no review task for %s: %s", pr.id[:8], exc)
+            return "", str(exc)[:200]
+        report.prs["tasks"] += 1
+        log.info("ngit: review task %s for PR %s", task_id, pr.id[:8])
+        return task_id, ""
+
+    def _note_review(self, pr: PullRequest, link: Optional[dict[str, Any]], task_id: str,
+                     problem: str) -> None:
+        """Record the task (or why there is none) on the link, so a later poll can retry."""
+        detail = pr_detail(pr, task_error=problem)
+        self.store.ngit_link_save(
+            self.target.key, KIND_PR, pr.id, state=(link["state"] if link else "pending"),
+            task_id=task_id or None, board=self.target.board, detail=detail)
+
+    def _late_review_task(self, pr: PullRequest, link: dict[str, Any], report: Report,
+                          *, dry_run: bool) -> None:
+        """A PR already announced with no task: make the task, post nothing.
+
+        The channel was told there was no review task and why, so the retry is silent --
+        the message is not repeated. Only a link that says a creation failed qualifies: a
+        PR announced before this bridge made tasks is not retrofitted.
+        """
+        if link["state"] != "signalled" or link.get("task_id"):
+            return
+        if not self.config.reviews or not _detail(link).get("task_error"):
+            return
+        task_id, problem = self._review_task(pr, report, dry_run=dry_run)
+        if dry_run:
+            return
+        self._note_review(pr, link, task_id, problem)
+        if task_id:
+            log.info("ngit: late review task %s for PR %s", task_id, pr.id[:8])
+
+    def _close_review(self, pr: PullRequest | None, merge: Merge, link: dict[str, Any],
+                      report: Report, *, dry_run: bool) -> None:
+        """Complete the PR's review task, naming the merge. Idempotent."""
+        task_id = str(link.get("task_id") or "")
+        if not task_id or dry_run:
+            return
+        how = f"merged as {merge.commit}" if merge.commit else "merged"
+        what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
+        nevent = str(_detail(link).get("nevent") or "")
+        try:
+            self.board.complete(
+                task_id, author="ngit",
+                comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
+                        + f"\nThe merge was published as status {merge.pr_id}; this review"
+                        " is closed by it.",
+                result=f"PR {merge.pr_id} {how}: the review is closed by the merge.")
+        except (BoardError, sqlite3.Error) as exc:
+            report.prs["review_errors"] += 1
+            report.errors.append(f"review task {task_id} for PR {merge.pr_id[:8]}: {exc}")
 
     def _since(self, override: int | None) -> int:
         """Where this poll starts reading.
@@ -1072,6 +1291,19 @@ def _detail(link: dict[str, Any]) -> dict[str, Any]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def pr_detail(pr: PullRequest, *, task_error: str = "") -> dict[str, Any]:
+    """What a later poll needs about a PR whose event it may no longer be carrying."""
+    detail: dict[str, Any] = {"nevent": pr.nevent, "subject": pr.subject,
+                              "author": pr.author, "branch": pr.branch}
+    if pr.commit:
+        detail["commit"] = pr.commit
+    if task_error:
+        # The one thing that makes a later poll try the review task again: the channel was
+        # already told there is none, so the retry posts nothing and only makes the task.
+        detail["task_error"] = task_error
+    return detail
 
 
 def task_body(issue: Issue, target: Target) -> str:
