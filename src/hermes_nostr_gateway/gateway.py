@@ -49,6 +49,7 @@ from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
+from .profiles import hermes_config_path, require_profiles
 from .projects import ProjectMap
 from .publisher import Publisher, make_publisher
 from .routing import Resolution, load_router, reported_route
@@ -163,19 +164,6 @@ class MarmotOwnershipError(RuntimeError):
     """Both readers of one wn-agent socket are switched on: pick a transport."""
 
 
-def hermes_config_path(cfg: dict[str, Any]) -> Path:
-    """Where Hermes' own config lives, as seen by this process.
-
-    `marmot.hermes_config` wins (a gateway in a container or beside a second Hermes
-    home needs that), then `$HERMES_HOME`, then the default `~/.hermes/config.yaml`.
-    """
-    configured = cfg.get("hermes_config")
-    if configured:
-        return Path(os.path.expanduser(str(configured)))
-    home = os.environ.get("HERMES_HOME") or "~/.hermes"
-    return Path(os.path.expanduser(home)) / "config.yaml"
-
-
 def hermes_marmot_state(cfg: dict[str, Any]) -> dict[str, Any]:
     """Whether Hermes' Marmot platform is attached to the same socket, and how we know.
 
@@ -262,6 +250,12 @@ class Gateway:
         # configuration that would deliver every Marmot message twice is not a
         # process to start and then warn about.
         self.hermes_marmot = self._guard_marmot_ownership(cfg.get("marmot") or {})
+        #: Which Hermes profile each plane and channel runs as, read here rather than at the
+        #: first message: a route naming a profile Hermes does not have would otherwise run
+        #: that turn as the default profile, which is the one outcome this may not have.
+        #: Refused before the secret, the store and the socket are touched;
+        #: `hng profiles --check` reports the same without starting anything.
+        self.profiles = require_profiles(cfg)
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
         # Publish transport (plan P2): one `nostr-sdk` client, one signed event per
@@ -722,6 +716,12 @@ class Gateway:
         for problem in self.control.problems:
             log.warning("control: %s", problem)
         log.info("control pane: %s", "; ".join(self.control.describe()))
+        # One line, for the same reason: which identity a plane or channel runs as is
+        # configuration, and a route that is only in a file is one nobody can check at boot.
+        if self.profiles:
+            for warning in self.profiles.warnings:
+                log.warning("profiles: %s", warning)
+            log.info("profiles: %s", "; ".join(self.profiles.describe()))
         # Before any relay worker exists: from here on, a store write is a queue append
         # and the commit happens on the writer's thread.
         await self.store_writer.start()
@@ -970,29 +970,6 @@ class Gateway:
         known = self.concord.channels() if self.concord.refreshed else None
         return self.routing.resolve(plane, conversation, known_channels=known)
 
-    def _routed(self, frame: dict[str, Any], *, plane: str, conversation: str) -> dict[str, Any]:
-        """A message frame carrying the route its turn is asked to use, or a refusal instead.
-
-        A route that cannot be honoured is not a message: handing the agent a turn with a
-        provider nobody chose (or a key that is not there, so the process quietly uses another)
-        is the silent substitution this block exists to prevent. It becomes a `blocked` frame —
-        stored, logged, visible — and the row stays unacknowledged, so the turn runs once the
-        route can be honoured: a key exported, or a stale channel entry corrected.
-        """
-        if not self.routing:
-            return frame
-        resolution = self.route_for(plane, conversation)
-        if resolution.error:
-            log.error("no route for %s %s: %s (%s)", plane, conversation or "(none)",
-                      resolution.error, resolution.detail)
-            return {"type": "blocked", "plane": plane,
-                    "from": frame.get("sender") or frame.get("from") or "",
-                    "reason": resolution.error, "why": resolution.detail,
-                    "rumor_id": frame.get("id")}
-        routed = dict(frame)
-        routed["route"] = resolution.to_frame()
-        return routed
-
     def frame_for(self, msg: Any) -> dict[str, Any]:
         """A message frame, or a `blocked` frame when policy refused it or it cannot be routed.
 
@@ -1055,9 +1032,49 @@ class Gateway:
         in a task, never in the read callback, so the loop stays free. Rows that arrive
         while the flush runs are committed by the next one.
         """
-        task = asyncio.create_task(self._deliver(self.frame_for(msg)))
+        task = asyncio.create_task(self._deliver(self._routed(
+            self.frame_for(msg), plane=msg.plane, conversation=msg.conversation,
+            sender=msg.sender, message_id=msg.id)))
         self._deliveries.add(task)
         task.add_done_callback(self._deliveries.discard)
+
+    def _routed(self, frame: dict[str, Any], *,
+                plane: str = "", conversation: str = "", sender: str = "",
+                message_id: str = "") -> dict[str, Any]:
+        """The frame carrying the route and the profile its turn is asked for, or a refusal.
+
+        Two decisions, one frame: which provider, model and credential the turn asks for, and
+        which Hermes profile it runs as. Neither can be defaulted quietly — a turn on a model
+        nobody chose, or under an identity nobody chose, is the silent substitution both blocks
+        exist to prevent. Either one failing makes a `blocked` frame, which is stored and
+        visible but never becomes a run, so a replay after the fix still delivers it.
+        """
+        if frame.get("type") != "message":
+            return frame
+        origin = sender or frame.get("sender") or frame.get("from") or ""
+        rumor_id = message_id or frame.get("id")
+        routed = dict(frame)
+        if self.routing:
+            resolution = self.route_for(plane, conversation)
+            if resolution.error:
+                log.error("no route for %s %s: %s (%s)", plane, conversation or "(none)",
+                          resolution.error, resolution.detail)
+                return {"type": "blocked", "plane": plane, "from": origin,
+                        "reason": resolution.error, "why": resolution.detail,
+                        "rumor_id": rumor_id}
+            routed["route"] = resolution.to_frame()
+        if self.profiles:
+            known = self.concord.channels() if plane == "concord" else None
+            profile = self.profiles.resolve(plane, conversation, known_channels=known,
+                                            verify=True)
+            if profile.error:
+                log.error("profile route refused for %s/%s: %s (%s)", plane, conversation,
+                          profile.error, profile.detail)
+                return {"type": "blocked", "plane": plane, "from": origin,
+                        "reason": profile.error, "detail": profile.detail,
+                        "rumor_id": rumor_id}
+            routed.update(profile.frame())
+        return routed
 
     async def _deliver(self, frame: dict[str, Any]) -> None:
         failures = self.store_writer.failures
@@ -1521,6 +1538,10 @@ class Gateway:
         `replay: true` is the adapter's cue: a frame it has already handed to the agent
         (the ack failed, so the row is still pending) must be acknowledged again rather
         than answered twice. The window and floor live in the store.
+
+        A replay is the same frame the first delivery would have been, profile included: a
+        crash between the store write and the ack must not turn a routed message into a turn
+        under the default profile.
         """
         frames = []
         for row in self.store.pending_immediate(limit or self.replay_limit,
@@ -1540,9 +1561,11 @@ class Gateway:
             # And the same route: a replayed turn must run on the provider it was asked for,
             # not on whatever the agent happens to be configured with. Routing is decided
             # again here rather than stored, so a key exported since the first attempt is
-            # what the retry uses.
+            # what the retry uses -- and a route that cannot be honoured now is a `blocked`
+            # frame, visible and unacknowledged, not a turn on somebody else's model.
             frames.append(self._routed(frame, plane=row["plane"],
-                                       conversation=row["conversation"]))
+                                       conversation=row["conversation"],
+                                       sender=row["sender"], message_id=row["id"]))
         return frames
 
     def replay_skip(self) -> dict[str, Any]:

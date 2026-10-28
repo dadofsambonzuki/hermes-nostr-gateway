@@ -1088,6 +1088,20 @@ class Store:
         expired = int(row["expired"] or 0)
         return {"total": total, "live": total - expired, "expired": expired}
 
+    def planes_for_conversation(self, conversation: str) -> list[str]:
+        """Which planes hold rows for *conversation*, most rows first.
+
+        `hng route` walks in with a string and no live message, and a Marmot group id looks
+        exactly like a peer pubkey: the plane is read from the evidence the store already has
+        rather than guessed from the shape of the string. Empty means "never seen".
+        """
+        rows = self.db.execute(
+            "SELECT plane, COUNT(*) AS n FROM rumors WHERE conversation = ?"
+            " GROUP BY plane ORDER BY n DESC, plane ASC",
+            (str(conversation or "").strip(),),
+        ).fetchall()
+        return [str(row["plane"]) for row in rows]
+
     def conversations(self, plane: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """The distinct conversations we hold messages for on `plane`, newest first.
 
