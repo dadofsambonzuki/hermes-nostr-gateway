@@ -89,8 +89,8 @@ Ops in: `subscribe`, `ack`, `mark_read`, `send`, `status`, `health`, `history`, 
 `media.get`, `marmot.group`, `marmot.timeline`, `replay.skip`, `ping`.
 
 Frames out: `message`, `blocked`, `delivery`, `reaction`, `concord_invite`, `media`, plus a reply
-envelope per op (`status`, `health`, `history`, `drops`, `peers`, `ok`, `pong`, `error`). A
-`blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
+envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, `ok`, `pong`,
+`error`). A `blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
 `route_key_missing`, `route_unresolved`) and never looks like chat.
 
 ## What it refuses
@@ -165,7 +165,7 @@ when the host user that owns those files is not 1000. The entrypoint is `hng`, s
 
 | | |
 |---|---|
-| [`docs/gateway-spec.md`](docs/gateway-spec.md) | planes, socket API and trust model — the design |
+| [`docs/gateway-spec.md`](docs/gateway-spec.md) | planes, relay policy, socket API and trust model — the design |
 | [`docs/decisions.md`](docs/decisions.md) | calls already made, and why |
 | [`docs/ngit-bridge.md`](docs/ngit-bridge.md) | issues as work, PRs signalled in a channel |
 | [`docs/marmot-ownership.md`](docs/marmot-ownership.md) | the one-owner rule and the flip |
@@ -174,8 +174,8 @@ when the host user that owns those files is not 1000. The entrypoint is `hng`, s
 | [`docs/store-writes.md`](docs/store-writes.md) | WAL, batching, and the measured latency |
 | [`docs/digest-cursor.md`](docs/digest-cursor.md) | digest batching and the ack cursor |
 
-Host-side operations — the service unit, relay web-of-trust gates, key handling — are kept with
-the host's own infrastructure notes, not in this repository.
+Host-side operations — relay web-of-trust gates, key handling — are kept with the host's own
+infrastructure notes, not in this repository.
 
 ## Credits
 

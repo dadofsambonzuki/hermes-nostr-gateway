@@ -127,8 +127,9 @@ def _peer_exclusions(cfg: dict[str, Any]) -> tuple[str, ...]:
     """Relays a peer must never drag into the DM read set.
 
     White Noise relays carry the Marmot plane's groups, refuse public kinds and are not
-    a general NIP-17 inbox (README, "Relays and kinds"). A peer listing one is saying
-    where their own inbox is, not asking us to subscribe to a group relay.
+    a general NIP-17 inbox (docs/gateway-spec.md §3 "Relay policy"; docs/decisions.md,
+    "White Noise relays are Marmot-only"). A peer listing one is saying where their own
+    inbox is, not asking us to subscribe to a group relay.
     """
     relays = cfg.get("relays") or {}
     values = [*(cfg.get("whitenoise") or []), *(relays.get("whitenoise") or [])]

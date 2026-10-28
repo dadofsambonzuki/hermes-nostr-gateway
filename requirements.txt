@@ -2,7 +2,7 @@
 # released 0.45.1 wheel does not expose nip44_v2_conversation_key, which the Concord plane
 # needs, but carries the same version number — so an install that resolves it by name
 # would silently swap the patch away. --hash makes pip/uv verify the exact bytes;
-# everything else comes from pyproject.toml. See README, "The patched nostr-sdk wheel".
+# everything else comes from pyproject.toml. See README, "Quick start".
 #
 # The project's only runtime dependencies are the patched wheel's; media needs
 # nothing beyond the standard library (urllib + hashlib + a bounded MIME table).
