@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any, Awaitable, Iterator, TypeVar
+from typing import Any, Coroutine, Iterator, TypeVar
 
 import nostr_sdk as sdk
 
@@ -98,15 +98,37 @@ def ensure(loop: asyncio.AbstractEventLoop | None = None) -> None:
         _set(running)
 
 
-def run_isolated(coro: Awaitable[T]) -> T:
-    """`asyncio.run` for a one-shot loop that must not keep the binding when it closes.
+def run_isolated(coro: Coroutine[Any, Any, T]) -> T:
+    """Run a one-shot coroutine without disturbing the bindings' loop.
 
-    Both caller shapes matter: a plain synchronous caller, and a caller inside a running
-    loop that is handed a worker thread. Each gets a loop of its own, and the global is
-    left as it was found — the daemon's main loop, usually.
+    While a daemon is running, *nothing* gets a loop of its own: the coroutine is handed to
+    the home loop with `run_coroutine_threadsafe` and this thread blocks for the result. That
+    is the only way to keep uniffi's process-global binding stable — two live loops in one
+    process means the global is right for one of them and wrong for the other, and the NIP-42
+    signer (which uniffi calls from a Rust worker thread) is the first thing to notice.
+
+    With no home loop — a CLI command, a test — the caller gets a private loop, and the
+    binding is put back to whatever it found, or to home if that has since closed.
     """
+    home = _HOME
+    if home is not None and home.is_running():
+        if _running_loop_is(home):
+            raise RuntimeError(
+                "sdkloop.run_isolated() cannot run on the loop it must hand off to; "
+                "call the async function instead of the blocking wrapper"
+            )
+        return asyncio.run_coroutine_threadsafe(coro, home).result()
     previous = current()
     try:
         return asyncio.run(coro)  # type: ignore[arg-type]
     finally:
         restore(previous)
+
+
+def _running_loop_is(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether the *caller's* thread is the one running `loop` (where blocking would deadlock)."""
+    try:
+        return asyncio.get_running_loop() is loop
+    except RuntimeError:
+        return False
+
