@@ -23,6 +23,14 @@ from .health import (
     relay_verdicts,
 )
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
+from .ngit_watch import (
+    WATCH_KINDS,
+    WATCH_SINCE_DAYS,
+    NgitWatchConfig,
+    NgitWatcher,
+    SubprocessPass,
+    watch_plan,
+)
 from .peer_inbox import (
     InboxResolver,
     PeerInboxConfig,
@@ -361,6 +369,16 @@ class Gateway:
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
+        #: Where this process was configured, so a child it starts reads the same file
+        #: rather than whatever `hng` would find on its own. Set by `hng serve`.
+        self.config_path = Path(config_path) if config_path else None
+        #: The ngit watcher: a relay subscription that wakes `hng ngit sync` when a mapped
+        #: repository's issue/PR/status event arrives. The pass stays the decision (see
+        #: `ngit_watch.py`); this only shortens the wait between cron passes. Decided here
+        #: from configuration, started in `start()` once the concord streams (and so the
+        #: conversation each mapped channel has) are known.
+        self.ngit_watch_cfg = NgitWatchConfig.from_config(cfg)
+        self.ngit_watch: NgitWatcher | None = None
         # Replay is for "crashed mid-delivery", not "history": minutes, and a floor.
         replay = cfg.get("replay") or {}
         self.replay_limit = int(replay.get("limit", 20))
@@ -419,7 +437,8 @@ class Gateway:
 
     def _new_worker(self, relay: str, *, kinds: tuple[int, ...],
                     p_tag: str | None = None, authors: tuple[str, ...] = (),
-                    purpose: str = "dm") -> PoolWorker:
+                    a_tags: tuple[str, ...] = (), purpose: str = "dm",
+                    since_days: int = 3) -> PoolWorker:
         """Build a read worker: one relay's subscription set on the shared client.
 
         `PoolWorker` is the only read transport now. Its counters and `live_state()` are
@@ -427,8 +446,8 @@ class Gateway:
         not branch on how the events arrive.
         """
         return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
-                          authors=authors, purpose=purpose,
-                          on_refusal=self._note_refusal)
+                          authors=authors, a_tags=a_tags, purpose=purpose,
+                          since_days=since_days, on_refusal=self._note_refusal)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -543,6 +562,66 @@ class Gateway:
                 await self.refresh_concord()
             except Exception:  # noqa: BLE001 - a refresh must never take the daemon down
                 log.exception("concord refresh failed")
+
+    # -- the ngit watcher: wake the pass, never decide for it -----------------
+
+    async def _start_ngit_watch(self) -> None:
+        """Build the watch plan off the loop, then subscribe and coalesce.
+
+        `ngit repo --json` is a child process per mapped checkout, so the plan is built in
+        a worker thread: a slow or missing ngit must not delay the daemon's first message.
+        Nothing here decides anything -- the watcher starts `hng ngit sync`, and that pass
+        owns the store, the board and the cursor.
+        """
+        if not self.ngit_watch_cfg.enabled:
+            if self.ngit_watch_cfg.explicit:
+                log.warning("ngit watch idle: %s", self.ngit_watch_cfg.reason)
+            else:
+                log.info("ngit watch idle: %s", self.ngit_watch_cfg.reason)
+            return
+        try:
+            plan = await asyncio.wait_for(asyncio.to_thread(
+                watch_plan, self.cfg, self.projects, self.concord.channels(),
+                read_relays=tuple(self.relays_read)), timeout=120)
+        except Exception as exc:  # noqa: BLE001 - cron is still the floor
+            log.warning("ngit watch: no watch plan (%s); cron keeps the bridge moving", exc)
+            return
+        for skip in plan.skips:
+            log.info("ngit watch: not watching %s", skip)
+        if not plan.enabled:
+            log.info("ngit watch idle: %s", plan.reason or "nothing to watch")
+            return
+        watcher = NgitWatcher(plan, runner=SubprocessPass(
+            config_path=self.config_path, socket_path=self.socket_path))
+        self.ngit_watch = watcher
+        log.info("ngit watch: %d channel(s), debounce %.0fs, relays %s",
+                 len(plan.targets), plan.debounce_s, ", ".join(plan.relays))
+        try:
+            await watcher.run(self._attach_ngit_watch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - cron is still the floor
+            log.exception("ngit watch: the watcher stopped; cron keeps the bridge moving")
+
+    def _attach_ngit_watch(self, addresses: tuple[str, ...],
+                           handler: Any) -> list[PoolWorker]:
+        """One narrowed read worker per relay, for the mapped repositories' `#a` addresses.
+
+        The watcher is an accelerator, so its workers are ordinary pool workers: same
+        NIP-42, same reconnects, same counters in `status`/`health` -- only the filter and
+        the handler differ. The handler is the watcher's own, so a repository event never
+        falls through to the message planes.
+        """
+        watcher = self.ngit_watch
+        relays = watcher.plan.relays if watcher is not None else ()
+        workers: list[PoolWorker] = []
+        for relay in relays:
+            worker = self._new_worker(relay, kinds=WATCH_KINDS, a_tags=addresses,
+                                      purpose="ngit", since_days=WATCH_SINCE_DAYS)
+            self.workers.append(worker)
+            self._tasks.append(asyncio.create_task(self._guarded(worker, handler)))
+            workers.append(worker)
+        return workers
 
     # -- invites: join on a trusted word, hold for a human ----------------
 
@@ -763,6 +842,10 @@ class Gateway:
                 self._tasks.append(asyncio.create_task(self._guarded(mentions)))
         self._tasks.append(asyncio.create_task(self._retry_loop()))
         self._tasks.append(asyncio.create_task(self._digest_loop()))
+        # The ngit watcher, if configured: a narrowed subscription that wakes the cron pass.
+        # Started after the concord refresh, because a wake names a channel and the channel
+        # has to be one this daemon has joined for the notice to land.
+        self._tasks.append(asyncio.create_task(self._start_ngit_watch()))
         if self.peer_cfg.enabled:
             # Background, not a gate on startup: the fixed read set comes up now and
             # peer inboxes join as they resolve.
@@ -893,9 +976,14 @@ class Gateway:
                             self.peer_cfg.max_extra, url)
         return additions
 
-    async def _guarded(self, worker: PoolWorker) -> None:
+    async def _guarded(self, worker: PoolWorker, handler: Any = None) -> None:
+        """Run one worker's subscription, with the gateway's own handler unless given one.
+
+        The ngit watcher brings its own handler: a repository event is not a message, and
+        must not be routed through the planes that turn one into an agent run.
+        """
         try:
-            await worker.run(self._on_event)
+            await worker.run(handler or self._on_event)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one relay must not take the daemon down
@@ -1477,6 +1565,10 @@ class Gateway:
             # subscription per filter set, so a relay that never received an event shows
             # as a subscription that has been quiet rather than as a healthy one.
             "transport": self.pool.stats(),
+            # The ngit accelerator, not a second source of truth: what it listens to, and
+            # how many passes its wakes started. `enabled: false` carries the reason, so a
+            # bridge that is only on cron says so instead of looking broken.
+            "ngit_watch": self._ngit_watch_status(),
             "retry": {"ttl_hours": self.retry_ttl_seconds / 3600,
                       "wraps": self.store.wrap_counts()},
             "bots": {**self.policy.bot_status(), **self.bots.status()},
@@ -1496,6 +1588,23 @@ class Gateway:
             ),
             "workers": [self._worker_state(w) for w in self.workers],
             "uptime_s": self.uptime_s(),
+        }
+
+    def _ngit_watch_status(self) -> dict[str, Any]:
+        """What the watcher is doing, or why it is not running.
+
+        Three states, all honest: the watcher is up (`enabled: true`); it is configured on
+        but the plan found nothing to watch (the reason says what); or it is off by
+        configuration (`ngit.watch: false`). Cron covers the bridge in the last two.
+        """
+        if self.ngit_watch is not None:
+            return self.ngit_watch.status()
+        return {
+            "enabled": False,
+            "debounce_s": self.ngit_watch_cfg.debounce_s,
+            "reason": self.ngit_watch_cfg.reason or "not started",
+            "channels": [], "relays": [], "targets": [],
+            "events": 0, "passes": 0, "alive": False,
         }
 
     def uptime_s(self) -> int | None:
@@ -1522,6 +1631,15 @@ class Gateway:
             why = self.marmot_error or self.marmot_idle
             if why:
                 notes.append(f"marmot plane not attached: {why}")
+        # The watcher is an accelerator, so its absence is a note, not a degraded plane --
+        # but an operator who asked for it should not have to read a journal to find out.
+        if self.ngit_watch is not None and not self.ngit_watch.status().get("alive"):
+            notes.append("ngit watch: no relay subscription is up yet; the cron pass is "
+                         "the only wake")
+        elif (self.ngit_watch is None and self.ngit_watch_cfg.explicit
+              and not self.ngit_watch_cfg.enabled
+              and self.ngit_watch_cfg.reason != "ngit.watch: false"):
+            notes.append(f"ngit watch: asked for but not running ({self.ngit_watch_cfg.reason})")
         return health_report(
             planes=self.plane_names(),
             plane_rows=self.store.plane_report(),

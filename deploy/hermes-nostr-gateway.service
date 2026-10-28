@@ -31,7 +31,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+# The state directory holds the store and the socket. The kanban boards are here too
+# because the ngit watcher starts `hng ngit sync` as a child of this unit (see
+# docs/ngit-bridge.md, "Waking the pass"), and a pass that cannot write a task would fail
+# only when woken -- the cron pass, which runs outside the unit, would keep working.
 ReadWritePaths=/home/ubuntu/.local/state/hermes-nostr-gateway
+ReadWritePaths=/home/ubuntu/.hermes/kanban
 StandardOutput=journal
 StandardError=journal
 

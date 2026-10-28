@@ -103,6 +103,19 @@ def test_filter_asks_for_the_kinds_and_the_p_tag():
     assert spec["since"] > 0
 
 
+def test_a_worker_can_be_narrowed_to_repository_addresses():
+    """The watcher's filter: a kind set plus `#a` addresses, never a kind on its own."""
+    pool = RelayPool(SECRET, client=FakeClient())
+    worker = PoolWorker(pool, RELAY, ME, kinds=(1621, 1618),
+                        a_tags=("30617:aa:one", "30617:bb:two"), purpose="ngit")
+    spec = json.loads(worker.filter().as_json())
+
+    assert sorted(spec["kinds"]) == [1618, 1621]
+    assert spec["#a"] == ["30617:aa:one", "30617:bb:two"]
+    assert "p" not in spec and "#p" not in spec
+    assert worker.live_state()["a_tags"] == 2
+
+
 def test_a_filter_with_no_kinds_is_refused_rather_than_becoming_a_firehose():
     pool = RelayPool(SECRET, client=FakeClient())
     worker = make_worker(pool, kinds=(1059,))
