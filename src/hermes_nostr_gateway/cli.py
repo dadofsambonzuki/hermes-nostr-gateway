@@ -312,7 +312,7 @@ def send_to_channel(args, cfg: dict[str, Any], conversation: str) -> int:
     from .server import request
 
     socket_path = Path(os.path.expanduser(
-        cfg.get("socket") or str(default_socket_path())))
+        os.path.expanduser(str(cfg.get("socket") or default_socket_path()))))
     try:
         frame = asyncio.run(request(socket_path, {
             "op": "send", "to": conversation, "text": args.text,
@@ -387,7 +387,7 @@ def cmd_status(args) -> int:
     relays, _ = relay_read_plan(cfg)
     publish = [str(relay) for relay in (cfg.get("relays") or {}).get("publish") or []]
     socket_path = Path(os.path.expanduser(
-        args.socket or cfg.get("socket") or str(default_socket_path())))
+        os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path()))))
 
     # The verdict comes from the running daemon, never from the store: relay_stats rows
     # are history (see health.py). A daemon that does not answer leaves the relays
@@ -504,7 +504,7 @@ def cmd_health(args) -> int:
     _crypto, store, _policy, plane = build(cfg)
     relays, _ = relay_read_plan(cfg)
     socket_path = Path(os.path.expanduser(
-        args.socket or cfg.get("socket") or str(default_socket_path())))
+        os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path()))))
 
     frame: dict[str, Any] | None = None
     problem: str | None = None
@@ -1044,7 +1044,7 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
             else:
                 prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
     notifier = bridge.DaemonNotifier(
-        args.socket or cfg.get("socket") or default_socket_path())
+        os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path())))
     sync = bridge.Sync(
         store=store, board=board, control=ControlConfig.from_config(cfg.get("control")),
         config=ngit_cfg, target=target,
