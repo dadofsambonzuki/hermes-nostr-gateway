@@ -155,3 +155,38 @@ issue were enough to put work in the queue, the queue would be writable by stran
 bridge silently ignored them, a real report from a new contributor would vanish. Holding it and
 asking a person is the only option that is neither.
 
+## The gateway is a bridge as well as a pump
+
+Planes are live and fail per message; the ngit bridge is a batch reconciler with its own cursor,
+outbox and idempotency keys, and it fails per pass. It lives in this repository because the
+alternative duplicates the identity, the relay set and the `concord.projects` mapping — the drift
+this repository exists to avoid. The pass owns the store, the board and the cursor; a relay handler
+may wake a pass but never create a task or move a cursor; the bridge never merges and never speaks
+as the operator; its notices are queued, then delivered.
+
+Why: the two engines share configuration, not control flow, and configuration is the part that
+cannot be copied without drifting. A second deployment would hold its own key, its own relay list
+and its own channel → checkout → project → board map, and the copy that has gone stale is found by
+a channel being told about a repository whose board it does not own. One home is only safe because
+the split is enforced rather than remembered: only the pass writes tasks, cursors and outbox rows —
+a relay handler may wake it and nothing more — so a live event arriving mid-pass cannot half-move a
+cursor or invent a task, and a wake that fires twice is just a second idempotent pass. The bridge
+stays a narrator for the same reason: a merge is something it reports, never something it does, and
+what it posts in the channel is a notice with the gateway's identity on it, not the operator
+speaking.
+
+## One repository, two runtimes
+
+systemd runs the daemon; cron runs the bridge; the daemon may optionally wake the bridge on an
+event. Cron stays the floor, so a missed event or a restart costs latency, not correctness.
+
+Why: the daemon is a long-lived process that owns a socket and a subscription per relay, so its
+lifecycle needs a supervisor — the operator restarts it, and `hng status` reports on it. A pass has
+no lifecycle to own: it is a command that reads to a cursor, writes down what it decided and exits,
+so its scheduler can be the host's own cron, with no supervision, no in-memory state and no restart
+to get wrong. Waking a pass from the daemon's read path is then an optimisation, not a dependency:
+the same pass runs sooner than the next tick, and because every pass is idempotent and
+cursor-driven, losing one to a restart or a busy daemon costs the channel minutes and never a
+message. Making cron the fallback rather than the trigger would put the bridge's correctness behind
+the daemon's liveness, which is the coupling this refuses.
+

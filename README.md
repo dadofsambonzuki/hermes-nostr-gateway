@@ -26,12 +26,14 @@ board that is locked or missing is reported as that pass's error rather than a s
 | state | the store, replayed on reconnect | links, cursors and an outbox of its own |
 | fails | per message | per pass |
 
-Both run on one spine: the same `identity`, the same `relays`, the same policy, the same `control`
-pane, and the same `concord.projects` mapping — channel → checkout → project → board. A second
-home for the bridge would mean a second identity and a second copy of that map, which is why the
-two live in one repository. Why both engines belong in one repository is a decision, not an
-accident: [`docs/decisions.md`](docs/decisions.md) is where this project's calls and their
-reasons live.
+Both run on one spine: the same `identity`, the same `relays`, the same `control` pane and the same
+`concord.projects` mapping — channel → checkout → project → board. What they do not share is the
+message policy: a bridge event is not a message, so nothing scores its reach or authority, and
+whether an issue author's work is queued is that pane's `trusted_npubs` (in *Bridges*, below), not
+a verdict on a message. A second home for the bridge would mean a second identity, a second relay
+set and a second copy of that map, which is why the two live in one repository. That is a decision,
+with the invariants that keep the two engines apart, recorded as "The gateway is a bridge as well
+as a pump" in [`docs/decisions.md`](docs/decisions.md#the-gateway-is-a-bridge-as-well-as-a-pump).
 
 ## Planes
 
