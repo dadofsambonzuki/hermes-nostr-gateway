@@ -49,6 +49,7 @@ from .planes.nip01 import Nip01Plane, feed_rules
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
+from .profiles import hermes_config_path, require_profiles
 from .projects import ProjectMap
 from .publisher import Publisher, make_publisher
 from .server import SocketServer
@@ -162,19 +163,6 @@ class MarmotOwnershipError(RuntimeError):
     """Both readers of one wn-agent socket are switched on: pick a transport."""
 
 
-def hermes_config_path(cfg: dict[str, Any]) -> Path:
-    """Where Hermes' own config lives, as seen by this process.
-
-    `marmot.hermes_config` wins (a gateway in a container or beside a second Hermes
-    home needs that), then `$HERMES_HOME`, then the default `~/.hermes/config.yaml`.
-    """
-    configured = cfg.get("hermes_config")
-    if configured:
-        return Path(os.path.expanduser(str(configured)))
-    home = os.environ.get("HERMES_HOME") or "~/.hermes"
-    return Path(os.path.expanduser(home)) / "config.yaml"
-
-
 def hermes_marmot_state(cfg: dict[str, Any]) -> dict[str, Any]:
     """Whether Hermes' Marmot platform is attached to the same socket, and how we know.
 
@@ -256,6 +244,12 @@ class Gateway:
         # configuration that would deliver every Marmot message twice is not a
         # process to start and then warn about.
         self.hermes_marmot = self._guard_marmot_ownership(cfg.get("marmot") or {})
+        #: Which Hermes profile each plane and channel runs as, read here rather than at the
+        #: first message: a route naming a profile Hermes does not have would otherwise run
+        #: that turn as the default profile, which is the one outcome this may not have.
+        #: Refused before the secret, the store and the socket are touched;
+        #: `hng profiles --check` reports the same without starting anything.
+        self.profiles = require_profiles(cfg)
         self._secret = secret_from(cfg)
         self.crypto = SdkCrypto(self._secret)
         # Publish transport (plan P2): one `nostr-sdk` client, one signed event per
@@ -716,6 +710,12 @@ class Gateway:
         for problem in self.control.problems:
             log.warning("control: %s", problem)
         log.info("control pane: %s", "; ".join(self.control.describe()))
+        # One line, for the same reason: which identity a plane or channel runs as is
+        # configuration, and a route that is only in a file is one nobody can check at boot.
+        if self.profiles:
+            for warning in self.profiles.warnings:
+                log.warning("profiles: %s", warning)
+            log.info("profiles: %s", "; ".join(self.profiles.describe()))
         # Before any relay worker exists: from here on, a store write is a queue append
         # and the commit happens on the writer's thread.
         await self.store_writer.start()
@@ -1015,9 +1015,33 @@ class Gateway:
         in a task, never in the read callback, so the loop stays free. Rows that arrive
         while the flush runs are committed by the next one.
         """
-        task = asyncio.create_task(self._deliver(self.frame_for(msg)))
+        task = asyncio.create_task(self._deliver(self._routed(
+            self.frame_for(msg), plane=msg.plane, conversation=msg.conversation,
+            sender=msg.sender, message_id=msg.id)))
         self._deliveries.add(task)
         task.add_done_callback(self._deliveries.discard)
+
+    def _routed(self, frame: dict[str, Any], *,
+                plane: str = "", conversation: str = "", sender: str = "",
+                message_id: str = "") -> dict[str, Any]:
+        """The frame with the profile its conversation runs as, or a refused frame.
+
+        A route is configuration, so it is normally resolved once at load. Resolving it again
+        here is the second gate: a profile deleted while the daemon runs must not become a turn
+        under the default profile (Hermes' own resolver falls back with only a log line), so the
+        frame is refused instead. `blocked` never becomes a run; the stored row stays
+        undelivered, so a reconnect replays it and the message runs once the profile is back.
+        """
+        if frame.get("type") != "message" or not self.profiles:
+            return frame
+        known = self.concord.channels() if plane == "concord" else None
+        route = self.profiles.resolve(plane, conversation, known_channels=known, verify=True)
+        if route.error:
+            log.error("profile route refused for %s/%s: %s (%s)",
+                      plane, conversation, route.error, route.detail)
+            return {"type": "blocked", "plane": plane, "from": sender,
+                    "reason": route.error, "detail": route.detail, "rumor_id": message_id}
+        return {**frame, **route.frame()}
 
     async def _deliver(self, frame: dict[str, Any]) -> None:
         failures = self.store_writer.failures
@@ -1469,6 +1493,10 @@ class Gateway:
         `replay: true` is the adapter's cue: a frame it has already handed to the agent
         (the ack failed, so the row is still pending) must be acknowledged again rather
         than answered twice. The window and floor live in the store.
+
+        A replay is the same frame the first delivery would have been, profile included: a
+        crash between the store write and the ack must not turn a routed message into a turn
+        under the default profile.
         """
         frames = []
         for row in self.store.pending_immediate(limit or self.replay_limit,
@@ -1485,6 +1513,13 @@ class Gateway:
             # adapter sees a photo it can no longer ask for.
             if row.get("attachments"):
                 frame["attachments"] = row["attachments"]
+            frame = self._routed(frame, plane=row["plane"], conversation=row["conversation"],
+                                 sender=row["sender"], message_id=row["id"])
+            if frame.get("type") == "blocked":
+                # Refused again: left out rather than offered, so the adapter is not asked to
+                # log a message that cannot run. The row stays pending and the daemon's own
+                # log carries the reason, which is where the route can be fixed.
+                continue
             frames.append(frame)
         return frames
 

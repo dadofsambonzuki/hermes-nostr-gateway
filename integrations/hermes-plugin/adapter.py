@@ -15,6 +15,16 @@ message id it was given is remembered here and a NIP-25 reaction on that message
 conversation it was sent to — resolves the same queue the typed `/approve` and `/deny`
 commands do. Nothing else about the gate changes: a reaction that cannot be matched to a
 prompt, from anyone else, or with an emoji that is not a decision leaves the gate blocked.
+
+A Hermes profile is a whole instance — its own config, sessions, skills and memory — and the
+gateway decides which one a conversation's turns run as (`profiles:` in its config; the
+runtime is Hermes'). This adapter's half is one field: the frame's `profile` becomes
+`SessionSource.profile`, the same field Hermes' own `gateway.profile_routes` stamps, so the
+turn resolves that profile's `HERMES_HOME`, writes to `profiles/<name>/state.db`, and keys
+the session `agent:<profile>:...`. A frame naming a profile Hermes does not have is refused
+rather than delivered: Hermes' resolver would otherwise fall back to the default home with
+only a log line, and a routed channel's messages landing in the wrong agent's memory is worse
+than a message that does not run.
 """
 
 from __future__ import annotations
@@ -98,6 +108,25 @@ def _extra(config: Any) -> dict[str, Any]:
 def socket_path(config: Any) -> Path:
     configured = os.environ.get("NOSTR_GATEWAY_SOCKET") or _extra(config).get("socket_path")
     return Path(os.path.expanduser(configured or DEFAULT_SOCKET))
+
+
+def profile_missing(name: str) -> bool:
+    """True when Hermes has no such profile, so the turn could only fall back to default.
+
+    Asked of Hermes when it is importable -- it is, in production, because this adapter runs
+    inside Hermes, and `hermes_cli.profiles.profile_exists` is the one definition of "there"
+    (a live directory with identity and no tombstone). A build where that import fails answers
+    "not missing" and leaves Hermes' own resolver as the next gate, rather than dropping every
+    routed frame in a test harness.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
+        return False
+    try:
+        return not profile_exists(name)
+    except Exception:  # noqa: BLE001 - an unanswerable question is not a refusal
+        return False
 
 
 def validate_config(config: Any) -> bool:
@@ -206,6 +235,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Approval prompts this adapter delivered, newest last: event id → (chat_id,
         # session_key). A reaction on one of these is a decision about that gate.
         self._approval_prompts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # The profile each conversation's turns run as, from the last frame it sent (hex/npub
+        # or `concord:…`). A prompt's session key must be built for the identity the turn ran
+        # under, or the gate lands in `agent:main` and no reaction can resolve it.
+        self._chat_profiles: OrderedDict[str, str] = OrderedDict()
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -328,10 +361,36 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         if not (callable(build) and callable(key_of)):
             return ""
         try:
-            return str(key_of(build(chat_id=chat_id, chat_type="dm", user_id=chat_id)))
+            source = build(chat_id=chat_id, chat_type="dm", user_id=chat_id)
+            # The turn that opened the gate ran under this profile, so the gate's key is in
+            # `agent:<profile>:…`. Without it the lookup is the default namespace's and the
+            # reaction resolves nothing — a routed channel's confirmations would be silent.
+            profile = self._chat_profile(chat_id)
+            if profile:
+                setattr(source, "profile", profile)
+            return str(key_of(source))
         except Exception:  # noqa: BLE001 - an unmatched reaction is safe; a wrong key is not
             logger.debug("nostr: no session key for %s", _short(chat_id), exc_info=True)
             return ""
+
+    def _chat_profile(self, chat_id: str) -> str:
+        """The profile this conversation's last turn ran as, or "" for the default."""
+        known = getattr(self, "_chat_profiles", None)
+        if not isinstance(known, dict):
+            return ""
+        return str(known.get((chat_id or "").strip().lower()) or "")
+
+    def _remember_chat_profile(self, chat_id: str, profile: str) -> None:
+        """Remember a conversation's profile for its prompt keys, keeping only the newest few."""
+        if not chat_id or not profile:
+            return
+        known = getattr(self, "_chat_profiles", None)
+        if not isinstance(known, OrderedDict):
+            known = self._chat_profiles = OrderedDict()
+        known[chat_id.strip().lower()] = profile
+        known.move_to_end(chat_id.strip().lower())
+        while len(known) > MAX_TRACKED_APPROVALS * 8:
+            known.popitem(last=False)
 
     def _resolve_approval(self, session_key: str, choice: str) -> int:
         """Resolve the pending gate for *session_key*; 0 when it cannot be pinned down.
@@ -521,9 +580,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     elif frame.get("type") == "blocked":
                         # Warnings, never user-visible chat (spec §11.6). A blocked
                         # frame has no content and must never become an agent run.
-                        logger.warning("nostr blocked %s… (%s)",
+                        detail = str(frame.get("detail") or "").strip()
+                        logger.warning("nostr blocked %s… (%s)%s",
                                        (frame.get("from") or "")[:12],
-                                       frame.get("reason") or "unknown")
+                                       frame.get("reason") or "unknown",
+                                       f": {detail}" if detail else "")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform
@@ -575,6 +636,22 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             self._peers.add(sender.lower())
         if conversation:
             self._peers.add(str(conversation).lower())
+        # Which identity this conversation's turns run as, decided by the gateway
+        # (`profiles:` there). Absent means the receiving profile, which is what keeps the
+        # wire unchanged for everything the block does not route.
+        profile = str(frame.get("profile") or "").strip()
+        if profile and profile_missing(profile):
+            # Hermes would resolve this to the *default* home with only a log line, so refuse
+            # it here: a routed channel's message must never land in another agent's memory.
+            # Ack anyway -- a refusal is final, and leaving the row pending replays it forever.
+            logger.error(
+                "nostr frame %s names profile %r, which Hermes does not have; refused rather "
+                "than run as the default profile (check `hng profiles --check`)",
+                (message_id or "")[:12] or "(no id)", profile)
+            await self._ack(message_id)
+            return
+        if profile and conversation:
+            self._remember_chat_profile(str(conversation), profile)
         if frame.get("replay") and message_id and message_id in self._delivered_ids:
             # Hermes already has this one; the previous ack is what failed.
             logger.info("nostr replay skipped: %s was already delivered", message_id[:12])
@@ -619,6 +696,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             user_name=_short(sender),
             role_authorized=authoritative,
             message_id=message_id,
+            # The identity the gateway routed this conversation to. `None` (everything the
+            # `profiles` block does not route) keeps the historical behaviour: the receiving
+            # profile runs the turn.
+            profile=profile or None,
         )
         event = MessageEvent(
             text=text,
@@ -670,6 +751,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 user_name="digest",
                 role_authorized=False,
                 message_id=message_id,
+                # A batch is one frame across planes and the store does not attribute one to
+                # a single plane, so it carries no profile today; honouring it if it ever
+                # does is one field, and the alternative is a routed plane's digest running
+                # silently under the wrong identity.
+                profile=str(frame.get("profile") or "").strip() or None,
             ),
             raw_message=frame,
             message_id=message_id,

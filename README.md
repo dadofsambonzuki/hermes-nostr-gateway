@@ -358,6 +358,56 @@ control:
 - Concord invites use both halves: a trusted inviter's invite joins without asking, anyone
   else's is held and posted into `control.concord` for a human (see *Joining a community*).
 
+### Profiles
+
+A Hermes profile is a whole instance — its own config, sessions, skills and memory, rooted at
+its own `HERMES_HOME` — so one plane or one channel can run as a different agent identity while
+the same daemon serves everything else as the default profile:
+
+```yaml
+profiles:
+  default: default                 # required with the block: every conversation ends here
+  planes:
+    marmot: work
+  channels:
+    - community: <community id>    # optional; restrict this rule to one community
+      channel: <channel id or name>
+      profile: ops
+```
+
+Precedence is channel > plane > default, and it is total: `profiles.default` is required with
+the block, so every conversation resolves to exactly one rule. A channel rule matches on its id
+before its name — a renamed channel keeps its profile — and a rule with `community` only matches
+that community. `hng route <conversation>` prints the rule that won, what it beat, and the home
+it resolves to; `hng profiles` prints the whole table and `--check` exits 1 when a route names a
+profile Hermes cannot run a turn as.
+
+**The runtime is Hermes'**, not this daemon's, and nothing here re-implements it. Hermes already
+routes a platform chat to a profile through `gateway.profile_routes`, and a routed turn gets that
+profile's config, skills, memory and provider keys, its own `profiles/<name>/state.db`, and the
+`agent:<profile>:...` session namespace. What Hermes cannot key on is a *plane* or a *Concord
+channel by name* — those are names this gateway defines — so this block is the route for this
+gateway's own conversations, and the frame carries the answer. The Hermes plugin sets it on the
+`SessionSource`, which is the same field `profile_routes` stamps; a route change never migrates a
+session, because the namespace is the profile's.
+
+- A route naming a profile Hermes does not have refuses the start; a profile deleted while the
+  daemon runs refuses the frame (it never falls back to the default profile). `hng profiles
+  --check` reports the same without starting anything.
+- Creating or configuring a profile is `hermes profile create <name>` / `hermes -p <name>
+  config` — never this file, and never this gateway.
+- Hermes has to be multiplexing (`gateway.multiplex_profiles` on, which is its default) and the
+  profile must not opt out with `gateway.standalone: true`; `hng profiles --check` says which of
+  those is wrong.
+- The control pane is not re-routed: a confirmation for a routed channel still goes to the
+  conversation that asked and to `control.<plane>`, and its approval prompts stay answerable
+  because the prompt's session key is built for the identity the turn ran under.
+- Every profile replies as this gateway's own Nostr key. A profile is an agent identity, not a
+  second transport: give it its own gateway if it needs its own key.
+- A digest batch is one frame across planes and has no single profile, so it runs as the default
+  profile. Immediate-reach traffic — what a routed channel normally carries — always carries its
+  profile.
+
 
 ## Relays and kinds
 

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1] / "integrations" / "hermes-plugin" / "adapter.py"
@@ -111,8 +112,32 @@ def load_adapter(name: str = "nostr_adapter"):
           cache_media_bytes_async=cache_media_bytes_async,
           validate_inbound_media_size=validate_inbound_media_size)
     _stub("gateway.platforms.event", MessageEvent=Kw, MessageType=MessageType)
+    # The adapter asks Hermes whether a routed profile exists; without the stub that question
+    # is unanswerable outside Hermes and every profile would be "not missing".
+    stub_profiles()
     spec = importlib.util.spec_from_file_location(name, PLUGIN)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+#: The profiles `hermes_cli.profiles.profile_exists` answers for, in a test's own terms. A
+#: module-level set because the stub is installed once, in `sys.modules`, and a test may change
+#: its mind between adapters.
+KNOWN_PROFILES: set[str] = set()
+
+
+def stub_profiles(names: Iterable[str] = ()) -> None:
+    """Make Hermes' own profile lookup answer for *names* (default: none at all)."""
+    KNOWN_PROFILES.clear()
+    KNOWN_PROFILES.update(str(name) for name in names or ())
+
+    def profile_exists(name: str) -> bool:
+        return str(name).strip() in KNOWN_PROFILES
+
+    _stub("hermes_cli")
+    _stub("hermes_cli.profiles", profile_exists=profile_exists,
+          get_profile_dir=lambda name: Path(f"/nonexistent/profiles/{name}"))
+    # `from hermes_cli.profiles import …` resolves the submodule through its parent.
+    sys.modules["hermes_cli"].profiles = sys.modules["hermes_cli.profiles"]  # type: ignore[attr-defined]

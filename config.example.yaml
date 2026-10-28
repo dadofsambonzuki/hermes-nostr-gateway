@@ -206,3 +206,31 @@ defaults:
 #     concord:
 #       trusted_npubs:                       # trusted here as well, not instead
 #         - npub1...
+
+# Profiles: which Hermes profile a conversation's turn runs as. A profile is a whole
+# instance -- its own config, sessions, skills and memory, under its own HERMES_HOME -- so a
+# channel routed to `ops` runs with ops' history and memory while everything else stays the
+# default profile. Hermes owns the runtime (`gateway.profile_routes` is its table for platform
+# chats); this block is the route for *this* gateway's own conversations, which Hermes cannot
+# key on: a plane, or a Concord channel by id or name.
+#
+# Precedence is channel > plane > default, and `default` is required with the block: every
+# conversation resolves to exactly one rule (`hng route <conversation>` prints which, and
+# what it beat). A route naming a profile Hermes does not have refuses the start rather than
+# running the turn as the default profile (`hng profiles --check` reports the same).
+#
+# Two things Hermes requires and this gateway checks: `gateway.multiplex_profiles` must not be
+# off in Hermes' config (a non-multiplexed gateway keeps the legacy agent:main namespace and
+# ignores a routed profile), and the profile must not opt out with `gateway.standalone: true`.
+# Creating a profile is `hermes profile create <name>` -- never this file, and never this
+# gateway.
+#
+# profiles:
+#   default: default                 # required with the block; routes to `default` are omitted
+#   # root: ~/.hermes/profiles      # optional; default: profiles/ beside Hermes' config.yaml
+#   planes:
+#     marmot: work
+#   channels:
+#     - community: <community id>    # optional; restrict this rule to one community
+#       channel: <channel id or name>
+#       profile: ops

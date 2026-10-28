@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -33,6 +34,13 @@ from .media import MediaError, media_config, resolve_attachment
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.nip17 import Nip17Plane
 from .policy import Policy
+from .profiles import (
+    PLANES,
+    ProfilesConfigError,
+    channels_from_invites,
+    hermes_profile_state,
+    load_profiles,
+)
 from .projects import Project, ProjectMap, checks_for, load_registry
 from .publisher import publish
 from .store import Store, drops_ttl_seconds
@@ -622,6 +630,208 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def _held_concord_channels(cfg: dict[str, Any]) -> list[Any] | None:
+    """The channels the stored Concord invites grant, or None when there is nothing to read.
+
+    `hng profiles --check` has no live plane, so this reads the same grants the daemon's
+    refresh unions from. None means "cannot say", which skips the existence check rather than
+    refusing a route on a guess.
+    """
+    path = Path(os.path.expanduser(str(cfg.get("store") or "gateway.db")))
+    if not path.exists():
+        return None
+    store = Store(path)
+    try:
+        rows = store.concord_invites(limit=50)
+    finally:
+        store.close()
+    return channels_from_invites(rows) or None
+
+
+def cmd_profiles(args) -> int:
+    """Which Hermes profile each plane and channel runs as, and whether Hermes can run it.
+
+    `hng profiles` prints the table. `--check` is the load gate: non-zero when a rule names a
+    profile Hermes does not have (or one that opted out of the host gateway), an unknown plane,
+    a duplicate channel rule, or a non-multiplexed Hermes -- the cases in which a routed turn
+    would quietly run as the default profile. Warnings (a parked profile, an unset
+    `gateway.multiplex_profiles`) are printed and do not fail the check: parking is temporary
+    and the flag defaults on.
+    """
+    cfg = load_config(args.config)
+    router = load_profiles(cfg)
+    state = hermes_profile_state(cfg)
+    known = _held_concord_channels(cfg) if router.channels else None
+
+    if getattr(args, "check", False):
+        problems = list(router.problems)
+        if router.channels and known is None:
+            # Not checked is not missing: an empty list would say "holds nothing", and every
+            # channel rule would be reported stale on a host whose first invite has not landed.
+            print("profiles: no stored Concord invite, so channel rules were not checked "
+                  "against a channel list", file=sys.stderr)
+        if known is not None:
+            problems.extend(router.channel_problems(known))
+        warnings = list(router.warnings)
+        if args.json:
+            print(json.dumps({"ok": not problems, "problems": problems, "warnings": warnings,
+                              "configured": router.configured,
+                              "multiplex": state.get("multiplex"),
+                              "source": state.get("source")}, indent=2))
+        else:
+            for problem in problems:
+                print(f"config: {problem}", file=sys.stderr)
+            for warning in warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+            if not problems and not router.configured:
+                print("profiles is not configured: every turn runs as the gateway's own profile")
+            elif not problems:
+                print("profiles are usable: every route names a profile Hermes can run a "
+                      "turn as")
+        return 1 if problems else 0
+
+    if args.json:
+        print(json.dumps(router.as_dict(), indent=2))
+        return 0 if (not router.configured or router.usable) else 1
+    for line in router.describe():
+        print(line)
+    return 0 if (not router.configured or router.usable) else 1
+
+
+def _plane_for(cfg: dict[str, Any], conversation: str, explicit: str) -> tuple[str, str]:
+    """The plane a conversation belongs to, and how that was decided.
+
+    Asked for, then read from the shape (`concord:` is unambiguous), then from the store's own
+    rows. A DM peer can have rows on two planes and a Marmot group id is a hex string like any
+    peer key, so evidence beats shape and an ambiguity is reported rather than resolved by a
+    guess: a route applied to the wrong plane is a turn under the wrong identity.
+    """
+    chosen = (explicit or "").strip().lower()
+    if chosen:
+        return chosen, "asked for with --plane"
+    if conversation.strip().lower().startswith("concord:"):
+        return "concord", "the conversation's shape"
+    path = Path(os.path.expanduser(str(cfg.get("store") or "gateway.db")))
+    if not path.exists():
+        return "", "unknown (no store to read)"
+    store = Store(path)
+    try:
+        planes = store.planes_for_conversation(conversation)
+    finally:
+        store.close()
+    if len(planes) == 1:
+        return planes[0], "the store"
+    if not planes:
+        return "", "unknown (the store has never seen it)"
+    return "", f"ambiguous ({', '.join(planes)} hold it); pass --plane"
+
+
+def _config_path(explicit: str | None = None) -> Path | None:
+    """The file `load_config` would read, for a caller that needs to name it.
+
+    `hng route` hands it to the model-route block, whose key lookup defaults to a `.env` beside
+    the config. The search order is `load_config`'s, so the two cannot disagree about which
+    file is in force.
+    """
+    for candidate in (explicit, os.environ.get("HNG_CONFIG"), str(DEFAULT_CONFIG),
+                      str(Path.home() / ".config/hermes-nostr-gateway/config.yaml")):
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    return None
+
+
+def _model_route_lines(cfg: dict[str, Any], config_path: Any, plane: str,
+                       conversation: str) -> list[str]:
+    """The model route for one conversation, when model routing is in this build.
+
+    Model routing is its own block with its own card (`pr/route-model`): it decides provider,
+    model and credential where this decides identity. It is imported rather than assumed, so
+    `hng route` works in a build that has one and not the other and prints both when it has
+    both -- which is the point of one verb.
+    """
+    try:
+        routing = importlib.import_module(f"{__package__}.routing")
+    except ImportError:
+        return []
+    if not cfg.get("routing"):
+        return []
+    try:
+        router = routing.Router.from_config(cfg.get("routing"), config_path=config_path)
+        resolution = router.resolve(plane, conversation)
+        data = resolution.as_dict()
+    except Exception as exc:  # noqa: BLE001 - an older module must not break `hng route`
+        return [f"  model      unavailable ({type(exc).__name__}: {exc})"[:200]]
+    if data.get("error"):
+        return [f"  model      UNRESOLVED {data['error']}: {data.get('detail', '')}"[:200]]
+    return [f"  model      {data.get('provider', '')}/{data.get('model', '')}"
+            f"  ({data.get('rule', 'none')})"]
+
+
+def cmd_route(args) -> int:
+    """Which profile -- and, when that block exists, which model -- one conversation uses.
+
+    `hng route <conversation>` answers the question an operator actually has: this channel's
+    answers come out on the wrong identity or the wrong model, so which rule won, what did it
+    beat, and is it usable. With no conversation it prints the whole profiles table.
+    """
+    cfg = load_config(args.config)
+    config_path = _config_path(args.config)
+    router = load_profiles(cfg)
+    conversation = (args.conversation or "").strip()
+    plane, how = _plane_for(cfg, conversation, args.plane)
+
+    if not conversation:
+        if args.json:
+            print(json.dumps(router.as_dict(), indent=2))
+            return 0 if (not router.configured or router.usable) else 1
+        print("profiles")
+        for line in router.describe():
+            print(line)
+        model = _model_route_lines(cfg, config_path, "", "")
+        if model:
+            print("model")
+            for line in model:
+                print(line)
+        return 0 if (not router.configured or router.usable) else 1
+
+    known = _held_concord_channels(cfg) if (router.channels and plane == "concord") else None
+    resolution = router.resolve(plane, conversation, known_channels=known)
+    # With no plane in hand, a plane rule may be exactly what decides this conversation, and
+    # printing `profiles.default` would answer a question that was not decidable.
+    undecided = (resolution.ok and not plane and bool(router.planes)
+                 and resolution.rule == "default")
+    model = _model_route_lines(cfg, config_path, plane, conversation)
+    if args.json:
+        data = {**resolution.as_dict()}
+        if undecided:
+            data.update(error="plane_unknown", ok=False, detail=how)
+        print(json.dumps({"conversation": conversation, "plane": plane, "plane_from": how,
+                          **data, "model": model}, indent=2))
+        return 1 if (undecided or not resolution.ok) else 0
+    print(f"{conversation}  ({plane or 'unknown plane'}; {how})")
+    if undecided:
+        print(f"  profile    UNRESOLVED plane_unknown: {how}; "
+              f"profiles.planes.{'/'.join(sorted(router.planes))} may decide it")
+        for line in model:
+            print(line)
+        return 1
+    if resolution.error:
+        print(f"  profile    UNRESOLVED {resolution.error}: {resolution.detail}")
+        if resolution.why:
+            print(f"  rule       {resolution.why}")
+        for line in model:
+            print(line)
+        return 1
+    home = router.homes.get(resolution.profile) if router.configured else None
+    print(f"  profile    {resolution.profile or '(not routed: profiles is not configured)'}")
+    if home is not None:
+        print(f"  home       {home.path}")
+    print(f"  rule       {resolution.why}")
+    for line in model:
+        print(line)
+    return 0
+
+
 def cmd_control(args) -> int:
     """Where a confirmation goes per plane, and who is trusted enough not to need one."""
     cfg = load_config(args.config)
@@ -811,6 +1021,12 @@ def cmd_serve(args) -> int:
         # exit so systemd records a failed start instead of a daemon that runs wrong.
         print(f"refusing to start: {exc}", file=sys.stderr)
         return 2
+    except ProfilesConfigError as exc:
+        # A route that names a profile Hermes cannot run a turn as is a turn under the wrong
+        # identity, so this is also a start that must not happen. `hng profiles --check`
+        # reports the same problems without starting anything.
+        print(f"refusing to start: profiles: {exc}", file=sys.stderr)
+        return 2
 
     async def run() -> None:
         await gw.start()
@@ -911,6 +1127,24 @@ def main(argv: list[str] | None = None) -> int:
                             help="exit 1 unless every declared checkout, project and board "
                                  "is there")
     p_projects.set_defaults(func=cmd_projects)
+
+    p_profiles = sub.add_parser(
+        "profiles", help="which Hermes profile each plane and channel runs as")
+    p_profiles.add_argument("--check", action="store_true",
+                            help="exit 1 unless every route names a profile Hermes can run a "
+                                 "turn as")
+    p_profiles.add_argument("--json", action="store_true")
+    p_profiles.set_defaults(func=cmd_profiles)
+
+    p_route = sub.add_parser(
+        "route", help="which profile (and, when configured, model) a turn uses")
+    p_route.add_argument("conversation", nargs="?", default="",
+                         help="a conversation: concord:<community>:<channel>, a peer hex/npub "
+                              "or a marmot group id; omit for the whole table")
+    p_route.add_argument("--plane", default="", choices=("", *PLANES),
+                         help="ask for a plane directly, when the store cannot say")
+    p_route.add_argument("--json", action="store_true")
+    p_route.set_defaults(func=cmd_route)
 
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
     p_control.add_argument("--json", action="store_true")

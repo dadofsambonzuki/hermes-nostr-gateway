@@ -36,3 +36,26 @@ experimental in docs, leave it out of the health frame, or make its tests opt-in
 Why: it runs in production for this gateway and carries real community traffic. A flag that
 defaults off means the plane is only exercised by whoever remembers to set it, and "experimental"
 in a doc is how a supported transport quietly stops being maintained.
+
+## A profile route is the frame's, and Hermes runs it
+
+Routing a plane or a Concord channel to a Hermes profile is a routing-table entry, not a second
+agent runtime. This gateway resolves the route (`profiles:` in its config) and puts the profile's
+name on the message frame; the Hermes plugin sets it on the `SessionSource`; Hermes resolves that
+profile's `HERMES_HOME`, its `state.db` and its `agent:<profile>:...` session namespace. Nothing
+in this repository creates, configures, supervises or sandboxes a profile, and no profile gets a
+session, memory or skills of its own from here.
+
+Why: Hermes already has this machinery, including the isolation and the fail-closed behaviour
+(`gateway/profile_routing.py`), and a second implementation would disagree with it exactly where
+it matters. What Hermes cannot key on is a *plane* or a *Concord channel by name* — names this
+gateway defines — so the route table has to live beside the names it uses. Copying the rules into
+Hermes' `gateway.profile_routes` instead would be a second copy that drifts, which is why the
+Marmot ownership guard reads Hermes' own flag rather than holding one.
+
+Two consequences worth keeping: a route naming a profile Hermes does not have refuses the start
+*and* refuses the frame at delivery (Hermes' own resolver would fall back to the default home with
+only a log line), and a route change never migrates a session — the namespace is the profile's,
+so the old session stays where it was. The control pane is not re-routed either: the route
+changes whose memory a turn runs in, not where a confirmation is asked or whose word it trusts.
+
