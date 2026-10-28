@@ -202,6 +202,35 @@ def test_live_store_gains_the_blocked_reason_column(tmp_path):
         assert "blocked_reason" in columns
 
 
+def test_live_store_gains_the_mode_column_and_old_rows_read_normal(tmp_path):
+    """A DB written before the prefixes existed must migrate, not fail, and say `normal`."""
+    import sqlite3
+
+    from hermes_nostr_gateway.store import Store
+
+    path = tmp_path / "old-modes.db"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE rumors (id TEXT PRIMARY KEY, wrapper_id TEXT NOT NULL,"
+        " sender TEXT NOT NULL, kind INTEGER NOT NULL, created_at INTEGER NOT NULL,"
+        " conversation TEXT, content TEXT, reply_to TEXT, plane TEXT NOT NULL,"
+        " reach TEXT, authority TEXT, rule TEXT, why TEXT, received_at INTEGER NOT NULL,"
+        " delivered_at INTEGER)"
+    )
+    old.execute(
+        "INSERT INTO rumors (id, wrapper_id, sender, kind, created_at, conversation, content,"
+        " reply_to, plane, reach, authority, rule, why, received_at) VALUES"
+        " ('old', 'w-old', 'aa', 14, 1700000000, 'aa', 'before the prefixes', NULL, 'nip17',"
+        " 'immediate', 'instructions', 't', 't', 1700000000)"
+    )
+    old.commit()
+    old.close()
+    with Store(path) as s:
+        columns = {row["name"] for row in s.db.execute("PRAGMA table_info(rumors)")}
+        assert "mode" in columns
+        assert s.rumor("old")["mode"] == "normal"
+
+
 def _immediate(store, ident, *, content=None, received_at=None, sender="ff" * 32):
     """Insert an immediate, replayable row, optionally pretending it arrived earlier."""
     import time

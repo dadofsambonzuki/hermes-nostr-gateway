@@ -327,6 +327,12 @@ A refusal is part of the contract, not an error to swallow: the adapter passes t
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
 attachment the agent cannot see must not read as a message that never had one.
 
+**Holding and steering are Hermes' own.** A `message` frame carries `mode` — `normal`, `queue`
+or `guide`. The gateway has already read and stripped those two prefixes and decided the sender
+may use them (README, "Holding a message back"), so the adapter must not re-read the text or
+second-guess the decision: it re-addresses a `queue` or `guide` message to Hermes' own `/queue`
+and `/steer` commands, which own the holding, the acknowledgement and the idle fallback.
+
 The adapter MUST NOT re-implement allowlisting, unwrapping, relay choice, retries or media
 fetching — if it needs to, the gateway is missing an operation.
 

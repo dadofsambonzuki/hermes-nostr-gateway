@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Protocol
 
+from .. import addressing
 from ..media import imeta_attachments
 from ..policy import Policy
 from ..store import Inbound, Store
@@ -74,20 +75,29 @@ class Nip17Plane:
         recipient = next((t[1] for t in tags if t and t[0] == "p"), None)
         if recipient and recipient != self.me:
             return None  # addressed to someone else
+        text = rumor.get("content", "")
+        # The policy reads the words, not the verb: a `/guide` in front of a message is a
+        # routing request, and an echo of our own text must still compare equal to it.
+        _, words = addressing.split(text)
 
         decision = self.policy.decide(sender=sender, kind=kind, dm=True,
                                       event_id=rumor.get("id"),
-                                      text=rumor.get("content", ""))
+                                      text=words)
+        # What the sender asked of the message — hold it, steer with it, or nothing — is the
+        # policy's to grant (`authority: instructions` *and* `reach: immediate`) and is
+        # stripped here, before the row and the frame exist, so neither re-parses text.
+        mode, content = addressing.resolve(text, decision)
         msg = Inbound(
             id=rumor["id"],
             wrapper_id=wrapper_id,
             sender=sender,
             kind=kind,
             created_at=int(rumor.get("created_at", 0)),
-            content=rumor.get("content", ""),
+            content=content,
             conversation=sender,
             reply_to=reply_to,
             reach=decision.reach,
+            mode=mode,
             authority=decision.authority,
             rule=decision.rule,
             why=decision.why,

@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS rumors (
     reply_to      TEXT,
     plane         TEXT NOT NULL DEFAULT 'nip17',
     reach         TEXT,
+    -- `queue` or `guide` when the sender asked for one (see addressing.py) and the policy
+    -- allowed it; `normal` otherwise, including for every row written before this column.
+    mode          TEXT NOT NULL DEFAULT 'normal',
     authority     TEXT,
     rule          TEXT,
     why           TEXT,
@@ -232,6 +235,9 @@ _RUMOR_COLUMNS = {
     #: The provider/model a turn was asked for, as JSON: names only, never a credential. On a
     #: reply row it is what the adapter reported using, which is the audit trail.
     "route": "TEXT",
+    #: A row from before the prefixes existed asked for nothing: `normal` is the truth, and
+    #: NOT NULL means a reader never has to distinguish "no mode" from "normal".
+    "mode": "TEXT NOT NULL DEFAULT 'normal'",
 }
 
 #: The states an invite can be in. `held` is the default, and the truth for every row
@@ -293,6 +299,9 @@ class Inbound:
     reply_to: str | None
     plane: str = "nip17"
     reach: str = "digest"
+    #: `normal`, `queue` or `guide`: what the sender asked of this message, when the policy
+    #: let them ask it (addressing.py). Kept on the row so a replay carries it too.
+    mode: str = "normal"
     authority: str = "none"
     rule: str = ""
     why: str = ""
@@ -320,6 +329,7 @@ class Inbound:
             "content": self.content,
             "reply_to": self.reply_to,
             "reach": self.reach,
+            "mode": self.mode,
             "authority": self.authority,
             "why": self.why,
         }
@@ -764,13 +774,14 @@ class Store:
                     "INSERT OR IGNORE INTO rumors (id, wrapper_id, sender, kind, created_at,"
                     " conversation, content, reply_to, plane, reach, authority, rule, why,"
                     " received_at, cursor, digest_rule, digest_state, digest_batch,"
-                    " blocked_reason, route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " blocked_reason, route, mode)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         msg.id, msg.wrapper_id, msg.sender, msg.kind, msg.created_at,
                         msg.conversation, msg.content, msg.reply_to, msg.plane,
                         msg.reach, msg.authority, msg.rule, msg.why, stamp,
                         cursor, digest_rule, digest_state, None, msg.blocked_reason,
-                        json.dumps(msg.route) if msg.route else None,
+                        json.dumps(msg.route) if msg.route else None, msg.mode,
                     ),
                 )
                 if cur.rowcount == 0:

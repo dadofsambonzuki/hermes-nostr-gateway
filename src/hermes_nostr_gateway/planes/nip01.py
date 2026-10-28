@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from .. import addressing
 from ..policy import Policy
 from ..store import Inbound, Store
 
@@ -88,23 +89,29 @@ class Nip01Plane:
         if reason is None:
             return None
         event_id = event.get("id") or ""
+        text = event.get("content", "")
+        # The policy has to read the words, not the verb: a `/queue` prefix is a routing
+        # request, and an echo of our own text must still compare equal to it (addressing.py).
+        _, words = addressing.split(text)
         decision = self.policy.decide(
             sender=sender, kind=event["kind"], mention=reason == "mention", event_id=event_id,
-            text=event.get("content", ""),
+            text=words,
         )
         if decision.duplicate:
             return None
+        mode, content = addressing.resolve(text, decision)
         msg = Inbound(
             id=event_id,
             wrapper_id=event_id,
             sender=sender,
             kind=event["kind"],
             created_at=int(event.get("created_at", 0)),
-            content=event.get("content", ""),
+            content=content,
             conversation=reason,
             reply_to=next((t[1] for t in event.get("tags", []) if t and t[0] == "e"), None),
             plane="nip01",
             reach=decision.reach,
+            mode=mode,
             authority=decision.authority,
             rule=decision.rule,
             why=f"{decision.why}; {reason}",

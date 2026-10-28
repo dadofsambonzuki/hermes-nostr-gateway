@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 import nostr_sdk as sdk
 import yaml
 
+from . import addressing
 from .bots import BotRegistry, kind0_fetcher
 from .control import ControlConfig
 from .crypto import SdkCrypto
@@ -1126,15 +1127,19 @@ class Gateway:
             _, text = nip04.open_event(self.crypto.keys, event)
         except Exception:  # noqa: BLE001 - undecryptable is not fatal
             return None
+        # The legacy plane gets the same two prefixes: a sender should not have to know which
+        # wrapper their app picked to say "next, not now" (addressing.py).
+        _, words = addressing.split(text)
         decision = self.policy.decide(sender=sender, kind=4, dm=True,
-                                      event_id=str(event.get("id") or ""), text=text)
+                                      event_id=str(event.get("id") or ""), text=words)
         if decision.duplicate:
             return None
+        mode, content = addressing.resolve(text, decision)
         msg = Inbound(
             id=str(event.get("id") or ""), wrapper_id=str(event.get("id") or ""),
             sender=sender, kind=4, created_at=int(event.get("created_at") or 0),
-            content=text, conversation=sender, reply_to=None, plane="nip04",
-            reach=decision.reach, authority=decision.authority,
+            content=content, conversation=sender, reply_to=None, plane="nip04",
+            reach=decision.reach, mode=mode, authority=decision.authority,
             rule=decision.rule, why=decision.why, interval_s=decision.interval_s,
             blocked_reason=decision.blocked_reason,
         )
@@ -1558,6 +1563,9 @@ class Gateway:
                 "kind": row["kind"], "created_at": row["created_at"],
                 "content": row["content"], "reply_to": row["reply_to"],
                 "reach": row["reach"], "authority": row["authority"], "why": row["why"],
+                # The mode is on the row, so a message held behind a turn survives a restart
+                # as a held message and the adapter never has to re-read a prefix.
+                "mode": row["mode"] or "normal",
                 "replay": True,
             }
             # A replay has to carry the same attachments as the original frame, or the

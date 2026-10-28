@@ -28,6 +28,25 @@ fixture is a name that has to be scrubbed later, and a hostname in an example is
 someone will copy verbatim. Keys and npubs live in host configuration, never here — including in
 test data that "will never be used".
 
+## Two prefixes, and who may use them
+
+`/queue <text>` and `/guide <text>` are read in the daemon *after* the policy decides the
+sender's reach and authority, and are honoured only for `authority: instructions` **and**
+`reach: immediate`. The command is stripped before the row is written, and the row and the frame
+carry `mode: normal|queue|guide`.
+
+Why: a mid-task message could previously only mean "another instruction", so a sender had no way
+to say "next, not now" without interrupting the turn or being buried in the backlog. Parsing
+after the policy is the safety property — a stranger's `/guide` is a word in their text, not a
+verb the agent obeys — and parsing before the frame is what lets the row keep the intent, so a
+replay of an unacknowledged message stays held instead of becoming a fresh instruction. A digest
+tier sender's prefix is left as typed: a batch is not a turn, so there is nothing there to hold
+behind or steer.
+
+The decision is deliberately narrow: no other commands, no aliases, lowercase only, and a prefix
+with no words after it is text. The gateway is not becoming a command parser, and Hermes is not
+being reimplemented — the adapter maps `mode` onto Hermes' own `/queue` and `/steer`.
+
 ## Concord is supported, not experimental
 
 Concord (Armada/Vector) is a first-class plane. Do not gate it behind a feature flag, label it
