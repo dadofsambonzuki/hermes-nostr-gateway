@@ -286,6 +286,26 @@ async def test_a_per_relay_failure_does_not_suppress_its_retry():
     assert len(inst.sent) == 1
 
 
+async def test_an_unreadable_reply_does_not_suppress_its_retry():
+    """A frame the adapter cannot parse proves nothing about the send."""
+    inst = _adapter()
+
+    async def _garbage(payload, timeout=30.0):
+        return ["not", "a", "frame"]
+
+    inst._request = _garbage
+    first = await inst.send(CHAT, BODY)
+    assert first.success is False and first.retryable is True
+
+    async def _ok(payload, timeout=30.0):
+        inst.sent.append(payload)
+        return {"type": "delivery", "ok": True, "message_id": "m1"}
+
+    inst._request = _ok
+    assert (await inst.send(CHAT, BODY)).success
+    assert len(inst.sent) == 1
+
+
 # -- the key is (chat, content) --------------------------------------------------
 
 async def test_the_same_content_to_two_chats_both_deliver():

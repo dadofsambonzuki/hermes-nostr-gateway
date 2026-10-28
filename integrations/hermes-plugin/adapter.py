@@ -894,6 +894,13 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 memory.release(chat_id, body)
             logger.warning("nostr send failed: %s", exc)
             return SendResult(success=False, error=str(exc)[:300], retryable=True)
+        if not isinstance(frame, dict):
+            # An unreadable reply says nothing about what the daemon did: treat it as an
+            # unknown outcome, not a delivery, or the retry would be suppressed.
+            if memory is not None:
+                memory.release(chat_id, body)
+            return SendResult(success=False, error="gateway reply was not a frame",
+                              retryable=True)
         if frame.get("type") == "error":
             if memory is not None:
                 memory.release(chat_id, body)
