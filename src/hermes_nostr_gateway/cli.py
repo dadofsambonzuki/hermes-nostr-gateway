@@ -48,6 +48,9 @@ from .store import Store, drops_ttl_seconds
 
 DEFAULT_CONFIG = Path("config.yaml")
 
+#: How long a `send` (a real publish to several relays) may take before the CLI gives up.
+SEND_TIMEOUT_S = 180.0
+
 
 def resolve_config_path(path: str | None = None) -> Path | None:
     """The file `load_config` would read, so a caller can name it back to the operator.
@@ -314,9 +317,12 @@ def send_to_channel(args, cfg: dict[str, Any], conversation: str) -> int:
     socket_path = Path(os.path.expanduser(
         os.path.expanduser(str(cfg.get("socket") or default_socket_path()))))
     try:
+        # A channel reply is a publish, not a lookup: send it with the same patience the
+        # DM path gets, not the 3s that `status` uses. 3s times out mid-publish and the
+        # caller reports "needs the running daemon" for a daemon that is answering fine.
         frame = asyncio.run(request(socket_path, {
             "op": "send", "to": conversation, "text": args.text,
-            "reply_to": args.reply_to}))
+            "reply_to": args.reply_to}, timeout=SEND_TIMEOUT_S))
     except (OSError, TimeoutError, ValueError) as exc:
         print(f"a channel reply needs the running daemon: {exc}", file=sys.stderr)
         return 1

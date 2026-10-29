@@ -1205,7 +1205,11 @@ class Gateway:
         except Exception as exc:  # noqa: BLE001 - report, do not kill the socket
             return {"type": "delivery", "id": cid, "ok": False, "error": str(exc)[:300]}
 
-        relays = self._recipient_relays(peer)
+        # A recipient's inbox relays are a network lookup (`fetch_first_blocking`), so it
+        # must not run on the loop: doing so blocks every socket request and every relay
+        # worker for the duration, and with sdkloop handing one-shots to this loop it
+        # deadlocks outright (the lookup waits for the loop it is blocking).
+        relays = await asyncio.to_thread(self._recipient_relays, peer)
         for event in wraps.values():
             self.store.record_wrap(event, rumor["id"], peer, relays)
 
@@ -1285,8 +1289,14 @@ class Gateway:
                 why="sent by us", route=route or None,
             ))
             # Queued through the writer, so flush before marking it delivered or our own
-            # message sits in `pending` as if it never went out.
-            await self.store.flush()
+            # message sits in `pending` as if it never went out. Bounded: the message is
+            # already published, and a writer that is slow must not turn a successful send
+            # into a socket request that never answers.
+            try:
+                await asyncio.wait_for(self.store.flush(), timeout=10.0)
+            except asyncio.TimeoutError:
+                log.warning("concord: store flush timed out after a channel send; "
+                            "the message is published but its row may land late")
             self.store.mark_delivered([str(rumor["id"])])
         delivery = {
             "type": "delivery", "id": cid, "ok": ok, "conversation": stream.chat_id,
