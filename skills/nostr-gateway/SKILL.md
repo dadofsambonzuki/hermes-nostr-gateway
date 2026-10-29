@@ -83,6 +83,22 @@ Every refusal is a word, and the word decides what to do.
 - **Review tasks are keyed `ngit:pr:<event id>`.** The key is what makes a re-poll or a
   wake idempotent: the board refuses a second task with the same key. Do not rename it.
 
+## The ngit CLI it drives
+
+The bridge shells out to `ngit`; these are the parts it depends on, not a copy of the CLI's
+manual — run `ngit skill install` for the rest.
+
+- A **PR is created by pushing a branch whose name starts with `pr/`**. Re-pushing the same
+  commit answers *"proposal has no commits after latest tip of inferred PR"* — that means the
+  PR already exists, not that the push failed.
+- **`ngit pr checkout <id-or-nevent>`** gets a PR whose branch is not on the remote: the
+  patches ride on the PR event itself. `git fetch` will not find it.
+- **`ngit issue comment` takes issues only** and refuses a PR. Do not fake a kind-1622 by hand
+  and assume it lands: a hand-published `e`/`a`/`p` comment is accepted by the relay and still
+  does not appear in `ngit pr view --comments`.
+- Read **`ngit pr view <id> --json`** for state, and judge a push by it — a self-hosted GRASP
+  can fail its ref update while the ngit relay took the change.
+
 ## Traps, as rules
 
 - Key every `concord.projects` entry by the channel **id** (hex), or by the whole
