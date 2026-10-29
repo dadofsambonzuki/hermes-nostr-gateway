@@ -18,7 +18,7 @@ the wrong tree.
 ngit:
   assignee: default        # the profile a task created from an issue is dispatched to
   reviews: true            # a PR also gets a review task (never a merge)
-  review_assignee: default # the profile that review task is dispatched to
+  review_assignee: review  # profile that review task is dispatched to (a bot role)
   # relays:                # where 1618/1631 events are read; default: the repository
   #   - wss://relay.example # announcement's own relay hints, then relays.read
   lookback_hours: 168      # the first poll's floor; 0 reads everything the relay will give
@@ -172,7 +172,9 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 - The notice names the task (`review task <id>`) instead of a second message announcing it.
   One PR, one channel event.
 - `ngit.review_assignee` (default `default`) is the profile the task is dispatched to and
-  `ngit.priority` its priority. The bridge writes no model on the task: the board's default,
+  `ngit.priority` its priority. A bot host points it at the review role's own profile, which
+  carries the identity that signs the verdict (see "Bot identities and profiles"). The bridge
+  writes no model on the task: the board's default,
   then that profile's own model, decides, so a review costs whatever the profile costs and
   there is no second place to keep a model in step. A task that needs another model is moved
   on its own (`hermes kanban set-model <id> <model> --provider <p>`), which is the operator's
@@ -198,6 +200,43 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
   queued ones it hands to the daemon. The first run, or a catch-up after a long outage, must
   not dump a month of merges into a channel; the remainder is counted as deferred and picked
   up on later polls.
+
+## Bot identities and profiles
+
+A bot role is a job with its own voice: it gets its own key and, when it runs agent work, its
+own Hermes profile. The default profile stays the box's general-purpose agent and is never a
+bot's signature.
+
+- **deps** — dependency proposals. The role's identity signs the `pr/deps-*` branches and the
+  CI triggers; the weekly unit that scans, builds and pushes holds it, so the role needs no
+  profile of its own.
+- **review** — PR verdicts. It has both: an identity to sign with and a profile the bridge
+  dispatches its tasks to (`ngit.review_assignee: review`). The profile is what makes a review
+  cheap or careful — its model is set once, and there is no per-task or per-config model to
+  keep in step with it.
+
+Rules that keep the pairing honest:
+
+- **The key belongs to the role, not the host.** Keep it outside every checkout at mode `0600`
+  and hand it to a command by path (`--nsec-file <path>`), never as an argument value, never
+  into a log, never into a tracked file. A role that borrows the default profile's key is not
+  a role: its work becomes unattributable.
+- **The verdict goes on the PR.** A review publishes its verdict as a NIP-34 comment signed as
+  its own identity, then reports the same verdict on the task, naming the event:
+
+  ```bash
+  ngit pr comment <id|nevent> --body "<verdict>" --nsec-file <path to the review key>
+  ```
+
+- **The profile must exist before the config names it.** `review_assignee: review` on a host
+  with no `review` profile files a task that nothing will pick up. Create the profile first,
+  then point the bridge at it.
+- **A new identity is an operator step at the relay.** A GRASP that gates writes by author
+  (`NGIT_REPOSITORY_WHITELIST`) refuses events from an npub it does not know — including a
+  comment on a PR it already hosts. Adding the bot's npub to that list is a deployment change:
+  the bridge does not make it, and a bot must not add itself. Until the operator does, the
+  publish fails visibly and the verdict is reported on the task with the relay's refusal
+  quoted.
 
 ## Delivery: decide, queue, then record
 
