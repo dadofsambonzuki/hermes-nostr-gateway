@@ -227,7 +227,8 @@ defaults:
 # ngit:
 #   assignee: default            # profile a task created from an issue is dispatched to
 #   reviews: true                # a PR also gets a review task on the board (never a merge)
-#   review_assignee: default     # profile that review task is dispatched to
+#   review_assignee: review      # profile that review task is dispatched to; a bot role's own
+#                                # identity + profile (see "Bot identities and profiles")
 #   relays:                      # where 1618/1631 events are read; default: relays.read
 #     - wss://relay.example
 #   lookback_hours: 168          # the first poll's floor (0 = everything the relay gives)
