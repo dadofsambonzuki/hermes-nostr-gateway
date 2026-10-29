@@ -172,14 +172,14 @@ def is_control_text(text: str) -> bool:
     return stripped in _CONTROL_EXACT or stripped.startswith(_CONTROL_PREFIXES)
 
 
-# A message can arrive with a `mode`: the gateway has already read two prefixes (`/queue
-# <text>`, `/guide <text>`), stripped them, and — only for a sender its policy judged able to
-# instruct — recorded which one the sender asked for. Hermes has the same two behaviours as
-# its own commands, and owns the machinery behind them (`display.busy_input_mode`), so this
+# A message can arrive with a `mode`: the gateway has already read a prefix (`/queue` or `/q`,
+# `/guide`, `/steer` or `/s`), stripped it, and — only for a sender its policy judged able to
+# instruct — recorded which behaviour the sender asked for. Hermes has the same two behaviours
+# as its own commands, and owns the machinery behind them (`display.busy_input_mode`), so this
 # adapter re-addresses the words to those rather than implementing a second queue:
 #
-#   /queue  hold the message and run it as its own turn when the current one finishes
-#   /steer  inject it into the run that is already going, after its next tool call
+#   /queue, /q          hold the message and run it as its own turn when the current one ends
+#   /guide, /steer, /s  inject it into the run that is already going, after its next tool call
 #
 # Both commands degrade to a plain turn when nothing is running (Hermes strips the command
 # and sends the payload), which is exactly what a `/guide` finding no turn should do. The
