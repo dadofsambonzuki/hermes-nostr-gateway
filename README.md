@@ -103,9 +103,23 @@ uv pip install --python .venv/bin/python -r requirements.txt
 uv pip install --python .venv/bin/python -e '.[dev]'
 cp config.example.yaml config.yaml
 $EDITOR config.yaml                      # key: identity.secret_file (or a systemd credential)
+.venv/bin/hng --config config.yaml doctor
 .venv/bin/hng --config config.yaml status
 .venv/bin/hng --config config.yaml serve
 ```
+
+`hng doctor` is the one preflight, and it replaces six commands run in a remembered
+order: the config parses, the identity key reads, the store is writable, the configured
+socket path expands and the daemon answers, `ngit` is on `PATH` at or above its floor,
+every `concord.projects` checkout is a git repository carrying a NIP-34 address, each
+declared project and board exists and is bound, cron carries a pass for every channel that
+queues work, and the watcher reports its state. Every failing check names its fix;
+`--json` is the same shape for a script, and the exit code is 1 when anything failed.
+`hng skill install` copies the repository's own generic skill
+(`skills/nostr-gateway/SKILL.md`: the verbs, the failure vocabulary and the traps) into
+`$HERMES_HOME/skills/nostr-gateway/`, so an agent on a fresh host does not have to
+rediscover them; `--print` writes the same text to stdout and `--profile <name>` installs
+into that profile's tree instead of the shared one.
 
 `hng status` is the five-second check, and it answers a live question: for each relay
 in `relays.read` it asks the running daemon what that relay's workers are doing right
@@ -350,6 +364,11 @@ outbound  kind-1618 PR       -> one "ready for review" message and one review ta
 hng ngit sync --channel concord:<community>:<channel>          # repo and board from the mapping
 hng ngit sync --channel ... --repo ~/Projects/example --board example-channel   # explicit
 ```
+
+The bridge shells out to `ngit`, so that binary is a pinned dependency: a version at or
+above **3.0.4** must be on `PATH` (the same floor `hng doctor` checks and names, with the
+install hint, in its `ngit` check). A missing or older binary fails at the preflight of
+`hng ngit sync`, before anything is read or written, rather than in a cron log at 03:00.
 
 An issue from a **trusted npub** (`control.trusted_npubs`, or the concord plane's own list)
 becomes a task `ready` for the dispatcher, and the channel gets one notice line,

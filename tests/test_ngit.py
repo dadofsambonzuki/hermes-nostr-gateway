@@ -1496,13 +1496,19 @@ def test_run_ngit_reports_the_stderr_line_not_a_traceback(monkeypatch, tmp_path)
         ngit.run_ngit(tmp_path, ["issue", "list"])
 
 
-def test_run_ngit_says_so_when_the_binary_is_missing(monkeypatch, tmp_path):
+def test_run_ngit_names_the_binary_and_the_floor_when_it_is_missing(monkeypatch, tmp_path):
     def fake_run(command, **kwargs):
         raise FileNotFoundError("ngit")
 
     monkeypatch.setattr(ngit.subprocess, "run", fake_run)
-    with pytest.raises(ngit.NgitError, match="ngit is not installed"):
+    with pytest.raises(ngit.NgitError) as raised:
         ngit.run_ngit(tmp_path, ["issue", "list"])
+    message = str(raised.value)
+    # "ngit is not installed" is not actionable: name the binary, the floor and the fix.
+    assert ngit.NGIT_FLOOR in message
+    assert "ngit" in message
+    assert "PATH" in message
+    assert "is not installed" not in message
 
 
 def test_run_ngit_rejects_output_that_is_not_one_document(monkeypatch, tmp_path):

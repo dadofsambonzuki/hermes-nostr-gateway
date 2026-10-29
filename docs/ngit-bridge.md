@@ -55,6 +55,12 @@ says what; 2 means the configuration is wrong (no assignee, no mapping, no board
 bridge did not touch anything. `--dry-run` reports what would happen and writes nothing — the
 first run against a live channel should be one.
 
+The bridge shells out to `ngit`, so the binary is a pinned dependency: **3.0.4** or newer,
+on `PATH`. A missing or older one fails at the preflight of `hng ngit sync` with the binary
+name, the floor and an install hint, not in a cron log hours later. `hng doctor` checks the
+same floor, plus the mapping, the project and board bindings, the cron pass for every mapped
+channel and the watcher's own state; every failing check names its fix.
+
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
 stable; `hng ngit sync` is the smallest thing that is useful today and does not block that. The
 daemon now offers that subscription as a *wake* — see "Waking the pass" below. Cron stays,
