@@ -228,6 +228,11 @@ Rules that keep the pairing honest:
   ngit pr comment <id|nevent> --body "<verdict>" --nsec-file <path to the review key>
   ```
 
+  The command reports a signed event, not a relay's acceptance: read the thread back **from a
+  relay** (a kind-1622 filter on the repository address) before calling the verdict published.
+  A comment that only exists in the local view is not on the PR, and a relay that does not
+  know the identity yet is the usual reason.
+
 - **The profile must exist before the config names it.** `review_assignee: review` on a host
   with no `review` profile files a task that nothing will pick up. Create the profile first,
   then point the bridge at it.
