@@ -201,3 +201,66 @@ cursor-driven, losing one to a restart or a busy daemon costs the channel minute
 message. Making cron the fallback rather than the trigger would put the bridge's correctness behind
 the daemon's liveness, which is the coupling this refuses.
 
+## One key, two copies, and the check that makes drift loud
+
+Two files hold the same account key on a headless host: wn-agent's own
+`accounts/<label>/secret.json`, and the copy this gateway reads — `identity.secret_file`, or the
+root-owned file a systemd `LoadCredential=` names. wn-agent's daemon has no other store:
+`AgentConnector::open` calls `AccountHome::open`, which is `LocalFileSecretStore` and nothing else.
+The Secret Service path (`zbus_secret_service_keyring_store`, selected per OS in
+`crates/marmot-account/src/keyring.rs`) belongs to the interactive `wn` CLI, whose
+`resolve_secret_store` defaults to `keychain` and accepts `file` only for local development. So
+there is no headless keyring to adopt for the daemon: it never consults one, and a `keyring` file
+backend would be a new store inside wn-agent, not a setting.
+
+**The duplicate stays, deliberately**: it is this gateway's independence from wn-agent's data
+directory, kept with a startup check rather than removed. The failure that motivated the question
+is drift — a replace or a restore that lands in one copy and not the other, where each file is
+individually valid and every message still succeeds — and that is a comparison nobody was making,
+not a file that should not exist. `Gateway._setup_marmot` now compares wn-agent's account id with
+the key this process signs with, and a mismatch disables the Marmot plane with both short ids and
+the reference to this entry in `status`. It is plane-scoped on purpose: NIP-17, Concord and ngit
+are this process's job, so a wrong Marmot key stops group traffic rather than taking the gateway
+down, and `status`/`health` are where it shows.
+
+Why: the two copies exist because the daemon and the gateway are separately supervised and
+separately restored — wn-agent's home can be rebuilt, renamed or re-bootstrapped without this
+process losing the identity its own planes sign with. Retiring the copy is possible (see below)
+but buys one fewer write per replace and costs that independence. What it does not buy is safety:
+the silent case is closed by comparing the public halves, which cost nothing — the account id is
+already in `accounts/<label>/account.json`, and the gateway already knows its own key.
+
+### The rotation story
+
+A Nostr identity is its key, so nothing rotates in place. What happens is a **replace** (a new npub,
+usually under a fresh label) or a **restore** (the same key put back). Both are:
+
+1. stop `wn-agent` and the gateway;
+2. write the key to wn-agent's `accounts/<label>/secret.json` (bootstrap or `import-identity` does
+   this) and to the gateway's identity source (the `LoadCredential=` file, or the `secret_file`
+   path);
+3. start `wn-agent`, then the gateway.
+
+Miss the second write and the gateway refuses the Marmot plane at its next start, naming both
+short ids; miss the first and wn-agent's own account check fails. The one window left is a replace
+performed while both processes keep running: each holds its key in memory, so the disagreement is
+caught at the next gateway start rather than at the send — which is why the runbook above restarts
+both.
+
+### Options considered and rejected
+
+- **A keyring with a file or encrypted backend.** Not a configuration this stack has. The daemon
+  never opens a keyring, and `keyrings.alt` is a Python package for a Rust binary; `keyring` 24's
+  file store would have to be added to wn-agent and selected there, which is upstream work and
+  would still leave the gateway's copy to reconcile.
+- **`LoadCredential=` for wn-agent.** The daemon reads and writes
+  `<home>/accounts/<label>/secret.json`; it never looks at `$CREDENTIALS_DIRECTORY`, and a
+  read-only credential would break its own bootstrap and removal paths. The gateway already uses
+  `LoadCredential=`, which is why the second copy takes the form it does.
+- **A user unit that unlocks a file-backed collection at boot.** There is no collection: the store
+  is a plain file, so this adds a unit and removes no copy.
+- **Retire the copy by pointing the gateway at wn-agent's file.** It works — a scratch config with
+  `identity.secret_file` set to wn-agent's `secret.json` resolves the same account id and opens
+  the live store — but it makes this process's identity depend on another service's data
+  directory. Rejected for that coupling, not for feasibility; if the duplicate is ever retired,
+  this is the one-line change, and the check should stay.

@@ -230,6 +230,26 @@ def marmot_ownership_error(state: dict[str, Any]) -> str:
     )
 
 
+def marmot_identity_error(account: str, me: str) -> str:
+    """The refusal when wn-agent's account and this process's key are not one identity.
+
+    Two copies of one account key exist on a headless host: wn-agent's own file and the
+    copy this gateway reads (a `secret_file`, or a systemd `LoadCredential=` source). Each
+    is individually valid, so a half-finished replace — a restore of one, a re-bootstrap
+    of the other — would leave the gateway signing DMs as one npub while the daemon signs
+    group traffic as another. Nothing else compares them; this does.
+    """
+    return (
+        f"wn-agent serves account {account[:12]}… but this gateway signs as "
+        f"{me[:12]}…: the account key and the copy this process reads have drifted "
+        "apart, so a group reply and a DM would come from different identities. Make "
+        "wn-agent's accounts/<label>/secret.json and this gateway's identity source "
+        "(secret_file or LoadCredential=) hold the same key, restart both, and the "
+        "plane attaches again. See docs/decisions.md, \"One key, two copies, and the "
+        "check that makes drift loud\". The Marmot plane is disabled until they agree."
+    )
+
+
 def _media_error(code: str, message: str) -> dict[str, Any]:
     """One shape for every `media.get` refusal: a code the adapter can branch on."""
     return {"type": "error", "op": "media.get", "code": code, "error": message[:300]}
@@ -482,6 +502,10 @@ class Gateway:
             account = str(cfg.get("account_id_hex") or "").strip() or resolve_account_id(
                 home, cfg.get("label")
             )
+            if account.lower() != self.me.lower():
+                self.marmot_error = marmot_identity_error(account, self.me)
+                log.error("marmot plane disabled: %s", self.marmot_error)
+                return
             control = MarmotControl(socket, request_timeout=float(cfg.get("request_timeout", 30)))
             plane = MarmotPlane(self.store, self.policy, control=control, account_id_hex=account)
         except MarmotError as exc:
