@@ -347,3 +347,43 @@ async def test_a_channel_reaction_from_an_authorityless_author_is_ignored(approv
     # Still answerable by someone who is allowed to instruct there.
     await inst._deliver(_reaction("\U0001f44d", sender=PEER, rumor_id="f" * 63 + "2"))
     assert approvals.resolved == [(SESSION, "once", "req-0")]
+
+
+def _capturing(inst):
+    """Replace the socket call with a recorder, so the sent text can be asserted."""
+    sent = []
+
+    async def _request(payload, timeout=30.0):
+        sent.append(payload)
+        return {"type": "delivery", "ok": True, "message_id": inst.next_id}
+
+    inst._request = _request
+    return sent
+
+
+async def test_an_approval_prompt_names_the_reaction_options():
+    """The host's text only knows the typed commands; the adapter adds the reactions it accepts."""
+    inst = _adapter()
+    sent = _capturing(inst)
+
+    await inst.send(PEER, "Run this command?\n\n/approve or /deny",
+                    metadata={"is_approval_prompt": True})
+
+    text = sent[0]["text"]
+    assert "\U0001f44d" in text and "\U0001f44e" in text   # 👍 👎
+    assert "/approve" in text                              # typed path still named
+    assert text.count("React ") == 1
+
+
+async def test_an_ordinary_message_gets_no_reaction_hint():
+    inst = _adapter()
+    sent = _capturing(inst)
+
+    await inst.send(PEER, "just a message")
+
+    assert "\U0001f44d" not in sent[0]["text"]
+
+
+def test_the_hint_is_added_once():
+    once = adapter.with_reaction_hint("Allow?")
+    assert adapter.with_reaction_hint(once) == once
