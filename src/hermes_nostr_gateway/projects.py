@@ -76,11 +76,6 @@ class Project:
     project: str = ""
     #: Kanban board slug: where this channel's work is queued. Empty = not kanban-driven.
     board: str = ""
-    #: The model a PR's review task runs on, for this channel only. Empty = the bridge's
-    #: own `ngit.review_model` (or the assignee profile's model when that is empty too).
-    review_model: str = ""
-    #: That model's provider. Read only alongside a `review_model`.
-    review_provider: str = ""
     #: The checkout is not usable (missing, or not a directory).
     problem: str = ""
     #: The entry contradicts itself (`board` with no `project`), so it is never resolved.
@@ -107,7 +102,6 @@ class Project:
             "path": str(self.path),
             "project": self.project,
             "board": self.board,
-            "review_model": self.review_model,
             "ok": self.ok,
             "problem": self.problem,
             "config_error": self.config_error,
@@ -250,22 +244,12 @@ def _project_from(entry: dict[str, Any], *, base: Optional[Path] = None) -> Opti
         log.warning("concord.projects: channel %r %s", channel, config_error)
 
     problem = "" if path.is_dir() else "path does not exist"
-    # The review model is one pair, like `ngit.review_model` / `ngit.review_provider`: a
-    # provider alone would be applied to whatever model won, which is a different backend.
-    review_model = str(entry.get("review_model") or "").strip()
-    review_provider = str(entry.get("review_provider") or "").strip()
-    if review_provider and not review_model:
-        log.warning("concord.projects: channel %r sets review_provider without review_model;"
-                    " ignoring it", channel)
-        review_provider = ""
     # Nothing a rejected entry declares is in force: the error says what it asked for, and
     # no integration reads a board off a mapping that is not honoured.
     return Project(channel=channel, path=path, name=name,
                    community=str(entry.get("community") or "").strip(),
                    project=project_slug if not config_error else "",
                    board=board_slug if not config_error else "",
-                   review_model=review_model if not config_error else "",
-                   review_provider=review_provider if not config_error else "",
                    problem=problem, config_error=config_error)
 
 

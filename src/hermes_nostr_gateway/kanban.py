@@ -131,18 +131,17 @@ class Board:
 
     def create(self, *, title: str, body: str, assignee: str, status: str,
                idempotency_key: str = "", created_by: str = "ngit",
-               anchor: Optional[Anchor] = None, priority: int = 0,
-               model_override: str = "", provider_override: str = "") -> str:
+               anchor: Optional[Anchor] = None, priority: int = 0) -> str:
         """Insert one task and return its id.
 
         A task that already carries this idempotency key is returned instead of duplicated,
         which is what makes a re-poll harmless. Status is written as given: the dispatcher
         claims `ready` ones, and a `blocked` task is waiting for a human, not for a crash.
 
-        `model_override` / `provider_override` are the board's own per-task routing (the
-        columns `hermes kanban set-model` writes): the dispatcher runs that task on another
-        model without a second profile. They are only written when asked for, so a board
-        from before per-task routing still takes an issue.
+        Nothing is written to `model_override` / `provider_override`: the bridge does not
+        choose a model for the work it files. The board's default, then the assignee
+        profile's own model, decides -- and an operator who wants a single task elsewhere
+        says so on that task (`hermes kanban set-model`).
         """
         key = (idempotency_key or "").strip()
         if key:
@@ -171,10 +170,6 @@ class Board:
             "workspace_path": None, "branch_name": None, "project_id": project_id,
             "idempotency_key": key or None, "block_kind": block_kind,
         }
-        model = str(model_override or "").strip()
-        if model:
-            row["model_override"] = model
-            row["provider_override"] = str(provider_override or "").strip() or None
         statement = (f"INSERT INTO tasks ({', '.join(row)})"
                      f" VALUES ({', '.join(['?'] * len(row))})")
 

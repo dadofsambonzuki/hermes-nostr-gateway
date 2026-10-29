@@ -12,10 +12,10 @@ the same lookup serves the inbound and the outbound half of this module:
               kind-1631 applied  -> one "merged as <commit>" follow-up, which also closes
                                    the review task
 
-A review task is a task like any other, except that it may be worked by a stronger model:
-`ngit.review_model` is written to the task's `model_override` (the column
-`hermes kanban set-model` uses), which the dispatcher already honours. That is how review
-runs on a different model without a second profile.
+A review task is a task like any other: the bridge names the PR, says which profile it is
+dispatched to, and stops there. The model is the board's to decide -- the board's default,
+then the assignee profile's own model -- so reviewing on a different model is the operator's
+call (`hermes kanban set-model`), not a second knob in this config.
 
 Authorisation is the control pane's. An issue from a trusted npub (`control.trusted_npubs`
 or the concord plane's own list) is queued `ready`; any other author is held `blocked` and
@@ -314,10 +314,6 @@ class Target:
     #: The branch a PR targets: the checkout's own. A kind-1618 event names its source
     #: branch and no target, so this is what a review task says the diff is against.
     default_branch: str = ""
-    #: This channel's review model, from its `concord.projects` entry. Beats the bridge's
-    #: own `ngit.review_model`; empty means the bridge's, then the profile's.
-    review_model: str = ""
-    review_provider: str = ""
 
     @property
     def key(self) -> str:
@@ -332,8 +328,6 @@ class BridgeConfig:
     assignee: str = ""
     reviews: bool = True
     review_assignee: str = "default"
-    review_model: str = ""
-    review_provider: str = ""
     relays: tuple[str, ...] = ()
     lookback_hours: int = 168
     issues: bool = True
@@ -365,13 +359,6 @@ class BridgeConfig:
         if not isinstance(relays, (list, tuple)):
             relays = []
         cleaned = tuple(str(url).strip() for url in relays if str(url or "").strip())
-        review_model = str(block.get("review_model") or "").strip()
-        review_provider = str(block.get("review_provider") or "").strip()
-        if review_provider and not review_model:
-            # The dispatcher resolves a provider only alongside a model; a provider alone
-            # would be read as one and quietly change nothing.
-            log.warning("ngit: review_provider is set without review_model; ignoring it")
-            review_provider = ""
         # Tri-state on purpose: absent means "the default" (on once the bridge is
         # configured), and only an explicit false turns the watcher off.
         watch = block.get("watch")
@@ -390,8 +377,6 @@ class BridgeConfig:
             assignee=str(block.get("assignee") or "").strip(),
             reviews=bool(block.get("reviews", True)),
             review_assignee=str(block.get("review_assignee") or "default").strip(),
-            review_model=review_model,
-            review_provider=review_provider,
             relays=cleaned,
             lookback_hours=int(block.get("lookback_hours", 168) or 0),
             issues=bool(block.get("issues", True)),
@@ -945,8 +930,7 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     if not slug:
         raise NgitError(f"channel {project.channel!r} declares no board: set `board:` on its"
                         " concord.projects entry or pass --board")
-    return Target(conversation=conversation, repo=path, board=slug, project=project.project,
-                  review_model=project.review_model, review_provider=project.review_provider)
+    return Target(conversation=conversation, repo=path, board=slug, project=project.project)
 
 
 def board_path(slug: str, *, home: str | Path | None = None) -> Path:
@@ -1269,17 +1253,6 @@ class Sync:
             if edge - CURSOR_OVERLAP_S > start:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
 
-    def _review_model(self) -> tuple[str, str]:
-        """The (model, provider) a review task carries: the channel's entry, then the block.
-
-        A `concord.projects` entry's own `review_model` wins, because a channel is where a
-        different kind of work lives; `ngit.review_model` is the default for every channel.
-        Empty means the assignee profile's model, which is what the dispatcher does anyway.
-        """
-        if self.target.review_model:
-            return self.target.review_model, self.target.review_provider
-        return self.config.review_model, self.config.review_provider
-
     def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool) -> tuple[str, str]:
         """One review task for this PR, or the reason there is none.
 
@@ -1290,7 +1263,6 @@ class Sync:
         if dry_run:
             return "", ""
         key = f"ngit:pr:{pr.id}"
-        model, provider = self._review_model()
         try:
             existing = self.board.by_idempotency(key)
             if existing is not None:
@@ -1298,8 +1270,7 @@ class Sync:
             task_id = self.board.create(
                 title=review_title(pr), body=review_body(pr, self.target),
                 assignee=self.config.review_assignee or "default", status="ready",
-                idempotency_key=key, anchor=self.anchor, priority=self.config.priority,
-                model_override=model, provider_override=provider)
+                idempotency_key=key, anchor=self.anchor, priority=self.config.priority)
         except (BoardError, sqlite3.Error) as exc:
             report.prs["review_errors"] += 1
             report.errors.append(f"review task for PR {pr.id[:8]}: {exc}")
