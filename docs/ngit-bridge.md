@@ -29,6 +29,9 @@ ngit:
   priority: 0              # task priority for anything the bridge creates
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
+  watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
+                           # default on once `assignee` is set, `false` is cron-only
+  watch_debounce_s: 30     # coalesce a channel's events this long before the pass
 ```
 
 Trusted authors are the control pane's (`control.trusted_npubs` unioned with
@@ -53,7 +56,74 @@ bridge did not touch anything. `--dry-run` reports what would happen and writes 
 first run against a live channel should be one.
 
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
-stable; `hng ngit sync` is the smallest thing that is useful today and does not block that.
+stable; `hng ngit sync` is the smallest thing that is useful today and does not block that. The
+daemon now offers that subscription as a *wake* — see "Waking the pass" below. Cron stays,
+because a subscription can replace the wait, not the decision.
+
+## Waking the pass
+
+Cron is the floor: every ten minutes the pass runs, whatever happened. The daemon can also wake
+a pass as soon as something changes, so a new issue or a revised PR shows up in seconds instead
+of up to ten minutes.
+
+The wait moves; the decision does not. A relay event says something was *proposed* — a revision
+is another event, an issue can be resolved or reopened later, and a merge is a kind-1631 that has
+to be matched against the branch. Only the repository says what is true, and only
+`ngit issue list --json` and the checkout's refs say it. So the watcher subscribes, coalesces,
+and runs `hng ngit sync --channel <conversation>` as a child process: the same command cron runs,
+with the same store, cursor and idempotency keys. It never opens the board or the outbox and never
+moves a cursor, so there is still exactly one writer to each.
+
+What it subscribes to:
+
+- kinds 1621 (issue), 1622 (comment), 1618 (PR), 1619 (PR revision) and 1631 (applied);
+- a `#a` filter naming only the mapped repositories — the `concord.projects` entries that declare
+  a board, resolved through their checkout's own `ngit repo --json` address — never a kind on
+  its own and never the whole relay.
+
+1619 is in that list on purpose: a revised PR is a new 1619 event, and a watcher that ignored it
+would leave the review task's brief stale until the next cron pass.
+
+Where it listens is the pass's own rule: `ngit.relays` when set, otherwise the repositories'
+announcement relay hints and then `relays.read`, capped at eight. Listening somewhere the pass
+does not read would wake it for events it will not see; listening only on `relays.read` would miss
+the grasp servers a NIP-34 repository actually publishes to.
+
+Debounce and single-flight:
+
+- a channel's events are coalesced for `watch_debounce_s` (30) after the last one, with a ceiling
+  of four intervals so a steady trickle still gets a pass rather than none;
+- one pass per channel at a time; an event that arrives while a pass is running earns one more
+  pass after it finishes, never a concurrent one;
+- the same event from three relays, or replayed by a resubscribe, is one wake: event ids are
+  remembered in a bounded set, and a wake is a flag rather than a queue.
+
+Failure is the floor's job. A pass that cannot run (no `ngit`, a locked board, a moved checkout)
+is logged and reported in `hng status`, and the next cron pass is unaffected. A daemon restart
+loses every pending wake and nothing else: whatever the watcher missed is exactly what the next
+ten-minute pass reads.
+
+```yaml
+ngit:
+  watch: true             # default: on once ngit.assignee is set; false is exactly cron-only
+  watch_debounce_s: 30    # coalesce a channel's events this long before running the pass
+```
+
+`hng status` prints the watcher — channel repositories, relays, passes woken, wakes still counting
+down — and `hng status --json` carries the same under `ngit_watch`. `hng health` notes it when a
+watcher was asked for but is not subscribed.
+
+Two operational notes:
+
+- **The sandbox.** The pass is a child of the daemon and inherits the unit's restrictions. With
+  `ProtectHome=read-only` the boards directory must be writable (`ReadWritePaths`, as the shipped
+  unit does): otherwise every woken pass fails to write its task while the cron pass — which runs
+  outside the unit — keeps working, which is a confusing half-failure to diagnose.
+- **Overlap with cron.** A cron pass and a woken pass can interleave for one channel. Tasks and
+  notices carry idempotency keys, so the ordinary outcome is still one task and one notice; the
+  board's check-then-insert is not atomic, though, so a duplicate is possible in that window. It
+  is the same window a slow cron pass already has, and the alternative — a lock shared with cron —
+  would mean changing the pass, which this deliberately does not do.
 
 ## Inbound: issues as work
 

@@ -435,6 +435,9 @@ def cmd_status(args) -> int:
             "wraps": store.wrap_counts(),
             "relays": [verdict.as_dict() for verdict in verdicts],
             "not_in_config": stale,
+            # The daemon's watcher, as it reports itself: absent from an older daemon, which
+            # is why this is read from the frame rather than from config.
+            "ngit_watch": (frame or {}).get("ngit_watch"),
         }, indent=2))
         return _status_exit(frame, verdicts, args)
 
@@ -460,6 +463,15 @@ def cmd_status(args) -> int:
         ago = f", up {human_age(uptime)}" if uptime is not None else ""
         print(f"daemon:   up ({socket_path}, {workers} worker(s){ago})")
         print("relays:   (live worker state)")
+        watch = frame.get("ngit_watch") or {}
+        if watch.get("enabled"):
+            due = [c for c in watch.get("channels") or [] if c.get("due_in_s") is not None]
+            print(f"ngit:     watching {len(watch.get('targets') or [])} channel repo(s) on "
+                  f"{len(watch.get('relays') or [])} relay(s); "
+                  f"{watch.get('passes', 0)} pass(es) woken"
+                  + (f", {len(due)} wake(s) due" if due else ""))
+        elif watch.get("reason"):
+            print(f"ngit:     not watching ({watch['reason']})")
     for line in render(verdicts):
         print(line)
     if frame is not None and not reports_event_times(frame):

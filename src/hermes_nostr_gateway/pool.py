@@ -95,7 +95,7 @@ class PoolWorker:
 
     def __init__(self, pool: "RelayPool", relay: str, me: str, *,
                  kinds: tuple[int, ...] = (1059,), authors: tuple[str, ...] = (),
-                 p_tag: str | None = None, auth: bool = True,
+                 p_tag: str | None = None, a_tags: tuple[str, ...] = (), auth: bool = True,
                  since_days: int = 3,
                  on_refusal: RefusalHandler | None = None, purpose: str = "dm"):
         self.pool = pool
@@ -108,6 +108,11 @@ class PoolWorker:
         self.on_refusal = on_refusal
         self.authors = authors
         self.p_tag = p_tag
+        #: `#a` addresses: what narrows a subscription to NIP-34 repositories (an issue or
+        #: PR event names its repository with an `a` tag) without asking a relay for the
+        #: whole kind. Empty means "no address filter", never "match nothing".
+        self.a_tags = tuple(str(value).strip() for value in a_tags
+                            if str(value or "").strip())
         self.auth = auth
         self.since_days = since_days
         self.me = (me or "").strip()
@@ -153,6 +158,12 @@ class PoolWorker:
         filt = sdk.Filter().kinds([sdk.Kind(kind) for kind in self.kinds])
         if self.p_tag:
             filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord("p")), self.p_tag)
+        if self.a_tags:
+            # One `#a` array: NIP-01 reads its values as alternatives, which is what "these
+            # repositories" means. One array rather than one tag entry per address, so the
+            # REQ a relay receives is the one an operator would write by hand.
+            filt = filt.custom_tags(sdk.SingleLetterTag.from_byte(ord("a")),
+                                    list(self.a_tags))
         for author in self.authors:
             filt = filt.author(sdk.PublicKey.parse(author))
         # Only the recent window: without this every resubscribe replays the relay's
@@ -190,6 +201,7 @@ class PoolWorker:
             "requested_kinds": list(self.requested_kinds),
             "refused_kinds": sorted(self.refused),
             "p_tag": bool(self.p_tag),
+            "a_tags": len(self.a_tags),
             "authors": len(self.authors),
             "events": self.events,
             "alive": self.alive,

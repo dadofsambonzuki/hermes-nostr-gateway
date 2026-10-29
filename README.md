@@ -395,6 +395,15 @@ filling the board and the channel in one pass. See
 [docs/ngit-bridge.md](docs/ngit-bridge.md) for the config, the cron shape and the recovery
 paths.
 
+The ten-minute cron pass is the floor, not the whole story: `hng serve` also **watches** the
+mapped repositories — a `#a` subscription for kinds 1621/1622/1618/1619/1631, nothing else —
+and wakes `hng ngit sync` when something changes, coalescing a channel's events for 30s and
+running one pass per channel at a time. It is an accelerator, not a second decision-maker: the
+watcher writes no cursor, no task and no notice; the pass still reads the repository and decides.
+Cron stays for restarts, relays that did not deliver and nudges lost while the daemon was down.
+`ngit.watch: false` is exactly the cron-only behaviour; `hng status` shows what the watcher is
+doing and what it has woken.
+
 ### Control pane
 
 Where the gateway asks before it acts, and whose word it takes without asking. One

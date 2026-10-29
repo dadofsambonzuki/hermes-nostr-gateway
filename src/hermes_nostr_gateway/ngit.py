@@ -95,6 +95,11 @@ CURSOR_OVERLAP_S = 300
 #: is queued, and giving up on it is what lets the poll finish and the next one retry.
 NOTIFY_TIMEOUT_S = 20.0
 
+#: Seconds the daemon's watcher waits after the last event for a channel before running a
+#: pass. Long enough that a PR revision and its status event coalesce, short enough that
+#: "within a minute" holds. See docs/ngit-bridge.md, "Waking the pass".
+DEFAULT_WATCH_DEBOUNCE_S = 30.0
+
 
 class NgitError(RuntimeError):
     """A sync or an answer cannot proceed; the message says what the operator must fix."""
@@ -211,6 +216,12 @@ class BridgeConfig:
     #: ones it may hand to the daemon. The first run (or a catch-up after downtime) must not
     #: dump a month of merged PRs into a channel; the rest follow on later polls.
     max_prs: int = 10
+    #: Whether the daemon listens for the mapped repositories' events and wakes a pass when
+    #: one arrives. `None` is "the default": on when the bridge is configured (an assignee
+    #: is set, so a pass can actually run), off otherwise. Cron stays the floor either way.
+    watch: bool | None = None
+    #: How long the watcher coalesces a channel's events before running its pass.
+    watch_debounce_s: float = DEFAULT_WATCH_DEBOUNCE_S
 
     @classmethod
     def from_config(cls, raw: Any) -> "BridgeConfig":
@@ -230,6 +241,20 @@ class BridgeConfig:
             # would be read as one and quietly change nothing.
             log.warning("ngit: review_provider is set without review_model; ignoring it")
             review_provider = ""
+        # Tri-state on purpose: absent means "the default" (on once the bridge is
+        # configured), and only an explicit false turns the watcher off.
+        watch = block.get("watch")
+        try:
+            debounce = float(block.get("watch_debounce_s", DEFAULT_WATCH_DEBOUNCE_S)
+                             or DEFAULT_WATCH_DEBOUNCE_S)
+        except (TypeError, ValueError):
+            log.warning("ngit: watch_debounce_s is not a number; using %gs",
+                        DEFAULT_WATCH_DEBOUNCE_S)
+            debounce = DEFAULT_WATCH_DEBOUNCE_S
+        if debounce <= 0:
+            log.warning("ngit: watch_debounce_s must be positive; using %gs",
+                        DEFAULT_WATCH_DEBOUNCE_S)
+            debounce = DEFAULT_WATCH_DEBOUNCE_S
         return cls(
             assignee=str(block.get("assignee") or "").strip(),
             reviews=bool(block.get("reviews", True)),
@@ -243,6 +268,8 @@ class BridgeConfig:
             priority=int(block.get("priority", 0) or 0),
             max_new=max(1, int(block.get("max_new", 20) or 1)),
             max_prs=max(1, int(block.get("max_prs", 10) or 1)),
+            watch=None if watch is None else bool(watch),
+            watch_debounce_s=debounce,
         )
 
 
