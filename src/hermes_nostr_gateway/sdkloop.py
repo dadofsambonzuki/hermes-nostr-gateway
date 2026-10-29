@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any, Awaitable, Iterator, TypeVar
+from typing import Any, Coroutine, Iterator, TypeVar
 
 import nostr_sdk as sdk
 
@@ -31,6 +31,11 @@ import nostr_sdk as sdk
 _BINDINGS = getattr(sdk, "nostr_sdk", sdk)
 
 T = TypeVar("T")
+
+#: The daemon's own loop, declared once at pump start. One-shot loops hand the binding back
+#: to this rather than to whatever they found, because "whatever they found" can be another
+#: one-shot's loop that is already closing.
+_HOME: Any = None
 
 
 def _set(loop: Any) -> None:
@@ -53,10 +58,27 @@ def bind(loop: asyncio.AbstractEventLoop | None = None) -> Any:
 
 
 def restore(previous: Any) -> None:
-    """Put back a binding from `bind`, dropping it if that loop has since closed."""
+    """Put back a binding from `bind`, falling back to the daemon's loop.
+
+    A one-shot loop must not leave the process unbound: the bindings resolve futures on the
+    global from a Rust worker thread, where there is no running loop to fall back to, so
+    restoring `None` turns into "no running event loop" on the next NIP-42 attempt — and
+    that is permanent, because every following attempt inherits the same `None`. Prefer the
+    home loop whenever the saved binding is gone or closed.
+    """
     if previous is not None and previous.is_closed():
         previous = None
+    if previous is None:
+        home = _HOME
+        previous = home if home is not None and not home.is_closed() else None
     _set(previous)
+
+
+def set_home(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Declare the daemon's loop as the binding and the fallback for one-shot restores."""
+    global _HOME
+    _HOME = loop if loop is not None else asyncio.get_running_loop()
+    _set(_HOME)
 
 
 @contextlib.contextmanager
@@ -76,15 +98,37 @@ def ensure(loop: asyncio.AbstractEventLoop | None = None) -> None:
         _set(running)
 
 
-def run_isolated(coro: Awaitable[T]) -> T:
-    """`asyncio.run` for a one-shot loop that must not keep the binding when it closes.
+def run_isolated(coro: Coroutine[Any, Any, T]) -> T:
+    """Run a one-shot coroutine without disturbing the bindings' loop.
 
-    Both caller shapes matter: a plain synchronous caller, and a caller inside a running
-    loop that is handed a worker thread. Each gets a loop of its own, and the global is
-    left as it was found — the daemon's main loop, usually.
+    While a daemon is running, *nothing* gets a loop of its own: the coroutine is handed to
+    the home loop with `run_coroutine_threadsafe` and this thread blocks for the result. That
+    is the only way to keep uniffi's process-global binding stable — two live loops in one
+    process means the global is right for one of them and wrong for the other, and the NIP-42
+    signer (which uniffi calls from a Rust worker thread) is the first thing to notice.
+
+    With no home loop — a CLI command, a test — the caller gets a private loop, and the
+    binding is put back to whatever it found, or to home if that has since closed.
     """
+    home = _HOME
+    if home is not None and home.is_running():
+        if _running_loop_is(home):
+            raise RuntimeError(
+                "sdkloop.run_isolated() cannot run on the loop it must hand off to; "
+                "call the async function instead of the blocking wrapper"
+            )
+        return asyncio.run_coroutine_threadsafe(coro, home).result()
     previous = current()
     try:
         return asyncio.run(coro)  # type: ignore[arg-type]
     finally:
         restore(previous)
+
+
+def _running_loop_is(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether the *caller's* thread is the one running `loop` (where blocking would deadlock)."""
+    try:
+        return asyncio.get_running_loop() is loop
+    except RuntimeError:
+        return False
+

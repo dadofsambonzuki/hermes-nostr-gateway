@@ -22,8 +22,10 @@ from hermes_nostr_gateway import sdkloop
 @pytest.fixture(autouse=True)
 def _clean_binding():
     """Every test starts and ends with no global binding: one process, one global."""
+    sdkloop._HOME = None
     sdkloop.restore(None)
     yield
+    sdkloop._HOME = None
     sdkloop.restore(None)
 
 
@@ -146,3 +148,53 @@ def test_bound_puts_the_binding_back_when_the_block_raises():
         sdkloop.restore(previous)
 
     asyncio.run(main())
+
+
+def test_a_one_shot_restore_prefers_the_home_loop_over_unbinding():
+    """Restoring a binding that is gone must not leave the process unbound.
+
+    uniffi calls our signer from a Rust worker thread, where there is no running loop, so a
+    `None` global is not "use the running loop" — it is "no running event loop", and every
+    later NIP-42 attempt fails the same way. A one-shot that entered with nothing bound must
+    therefore hand the binding back to the daemon's loop.
+    """
+
+    async def home() -> None:
+        loop = asyncio.get_running_loop()
+        sdkloop.set_home(loop)
+        assert sdkloop.current() is loop
+        sdkloop.restore(None)          # what run_isolated does when it found no binding
+        assert sdkloop.current() is loop
+
+    asyncio.run(home())
+
+
+def test_run_isolated_hands_off_to_the_home_loop_instead_of_making_a_second_one():
+    """One process, one loop: a one-shot coroutine runs on the daemon's loop, not its own.
+
+    Two live loops mean uniffi's global is right for one of them and wrong for the other, and
+    the NIP-42 signer — called from a Rust worker thread, where there is no running loop — is
+    the first casualty: the relay answers `auth-required`, closes, and never authenticates.
+    """
+    home_loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def run_home() -> None:
+        asyncio.set_event_loop(home_loop)
+        home_loop.call_soon(ready.set)
+        home_loop.run_forever()
+
+    thread = threading.Thread(target=run_home, daemon=True)
+    thread.start()
+    try:
+        assert ready.wait(5), "the home loop did not start"
+        sdkloop.set_home(home_loop)
+
+        async def where() -> Any:
+            return asyncio.get_running_loop()
+
+        assert sdkloop.run_isolated(where()) is home_loop
+    finally:
+        home_loop.call_soon_threadsafe(home_loop.stop)
+        thread.join(5)
+        home_loop.close()

@@ -49,6 +49,10 @@ CONNECT_TIMEOUT = dt.timedelta(seconds=15)
 #: is re-requested after this pause, rather than waiting for a reconnect event.
 RESUBSCRIBE_DELAY = 5.0
 
+#: How long one REQ may take before the worker treats it as failed and retries. Without
+#: this a wedged subscribe leaves the relay reporting "authenticating" forever.
+REQUEST_TIMEOUT_S = 20.0
+
 
 def _norm(url: str) -> str:
     """Compare relay URLs the way the library does: one trailing slash, lowercase host."""
@@ -287,8 +291,9 @@ class RelayPool:
         # uniffi invokes our async signer from a Rust worker thread, where
         # `asyncio.get_running_loop()` does not exist: bind the loop explicitly or every
         # NIP-42 attempt dies with "no running event loop" and a restricted relay closes
-        # the subscription as unauthenticated.
-        sdkloop.ensure()
+        # the subscription as unauthenticated. Declaring it as the *home* loop also gives
+        # concurrent one-shot loops something correct to restore to (see sdkloop.restore).
+        sdkloop.set_home()
         self.started_at = self.started_at or time.time()
         self._pump = asyncio.create_task(self._pump_notifications())
         await self._started.wait()
@@ -386,14 +391,27 @@ class RelayPool:
         The client keeps a closed subscription in its own map, so a re-REQ with the same
         id fails with "subscription ID already exists" — which reads like a server error
         and is only our own bookkeeping.
+
+        Bounded, because the alternative is a worker that never reports again: `attach`
+        only retries after this returns, and `_schedule_resubscribe` declines to start a
+        second task while one is live, so an await that never resolves leaves the relay
+        stuck at "authenticating" with nothing in the log to say why.
         """
         try:
-            await self.client.unsubscribe(worker.subscription_id)
+            await asyncio.wait_for(
+                self.client.unsubscribe(worker.subscription_id), timeout=REQUEST_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            log.warning("pool: unsubscribe of %s timed out; re-REQing anyway",
+                        worker.subscription_id)
         except Exception:  # noqa: BLE001 - absent is the normal case
             log.debug("pool: unsubscribe before re-REQ of %s failed",
                       worker.subscription_id, exc_info=True)
         sdkloop.ensure()
-        return await self.client.subscribe(self._target(worker), id=worker.subscription_id)
+        return await asyncio.wait_for(
+            self.client.subscribe(self._target(worker), id=worker.subscription_id),
+            timeout=REQUEST_TIMEOUT_S,
+        )
 
     # -- pump ----------------------------------------------------------
 
