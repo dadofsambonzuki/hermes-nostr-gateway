@@ -1,11 +1,16 @@
-"""Two prefixes a sender may put on a message: `/queue` and `/guide`.
+"""The spellings a sender may put in front of a message: `/queue`/`/q`, `/guide`/`/steer`/`/s`.
 
 A message that lands while the agent is mid-turn used to have one meaning — another
-instruction, arriving when the agent was least able to take it. These two prefixes let the
+instruction, arriving when the agent was least able to take it. These prefixes let the
 sender say what they mean instead:
 
-    /queue <text>   hold it until the current turn finishes, then run it as its own turn
-    /guide <text>   steer it into the turn that is already running, not a new request
+    /queue <text>, /q <text>                 hold it until the current turn finishes
+    /guide <text>, /steer <text>, /s <text>  steer it into the turn that is already running
+
+An alias is the same command under another spelling, never a second implementation: `/q`
+resolves to `queue`, `/steer` and `/s` resolve to `guide`, and nothing downstream of this
+module can tell which spelling was typed. The short forms are what the issue asked for
+(`/queue` `/q` and `/steer` `/s`); `/guide` predates them and stays as the name of the mode.
 
 The command is a *routing* decision, not content. It is read here, before the message is
 stored, and stripped from the text before the frame is built; the row keeps `mode` so a
@@ -42,11 +47,16 @@ MODE_GUIDE = "guide"
 #: Every mode, for a caller that validates rather than trusts (a hand-edited store, config).
 MODES: tuple[str, ...] = (MODE_NORMAL, MODE_QUEUE, MODE_GUIDE)
 
-#: The whole grammar: a leading `/queue` or `/guide`, one whitespace run, then words. Anything
+#: The whole grammar: a leading command, one whitespace run, then words. Five spellings, two
+#: behaviours: an alias shares its long form's mode, so `/q` is `queue` and `/steer` and `/s`
+#: are `guide` — the regex recognises the word and `_MODE_OF` names the behaviour. Anything
 #: else is text the sender typed — `/queue` alone (nothing to hold), `/queuex`, `/Queue` (a
 #: sentence opening with a path), or a command mentioned mid-sentence, which is not a command.
-_COMMAND = re.compile(r"^/(queue|guide)\s+(\S.*)$", re.DOTALL)
-_MODE_OF = {"queue": MODE_QUEUE, "guide": MODE_GUIDE}
+_COMMAND = re.compile(r"^/(queue|q|guide|steer|s)\s+(\S.*)$", re.DOTALL)
+_MODE_OF = {
+    "queue": MODE_QUEUE, "q": MODE_QUEUE,
+    "guide": MODE_GUIDE, "steer": MODE_GUIDE, "s": MODE_GUIDE,
+}
 
 
 def split(text: str) -> tuple[str, str]:

@@ -28,12 +28,19 @@ fixture is a name that has to be scrubbed later, and a hostname in an example is
 someone will copy verbatim. Keys and npubs live in host configuration, never here — including in
 test data that "will never be used".
 
-## Two prefixes, and who may use them
+## Two behaviours, five spellings, and who may use them
 
-`/queue <text>` and `/guide <text>` are read in the daemon *after* the policy decides the
-sender's reach and authority, and are honoured only for `authority: instructions` **and**
-`reach: immediate`. The command is stripped before the row is written, and the row and the frame
-carry `mode: normal|queue|guide`.
+`/queue <text>` (alias `/q`) and `/guide <text>` (aliases `/steer` and `/s`) are read in the
+daemon *after* the policy decides the sender's reach and authority, and are honoured only for
+`authority: instructions` **and** `reach: immediate`. The command is stripped before the row is
+written, and the row and the frame carry `mode: normal|queue|guide` — `guide` whichever of its
+three spellings was typed, because a spelling is not a behaviour. An alias is an entry in the
+same word-to-mode table, never a second parser and never a second mode, so it cannot drift from
+its long form's gate or its semantics.
+
+The pair means "hold until the turn ends" (`/queue`, `/q`) versus "steer the turn now"
+(`/guide`, `/steer`, `/s`). The short and spelled forms are what the issue asked for; `/guide`
+predates them and stays as the name of the mode and of the row.
 
 Why: a mid-task message could previously only mean "another instruction", so a sender had no way
 to say "next, not now" without interrupting the turn or being buried in the backlog. Parsing
@@ -43,9 +50,13 @@ replay of an unacknowledged message stays held instead of becoming a fresh instr
 tier sender's prefix is left as typed: a batch is not a turn, so there is nothing there to hold
 behind or steer.
 
-The decision is deliberately narrow: no other commands, no aliases, lowercase only, and a prefix
-with no words after it is text. The gateway is not becoming a command parser, and Hermes is not
-being reimplemented — the adapter maps `mode` onto Hermes' own `/queue` and `/steer`.
+The decision is deliberately narrow: no other commands, lowercase only, and a prefix with no
+words after it is text. `/s` is one letter, so for a sender allowed to steer, a message that
+opens `/s ` is a steer request whether or not that was the intent — the parser cannot tell a
+sarcasm marker from a command, and the short spelling was asked for by name. The cost is bounded
+by the same gate as the long forms: anyone who may not steer keeps the prefix as text. The
+gateway is not becoming a command parser, and Hermes is not being reimplemented — the adapter
+maps `mode` onto Hermes' own `/queue` and `/steer`.
 
 ## Concord is supported, not experimental
 

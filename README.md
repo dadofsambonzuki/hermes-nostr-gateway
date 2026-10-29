@@ -703,43 +703,51 @@ peer degrades to blocked rather than a queue that grows, and no blocked message 
 look like chat to a consumer. `rate_limit: {burst: 10, per_hour: 30}` in the config
 overrides the defaults; `enabled: false` turns it off.
 
-## Holding a message back: `/queue` and `/guide`
+## Holding a message back, or steering it: `/queue` `/q` and `/guide` `/steer` `/s`
 
 A message that lands while the agent is mid-turn arrives as another instruction, which is
-either an interruption or a line lost among the backlog. Two prefixes let the sender choose:
+either an interruption or a line lost among the backlog. Two prefixes let the sender choose,
+each with a short spelling:
 
-- **`/queue <text>`** — hold it, and deliver it as its own turn once the current one finishes.
-  "I am not interrupting you; do this next."
-- **`/guide <text>`** — steer it into the turn that is already running, as guidance rather than
-  a new request. "Change what you are doing now."
+- **`/queue <text>`, `/q <text>`** — hold it until the current turn ends, then run it as its
+  own turn. "I am not interrupting you; do this next."
+- **`/guide <text>`, `/steer <text>`, `/s <text>`** — steer it into the turn that is already
+  running, as guidance rather than a new request. "Change what you are doing now."
+
+The pair is "hold until the turn ends" versus "steer the turn now", and the aliases are only
+spellings: `/q` is `/queue`, `/steer` and `/s` are `/guide`. They resolve to the same mode and
+take the same gate, so there is one implementation of each behaviour and the record says what
+the sender asked for rather than which word they typed.
 
 "Current" is per conversation, because that is what a Hermes session is: a `/queue` from one
 room cannot hold a message behind another room's turn.
 
-Both are read in the daemon, after the policy has decided the sender's reach and authority and
-before the frame is built. Only a sender the policy gives **`authority: instructions` and
-`reach: immediate`** can use them: anyone else's `/queue ...` or `/guide ...` is stored exactly
-as typed and reaches the agent as data, because a stranger must not be able to queue work or
+All five spellings are read in the daemon, after the policy has decided the sender's reach and
+authority and before the frame is built. Only a sender the policy gives **`authority:
+instructions` and `reach: immediate`** can use them: anyone else's prefix is stored exactly as
+typed and reaches the agent as data, because a stranger must not be able to queue work or
 steer a turn. A sender held to a digest — the loop tier — keeps its text as typed too: a digest
 is a batch, not a turn, so there is nothing there to hold behind.
 
-The prefix is stripped before the message is stored, and the row keeps which one it was:
+The prefix is stripped before the message is stored, and the row keeps which behaviour it was:
 
 ```json
 {"type":"message","plane":"nip17","id":"…","content":"read the log after this",
  "reach":"immediate","mode":"queue","authority":"instructions"}
 ```
 
-`mode` is `normal`, `queue` or `guide`, and a replay carries it too — a message the adapter
-never acknowledged arrives as the held message it was, not as a fresh instruction. Dedupe runs
+`mode` is `normal`, `queue` or `guide` — `guide` for `/steer` and `/s` too, because the
+spelling is not a mode — and a replay carries it too — a message the adapter never
+acknowledged arrives as the held message it was, not as a fresh instruction. Dedupe runs
 before this path, so the same wrapper arriving on two relays cannot queue twice. The command is
 only read at the very start of a message, in lowercase, and only when words follow it:
-`/queue` on its own, `/queuex`, `/Queue this` and a command named mid-sentence are all ordinary
-text.
+`/queue`, `/q`, `/guide`, `/steer` or `/s` on its own is ordinary text, and so are `/queuex`,
+`/sx`, `/Queue this` and a command named mid-sentence.
 
 Holding is Hermes' job, not the gateway's: the adapter re-addresses the words to Hermes' own
 `/queue` and `/steer` commands, whose per-command busy handlers do the holding and the mid-turn
-injection. `display.busy_input_mode` sets what a *plain* message does while the agent is busy
+injection — `/queue` and `/q` become Hermes' `/queue`, `/guide`, `/steer` and `/s` become its
+`/steer`. `display.busy_input_mode` sets what a *plain* message does while the agent is busy
 (by default it interrupts the turn); a prefix is how one sender chooses for one message, and the
 acknowledgement ("Queued for the next turn") comes back from Hermes with it. Both commands fall
 back to a normal turn when nothing is running, so a `/guide` that finds no turn to steer is
@@ -835,9 +843,9 @@ agent runtime (Hermes plugin)
   that exist only on the sender's app relays — measured, not theorised (spec §3).
 - **The gateway does not interpret content.** No fetching beyond a Blossom blob a stored
   message references and addresses by sha256 (lazy, capped, verified — see "Media"), no reply
-  policy, no read receipts. The one exception is routing: a leading `/queue` or `/guide` is
-  read, stripped and recorded as `mode`, after the policy and for an instructing sender only
-  (see "Holding a message back"). Nothing else in a message is parsed.
+  policy, no read receipts. The one exception is routing: a leading `/queue`, `/q`, `/guide`,
+  `/steer` or `/s` is read, stripped and recorded as `mode`, after the policy and for an
+  instructing sender only (see "Holding a message back"). Nothing else in a message is parsed.
 
 ## Credits
 
