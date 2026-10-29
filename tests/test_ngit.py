@@ -1424,6 +1424,47 @@ def test_applied_event_names_the_root_pr_and_the_merge_commit():
     assert merge.pr_id == event_id("d6") and merge.commit == "a" * 40
 
 
+def test_a_merged_pr_is_read_from_the_tag_ngit_publishes():
+    """A kind-1631 as relay.ngit.dev carries it: alt, the root `e`, one `q`, a `p` per
+    maintainer and author, an `a` per maintainer, the repository's `r`, then ngit's own
+    `merge-commit-id` and the merge commit as a second `r` -- NIP-34's `merge-commit`
+    spelling is never published by ngit 3.0.4."""
+    merge_commit = "992291e33c9c1159ea53a52e9994a78f03ab80ee"
+    merge = ngit.merge_from_event({
+        "id": event_id("d8"), "pubkey": REPO_OWNER, "kind": ngit.KIND_APPLIED,
+        "created_at": 30, "content": "",
+        "tags": [
+            ["alt", "git proposal merged / applied"],
+            ["e", event_id("d9"), "wss://relay.ngit.dev", "root"],
+            ["q", event_id("da")],
+            ["p", REPO_OWNER], ["p", TRUSTED_HEX], ["p", STRANGER_HEX],
+            ["a", ADDRESS],
+            ["a", f"30617:{TRUSTED_HEX}:example-repo"],
+            ["a", f"30617:{STRANGER_HEX}:example-repo"],
+            ["r", "f" * 40],
+            ["merge-commit-id", merge_commit],
+            ["r", merge_commit],
+        ]})
+
+    assert merge is not None
+    assert merge.pr_id == event_id("d9")
+    assert merge.commit == merge_commit
+
+
+def test_an_applied_patch_names_the_first_commit_it_was_replayed_as():
+    """ngit switches the tag to `applied-as-commits` when it replays a patch under fresh
+    commit ids; there is no merge commit to name, and the first commit is the one used."""
+    merge = ngit.merge_from_event({
+        "id": event_id("db"), "pubkey": REPO_OWNER, "kind": ngit.KIND_APPLIED,
+        "created_at": 40, "content": "",
+        "tags": [["e", event_id("dc"), "", "root"],
+                 ["applied-as-commits", "1" * 40, "2" * 40],
+                 ["r", "1" * 40], ["r", "2" * 40]]})
+
+    assert merge is not None
+    assert merge.pr_id == event_id("dc") and merge.commit == "1" * 40
+
+
 def test_an_applied_event_without_a_root_reference_is_ignored():
     merge = ngit.merge_from_event({"id": event_id("d7"), "kind": ngit.KIND_APPLIED,
                                   "tags": [["a", ADDRESS]]})
