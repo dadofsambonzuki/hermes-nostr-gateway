@@ -59,6 +59,38 @@ def _norm(url: str) -> str:
     return str(url).strip().rstrip("/").lower()
 
 
+#: A CLOSED that is about authentication, in the several ways relays word it.
+_AUTH_REQUIRED = ("auth-required", "auth required", "must be authenticated",
+                  "must authenticate", "you must auth")
+
+
+def _auth_required(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _AUTH_REQUIRED)
+
+
+def resubscribe_delay(worker: "PoolWorker") -> float:
+    """How long to wait before re-REQing a worker whose subscription was closed.
+
+    Three cases, in order:
+
+    * the relay asked for NIP-42 and has closed the REQ only once since the last
+      delivery — the challenge just completed, so the next request should be accepted
+      and waiting is a delay for nothing;
+    * it has asked for NIP-42 and refused twice or more since the last delivery — that
+      is a decision about this key, so back off on the streak, not on the general
+      counter that a successful subscribe keeps resetting (a relay that accepts and then
+      closes would otherwise be re-REQed every 0.2 s for ever, which is also what made a
+      permanent refusal read as `authenticating` in `hng status`);
+    * anything else — the general backoff, which the caller doubles each time.
+    """
+    if worker.auth_at and worker.auth_refusals <= 1:
+        return 0.2
+    if worker.auth_refusals >= 2:
+        return min(RESUBSCRIBE_DELAY * 2 ** (worker.auth_refusals - 2), 300.0)
+    return worker._resubscribe_delay or RESUBSCRIBE_DELAY
+
+
 class KeysSigner(sdk.AsyncNostrSigner):
     """NIP-42 authentication in-process: the client signs the AUTH event with our keys.
 
@@ -130,6 +162,12 @@ class PoolWorker:
         self.attempts = 0
         self.connected_at: float | None = None
         self.auth_at: float | None = None
+        #: A relay that answered NIP-42 and then closed the REQ anyway. That is a
+        #: decision about this key (damus does it for some filters), not a handshake in
+        #: flight: counted, so the backoff can escalate, and stamped, so `status` can
+        #: name it instead of reporting "authenticating" for ever.
+        self.auth_refusals = 0
+        self.auth_refused_at: float | None = None
         self.last_event_at: float | None = None
         self.last_stderr: str | None = None
         self.rate_limited_at: float | None = None
@@ -193,9 +231,32 @@ class PoolWorker:
     def note_auth(self) -> None:
         self.auth_at = time.time()
 
+    def note_auth_refusal(self, text: str | None) -> None:
+        """The relay asked for NIP-42 and closed the REQ anyway.
+
+        A relay that answers the challenge and still refuses the filter is deciding
+        something about this key, not asking for another attempt. Counting it lets the
+        backoff escalate; stamping it lets `health` say "refusing" rather than
+        "authenticating" — which is what a permanent refusal used to look like, because
+        every retry produced a fresh challenge and refreshed `auth_at`.
+        """
+        self.auth_refusals += 1
+        self.auth_refused_at = time.time()
+        self.auth_at = None
+        self.last_error = (
+            f"auth-required after authenticating ({self.auth_refusals}x): "
+            f"{(text or '')[:140]}")[:300]
+        if self.auth_refusals == 3:
+            log.error(
+                "%s answers NIP-42 and still refuses this filter for our key; backing "
+                "off between attempts instead of re-REQing it", self.relay)
+
     def note_event(self) -> None:
         self.events += 1
         self.last_event_at = time.time()
+        # Delivery is the refutation: whatever refused us is not refusing now.
+        self.auth_refusals = 0
+        self.auth_refused_at = None
 
     def live_state(self) -> dict[str, Any]:
         return {
@@ -214,6 +275,8 @@ class PoolWorker:
             "attempt_started_at": self.attempt_started_at,
             "connected_at": self.connected_at,
             "auth_at": self.auth_at,
+            "auth_refusals": self.auth_refusals,
+            "auth_refused_at": self.auth_refused_at,
             "last_event_at": self.last_event_at,
             "last_stderr": self.last_stderr,
             "last_error": self.last_error,
@@ -347,6 +410,11 @@ class RelayPool:
                     await asyncio.sleep(0.5)
                     continue
                 worker.last_error = f"subscribe refused: {reason}"[:200]
+                if _auth_required(reason):
+                    # The same refusal, arriving as a failed subscribe instead of a
+                    # CLOSED: count it too, or `status` cannot name it and the backoff
+                    # here has no idea it is permanent.
+                    worker.note_auth_refusal(reason)
                 if worker.note_refusals(reason) and worker.kinds:
                     backoff = 2  # a refusal is a filter problem: resubscribe at once
                     continue
@@ -476,6 +544,13 @@ class RelayPool:
             if worker is None:
                 return
             text = getattr(message, "message", "") or ""
+            if _auth_required(text):
+                # Ask for auth, refuse anyway: a decision about this key, not a retry.
+                worker.note_auth_refusal(text)
+                if not worker.kinds:
+                    return
+                self._schedule_resubscribe(worker, text)
+                return
             worker.last_error = text[:200] or "CLOSED"
             if "429" in text or "rate limit" in text.lower():
                 worker.rate_limited_at = time.time()
@@ -514,13 +589,10 @@ class RelayPool:
 
     async def _resubscribe(self, worker: PoolWorker, handler: Handler) -> None:
         try:
-            delay = worker._resubscribe_delay or RESUBSCRIBE_DELAY
-            if worker.auth_at:
-                # NIP-42 completed after the relay closed the unauthenticated REQ: the
-                # next request will be accepted, so do not sit out the full backoff.
-                delay = 0.2
-            # A permanent reason ("restricted: you must be in the web of trust") must not
-            # turn into a 5s storm: double the pause each time, up to five minutes.
+            delay = resubscribe_delay(worker)
+            # A permanent reason ("restricted: you must be in the web of trust", a relay
+            # that authenticates us and refuses the filter anyway) must not turn into a
+            # storm: double the pause each time, up to five minutes.
             worker._resubscribe_delay = min(delay * 2, 300.0)
             await asyncio.sleep(delay)
             if self._stop.is_set() or worker._stop.is_set():

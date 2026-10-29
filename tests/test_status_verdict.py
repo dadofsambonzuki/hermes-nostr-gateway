@@ -115,6 +115,35 @@ def test_a_relay_that_refuses_every_kind_is_refusing():
     assert "4, 1059" in verdict.detail
 
 
+def test_a_relay_that_authenticates_and_still_refuses_is_named_not_authenticating():
+    """The reported stuck state: `authenticating` for ever, because every retry auths.
+
+    A relay that answers AUTH and closes the filter anyway has decided something about
+    this key. Reporting it as a handshake in progress hides the blind spot behind a WARN
+    that never expires; it is a refusal and it is BAD.
+    """
+    verdict = verdict_for(worker(
+        events=0, last_event_at=None, connected_at=NOW - 600, alive=False,
+        auth_at=NOW - 5,                 # the challenge for the latest attempt
+        auth_refusals=4, auth_refused_at=NOW - 5,
+        last_error="auth-required after authenticating (4x): requested filter ..."))
+
+    assert verdict.state == "refusing", "a permanent auth refusal read as a handshake"
+    assert verdict.severity == BAD
+    assert "answered NIP-42" in verdict.detail
+    assert "4x" in verdict.detail
+    line = render([verdict])[0]
+    assert "authenticating" not in line
+
+
+def test_a_relay_that_delivered_then_refuses_auth_is_not_called_a_refusal():
+    """A relay that has delivered is a different fault; its history must not be erased."""
+    verdict = verdict_for(worker(events=9, auth_refusals=3, auth_refused_at=NOW - 5,
+                                 auth_at=NOW - 5))
+
+    assert verdict.state != "refusing"
+
+
 def test_a_partial_refusal_stays_connected_and_says_what_is_still_read():
     verdict = verdict_for(worker(kinds=[1059], refused_kinds=[4]))
 

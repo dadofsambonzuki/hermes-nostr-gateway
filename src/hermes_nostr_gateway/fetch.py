@@ -53,8 +53,11 @@ def _client(secret: str | None = None) -> sdk.Client:
     if not secret:
         return sdk.Client()
     keys = sdk.Keys.parse(parse_secret(secret))
-    # The async signer runs on a Rust worker thread: bind before the client is built.
-    sdkloop.bind()
+    # `ensure`, not `bind`: this coroutine may be running on the daemon's home loop (when
+    # `run_isolated` handed it there) or on a private one (a CLI, a test). Either way the
+    # loop it runs on is the one the bindings must resolve its futures on, and a bare
+    # `bind` that nobody restores is the shape that leaves a dead loop behind.
+    sdkloop.ensure()
     return sdk.ClientBuilder().authenticator(sdk.SignerAuthenticator(KeysSigner(keys))).build()
 
 

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 import nostr_sdk as sdk
 import yaml
 
-from . import addressing
+from . import addressing, sdkloop
 from .bots import BotRegistry, kind0_fetcher
 from .control import ControlConfig
 from .crypto import SdkCrypto
@@ -790,6 +790,16 @@ class Gateway:
                         invite.wrap_id[:12], status)
 
     async def start(self) -> None:
+        # One loop for the whole process, declared before the first await. uniffi
+        # resolves every call — including the NIP-42 signer it invokes from a Rust
+        # worker thread — through one process-global loop, so a one-shot that runs while
+        # this daemon has no declared home manufactures a second loop and closes it, and
+        # the next auth attempt builds its future on the dead one (see `sdkloop`).
+        # `_ensure_pump` re-asserts the same loop for a pool used on its own; declaring it
+        # here first removes the window between the socket opening and the first
+        # subscription, in which a request can reach a cold fetch (`send` does exactly
+        # that) and that fetch would otherwise get a loop of its own.
+        sdkloop.set_home()
         await self.server.start()
         self._started_at = time.time()
         # One line, because a missing destination is a configuration fact the operator
