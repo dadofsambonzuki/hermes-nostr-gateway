@@ -84,6 +84,19 @@ REACTION_CHOICES = {
 
 logger = logging.getLogger(__name__)
 
+#: Appended to an approval prompt: the host's text names the typed commands only, because it
+#: cannot know which adapter can carry a reaction. This one can, so it says so where the
+#: person is actually reading — next to the commands, not in a manual.
+REACTION_HINT = ("React 👍 to approve once or 👎 to deny — or reply /approve, /deny "
+                 "(add \"session\" to approve for the rest of it).")
+
+
+def with_reaction_hint(text: str) -> str:
+    """The prompt with the reaction options named, once (a re-sent prompt keeps one copy)."""
+    if "\U0001f44d" in text:
+        return text
+    return text.rstrip() + "\n\n" + REACTION_HINT
+
 
 def reaction_choice(content: str) -> Optional[str]:
     """The approval choice a reaction makes, or None when it is not a decision.
@@ -1067,6 +1080,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # message id), and dropping the second would leave the host blocked on a prompt the
         # human never saw. The gate owns its own replay semantics; this guard is for chat.
         prompt = bool((metadata or {}).get("is_approval_prompt"))
+        if prompt:
+            # Name the reaction options beside the typed ones. Content is what gets sent, so
+            # this has to happen before the payload is built, and body is recomputed to match.
+            content = with_reaction_hint(content)
+            body = reply_body(content)
         memory = None if prompt else self._dedupe()
         if memory is not None:
             duplicate = memory.claim(chat_id, body, recovered=recovered)
