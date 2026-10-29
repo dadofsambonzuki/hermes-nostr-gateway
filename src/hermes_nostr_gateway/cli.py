@@ -1014,13 +1014,9 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     from .kanban import Anchor, Board, BoardError
     from .projects import hermes_home
 
-    # The dependency, before anything is read or written: a missing or old `ngit` is a
-    # preflight failure with a version to install, not a surprise in a cron log at 03:00.
-    try:
-        bridge.require_ngit()
-    except bridge.NgitError as exc:
-        print(f"ngit: {exc}", file=sys.stderr)
-        return 2
+    # Configuration first: a missing assignee, an unmapped channel or a board that is not
+    # there is the operator's to fix and does not depend on what this host has installed,
+    # so it is refused before the host is read at all -- exit 2, and nothing touched.
     ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
     assignee = str(args.assignee or ngit_cfg.assignee or "").strip()
     if not assignee:
@@ -1033,17 +1029,27 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     except bridge.NgitError as exc:
         print(f"ngit: {exc}", file=sys.stderr)
         return 2
-    checkout = bridge.Ngit(target.repo)
-    repository = checkout.repository()
-    target = replace(target, address=repository.address,
-                     default_branch=bridge.default_branch(target.repo))
-
     home = hermes_home()
     try:
         board = Board(bridge.board_path(target.board, home=home))
     except BoardError as exc:
         print(f"ngit: {exc}", file=sys.stderr)
         return 2
+
+    # The dependency, once the configuration is known to be usable: a missing or old
+    # `ngit` is a preflight failure with a version to install, not a surprise in a cron
+    # log at 03:00, and it still comes before any pass work.
+    try:
+        bridge.require_ngit()
+    except bridge.NgitError as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return 2
+
+    checkout = bridge.Ngit(target.repo)
+    repository = checkout.repository()
+    target = replace(target, address=repository.address,
+                     default_branch=bridge.default_branch(target.repo))
+
     anchor = Anchor.for_board(home, target.board)
     crypto, store, _policy, _plane = build(cfg)
     ngit_cfg = replace(ngit_cfg, assignee=assignee)

@@ -141,6 +141,41 @@ def ngit_binary() -> str:
     return os.environ.get("HNG_NGIT") or "ngit"
 
 
+@dataclass(frozen=True)
+class NgitProbe:
+    """One look at the host: where `ngit` is, and what it said when asked.
+
+    An empty `path` means there is no such command; `error` means it exists but could not
+    be run at all; otherwise `stdout`, `stderr` and `code` are what `--version` produced.
+    Nothing here judges the answer -- that is `ngit_status`'s job -- so this is the one
+    structure a test has to invent to describe a host without an `ngit` on it.
+    """
+
+    path: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    code: int = 0
+    error: str = ""
+
+
+def probe_ngit(binary: str) -> NgitProbe:
+    """Find `binary` and ask its version: the single host lookup, so it can be stubbed.
+
+    The suite runs on machines with no `ngit` at all (CI is one), so a test that is about
+    the message, the exit code or the ordering stubs this and leaves the host out of it.
+    """
+    found = shutil.which(binary)
+    if not found:
+        return NgitProbe()
+    try:
+        done = subprocess.run([found, "--version"], capture_output=True, text=True,
+                              timeout=15.0)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return NgitProbe(path=found, error=str(exc))
+    return NgitProbe(path=found, stdout=done.stdout or "", stderr=done.stderr or "",
+                     code=done.returncode)
+
+
 def parse_version(text: str) -> tuple[int, ...]:
     """A version out of `ngit --version` output, dotted numeric components only.
 
@@ -161,27 +196,28 @@ def ngit_status() -> NgitStatus:
     Never raises: a missing or too-old binary is an answer, not an exception, so both
     callers can report it in their own shape. The problem text names the binary, the floor
     and how to install it, because "ngit is not installed" is not actionable.
+
+    The host is read exactly once, by `probe_ngit`, and everything here is a judgement on
+    what came back. That seam is what lets the suite describe a host with no `ngit` at all.
     """
     binary = ngit_binary()
-    found = shutil.which(binary)
-    if not found:
+    probe = probe_ngit(binary)
+    if not probe.path:
         return NgitStatus(binary=binary, problem=f"`{binary}` was not found on PATH; "
                                                  f"the bridge needs ngit >= {NGIT_FLOOR}: "
                                                  f"{NGIT_INSTALL_HINT}")
-    try:
-        done = subprocess.run([found, "--version"], capture_output=True, text=True,
-                              timeout=15.0)
-    except (OSError, subprocess.SubprocessError) as exc:
+    found = probe.path
+    if probe.error:
         return NgitStatus(binary=binary, path=found,
-                          problem=f"`{found} --version` could not be run ({exc}); "
+                          problem=f"`{found} --version` could not be run ({probe.error}); "
                                   f"the bridge needs ngit >= {NGIT_FLOOR}: "
                                   f"{NGIT_INSTALL_HINT}")
-    version = parse_version(done.stdout or "")
-    if done.returncode != 0 or not version:
-        detail = ((done.stderr or done.stdout or "").strip().splitlines() or [""])[0][:200]
+    version = parse_version(probe.stdout)
+    if probe.code != 0 or not version:
+        detail = ((probe.stderr or probe.stdout or "").strip().splitlines() or [""])[0][:200]
         return NgitStatus(binary=binary, path=found,
                           problem=f"`{binary} --version` did not name a version "
-                                  f"({detail or f'exit {done.returncode}'}); the bridge "
+                                  f"({detail or f'exit {probe.code}'}); the bridge "
                                   f"needs ngit >= {NGIT_FLOOR}: {NGIT_INSTALL_HINT}")
     text = ".".join(str(part) for part in version)
     if version < parse_version(NGIT_FLOOR):

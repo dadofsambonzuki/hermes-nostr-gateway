@@ -51,15 +51,19 @@ Cron, per channel, on the host that holds the checkout and the gateway:
 
 Exit code 0 means every message reached the channel **or is queued and waiting for the daemon**
 (the report says which); 1 means something was refused or could not be read, and the report
-says what; 2 means the configuration is wrong (no assignee, no mapping, no board) and the
-bridge did not touch anything. `--dry-run` reports what would happen and writes nothing — the
-first run against a live channel should be one.
+says what; 2 means the run was refused before any pass work — bad configuration (no assignee,
+no mapping, no board) or an unusable `ngit` — and the bridge did not touch anything.
+`--dry-run` reports what would happen and writes nothing — the first run against a live
+channel should be one.
 
-The bridge shells out to `ngit`, so the binary is a pinned dependency: **3.0.4** or newer,
-on `PATH`. A missing or older one fails at the preflight of `hng ngit sync` with the binary
-name, the floor and an install hint, not in a cron log hours later. `hng doctor` checks the
-same floor, plus the mapping, the project and board bindings, the cron pass for every mapped
-channel and the watcher's own state; every failing check names its fix.
+Configuration is checked first: a missing `ngit.assignee`, an unmapped channel or a board that
+is not there is the operator's to fix and does not depend on what is installed, so it is
+refused before the host is read at all. Then, because the bridge shells out to `ngit`, that
+binary is a pinned dependency: **3.0.4** or newer, on `PATH`. A missing or older one fails at
+the preflight of `hng ngit sync` with the binary name, the floor and an install hint, not in a
+cron log hours later. `hng doctor` checks the same floor, plus the mapping, the project and
+board bindings, the cron pass for every mapped channel and the watcher's own state; every
+failing check names its fix.
 
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
 stable; `hng ngit sync` is the smallest thing that is useful today and does not block that. The

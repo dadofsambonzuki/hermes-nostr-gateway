@@ -368,7 +368,8 @@ hng ngit sync --channel ... --repo ~/Projects/example --board example-channel   
 The bridge shells out to `ngit`, so that binary is a pinned dependency: a version at or
 above **3.0.4** must be on `PATH` (the same floor `hng doctor` checks and names, with the
 install hint, in its `ngit` check). A missing or older binary fails at the preflight of
-`hng ngit sync`, before anything is read or written, rather than in a cron log at 03:00.
+`hng ngit sync`, before any pass work, rather than in a cron log at 03:00 — and after the
+configuration has been checked, because a bad config does not depend on what is installed.
 
 An issue from a **trusted npub** (`control.trusted_npubs`, or the concord plane's own list)
 becomes a task `ready` for the dispatcher, and the channel gets one notice line,

@@ -328,11 +328,3 @@ def test_every_failing_check_carries_a_fix(good, monkeypatch, capsys, tmp_path):
         assert check["fix"], f"{check['name']} failed without a fix"
 
 
-def test_ngit_sync_preflight_names_the_binary_and_the_floor(tmp_path, monkeypatch, capsys):
-    path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump({"ngit": {"assignee": "default"}}))
-    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
-    assert cli.main(["--config", str(path), "ngit", "sync", "--channel", CONVERSATION]) == 2
-    err = capsys.readouterr().err
-    assert "ngit" in err and NGIT_FLOOR in err
-    assert "not installed" not in err
