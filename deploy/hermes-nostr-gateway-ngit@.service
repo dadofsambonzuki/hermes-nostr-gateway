@@ -1,0 +1,41 @@
+[Unit]
+Description=Hermes Nostr Gateway ngit bridge pass for channel %i
+Documentation=file:///home/ubuntu/Projects/hermes-nostr-gateway/docs/ngit-bridge.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# One pass over one channel's repository, then exit. The instance name is the channel
+# id (`hermes-nostr-gateway-ngit@<channel-id>`), which is exactly what `--channel` takes
+# for a `concord.projects` entry keyed by the id -- the keying every scheduled pass
+# needs, because a timer instance has no community to name.
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/hermes-nostr-gateway
+Environment=HOME=/home/ubuntu
+Environment=PYTHONPATH=/home/ubuntu/Projects/hermes-nostr-gateway/src
+# Both binaries a pass shells out to: `hng` from the virtualenv and `ngit` from the
+# operator's local bin. systemd's default PATH has neither, and the failure would only
+# appear in the journal, per tick.
+Environment=PATH=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NGIT_CACHE_DIR=/home/ubuntu/.local/state/hermes-nostr-gateway/ngit-cache
+# The same credential the daemon gets, from the same root-owned file: a timer has no
+# crontab, so this is the form that lets both halves read the key the same way and lets
+# `identity.secret_file` go. config.yaml names it:
+#     identity:
+#       secret_credential: nostr_secret
+# The source must exist before the first tick, or the pass fails on identity.
+LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json
+ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng --config /home/ubuntu/Projects/hermes-nostr-gateway/config.yaml ngit sync --channel %i --json
+# A pass that hangs is killed, not left running: the next tick is ten minutes away, and
+# two overlapping passes would reach for the same board. The limit is half the interval
+# so a slow pass is reported and cleared before the next one is due.
+TimeoutStartSec=300
+Nice=10
+# No privilege and no shared /tmp; the pass needs nothing either the daemon or ngit
+# does not already write as its own user.
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

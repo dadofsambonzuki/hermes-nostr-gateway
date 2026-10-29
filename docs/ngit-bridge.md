@@ -7,12 +7,15 @@ announced in the channel. One mapping, used in both directions.
 
 The channel already resolves to a checkout, a project and a board (`concord.projects`, see the
 README). The bridge reads that same map: `--channel` names the conversation, the entry supplies
-the rest. Because a cron job has nothing but the conversation string, the entry it matches must
-be keyed by the conversation's channel id (hex) or by the whole conversation
-(`channel: concord:<community>:<channel>`); a friendly name cannot be turned back into an id
-without the client. `--repo` and `--board` override a single run and never replace the mapping —
-a channel with no entry is an error, because a bridge that guessed a checkout would file work in
-the wrong tree.
+the rest. A systemd timer pass has nothing but the channel id — the unit instance — so the entry it
+matches must be keyed by the channel id (hex). A crontab pass may instead name the whole
+conversation, and an entry may be keyed by that (`channel: concord:<community>:<channel>`). A
+friendly name cannot be turned back into an id without the client, so it cannot schedule a pass.
+An id-keyed entry must also declare `community:`: a notice is addressed by the whole conversation,
+which the id alone does not spell, so the pass refuses at the preflight rather than failing every
+notice at delivery. `--repo` and `--board` override a single run and never replace the mapping — a
+channel with no entry is an error, because a bridge that guessed a checkout would file work in the
+wrong tree.
 
 ```yaml
 ngit:
@@ -28,7 +31,7 @@ ngit:
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
   watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
-                           # default on once `assignee` is set, `false` is cron-only
+                           # default on once `assignee` is set, `false` is the timer alone
   watch_debounce_s: 30     # coalesce a channel's events this long before the pass
 ```
 
@@ -41,11 +44,67 @@ coordinate). Nothing about a particular box is compiled in.
 
 ## Running it
 
-Cron, per channel, on the host that holds the checkout and the gateway:
+A systemd timer per mapped channel, on the host that holds the checkout and the gateway. The two
+units ship as one template pair:
+
+- `deploy/hermes-nostr-gateway-ngit@.service` — `Type=oneshot`, one pass, the unit instance is
+  the channel id, and `LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json` hands
+  it the same identity the daemon reads. That is why the pass runs from a timer rather than from
+  crontab: a user crontab has no `$CREDENTIALS_DIRECTORY`, so an `identity.secret_credential`
+  would fail every scheduled pass while the daemon looked healthy. One credential form, no second
+  copy of the key.
+- `deploy/hermes-nostr-gateway-ngit@.timer` — every ten minutes, `Persistent=true` so a tick
+  missed while the host was down runs at the next opportunity, and `RandomizedDelaySec=30` so
+  instances due on the same minute do not start together. A pass that hangs is killed by the
+  service's `TimeoutStartSec`, not left running into the next tick.
+
+Install the pair once, then enable one instance per mapped channel id:
+
+```sh
+sudo install -m 0644 deploy/hermes-nostr-gateway-ngit@.service \
+    deploy/hermes-nostr-gateway-ngit@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now hermes-nostr-gateway-ngit@<channel-id>.timer
+sudo systemctl enable --now hermes-nostr-gateway-ngit@<other-channel-id>.timer
+```
+
+The instance name is the `concord.projects` entry's `channel:` as written when it is keyed by id
+(hex). `systemctl list-timers 'hermes-nostr-gateway-ngit@*'` shows each schedule and its last and
+next run; `hng doctor` counts an enabled instance as that channel's pass and names the unit.
+
+Crontab still works, and still counts in `hng doctor`, for a host that prefers it:
 
 ```cron
-*/10 * * * *  cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel> --json >> /var/log/hng-ngit.log 2>&1
+*/10 * * * *  cd /path/to/gateway && PATH=<dir holding hng>:<dir holding ngit>:$PATH hng --config <config> ngit sync --channel concord:<community>:<channel> --json
 ```
+
+A crontab line cannot carry a systemd credential, though: with `identity.secret_credential` set,
+the timer is the only scheduler that works, so that host should not keep both.
+
+### Cutover, in the order that never leaves the bridge unscheduled
+
+1. Check the credential the daemon already uses is there and root-owned:
+   `sudo ls -l /etc/hermes-nostr-gateway/identity.json`.
+2. Install the pair and enable one instance per mapped channel id (above). Both schedulers now
+   run; the config still says `secret_file`, so nothing changes yet, and `hng doctor` is still
+   green.
+3. Remove the ngit crontab lines (`crontab -e`). The timers are the floor now.
+4. In `config.yaml`, replace `identity.secret_file: …` with `identity.secret_credential:
+   nostr_secret`, then `sudo systemctl restart hermes-nostr-gateway`. A crontab pass would fail
+   from here on; a timer pass does not.
+5. Prove the credential once by hand:
+   `sudo systemctl start hermes-nostr-gateway-ngit@<channel-id>.service` and read
+   `journalctl -u hermes-nostr-gateway-ngit@<channel-id>.service` — the pass reports what it
+   did, and `identity` is the check that would have failed under cron.
+6. Confirm an unattended tick does the same: `systemctl list-timers
+   'hermes-nostr-gateway-ngit@*'` shows last and next run; the journal for that instance shows
+   the same report without anyone starting it.
+7. `hng doctor` is green, naming `systemd timer hermes-nostr-gateway-ngit@<channel-id>.timer`
+   for every mapped channel.
+
+Steps 2–7 are the operator's: the units ship here, but nothing installs, enables, starts or
+rewrites the host's config on its own.
 
 Exit code 0 means every message reached the channel **or is queued and waiting for the daemon**
 (the report says which); 1 means something was refused or could not be read, and the report
@@ -58,10 +117,10 @@ Configuration is checked first: a missing `ngit.assignee`, an unmapped channel o
 is not there is the operator's to fix and does not depend on what is installed, so it is
 refused before the host is read at all. Then, because the bridge shells out to `ngit`, that
 binary is a pinned dependency: **3.0.4** or newer, on `PATH`. A missing or older one fails at
-the preflight of `hng ngit sync` with the binary name, the floor and an install hint, not in a
-cron log hours later. `hng doctor` checks the same floor, plus the mapping, the project and
-board bindings, the cron pass for every mapped channel and the watcher's own state; every
-failing check names its fix.
+the preflight of `hng ngit sync` with the binary name, the floor and an install hint, not in a log
+hours later. `hng doctor` checks the same floor, plus the mapping, the project and board bindings,
+a scheduled pass for every mapped channel (an enabled systemd timer instance or a crontab line)
+and the watcher's own state; every failing check names its fix.
 
 The better long-term shape is a live subscription off the daemon's read path, once the daemon is
 stable; `hng ngit sync` is the smallest thing that is useful today and does not block that. The
@@ -70,7 +129,7 @@ because a subscription can replace the wait, not the decision.
 
 ## Waking the pass
 
-Cron is the floor: every ten minutes the pass runs, whatever happened. The daemon can also wake
+The timer is the floor: every ten minutes the pass runs, whatever happened. The daemon can also wake
 a pass as soon as something changes, so a new issue or a revised PR shows up in seconds instead
 of up to ten minutes.
 
@@ -78,8 +137,8 @@ The wait moves; the decision does not. A relay event says something was *propose
 is another event, an issue can be resolved or reopened later, and a merge is a kind-1631 that has
 to be matched against the branch. Only the repository says what is true, and only
 `ngit issue list --json` and the checkout's refs say it. So the watcher subscribes, coalesces,
-and runs `hng ngit sync --channel <conversation>` as a child process: the same command cron runs,
-with the same store, cursor and idempotency keys. It never opens the board or the outbox and never
+and runs `hng ngit sync --channel <conversation>` as a child process: the same command the timer
+runs, with the same store, cursor and idempotency keys. It never opens the board or the outbox and never
 moves a cursor, so there is still exactly one writer to each.
 
 What it subscribes to:
@@ -90,7 +149,7 @@ What it subscribes to:
   its own and never the whole relay.
 
 1619 is in that list on purpose: a revised PR is a new 1619 event, and a watcher that ignored it
-would leave the review task's brief stale until the next cron pass.
+would leave the review task's brief stale until the next scheduled pass.
 
 Where it listens is the pass's own rule: `ngit.relays` when set, otherwise the repositories'
 announcement relay hints and then `relays.read`, capped at eight. Listening somewhere the pass
@@ -107,13 +166,14 @@ Debounce and single-flight:
   remembered in a bounded set, and a wake is a flag rather than a queue.
 
 Failure is the floor's job. A pass that cannot run (no `ngit`, a locked board, a moved checkout)
-is logged and reported in `hng status`, and the next cron pass is unaffected. A daemon restart
+is logged and reported in `hng status`, and the next scheduled pass is unaffected. A daemon restart
 loses every pending wake and nothing else: whatever the watcher missed is exactly what the next
 ten-minute pass reads.
 
 ```yaml
 ngit:
-  watch: true             # default: on once ngit.assignee is set; false is exactly cron-only
+  watch: true             # default: on once ngit.assignee is set; false is the scheduled
+                           # pass alone
   watch_debounce_s: 30    # coalesce a channel's events this long before running the pass
 ```
 
@@ -123,15 +183,16 @@ watcher was asked for but is not subscribed.
 
 Two operational notes:
 
-- **The sandbox.** The pass is a child of the daemon and inherits the unit's restrictions. With
-  `ProtectHome=read-only` the boards directory must be writable (`ReadWritePaths`, as the shipped
-  unit does): otherwise every woken pass fails to write its task while the cron pass — which runs
-  outside the unit — keeps working, which is a confusing half-failure to diagnose.
-- **Overlap with cron.** A cron pass and a woken pass can interleave for one channel. Tasks and
-  notices carry idempotency keys, so the ordinary outcome is still one task and one notice; the
-  board's check-then-insert is not atomic, though, so a duplicate is possible in that window. It
-  is the same window a slow cron pass already has, and the alternative — a lock shared with cron —
-  would mean changing the pass, which this deliberately does not do.
+- **The sandbox.** A pass woken by the daemon is a child of the daemon and inherits the unit's
+  restrictions. With `ProtectHome=read-only` the boards directory must be writable
+  (`ReadWritePaths`, as the shipped unit does): otherwise every woken pass fails to write its task
+  while a timer pass — which is its own unit and has no such restriction — keeps working, which is
+  a confusing half-failure to diagnose.
+- **Overlap between the timer and a wake.** A timer pass and a woken pass can interleave for one
+  channel. Tasks and notices carry idempotency keys, so the ordinary outcome is still one task and
+  one notice; the board's check-then-insert is not atomic, though, so a duplicate is possible in
+  that window. It is the same window a slow pass already has, and the alternative — a lock shared
+  with the scheduler — would mean changing the pass, which this deliberately does not do.
 
 ## Inbound: issues as work
 

@@ -82,11 +82,14 @@ def hermes_home(tmp_path: Path, *, registry: bool = True, board: bool = True,
     return home
 
 
-def write_config(tmp_path: Path, home: Path, checkout: Path, *, identity: Path | None = None,
+def write_config(tmp_path: Path, home: Path, checkout: Path, *,
+                 identity: Path | dict | None = None,
                  projects: list[dict] | None = None, ngit: dict | None = None,
                  store: Path | None = None) -> Path:
+    ident = identity if isinstance(identity, dict) else {
+        "secret_file": str(identity or make_secret(tmp_path))}
     cfg = {
-        "identity": {"secret_file": str(identity or make_secret(tmp_path))},
+        "identity": ident,
         "store": str(store or tmp_path / "gateway.db"),
         "socket": str(tmp_path / "gateway.sock"),
         "relays": {"read": ["wss://relay.example"],
@@ -135,6 +138,28 @@ def stub_cron(monkeypatch, *, covered: bool = True) -> None:
     monkeypatch.setattr(doctor, "cron_sources",
                         lambda: [("crontab", line if covered else
                                   f"# ... ngit sync --channel {CONVERSATION}")])
+    # No unit directory by default: the check must not read this host's /etc, so a test's
+    # verdict is decided by the sources the test writes.
+    monkeypatch.setattr(doctor, "SYSTEMD_UNIT_DIRS", ())
+
+
+def stub_units(monkeypatch, tmp_path: Path) -> Path:
+    """A systemd unit directory the check reads instead of the host's, plus its path."""
+    units = tmp_path / "systemd"
+    units.mkdir(exist_ok=True)
+    monkeypatch.setattr(doctor, "SYSTEMD_UNIT_DIRS", (units,))
+    return units
+
+
+def want_instance(units: Path, channel: str) -> Path:
+    """`systemctl enable` on the template: a symlink in timers.target.wants, named for the id."""
+    template = units / "hermes-nostr-gateway-ngit@.timer"
+    template.write_text("[Timer]\nOnCalendar=*:0/10\nPersistent=true\n")
+    wants = units / "timers.target.wants"
+    wants.mkdir(exist_ok=True)
+    instance = wants / f"hermes-nostr-gateway-ngit@{channel}.timer"
+    instance.symlink_to(template)
+    return instance
 
 
 def run_doctor(monkeypatch, tmp_path: Path, config: Path, home: Path | None = None) -> int:
@@ -177,6 +202,57 @@ def test_bad_identity_is_named_with_a_fix(good, monkeypatch, capsys, tmp_path):
     assert identity["fix"], "a failing check must name its fix"
     assert "secret_file" in identity["fix"]
     assert "missing-secret.json" in identity["detail"]
+
+
+def test_a_credential_is_checked_through_the_unit_that_loads_it(good, monkeypatch, capsys,
+                                                                 tmp_path):
+    """A hand-run doctor cannot read a credential; it checks the wiring that can."""
+    tmp_path, home, checkout, _ = good
+    units = stub_units(monkeypatch, tmp_path)
+    source = tmp_path / "identity.json"
+    source.write_text('{"secret_key_hex": "' + "11" * 32 + '"}')
+    (units / "hermes-nostr-gateway.service").write_text(
+        f"LoadCredential=nostr_secret:{source}\n")
+    config = write_config(tmp_path, home, checkout,
+                          identity={"secret_credential": "nostr_secret"})
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    identity = checks_by_name(capsys)["identity"]
+    assert identity["ok"]
+    assert "hermes-nostr-gateway.service" in identity["detail"]
+    assert str(source) in identity["detail"]
+
+
+def test_a_credential_no_unit_loads_is_named(good, monkeypatch, capsys, tmp_path):
+    tmp_path, home, checkout, _ = good
+    stub_units(monkeypatch, tmp_path)
+    config = write_config(tmp_path, home, checkout,
+                          identity={"secret_credential": "nostr_secret"})
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    identity = checks_by_name(capsys)["identity"]
+    assert not identity["ok"]
+    assert "not loaded by any installed" in identity["detail"]
+    assert "LoadCredential=" in identity["fix"]
+
+
+def test_a_credential_source_that_is_missing_is_named(good, monkeypatch, capsys, tmp_path):
+    tmp_path, home, checkout, _ = good
+    units = stub_units(monkeypatch, tmp_path)
+    source = tmp_path / "not-there.json"
+    (units / "hermes-nostr-gateway.service").write_text(
+        f"LoadCredential=nostr_secret:{source}\n")
+    config = write_config(tmp_path, home, checkout,
+                          identity={"secret_credential": "nostr_secret"})
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    identity = checks_by_name(capsys)["identity"]
+    assert not identity["ok"]
+    assert "which is not there" in identity["detail"]
+    assert "create" in identity["fix"]
 
 
 def test_missing_board_is_named_with_a_fix(good, monkeypatch, capsys, tmp_path):
@@ -274,14 +350,82 @@ def test_old_ngit_names_the_version_and_the_floor(good, monkeypatch, capsys, tmp
     assert NGIT_FLOOR in ngit["detail"]
 
 
-def test_missing_cron_pass_is_named_with_an_example(good, monkeypatch, capsys, tmp_path):
+def test_missing_pass_is_named_with_an_example(good, monkeypatch, capsys, tmp_path):
     tmp_path, home, checkout, config = good
     stub_cron(monkeypatch, covered=False)
     assert run_doctor(monkeypatch, tmp_path, config) == 1
-    cron = checks_by_name(capsys)["cron"]
-    assert not cron["ok"]
-    assert CHANNEL_ID in cron["detail"]
-    assert "ngit sync --channel" in cron["fix"]
+    schedule = checks_by_name(capsys)["schedule"]
+    assert not schedule["ok"]
+    assert CHANNEL_ID in schedule["detail"]
+    assert "ngit sync --channel" in schedule["fix"]
+    assert "systemctl enable --now" in schedule["fix"]
+
+
+def test_a_crontab_line_counts_as_a_pass_and_is_named(good, monkeypatch, capsys, tmp_path):
+    tmp_path, home, checkout, config = good
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    schedule = checks_by_name(capsys)["schedule"]
+    assert schedule["ok"]
+    assert f"{CHANNEL_ID} (crontab)" in schedule["detail"]
+
+
+def test_a_systemd_timer_counts_as_a_pass_and_is_named(good, monkeypatch, capsys, tmp_path):
+    """The cutover verdict: no crontab line, one enabled timer instance, the channel is a pass."""
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    units = stub_units(monkeypatch, tmp_path)
+    unit = f"hermes-nostr-gateway-ngit@{CHANNEL_ID}.timer"
+    (units / unit).write_text("[Timer]\nOnCalendar=*:0/10\nPersistent=true\n")
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    schedule = checks_by_name(capsys)["schedule"]
+    assert schedule["ok"]
+    assert f"{CHANNEL_ID} (systemd timer {unit})" in schedule["detail"]
+    assert "crontab" not in schedule["detail"]
+
+
+def test_an_enabled_instance_is_read_through_the_template_symlink(good, monkeypatch, capsys,
+                                                                   tmp_path):
+    """`systemctl enable` leaves a symlink to the template; its name is the channel."""
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    units = stub_units(monkeypatch, tmp_path)
+    instance = want_instance(units, CHANNEL_ID)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    schedule = checks_by_name(capsys)["schedule"]
+    assert schedule["ok"]
+    assert f"systemd timer {instance.name}" in schedule["detail"]
+
+
+def test_the_template_alone_is_not_a_pass_and_the_fix_names_the_instance(good, monkeypatch,
+                                                                         capsys, tmp_path):
+    """A template schedules nothing: it has to name the instance an operator must enable."""
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    units = stub_units(monkeypatch, tmp_path)
+    (units / "hermes-nostr-gateway-ngit@.timer").write_text(
+        "[Timer]\nOnCalendar=*:0/10\nPersistent=true\n")
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    schedule = checks_by_name(capsys)["schedule"]
+    assert not schedule["ok"]
+    assert CHANNEL_ID in schedule["detail"]
+    assert (f"systemctl enable --now hermes-nostr-gateway-ngit@{CHANNEL_ID}.timer"
+            in schedule["fix"])
+
+
+def test_a_timer_for_another_channel_does_not_cover_this_one(good, monkeypatch, capsys,
+                                                             tmp_path):
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    units = stub_units(monkeypatch, tmp_path)
+    want_instance(units, "ab" * 32)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    schedule = checks_by_name(capsys)["schedule"]
+    assert not schedule["ok"]
+    assert CHANNEL_ID in schedule["detail"]
 
 
 def test_daemon_down_fails_the_socket_and_names_the_fix(good, monkeypatch, capsys, tmp_path):

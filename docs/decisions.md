@@ -188,16 +188,19 @@ speaking.
 
 ## One repository, two runtimes
 
-systemd runs the daemon; cron runs the bridge; the daemon may optionally wake the bridge on an
-event. Cron stays the floor, so a missed event or a restart costs latency, not correctness.
+systemd runs both: the daemon as a service, and the bridge as a timer that starts a `Type=oneshot`
+pass per channel (the daemon may optionally wake another pass on an event). The timer stays the
+floor, so a missed event or a restart costs latency, not correctness.
 
 Why: the daemon is a long-lived process that owns a socket and a subscription per relay, so its
 lifecycle needs a supervisor — the operator restarts it, and `hng status` reports on it. A pass has
 no lifecycle to own: it is a command that reads to a cursor, writes down what it decided and exits,
-so its scheduler can be the host's own cron, with no supervision, no in-memory state and no restart
-to get wrong. Waking a pass from the daemon's read path is then an optimisation, not a dependency:
-the same pass runs sooner than the next tick, and because every pass is idempotent and
-cursor-driven, losing one to a restart or a busy daemon costs the channel minutes and never a
-message. Making cron the fallback rather than the trigger would put the bridge's correctness behind
-the daemon's liveness, which is the coupling this refuses.
+so a timer can start it with no supervision, no in-memory state and no restart to get wrong. The
+scheduler is systemd rather than cron because the identity is a systemd credential: a user crontab
+has no `$CREDENTIALS_DIRECTORY`, so a pass scheduled there could only read a key file while the
+daemon read a credential — the same key in two forms. Waking a pass from the daemon's read path is
+then an optimisation, not a dependency: the same pass runs sooner than the next tick, and because
+every pass is idempotent and cursor-driven, losing one to a restart or a busy daemon costs the
+channel minutes and never a message. Making the timer the fallback rather than the trigger would
+put the bridge's correctness behind the daemon's liveness, which is the coupling this refuses.
 

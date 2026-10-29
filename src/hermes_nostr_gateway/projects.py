@@ -400,3 +400,19 @@ class ProjectMap:
             if name and project.channel.strip().lower() == name:
                 return project
         return None
+
+    def resolve_id(self, channel_id: str) -> Optional[Project]:
+        """The usable entry keyed by this channel id, across every community.
+
+        A pass scheduled as a systemd timer is named by the channel id alone -- the unit
+        instance -- and was never told a community, so applying the entry's `community:`
+        would make every such pass unroutable. The id is the unambiguous key; `community`
+        still scopes an inbound message, which always carries one.
+        """
+        ident = (channel_id or "").strip().lower()
+        if not ident:
+            return None
+        for project in self._projects:
+            if project.ok and project.channel.strip().lower() == ident:
+                return project
+        return None

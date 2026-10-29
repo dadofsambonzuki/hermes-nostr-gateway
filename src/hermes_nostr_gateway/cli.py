@@ -1317,7 +1317,7 @@ def cmd_skill(args) -> int:
 
 
 def cmd_doctor(args) -> int:
-    """One preflight over the config, identity, store, socket, ngit, mappings and cron.
+    """One preflight over the config, identity, store, socket, ngit, mappings and schedules.
 
     Every failing check names its fix, `--json` carries the same shape, and the exit code is
     1 when anything failed — so a fresh host can be driven to green by the output alone.
@@ -1492,7 +1492,7 @@ def main(argv: list[str] | None = None) -> int:
     p_projects.set_defaults(func=cmd_projects)
 
     p_doctor = sub.add_parser(
-        "doctor", help="one preflight: config, identity, store, socket, ngit, mappings, cron")
+        "doctor", help="one preflight: config, identity, store, socket, ngit, mappings, schedules")
     p_doctor.add_argument("--socket", default=None, help="daemon socket override")
     p_doctor.add_argument("--json", action="store_true",
                           help="machine-readable checks; exit 1 when any fails")
