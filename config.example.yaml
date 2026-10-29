@@ -187,8 +187,6 @@ defaults:
 #       path: ~/Projects/example        # the checkout
 #       project: example-project        # optional; Hermes project slug
 #       board: example-channel          # optional; kanban board slug
-#       # review_model: some-model      # optional; a PR review task for this channel runs
-#       # review_provider: provider      # on this model instead of ngit.review_model's
 
 # Who answers, and on what account (see docs/decisions.md, "A route travels on the frame").
 # Ordinary turns run on whatever Hermes is configured with; a route lets one
@@ -230,8 +228,6 @@ defaults:
 #   assignee: default            # profile a task created from an issue is dispatched to
 #   reviews: true                # a PR also gets a review task on the board (never a merge)
 #   review_assignee: default     # profile that review task is dispatched to
-#   # review_model: some-model   # run review on another model via the task's own override
-#   # review_provider: provider  # the provider that model belongs to (needs review_model)
 #   relays:                      # where 1618/1631 events are read; default: relays.read
 #     - wss://relay.example
 #   lookback_hours: 168          # the first poll's floor (0 = everything the relay gives)

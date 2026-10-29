@@ -19,8 +19,6 @@ ngit:
   assignee: default        # the profile a task created from an issue is dispatched to
   reviews: true            # a PR also gets a review task (never a merge)
   review_assignee: default # the profile that review task is dispatched to
-  # review_model: ...      # run the review on another model, via the task's own override
-  # review_provider: ...   # that model's provider (only read alongside review_model)
   # relays:                # where 1618/1631 events are read; default: the repository
   #   - wss://relay.example # announcement's own relay hints, then relays.read
   lookback_hours: 168      # the first poll's floor; 0 reads everything the relay will give
@@ -174,12 +172,11 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 - The notice names the task (`review task <id>`) instead of a second message announcing it.
   One PR, one channel event.
 - `ngit.review_assignee` (default `default`) is the profile the task is dispatched to and
-  `ngit.priority` its priority. `ngit.review_model` (and optionally `ngit.review_provider`)
-  is written to the task's own `model_override` / `provider_override` — the columns
-  `hermes kanban set-model` writes and the dispatcher already honours — so review can run on
-  a stronger model than routine work without a second profile. A `review_model` /
-  `review_provider` on the channel's `concord.projects` entry beats it for that channel
-  alone; unset everywhere means the assignee profile's model.
+  `ngit.priority` its priority. The bridge writes no model on the task: the board's default,
+  then that profile's own model, decides, so a review costs whatever the profile costs and
+  there is no second place to keep a model in step. A task that needs another model is moved
+  on its own (`hermes kanban set-model <id> <model> --provider <p>`), which is the operator's
+  call, not the bridge's.
 - A kind-1631 event for a PR this bridge announced posts one follow-up, `merged as <commit>`
   (NIP-34's `merge-commit` tag, or `merge-commit-id` — the spelling ngit 3.0.4 actually
   publishes, one oid for a merge commit and every commit the push added for a fast-forward —

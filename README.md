@@ -100,11 +100,9 @@ An issue from a trusted npub (`control.trusted_npubs`, or the concord plane's ow
 which a trusted npub answers with `hng ngit answer <task-id|nevent> --yes|--no --by <npub>` — the
 author of an issue does not thereby authorise it.
 
-A PR's review task can run on a different model from routine work: `ngit.review_model` (with
-`ngit.review_provider`) is written to the task's own model override — the column the dispatcher
-already honours — and a channel's `concord.projects` entry can set its own for that channel alone.
-The task ends in a verdict and a comment on the task; it never merges, and the merge event closes
-it.
+A PR's review task ends in a verdict and a comment on the task; it never merges, and the merge
+event closes it. The bridge chooses no model for it: the board's default, then the assignee
+profile's own model, decides, and one task can be moved with `hermes kanban set-model`.
 
 Notices are queued in `ngit_outbox` before they are sent, each with an idempotency key the daemon
 records, so a busy daemon delays a notice instead of losing it and a lost acknowledgement cannot
@@ -166,8 +164,7 @@ the daemon's default is `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`.
   (`project`) and the kanban board (`board`). Three names with three jobs, none inferred from
   another; a board without a project is a config error, because nothing anchors the worktree.
 - **`ngit`** — the bridge, a sibling block rather than a corner of Concord: `assignee`, `reviews`,
-  `review_assignee`, `review_model` / `review_provider`, `relays`, `lookback_hours`, `issues`,
-  `prs`, `priority`, `max_new`, `max_prs`.
+  `review_assignee`, `relays`, `lookback_hours`, `issues`, `prs`, `priority`, `max_new`, `max_prs`.
 
 ## Operations
 

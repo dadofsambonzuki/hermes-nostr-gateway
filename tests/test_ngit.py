@@ -1057,85 +1057,31 @@ def test_the_review_task_goes_to_the_review_profile_and_priority(home, store):
         made.close()
 
 
-def test_review_model_rides_on_the_task_without_a_second_profile(home, store):
+def test_a_review_task_carries_no_model_of_its_own(harness):
+    """The bridge names the profile and stops: the board's default, then the profile, decides.
+
+    A per-task override is the first thing the dispatcher honours, so writing one here would
+    outrank both -- and a review pinned to a model that hits a quota wall becomes a requeue
+    loop nobody is watching.
+    """
     pr = make_pr("b4")
-    made = Harness(home, store, prs=([pr], []))
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
-                                    review_model="big-model",
-                                    review_provider="big-provider")
-    try:
-        made.sync()
-        task = review_tasks(made)[0]
-        # The dispatcher's own per-task routing: the same columns `kanban set-model` writes.
-        assert task["model_override"] == "big-model"
-        assert task["provider_override"] == "big-provider"
-        # Still the same profile: the model is the task's, not a second install's.
-        assert task["assignee"] == "default"
-    finally:
-        made.close()
-
-
-def test_without_review_model_the_task_runs_on_the_profile_model(harness):
-    pr = make_pr("b5")
     harness.prs_data = ([pr], [])
     harness.sync()
+
     task = review_tasks(harness)[0]
-    assert not task["model_override"]
-    assert not task["provider_override"]
+    assert task["model_override"] is None
+    assert task["provider_override"] is None
+    # Still the review task, still on its profile: only the model knob is gone.
+    assert task["assignee"] == "default"
 
 
-def test_review_config_defaults_and_a_provider_with_no_model():
+def test_review_config_defaults():
     default = ngit.BridgeConfig.from_config({})
     assert default.review_assignee == "default"
-    assert default.review_model == "" and default.review_provider == ""
     assert default.reviews is True
 
-    chosen = ngit.BridgeConfig.from_config(
-        {"review_assignee": "reviewer", "review_model": "m", "review_provider": "p"})
-    assert (chosen.review_assignee, chosen.review_model, chosen.review_provider) == (
-        "reviewer", "m", "p")
-
-    # A provider alone would be read as a model and quietly change nothing.
-    stray = ngit.BridgeConfig.from_config({"review_provider": "p"})
-    assert stray.review_provider == ""
-
-
-def test_a_channel_entry_can_pick_its_own_review_model(harness):
-    """The channel's own `review_model` beats the bridge block: a channel is the context."""
-    from dataclasses import replace as dataclass_replace
-
-    pr = make_pr("c5")
-    harness.prs_data = ([pr], [])
-    harness.target = dataclass_replace(harness.target, review_model="channel-model",
-                                       review_provider="channel-prov")
-    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
-                                       review_model="bridge-model",
-                                       review_provider="bridge-prov")
-
-    harness.sync()
-
-    task = review_tasks(harness)[0]
-    assert task["model_override"] == "channel-model"
-    assert task["provider_override"] == "channel-prov"
-
-
-def test_a_project_entry_carries_its_review_model_onto_the_target(tmp_path):
-    repo = tmp_path / "checkout"
-    repo.mkdir()
-    cfg = {"concord": {"projects": [
-        {"channel": CHANNEL, "path": str(repo), "project": PROJECT, "board": BOARD,
-         "review_model": "entry-model", "review_provider": "entry-prov"},
-        {"channel": "other-channel", "path": str(repo), "project": PROJECT, "board": BOARD,
-         "review_provider": "provider-with-no-model"},
-    ]}}
-
-    target = ngit.resolve_target(cfg, channel=f"concord:{COMMUNITY}:{CHANNEL}")
-    assert (target.review_model, target.review_provider) == ("entry-model", "entry-prov")
-
-    # A provider with no model is not a pair: it is dropped rather than paired with a model
-    # it does not belong to.
-    other = ngit.resolve_target(cfg, channel="other-channel")
-    assert (other.review_model, other.review_provider) == ("", "")
+    chosen = ngit.BridgeConfig.from_config({"review_assignee": "reviewer"})
+    assert chosen.review_assignee == "reviewer"
 
 
 def test_a_merge_completes_the_review_task(harness):
