@@ -22,6 +22,7 @@ Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 # The source must exist before the first start, or the unit fails to start. Creating it
 # is documented in docs/ops-notes.md, "Key handling".
 LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json
+ExecStartPre=/usr/bin/install -d -m 0755 /home/ubuntu/.local/state/hermes-nostr-gateway/ngit-cache
 ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng serve
 Restart=always
 RestartSec=5
@@ -35,8 +36,16 @@ ProtectHome=read-only
 # because the ngit watcher starts `hng ngit sync` as a child of this unit (see
 # docs/ngit-bridge.md, "Waking the pass"), and a pass that cannot write a task would fail
 # only when woken -- the cron pass, which runs outside the unit, would keep working.
+#
+# ngit needs two more writable places or every pass dies with "Read-only file system":
+# its own cache (`NGIT_CACHE_DIR`; the default lives under ~/.cache, which ProtectHome
+# covers) and the checkout's `.git`, because `ngit issue list` fetches before it lists.
+# The rest of the checkout stays read-only on purpose -- the daemon has no business
+# rewriting its own source.
+Environment=NGIT_CACHE_DIR=/home/ubuntu/.local/state/hermes-nostr-gateway/ngit-cache
 ReadWritePaths=/home/ubuntu/.local/state/hermes-nostr-gateway
 ReadWritePaths=/home/ubuntu/.hermes/kanban
+ReadWritePaths=/home/ubuntu/Projects/hermes-nostr-gateway/.git
 StandardOutput=journal
 StandardError=journal
 
