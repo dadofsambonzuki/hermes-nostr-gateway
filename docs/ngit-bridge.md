@@ -236,12 +236,12 @@ Rules that keep the pairing honest:
 - **The profile must exist before the config names it.** `review_assignee: review` on a host
   with no `review` profile files a task that nothing will pick up. Create the profile first,
   then point the bridge at it.
-- **A new identity is an operator step at the relay.** A GRASP that gates writes by author
-  (`NGIT_REPOSITORY_WHITELIST`) refuses events from an npub it does not know — including a
-  comment on a PR it already hosts. Adding the bot's npub to that list is a deployment change:
-  the bridge does not make it, and a bot must not add itself. Until the operator does, the
-  publish fails visibly and the verdict is reported on the task with the relay's refusal
-  quoted.
+- **A new identity is an operator step at the relay.** A GRASP may gate writes by author
+  (`NGIT_REPOSITORY_WHITELIST`), and whether a comment needs the identity listed depends on the
+  deployment — check by publishing and reading the answer back, never by trusting the publish
+  command's success line. Adding the bot's npub to that list is a deployment change: the bridge
+  does not make it, and a bot must not add itself. Until the operator does, say which relay
+  refused and why, and report the verdict on the task with the refusal quoted.
 
 ## Delivery: decide, queue, then record
 
