@@ -396,7 +396,7 @@ class MarmotPlane:
         if sender_block.get("is_self") or sender == self.account_id_hex:
             return None
         text = str(message.get("text") or "")
-        # A leading `/queue` or `/guide` is a routing request, not words for the policy's
+        # A leading `/queue` or `/steer` is a routing request, not words for the policy's
         # echo and quota checks to weigh (addressing.py).
         _, words = addressing.split(text)
         decision = self.policy.decide(

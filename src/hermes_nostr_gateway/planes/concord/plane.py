@@ -232,7 +232,7 @@ class ConcordPlane:
         if kind == REACTION_KIND:
             return self._reaction(stream, rumor, wrapper_id, policy, sender=sender,
                                   addressing=mention_flag, note=note)
-        # The policy reads the words, not a leading `/queue`/`/guide`: see addressing.py.
+        # The policy reads the words, not a leading `/queue`/`/steer`: see addressing.py.
         _, words = addressing.split(text)
         decision = policy.decide(sender=sender, kind=9, mention=mention_flag, dm=False,
                                  event_id=rumor.get("id"), text=words)

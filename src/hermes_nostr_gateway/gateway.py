@@ -1729,8 +1729,9 @@ class Gateway:
                 "content": row["content"], "reply_to": row["reply_to"],
                 "reach": row["reach"], "authority": row["authority"], "why": row["why"],
                 # The mode is on the row, so a message held behind a turn survives a restart
-                # as a held message and the adapter never has to re-read a prefix.
-                "mode": row["mode"] or "normal",
+                # as a held message and the adapter never has to re-read a prefix. A row
+                # written before `/steer` was the name says `guide`; it replays as `steer`.
+                "mode": addressing.canonical(row["mode"]),
                 "replay": True,
             }
             # A replay has to carry the same attachments as the original frame, or the

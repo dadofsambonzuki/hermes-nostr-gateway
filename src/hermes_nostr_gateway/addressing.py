@@ -1,16 +1,23 @@
-"""The spellings a sender may put in front of a message: `/queue`/`/q`, `/guide`/`/steer`/`/s`.
+"""Two words a sender may put in front of a message: `/queue` and `/steer`.
 
 A message that lands while the agent is mid-turn used to have one meaning — another
 instruction, arriving when the agent was least able to take it. These prefixes let the
 sender say what they mean instead:
 
-    /queue <text>, /q <text>                 hold it until the current turn finishes
-    /guide <text>, /steer <text>, /s <text>  steer it into the turn that is already running
+    /queue <text>, /q <text>   hold it until the current turn finishes, then run it as its own turn
+    /steer <text>, /s <text>   steer it into the turn that is already running, not a new request
 
-An alias is the same command under another spelling, never a second implementation: `/q`
-resolves to `queue`, `/steer` and `/s` resolve to `guide`, and nothing downstream of this
-module can tell which spelling was typed. The short forms are what the issue asked for
-(`/queue` `/q` and `/steer` `/s`); `/guide` predates them and stays as the name of the mode.
+The words are Hermes', not this gateway's. Hermes' own command table spells the same two
+behaviours `/queue` (`/q`) and `/steer` (`/s`), each with a mid-run handler — "hold for the next
+turn" and "inject after the next tool call" — while `display.busy_input_mode` sets what a
+*plain* message does when the agent is busy. An agent and a person should not have to learn two
+vocabularies for one idea, so the prefixes reuse the names and the short forms, and the adapter
+hands the behaviour to Hermes rather than keeping a second queue here.
+
+`/guide` was this gateway's own coinage for steering, invented before anyone checked the host's
+vocabulary. It is retired: still read as a deprecated alias, so a message written before the
+rename is not silently delivered as text, but never presented as the name. There is no `/g` —
+the short form of `/steer` is `/s`, because that is Hermes' own short form.
 
 The command is a *routing* decision, not content. It is read here, before the message is
 stored, and stripped from the text before the frame is built; the row keeps `mode` so a
@@ -21,12 +28,6 @@ It is honoured only for a sender the policy has already judged — `authority: i
 the sender asked for, the policy decides, and `resolve` applies it. A stranger's
 `/queue ...` is stored exactly as typed and reaches the agent as data; it can neither queue
 nor steer anything, because the prefix is read before the decision and applied after it.
-
-The names are this gateway's, not Hermes': Hermes spells the same two behaviours `/queue`
-and `/steer`, two commands with their own mid-run handlers — "hold for the next turn" and
-"inject after the next tool call" — while `display.busy_input_mode` sets what a *plain*
-message does when the agent is busy. The adapter maps one onto the other, so the hold and the
-steer are Hermes' own implementation rather than a second queue kept here.
 """
 
 from __future__ import annotations
@@ -42,20 +43,39 @@ MODE_NORMAL = "normal"
 #: Hold until the current turn ends, then deliver as its own turn.
 MODE_QUEUE = "queue"
 #: Steer into the turn that is already running.
-MODE_GUIDE = "guide"
+MODE_STEER = "steer"
+
+#: The value `/guide` used to name, and the one rows written before the rename carry.
+LEGACY_MODE_GUIDE = "guide"
 
 #: Every mode, for a caller that validates rather than trusts (a hand-edited store, config).
-MODES: tuple[str, ...] = (MODE_NORMAL, MODE_QUEUE, MODE_GUIDE)
+#: `guide` is not one of them: it was a spelling of `steer`, never a third behaviour.
+MODES: tuple[str, ...] = (MODE_NORMAL, MODE_QUEUE, MODE_STEER)
 
-#: The whole grammar: a leading command, one whitespace run, then words. Five spellings, two
-#: behaviours: an alias shares its long form's mode, so `/q` is `queue` and `/steer` and `/s`
-#: are `guide` — the regex recognises the word and `_MODE_OF` names the behaviour. Anything
-#: else is text the sender typed — `/queue` alone (nothing to hold), `/queuex`, `/Queue` (a
-#: sentence opening with a path), or a command mentioned mid-sentence, which is not a command.
-_COMMAND = re.compile(r"^/(queue|q|guide|steer|s)\s+(\S.*)$", re.DOTALL)
+
+def canonical(mode: str | None) -> str:
+    """`mode` in today's words: the retired `guide` reads as `steer`, absent reads as `normal`.
+
+    A row written before the rename keeps its old value, and a daemon a release behind can
+    still put it on a frame. Normalising at that boundary is what keeps a replayed steer a
+    steer instead of an unknown mode the adapter would deliver as ordinary text.
+    """
+    if not mode:
+        return MODE_NORMAL
+    return MODE_STEER if mode == LEGACY_MODE_GUIDE else mode
+
+
+#: The whole grammar: a leading command, one whitespace run, then words. Two behaviours, four
+#: current spellings — `/q` shares `/queue`'s mode and `/s` shares `/steer`'s — plus the retired
+#: `/guide`, an entry in the same table rather than a second parser, so no alias can drift from
+#: its word's gate or semantics. Anything else is text the sender typed: `/steer` alone
+#: (nothing to steer), `/steerx`, `/Steer` (a sentence opening with a path), `/g` (not a word
+#: here — Hermes' short form is `/s`), or a command mentioned mid-sentence.
+_COMMAND = re.compile(r"^/(queue|q|steer|s|guide)\s+(\S.*)$", re.DOTALL)
 _MODE_OF = {
     "queue": MODE_QUEUE, "q": MODE_QUEUE,
-    "guide": MODE_GUIDE, "steer": MODE_GUIDE, "s": MODE_GUIDE,
+    "steer": MODE_STEER, "s": MODE_STEER,
+    "guide": MODE_STEER,  # retired spelling, kept readable for a release; never the name
 }
 
 
@@ -77,7 +97,7 @@ def permitted(asked: str, decision: Decision) -> str:
     """The mode the policy allows: a prefix directs nothing unless the sender may instruct now.
 
     Two conditions, both the policy's rather than this module's. `authority: instructions`
-    because a stranger's text is data and `/guide` in it is a word, not a verb. `reach:
+    because a stranger's text is data and `/steer` in it is a word, not a verb. `reach:
     immediate` because a digest row is delivered as a batch after the turn it would have
     steered has ended — so a loop-tier sender's `/queue` stays a digest row, with its text as
     typed, rather than becoming an immediate turn on the way out of the batch.

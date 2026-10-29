@@ -51,8 +51,9 @@ CREATE TABLE IF NOT EXISTS rumors (
     reply_to      TEXT,
     plane         TEXT NOT NULL DEFAULT 'nip17',
     reach         TEXT,
-    -- `queue` or `guide` when the sender asked for one (see addressing.py) and the policy
-    -- allowed it; `normal` otherwise, including for every row written before this column.
+    -- `queue` or `steer` when the sender asked for one (see addressing.py) and the policy
+    -- allowed it; `normal` otherwise, including for every row written before this column. A
+    -- row written before `/steer` was the name still says `guide`, read as `steer`.
     mode          TEXT NOT NULL DEFAULT 'normal',
     authority     TEXT,
     rule          TEXT,
@@ -329,7 +330,7 @@ class Inbound:
     reply_to: str | None
     plane: str = "nip17"
     reach: str = "digest"
-    #: `normal`, `queue` or `guide`: what the sender asked of this message, when the policy
+    #: `normal`, `queue` or `steer`: what the sender asked of this message, when the policy
     #: let them ask it (addressing.py). Kept on the row so a replay carries it too.
     mode: str = "normal"
     authority: str = "none"
