@@ -1496,13 +1496,19 @@ def test_run_ngit_reports_the_stderr_line_not_a_traceback(monkeypatch, tmp_path)
         ngit.run_ngit(tmp_path, ["issue", "list"])
 
 
-def test_run_ngit_says_so_when_the_binary_is_missing(monkeypatch, tmp_path):
+def test_run_ngit_names_the_binary_and_the_floor_when_it_is_missing(monkeypatch, tmp_path):
     def fake_run(command, **kwargs):
         raise FileNotFoundError("ngit")
 
     monkeypatch.setattr(ngit.subprocess, "run", fake_run)
-    with pytest.raises(ngit.NgitError, match="ngit is not installed"):
+    with pytest.raises(ngit.NgitError) as raised:
         ngit.run_ngit(tmp_path, ["issue", "list"])
+    message = str(raised.value)
+    # "ngit is not installed" is not actionable: name the binary, the floor and the fix.
+    assert ngit.NGIT_FLOOR in message
+    assert "ngit" in message
+    assert "PATH" in message
+    assert "is not installed" not in message
 
 
 def test_run_ngit_rejects_output_that_is_not_one_document(monkeypatch, tmp_path):
@@ -1591,3 +1597,116 @@ def test_cli_refuses_a_board_that_is_not_there(tmp_path, monkeypatch, capsys):
                      "--channel", f"concord:{COMMUNITY}:{CHANNEL}"])
     assert code == 2
     assert "no board database" in capsys.readouterr().err
+
+
+# -- the host is described by the test, never measured -----------------------
+#
+# CI has no `ngit` on PATH, so a test about the preflight's message, its exit code or its
+# ordering stubs `probe_ngit` and leaves the host out of it. The suite must pass on a
+# machine with no `ngit` at all.
+
+def below_floor() -> str:
+    """One patch release under the floor, derived so a floor bump does not rot this."""
+    parts = ngit.parse_version(ngit.NGIT_FLOOR)
+    return ".".join(str(part) for part in (*parts[:-1], parts[-1] - 1))
+
+
+def sync_with_probe(tmp_path, monkeypatch, probe: ngit.NgitProbe) -> int:
+    """`hng ngit sync` with a valid config and the host lookup replaced by `probe`."""
+    monkeypatch.setenv("HNG_TEST_SECRET", "44" * 32)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(ngit, "probe_ngit", lambda binary: probe)
+    config = write_config(tmp_path, [{"channel": CHANNEL, "path": str(tmp_path),
+                                      "project": PROJECT, "board": BOARD}])
+    return cli.main(["--config", config, "ngit", "sync",
+                     "--channel", f"concord:{COMMUNITY}:{CHANNEL}"])
+
+
+def test_cli_refuses_a_host_with_no_ngit_at_all(home, tmp_path, monkeypatch, capsys):
+    assert sync_with_probe(tmp_path, monkeypatch, ngit.NgitProbe()) == 2
+    err = capsys.readouterr().err
+    assert "`ngit`" in err
+    assert f"ngit >= {ngit.NGIT_FLOOR}" in err
+    assert ngit.NGIT_INSTALL_HINT in err
+
+
+def test_cli_refuses_an_ngit_below_the_floor(home, tmp_path, monkeypatch, capsys):
+    old = below_floor()
+    probe = ngit.NgitProbe(path="/opt/ngit/bin/ngit", stdout=f"ngit {old}\n")
+    assert sync_with_probe(tmp_path, monkeypatch, probe) == 2
+    err = capsys.readouterr().err
+    assert f"ngit {old}" in err
+    assert f">= {ngit.NGIT_FLOOR}" in err
+    assert ngit.NGIT_INSTALL_HINT in err
+
+
+def test_cli_preflight_names_the_binary_and_the_floor_on_a_real_host(
+        home, tmp_path, monkeypatch, capsys):
+    """No stub at all: PATH holds no `ngit`, so this is the message a real host shows."""
+    monkeypatch.setenv("HNG_TEST_SECRET", "44" * 32)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    monkeypatch.delenv("HNG_NGIT", raising=False)
+    config = write_config(tmp_path, [{"channel": CHANNEL, "path": str(tmp_path),
+                                      "project": PROJECT, "board": BOARD}])
+    code = cli.main(["--config", config, "ngit", "sync",
+                     "--channel", f"concord:{COMMUNITY}:{CHANNEL}"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "`ngit` was not found on PATH" in err
+    assert f"ngit >= {ngit.NGIT_FLOOR}" in err
+    assert "cargo install ngit" in err and "ngit update" in err
+    assert "not installed" not in err
+
+
+@pytest.mark.parametrize("projects, assignee, expected", [
+    ([{"channel": CHANNEL, "path": "", "project": PROJECT, "board": BOARD}], None,
+     "ngit.assignee"),
+    ([], "default", "no concord.projects entry"),
+    ([{"channel": CHANNEL, "path": "", "project": PROJECT, "board": "no-such-board"}],
+     "default", "no board database"),
+])
+def test_cli_validates_the_config_before_it_reads_the_host(
+        home, tmp_path, monkeypatch, capsys, projects, assignee, expected):
+    """A bad config is the operator's to fix: the host is not consulted at all."""
+
+    def forbidden(binary):
+        raise AssertionError("the host was probed before the config was validated")
+
+    monkeypatch.setattr(ngit, "probe_ngit", forbidden)
+    monkeypatch.setenv("HNG_TEST_SECRET", "44" * 32)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    for project in projects:
+        project["path"] = str(tmp_path)
+    config = write_config(tmp_path, projects, assignee=assignee)
+    code = cli.main(["--config", config, "ngit", "sync",
+                     "--channel", f"concord:{COMMUNITY}:{CHANNEL}"])
+    assert code == 2
+    assert expected in capsys.readouterr().err
+
+
+def test_ngit_status_is_one_judgement_on_the_probe(monkeypatch):
+    monkeypatch.setattr(ngit, "probe_ngit",
+                        lambda binary: ngit.NgitProbe(path="/opt/ngit/bin/ngit",
+                                                      stdout=f"ngit {ngit.NGIT_FLOOR}\n"))
+    status = ngit.ngit_status()
+    assert status.usable
+    assert status.path == "/opt/ngit/bin/ngit"
+    assert status.version == ngit.NGIT_FLOOR
+
+
+@pytest.mark.parametrize("probe, expected", [
+    (ngit.NgitProbe(path="/opt/ngit/bin/ngit", error="Permission denied"),
+     "could not be run"),
+    (ngit.NgitProbe(path="/opt/ngit/bin/ngit", stdout="ngit\n"), "did not name a version"),
+    (ngit.NgitProbe(path="/opt/ngit/bin/ngit", stdout="ngit 3\n", stderr="boom", code=1),
+     "did not name a version"),
+])
+def test_ngit_status_names_the_fix_when_the_binary_is_unusable(monkeypatch, probe, expected):
+    monkeypatch.setattr(ngit, "probe_ngit", lambda binary: probe)
+    status = ngit.ngit_status()
+    assert not status.usable
+    assert expected in status.problem
+    assert ngit.NGIT_FLOOR in status.problem
+    assert ngit.NGIT_INSTALL_HINT in status.problem
+

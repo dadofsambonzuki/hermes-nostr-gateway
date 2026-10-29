@@ -1020,6 +1020,9 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     from .kanban import Anchor, Board, BoardError
     from .projects import hermes_home
 
+    # Configuration first: a missing assignee, an unmapped channel or a board that is not
+    # there is the operator's to fix and does not depend on what this host has installed,
+    # so it is refused before the host is read at all -- exit 2, and nothing touched.
     ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
     assignee = str(args.assignee or ngit_cfg.assignee or "").strip()
     if not assignee:
@@ -1032,17 +1035,27 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     except bridge.NgitError as exc:
         print(f"ngit: {exc}", file=sys.stderr)
         return 2
-    checkout = bridge.Ngit(target.repo)
-    repository = checkout.repository()
-    target = replace(target, address=repository.address,
-                     default_branch=bridge.default_branch(target.repo))
-
     home = hermes_home()
     try:
         board = Board(bridge.board_path(target.board, home=home))
     except BoardError as exc:
         print(f"ngit: {exc}", file=sys.stderr)
         return 2
+
+    # The dependency, once the configuration is known to be usable: a missing or old
+    # `ngit` is a preflight failure with a version to install, not a surprise in a cron
+    # log at 03:00, and it still comes before any pass work.
+    try:
+        bridge.require_ngit()
+    except bridge.NgitError as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return 2
+
+    checkout = bridge.Ngit(target.repo)
+    repository = checkout.repository()
+    target = replace(target, address=repository.address,
+                     default_branch=bridge.default_branch(target.repo))
+
     anchor = Anchor.for_board(home, target.board)
     crypto, store, _policy, _plane = build(cfg)
     ngit_cfg = replace(ngit_cfg, assignee=assignee)
@@ -1273,6 +1286,76 @@ def cmd_policy_test(args) -> int:
 
 
 
+def cmd_skill(args) -> int:
+    """The repository's own skill: print it, or install it where Hermes reads skills.
+
+    `--print` is the acceptance path for a clean checkout: the file's text and nothing else,
+    so a reader can pipe it. An install is idempotent (a matching file is left alone) and
+    refuses to replace an edited copy without `--force`.
+    """
+    from . import skill
+
+    if getattr(args, "print_", False):
+        try:
+            sys.stdout.write(skill.content())
+        except skill.SkillError as exc:
+            print(f"skill: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    try:
+        result = skill.install(args.profile, force=bool(args.force))
+    except skill.SkillError as exc:
+        print(f"skill: {exc}", file=sys.stderr)
+        return 1
+    where = f"profile {args.profile!r}" if args.profile else "the shared skills tree"
+    if result.action == "current":
+        print(f"{skill.NAME}: already current at {result.path} ({where})")
+    else:
+        print(f"{skill.NAME}: installed at {result.path} ({where}; "
+              f"{len(result.written)} file(s) written)")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """One preflight over the config, identity, store, socket, ngit, mappings and cron.
+
+    Every failing check names its fix, `--json` carries the same shape, and the exit code is
+    1 when anything failed — so a fresh host can be driven to green by the output alone.
+    """
+    from . import doctor
+
+    found = resolve_config_path(args.config)
+    if found is None:
+        path = str(args.config or DEFAULT_CONFIG)
+        report = doctor.Report(config=path, checks=(doctor.Check(
+            "config", False, f"no config found at {path}",
+            "write config.yaml beside the checkout (start from config.example.yaml) or pass "
+            "`hng --config <path> doctor`"),))
+    else:
+        try:
+            cfg = load_config(str(found))
+        except (SystemExit, yaml.YAMLError, OSError) as exc:
+            message = str(exc) or exc.__class__.__name__
+            report = doctor.Report(config=str(found), checks=(doctor.Check(
+                "config", False, message,
+                f"fix the YAML in {found} (compare with config.example.yaml)"),))
+        else:
+            if not isinstance(cfg, dict):
+                report = doctor.Report(config=str(found), checks=(doctor.Check(
+                    "config", False,
+                    f"{found} parses to a {type(cfg).__name__}, not a mapping of settings",
+                    "a config is a YAML mapping: start from config.example.yaml"),))
+            else:
+                report = doctor.run(cfg, config_path=found, socket=args.socket)
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        print(f"config: {report.config}")
+        for line in report.lines():
+            print(line)
+    return 0 if report.ok else 1
+
+
 STOP_BUDGET_S = 8.0
 
 
@@ -1407,6 +1490,26 @@ def main(argv: list[str] | None = None) -> int:
                             help="exit 1 unless every declared checkout, project and board "
                                  "is there")
     p_projects.set_defaults(func=cmd_projects)
+
+    p_doctor = sub.add_parser(
+        "doctor", help="one preflight: config, identity, store, socket, ngit, mappings, cron")
+    p_doctor.add_argument("--socket", default=None, help="daemon socket override")
+    p_doctor.add_argument("--json", action="store_true",
+                          help="machine-readable checks; exit 1 when any fails")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_skill = sub.add_parser("skill", help="the repository's own agent skill")
+    skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
+    p_skill_install = skill_sub.add_parser(
+        "install", help="install the bundled skill into Hermes' skills tree")
+    p_skill_install.add_argument("--profile", default=None,
+                                 help="install into this Hermes profile instead of the shared "
+                                      "skills tree")
+    p_skill_install.add_argument("--print", dest="print_", action="store_true",
+                                 help="print the skill to stdout instead of installing it")
+    p_skill_install.add_argument("--force", action="store_true",
+                                 help="replace an existing, different copy")
+    p_skill_install.set_defaults(func=cmd_skill)
 
     p_profiles = sub.add_parser(
         "profiles", help="which Hermes profile each plane and channel runs as")

@@ -30,6 +30,11 @@ hng = "hermes_nostr_gateway.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_nostr_gateway"]
 
+# The agent skill ships beside the package too, so `hng skill install` works from a wheel
+# and not only from a checkout. The canonical copy is `skills/nostr-gateway/` at the root.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "hermes_nostr_gateway/skills"
+
 # nostr-sdk is a direct URL (patched wheel); the package is not published to PyPI.
 [tool.hatch.metadata]
 allow-direct-references = true

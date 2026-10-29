@@ -46,6 +46,8 @@ import concurrent.futures
 import datetime as dt
 import json
 import logging
+import os
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -100,9 +102,138 @@ NOTIFY_TIMEOUT_S = 20.0
 #: "within a minute" holds. See docs/ngit-bridge.md, "Waking the pass".
 DEFAULT_WATCH_DEBOUNCE_S = 30.0
 
+#: The oldest `ngit` the bridge will drive. Pinned because the bridge parses `--json`
+#: documents and reads the `merge-commit-id` tag, and a missing or older binary must fail at
+#: a preflight rather than at 03:00 in a cron log. Bump this when a document the bridge
+#: reads changes shape, and keep `hng doctor` on the same constant.
+NGIT_FLOOR = "3.0.4"
+
+#: Named in every dependency error: a version, and how to get it.
+NGIT_INSTALL_HINT = (
+    f"install ngit >= {NGIT_FLOOR} (`cargo install ngit --version {NGIT_FLOOR}`, or "
+    "`ngit update` when it is already installed) and put the directory holding it on PATH")
+
 
 class NgitError(RuntimeError):
     """A sync or an answer cannot proceed; the message says what the operator must fix."""
+
+
+@dataclass(frozen=True)
+class NgitStatus:
+    """What `ngit` is on this host: where it is, what version, or why it is unusable."""
+
+    binary: str
+    path: str = ""
+    version: str = ""
+    problem: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return not self.problem
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"binary": self.binary, "path": self.path, "version": self.version,
+                "floor": NGIT_FLOOR, "usable": self.usable, "problem": self.problem}
+
+
+def ngit_binary() -> str:
+    """The command the bridge runs: `ngit`, or `$HNG_NGIT` for a build outside PATH."""
+    return os.environ.get("HNG_NGIT") or "ngit"
+
+
+@dataclass(frozen=True)
+class NgitProbe:
+    """One look at the host: where `ngit` is, and what it said when asked.
+
+    An empty `path` means there is no such command; `error` means it exists but could not
+    be run at all; otherwise `stdout`, `stderr` and `code` are what `--version` produced.
+    Nothing here judges the answer -- that is `ngit_status`'s job -- so this is the one
+    structure a test has to invent to describe a host without an `ngit` on it.
+    """
+
+    path: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    code: int = 0
+    error: str = ""
+
+
+def probe_ngit(binary: str) -> NgitProbe:
+    """Find `binary` and ask its version: the single host lookup, so it can be stubbed.
+
+    The suite runs on machines with no `ngit` at all (CI is one), so a test that is about
+    the message, the exit code or the ordering stubs this and leaves the host out of it.
+    """
+    found = shutil.which(binary)
+    if not found:
+        return NgitProbe()
+    try:
+        done = subprocess.run([found, "--version"], capture_output=True, text=True,
+                              timeout=15.0)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return NgitProbe(path=found, error=str(exc))
+    return NgitProbe(path=found, stdout=done.stdout or "", stderr=done.stderr or "",
+                     code=done.returncode)
+
+
+def parse_version(text: str) -> tuple[int, ...]:
+    """A version out of `ngit --version` output, dotted numeric components only.
+
+    The line is `ngit 3.0.4`; update notices on stderr are ignored because only stdout is
+    read. Returns an empty tuple when nothing parseable is there.
+    """
+    for token in (text or "").split():
+        candidate = token.strip().lstrip("v")
+        parts = candidate.split(".")
+        if parts and all(part.isdigit() for part in parts if part) and len(parts) >= 2:
+            return tuple(int(part) for part in parts if part)
+    return ()
+
+
+def ngit_status() -> NgitStatus:
+    """Resolve the binary and its version once, for the preflight and for `doctor`.
+
+    Never raises: a missing or too-old binary is an answer, not an exception, so both
+    callers can report it in their own shape. The problem text names the binary, the floor
+    and how to install it, because "ngit is not installed" is not actionable.
+
+    The host is read exactly once, by `probe_ngit`, and everything here is a judgement on
+    what came back. That seam is what lets the suite describe a host with no `ngit` at all.
+    """
+    binary = ngit_binary()
+    probe = probe_ngit(binary)
+    if not probe.path:
+        return NgitStatus(binary=binary, problem=f"`{binary}` was not found on PATH; "
+                                                 f"the bridge needs ngit >= {NGIT_FLOOR}: "
+                                                 f"{NGIT_INSTALL_HINT}")
+    found = probe.path
+    if probe.error:
+        return NgitStatus(binary=binary, path=found,
+                          problem=f"`{found} --version` could not be run ({probe.error}); "
+                                  f"the bridge needs ngit >= {NGIT_FLOOR}: "
+                                  f"{NGIT_INSTALL_HINT}")
+    version = parse_version(probe.stdout)
+    if probe.code != 0 or not version:
+        detail = ((probe.stderr or probe.stdout or "").strip().splitlines() or [""])[0][:200]
+        return NgitStatus(binary=binary, path=found,
+                          problem=f"`{binary} --version` did not name a version "
+                                  f"({detail or f'exit {probe.code}'}); the bridge "
+                                  f"needs ngit >= {NGIT_FLOOR}: {NGIT_INSTALL_HINT}")
+    text = ".".join(str(part) for part in version)
+    if version < parse_version(NGIT_FLOOR):
+        return NgitStatus(binary=binary, path=found, version=text,
+                          problem=f"found ngit {text} at {found}, but the bridge needs "
+                                  f">= {NGIT_FLOOR}: {NGIT_INSTALL_HINT}")
+    return NgitStatus(binary=binary, path=found, version=text)
+
+
+def require_ngit() -> NgitStatus:
+    """The preflight for anything that shells out to `ngit`: raise with the fix, or pass."""
+    status = ngit_status()
+    if not status.usable:
+        raise NgitError(status.problem)
+    return status
+
 
 
 class NotifyError(RuntimeError):
@@ -498,13 +629,13 @@ def run_ngit(repo: Path, args: Sequence[str], *, timeout: float = 120.0) -> Any:
     promises exactly one document. A non-zero exit carries the stderr line, never a
     traceback, because this runs from cron and its output is a log line.
     """
-    command = ["ngit", *args, "--json"]
+    command = [ngit_binary(), *args, "--json"]
     try:
         done = subprocess.run(command, cwd=str(repo), capture_output=True, text=True,
                               timeout=timeout)
     except FileNotFoundError as exc:
-        raise NgitError("ngit is not installed: `hng ngit sync` reads issues through it"
-                        ) from exc
+        raise NgitError(ngit_status().problem
+                        or f"`{ngit_binary()}` could not be run") from exc
     except subprocess.TimeoutExpired as exc:
         raise NgitError(f"ngit {args[0] if args else ''} timed out after {timeout:.0f}s"
                         ) from exc
