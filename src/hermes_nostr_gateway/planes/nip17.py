@@ -76,7 +76,7 @@ class Nip17Plane:
         if recipient and recipient != self.me:
             return None  # addressed to someone else
         text = rumor.get("content", "")
-        # The policy reads the words, not the verb: a `/guide` in front of a message is a
+        # The policy reads the words, not the verb: a `/steer` in front of a message is a
         # routing request, and an echo of our own text must still compare equal to it.
         _, words = addressing.split(text)
 

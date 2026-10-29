@@ -1,10 +1,10 @@
-"""The adapter's half of `/queue` and `/guide`: re-address the words to Hermes' own commands.
+"""The adapter's half of `/queue` and `/steer`: re-address the words to Hermes' own commands.
 
 The gateway has already decided that the sender may ask, and stripped the prefix; the text
 that arrives is only the words. Hermes owns the holding, so this adapter maps the frame's
 `mode` onto the two commands Hermes already implements — `/queue` for "next turn", `/steer`
 for "into the turn that is running" — and never inspects the text itself. Both commands fall
-back to a plain turn when nothing is running, which is what a `/guide` with no turn to steer
+back to a plain turn when nothing is running, which is what a `/steer` with no turn to steer
 is supposed to do; that behaviour lives in Hermes, so what is pinned here is the mapping.
 """
 
@@ -82,7 +82,14 @@ def test_a_queued_message_is_readdressed_to_hermes_queue(monkeypatch):
     assert inst.acked == [_frame()["id"]]
 
 
-def test_a_guide_is_readdressed_to_hermes_steer(monkeypatch):
+def test_a_steer_is_readdressed_to_hermes_steer(monkeypatch):
+    _, event = _deliver(_frame(mode="steer", content="stop, wrong file"), monkeypatch)
+
+    assert event.text == "/steer stop, wrong file"
+
+
+def test_a_frame_from_a_gateway_a_release_behind_still_steers(monkeypatch):
+    """`guide` was the gateway's old name for steer: an upgrade on one side must not lose it."""
     _, event = _deliver(_frame(mode="guide", content="stop, wrong file"), monkeypatch)
 
     assert event.text == "/steer stop, wrong file"

@@ -81,7 +81,7 @@ envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, 
 `error`). A `blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
 `route_key_missing`, `route_unresolved`) and never looks like chat.
 
-### Holding a message back, or steering it: `/queue` `/q` and `/guide` `/steer` `/s`
+### Holding a message back, or steering it: `/queue` `/q` and `/steer` `/s`
 
 A message that lands while the agent is mid-turn arrives as another instruction, which is either
 an interruption or a line lost among the backlog. Two prefixes let the sender choose, each with a
@@ -89,18 +89,21 @@ short spelling:
 
 - **`/queue <text>`, `/q <text>`** — hold it until the current turn ends, then run it as its own
   turn. "I am not interrupting you; do this next."
-- **`/guide <text>`, `/steer <text>`, `/s <text>`** — steer it into the turn that is already
-  running, as guidance rather than a new request. "Change what you are doing now."
+- **`/steer <text>`, `/s <text>`** — steer it into the turn that is already running, as guidance
+  rather than a new request. "Change what you are doing now."
 
-The pair is "hold until the turn ends" versus "steer the turn now", and the aliases are only
-spellings: `/q` is `/queue`, `/steer` and `/s` are `/guide`. They resolve to the same mode and
-take the same gate, so there is one implementation of each behaviour and the record says what the
-sender asked for rather than which word they typed.
+The words are Hermes' own, and so are the short forms: an agent and a person should not have to
+learn two vocabularies for the same idea. The aliases are only spellings — `/q` is `/queue`, `/s`
+is `/steer` — so they resolve to the same mode and take the same gate: one implementation of each
+behaviour, and the record says what the sender asked for rather than which word they typed.
+`/guide` was this gateway's own coinage for steering and is retired; it is still accepted as a
+deprecated alias of `/steer` for a release, so an old message is not silently treated as text.
+There is no `/g` — the short form is `/s`.
 
 "Current" is per conversation, because that is what a Hermes session is: a `/queue` from one room
 cannot hold a message behind another room's turn.
 
-All five spellings are read in the daemon, after the policy has decided the sender's reach and
+Both prefixes are read in the daemon, after the policy has decided the sender's reach and
 authority and before the frame is built. Only a sender the policy gives **`authority:
 instructions` and `reach: immediate`** can use them: anyone else's prefix is stored exactly as
 typed and reaches the agent as data, because a stranger must not be able to queue work or steer a
@@ -235,8 +238,8 @@ The rest answer one question each: `hng recent`, `hng drops`, `hng listen --once
   matters — and never delivered. See `rate_limit` in the config.
 - **A bot peer is not a person.** A peer whose kind-0 metadata says `bot` is held to digest reach,
   has its echo of our own text dropped, and gets a bounded number of messages an hour (`bots`).
-- **`/queue` and `/guide` are privileges.** A leading `/queue <text>` holds a message for the next
-  turn and `/guide <text>` steers the running one. Both are read only for a sender with
+- **`/queue` and `/steer` are privileges.** A leading `/queue <text>` holds a message for the next
+  turn and `/steer <text>` steers the running one. Both are read only for a sender with
   `authority: instructions` and `reach: immediate`; anyone else's prefix stays literal text.
 - **Nothing is fetched beyond an attachment a stored message names.** NIP-92 `imeta` is passed on
   as a claim; bytes are fetched only when the adapter asks with `media.get`, verified against the

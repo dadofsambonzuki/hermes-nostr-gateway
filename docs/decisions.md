@@ -28,23 +28,32 @@ fixture is a name that has to be scrubbed later, and a hostname in an example is
 someone will copy verbatim. Keys and npubs live in host configuration, never here — including in
 test data that "will never be used".
 
-## Two behaviours, five spellings, and who may use them
+## Two words, Hermes' words: `/queue` and `/steer`
 
-`/queue <text>` (alias `/q`) and `/guide <text>` (aliases `/steer` and `/s`) are read in the
-daemon *after* the policy decides the sender's reach and authority, and are honoured only for
-`authority: instructions` **and** `reach: immediate`. The command is stripped before the row is
-written, and the row and the frame carry `mode: normal|queue|guide` — `guide` whichever of its
-three spellings was typed, because a spelling is not a behaviour. An alias is an entry in the
-same word-to-mode table, never a second parser and never a second mode, so it cannot drift from
-its long form's gate or its semantics.
+`/queue <text>` (alias `/q`) and `/steer <text>` (alias `/s`) are read in the daemon *after* the
+policy decides the sender's reach and authority, and are honoured only for `authority:
+instructions` **and** `reach: immediate`. The command is stripped before the row is written, and
+the row and the frame carry `mode: normal|queue|steer` — the same words whichever spelling was
+typed, because a spelling is not a behaviour. An alias is an entry in the same word-to-mode
+table, never a second parser and never a second mode, so it cannot drift from its word's gate or
+its semantics.
 
 The pair means "hold until the turn ends" (`/queue`, `/q`) versus "steer the turn now"
-(`/guide`, `/steer`, `/s`). The short and spelled forms are what the issue asked for; `/guide`
-predates them and stays as the name of the mode and of the row.
+(`/steer`, `/s`). Those are Hermes' own words: its command table spells the same two behaviours
+`/queue` (`/q`) and `/steer` (`/s`), with mid-run handlers behind them. An agent and a person
+should not have to learn two vocabularies for the same idea, so a gateway prefix that means the
+same thing reuses the name instead of inventing a synonym — and the same rule covers `/bg` and
+`/btw` if a plane ever wants to carry them.
+
+`/guide` was this gateway's own coinage, invented before anyone checked the host's vocabulary.
+It is retired: still read as a deprecated alias of `/steer` for a release, so a message written
+before the rename is not silently delivered as text, and a row or a frame from that release that
+says `mode: guide` is read as `steer`. It is no longer the name in the code, the spec or this
+record. There is no `/g`: Hermes has no such command, and `/s` is already the short form.
 
 Why: a mid-task message could previously only mean "another instruction", so a sender had no way
 to say "next, not now" without interrupting the turn or being buried in the backlog. Parsing
-after the policy is the safety property — a stranger's `/guide` is a word in their text, not a
+after the policy is the safety property — a stranger's `/steer` is a word in their text, not a
 verb the agent obeys — and parsing before the frame is what lets the row keep the intent, so a
 replay of an unacknowledged message stays held instead of becoming a fresh instruction. A digest
 tier sender's prefix is left as typed: a batch is not a turn, so there is nothing there to hold
@@ -53,10 +62,10 @@ behind or steer.
 The decision is deliberately narrow: no other commands, lowercase only, and a prefix with no
 words after it is text. `/s` is one letter, so for a sender allowed to steer, a message that
 opens `/s ` is a steer request whether or not that was the intent — the parser cannot tell a
-sarcasm marker from a command, and the short spelling was asked for by name. The cost is bounded
-by the same gate as the long forms: anyone who may not steer keeps the prefix as text. The
-gateway is not becoming a command parser, and Hermes is not being reimplemented — the adapter
-maps `mode` onto Hermes' own `/queue` and `/steer`.
+sarcasm marker from a command, and the short spelling is Hermes' own. The cost is bounded by the
+same gate as the long form: anyone who may not steer keeps the prefix as text. The gateway is not
+becoming a command parser, and Hermes is not being reimplemented — the adapter maps `mode` onto
+Hermes' own `/queue` and `/steer`.
 
 ## Concord is supported, not experimental
 
