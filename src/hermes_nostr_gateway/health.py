@@ -106,6 +106,14 @@ def _float(value: Any) -> float | None:
         return None
 
 
+def _count(worker: dict[str, Any], key: str) -> int:
+    """An integer counter from a worker entry; a missing or odd one reads as 0."""
+    try:
+        return int(worker.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _latest(workers: Iterable[dict[str, Any]], key: str) -> float | None:
     stamps = [_float(w.get(key)) for w in workers]
     stamps = [stamp for stamp in stamps if stamp is not None]
@@ -163,6 +171,24 @@ def _verdict(relay: str, workers: list[dict[str, Any]], *, now: float,
                        f"refused kind(s) {_kind_list(refused)}; nothing left to read",
                        events=events, last_event_at=_stamp(last_event_at), age_s=age_s,
                        severity=BAD)
+
+    # A relay that answered AUTH and closed the filter anyway is deciding something
+    # about this key, not finishing a handshake. "authenticating" would be a permanent
+    # lie — every retry earns a fresh challenge, so the state never expires — and the
+    # blind spot would never be named. Checked before the "down" and mid-AUTH states,
+    # because a refusal streak is the *cause* of both: a worker waiting to re-subscribe
+    # is not a dead child, and what it is waiting on is known. Only when nothing has ever
+    # been delivered: a relay that delivered and refuses now is a different, later fault.
+    auth_refused = [worker for worker in workers if _count(worker, "auth_refusals") >= 2]
+    if auth_refused and not events:
+        count = max(_count(worker, "auth_refusals") for worker in auth_refused)
+        stamps = [_float(worker.get("auth_refused_at")) for worker in auth_refused]
+        newest = max([stamp for stamp in stamps if stamp is not None], default=None)
+        detail = f"answered NIP-42 and still refused the filter ({count}x)"
+        if newest is not None:
+            detail += f", last {human_age(now - newest)} ago"
+        return Verdict(relay, "refusing", "refusing", detail,
+                       events=events, severity=BAD)
 
     if not alive:
         # Deliberately no stderr text here: a child's last words are diagnostics, not a
