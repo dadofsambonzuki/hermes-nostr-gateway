@@ -16,7 +16,7 @@ from pathlib import Path
 import nostr_sdk as sdk
 import pytest
 
-from hermes_nostr_gateway import cli, ngit
+from hermes_nostr_gateway import cli, ngit, ngit_labels
 from hermes_nostr_gateway.control import ControlConfig
 from hermes_nostr_gateway.kanban import Anchor, Board
 from hermes_nostr_gateway.store import Store
@@ -63,10 +63,11 @@ def make_comment(seed: str, *, author: str = STRANGER_HEX, body: str = "Same her
 
 
 def make_pr(seed: str, *, author: str = TRUSTED_HEX, subject: str = "Add a widget",
-            branch: str = "pr/widget", created_at: int = 1000) -> ngit.PullRequest:
+            branch: str = "pr/widget", created_at: int = 1000,
+            commit: str = "") -> ngit.PullRequest:
     identifier = event_id(seed)
     return ngit.PullRequest(id=identifier, author=npub(author), subject=subject,
-                            branch=branch, created_at=created_at,
+                            branch=branch, created_at=created_at, commit=commit,
                             nevent=nevent(identifier, kind=ngit.KIND_PR, author=author))
 
 
@@ -135,7 +136,7 @@ class Harness:
 
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
-                 notifier=None, prs=((), ())):
+                 notifier=None, prs=((), ()), labeler=None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -145,6 +146,8 @@ class Harness:
         self.detail_calls: list[str] = []
         self.prs_data = prs
         self.since_seen: list[int] = []
+        self.label_calls: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
+        self.labeler = labeler or self._label
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
         self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0)
@@ -162,14 +165,25 @@ class Harness:
 
     def prs(self, since: int):
         self.since_seen.append(since)
-        return self.prs_data
+        # Tests set `prs_data` either as a PrFeed or as the older (prs, merges) pair; the
+        # harness is the one place the shape is allowed to be loose.
+        if isinstance(self.prs_data, ngit.PrFeed):
+            return self.prs_data
+        return ngit.PrFeed(*self.prs_data)
+
+    def _label(self, pr_id: str, address: str, add, retract=()):
+        """Record what the sync asked to publish, and say it landed."""
+        self.label_calls.append((pr_id, address, tuple(add), tuple(retract)))
+        event = f"l{len(self.label_calls):03d}".ljust(64, "0")
+        return ngit_labels.LabelResult(ok=True, events=(event,), retracted=True, relays=2)
 
     def sync(self, **kwargs):
         sync = ngit.Sync(
             store=self.store, board=self.board, control=self.control,
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
-            prs=self.prs, notify=self.notifier, anchor=self.anchor)
+            prs=self.prs, notify=self.notifier, anchor=self.anchor,
+            labels=self.labeler)
         return sync.run(**kwargs)
 
     def task(self, task_id: str):
@@ -1248,6 +1262,212 @@ def test_default_branch_says_nothing_where_git_cannot(tmp_path):
     assert ngit.default_branch(tmp_path) == ""
 
 
+# -- the label the PR carries -------------------------------------------------
+
+def label_detail(harness, pr_id: str) -> dict:
+    """What the link row says about the label: the last set published and its events."""
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr_id) or {}
+    return json.loads(link.get("detail") or "{}")
+
+
+def set_review_status(harness, task_id: str, status: str) -> None:
+    harness.board.db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+
+def pr_with_review_task(harness, seed: str = "e1", *, commit: str = "c0ffee") -> tuple:
+    pr = make_pr(seed, commit=commit)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    return pr, review_tasks(harness)[0]["id"]
+
+
+def test_a_new_pr_is_labelled_review_required_exactly_once(harness):
+    pr, _task = pr_with_review_task(harness)
+
+    assert harness.label_calls == [(pr.id, ADDRESS, ("review-required",), ())]
+    detail = label_detail(harness, pr.id)
+    assert detail["label"] == ["review-required"]
+    assert len(detail["label_events"]) == 1
+
+    # Two polls, one event: the label is on the PR, not republished in a loop.
+    harness.prs_data = ([], [])
+    report = harness.sync()
+    assert len(harness.label_calls) == 1
+    assert report.prs["labels"] == 0
+
+
+def test_starting_the_review_flips_it_to_in_review_and_retracts_the_old_label(harness):
+    pr, task = pr_with_review_task(harness)
+    first = tuple(label_detail(harness, pr.id)["label_events"])
+
+    set_review_status(harness, task, "running")
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("in-review",), first)
+    assert report.prs["labels"] == 1
+    assert label_detail(harness, pr.id)["label"] == ["in-review"]
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("## Verdict: approved", "approved"),
+    ("## Verdict: changes needed at a9c6139", "changes-requested"),
+])
+def test_a_verdict_flips_the_label_and_retracts_the_one_before(harness, body, expected):
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", body)
+    set_review_status(harness, task, "done")
+    previous = tuple(label_detail(harness, pr.id)["label_events"])
+
+    harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, (expected,), previous)
+    assert label_detail(harness, pr.id)["label"] == [expected]
+
+
+def test_a_revision_after_an_approval_needs_review_and_is_stale(harness):
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", "Verdict: approved")
+    set_review_status(harness, task, "done")
+    harness.sync()
+    approved = tuple(label_detail(harness, pr.id)["label_events"])
+
+    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
+                             event_id="1" * 64)
+    harness.prs_data = ngit.PrFeed(revisions=[revision])
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("review-required", "stale"), approved)
+    assert report.prs["labels"] == 1
+    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
+
+
+def test_a_revision_after_changes_requested_needs_review_without_stale(harness):
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", "Verdict: changes needed at a9c6139")
+    set_review_status(harness, task, "done")
+    harness.sync()
+
+    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
+                             event_id="1" * 64)
+    harness.prs_data = ngit.PrFeed(revisions=[revision])
+    harness.sync()
+
+    assert harness.label_calls[-1][2] == ("review-required",)
+
+
+def test_a_revision_of_a_pr_a_poll_did_not_carry_still_moves_the_label(home, store):
+    """The task can finish between two passes; the label must not need the PR event again."""
+    made = Harness(home, store)
+    pr, task = pr_with_review_task(made, "e2")
+    made.board.comment(task, "review", "Verdict: approved")
+    set_review_status(made, task, "done")
+    made.sync()
+
+    made.prs_data = ngit.PrFeed(revisions=[ngit.Revision(
+        pr_id=pr.id, commit="beef" * 10, created_at=2500, event_id="2" * 64)])
+    made.sync()
+    label = label_detail(made, pr.id)["label"]
+    made.close()
+
+    assert label == ["review-required", "stale"]
+
+
+def test_a_merge_leaves_the_last_verdict_in_place_and_closes_the_task(harness):
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", "Verdict: approved")
+    harness.sync()
+    published = len(harness.label_calls)
+
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=3000)
+    harness.prs_data = ([pr], [merge])
+    report = harness.sync()
+
+    assert harness.task(task)["status"] == "done"
+    assert report.prs["merged"] == 1
+    # No new label: a merge does not rewrite the verdict it was decided on.
+    assert len(harness.label_calls) == published
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+
+
+def test_a_label_that_could_not_be_published_is_retried_not_believed(home, store):
+    failures = {"left": 1}
+
+    def flaky(pr_id, address, add, retract=()):
+        if failures["left"]:
+            failures["left"] -= 1
+            return ngit_labels.LabelResult(ok=False, error="blocked: not today")
+        return ngit_labels.LabelResult(ok=True, events=("ab" * 32,), retracted=True, relays=1)
+
+    made = Harness(home, store, labeler=flaky)
+    pr = make_pr("e3", commit="c1")
+    made.prs_data = ([pr], [])
+    try:
+        report = made.sync()
+        assert report.prs["label_errors"] == 1
+        assert any("blocked: not today" in error for error in report.errors)
+        # Nothing was recorded as published, so the next poll tries again.
+        assert "label" not in label_detail(made, pr.id)
+
+        made.prs_data = ([], [])
+        again = made.sync()
+        assert again.prs["labels"] == 1
+        assert label_detail(made, pr.id)["label"] == ["review-required"]
+    finally:
+        made.close()
+
+
+def test_a_pr_announced_before_labels_existed_is_not_retrofitted(home, store):
+    made = Harness(home, store)
+    pr = make_pr("e4", commit="c2")
+    made.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, state="signalled", board=BOARD,
+                              detail={"subject": pr.subject})
+    made.prs_data = ([], [])
+    try:
+        made.sync()
+        assert made.label_calls == []
+    finally:
+        made.close()
+
+
+def test_labels_can_be_turned_off(home, store):
+    made = Harness(home, store)
+    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, labels=False)
+    pr = make_pr("e5", commit="c3")
+    made.prs_data = ([pr], [])
+    try:
+        report = made.sync()
+        assert made.label_calls == []
+        assert report.prs["labels"] == 0 and report.prs["label_errors"] == 0
+        assert "label" not in label_detail(made, pr.id)
+    finally:
+        made.close()
+
+
+def test_a_dry_run_publishes_no_label(harness):
+    pr = make_pr("e6", commit="c4")
+    harness.prs_data = ([pr], [])
+    report = harness.sync(dry_run=True)
+
+    assert harness.label_calls == []
+    assert report.prs["would_post"] == 1
+
+
+def test_a_pr_first_seen_already_merged_gets_no_label(harness):
+    """`review-required` on a PR that is already merged would be a lie in the LABELS column."""
+    pr = make_pr("e7", commit="c5")
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1100)
+    harness.prs_data = ([pr], [merge])
+
+    harness.sync()
+
+    assert harness.label_calls == []
+
+
+def test_the_label_vocabulary_is_a_config_default():
+    assert ngit.BridgeConfig.from_config({}).labels is True
+    assert ngit.BridgeConfig.from_config({"labels": False}).labels is False
+
+
 # -- the board anchor ---------------------------------------------------------
 
 def test_a_project_board_gives_the_task_a_worktree_and_a_branch(home, store):
@@ -1521,6 +1741,22 @@ def test_the_repo_address_comes_from_the_announcement_coordinate(tmp_path):
     assert repository.address == ADDRESS
     # The read set for its issues and PRs comes from the announcement's own hints.
     assert repository.relays == ("wss://relay.example",)
+
+
+def test_the_hosting_servers_are_part_of_the_read_set(tmp_path):
+    """A retracted label must reach every server that hosts the repo, not just the hint."""
+    coordinate = sdk.Nip19Coordinate(sdk.Coordinate.parse(ADDRESS),
+                                     [sdk.RelayUrl.parse("wss://relay.example")]).to_bech32()
+
+    def fake_run(repo, args, *, timeout=120.0):
+        return {"is_nostr_repo": True, "coordinate": coordinate,
+                "grasp_servers": ["relay.example", "other.example", "relay.example",
+                                  "wss://third.example"]}
+
+    repository = ngit.Ngit(tmp_path, runner=fake_run).repository()
+
+    assert repository.relays == ("wss://relay.example", "wss://other.example",
+                                 "wss://third.example")
 
 
 def test_a_checkout_with_no_nostr_remote_has_no_address(tmp_path):

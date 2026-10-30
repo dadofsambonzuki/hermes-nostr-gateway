@@ -30,6 +30,7 @@ ngit:
   priority: 0              # task priority for anything the bridge creates
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
+  labels: true             # publish each PR's review state as a NIP-34 label (see below)
   watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
                            # default on once `assignee` is set, `false` is the timer alone
   watch_debounce_s: 30     # coalesce a channel's events this long before the pass
@@ -271,6 +272,49 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
   queued ones it hands to the daemon. The first run, or a catch-up after a long outage, must
   not dump a month of merges into a channel; the remainder is counted as deferred and picked
   up on later polls.
+
+## The label on the PR
+
+`ngit pr list` has a LABELS column, and it is where a reader looks before opening anything. The
+bridge keeps it current, so "waiting on a review", "approved" and "changes asked for" are on
+the PR rather than only in a task comment. Five words, one namespace:
+
+| label | when |
+| --- | --- |
+| `review-required` | the PR has no verdict yet — what a new PR gets |
+| `in-review` | its review task is running, so a reviewer has it |
+| `approved` | the verdict is an approval; merging is still the operator's |
+| `changes-requested` | the verdict asked for changes |
+| `stale` | a revision (`kind 1619`) landed after an approval, so the approval no longer covers the tip |
+
+The state is **not** kept in the bridge: it is read from the review task the bridge already
+made — its status, and the verdict line in its comments (`Verdict: approved` or
+`Verdict: changes-requested`, which the task brief asks for) — plus the PR's tip. The link row
+remembers only what was last published, so a poll publishes on change and a quiet poll
+publishes nothing. A merge leaves the last verdict in place: it is the verdict the merge was
+decided on, and a `stale`-free `approved` on a merged PR is the record of that. A revision
+after an approval gives `review-required` **and** `stale`; after a `changes-requested` it is
+`review-required` alone, because nothing was ever approved.
+
+Two things about the format were measured against ngit 3.0.5 and decide how it is published:
+
+- The namespace is `#t` (NIP-32), because that is the label a `ngit pr list` reader shows; a
+  namespace of the bridge's own does not appear in the column at all. One kind-1985 event
+  carries `L=#t`, `l=<label>,#t`, the repository's `a` and the PR's `e`.
+- A later label does **not** supersede an earlier one: ngit merges `#t` labels, so publishing
+  `approved` over `review-required` shows both. The bridge therefore retracts the label it is
+  replacing with a NIP-09 kind-5, sent to every relay it published the label to. Without that
+  the column accumulates a history and a superseded `approved` still reads as a green light.
+
+A reader with a cached checkout may still show the previous label until ngit refreshes its
+`.git/nostr-cache.lmdb`: the events on the relays are the state, and the cache is a copy of
+them. `ngit.labels: false` turns the whole thing off — a deployment that does not want the
+extra events on its repository's relays publishes none.
+
+Retrofitting is deliberately not done: the first poll after upgrading labels the PRs it
+carries, and an old PR still open is labelled when a revision or a merge puts it back in the
+window. Publishing a label onto every PR the bridge ever announced would be a burst of events
+nobody asked for.
 
 ## Bot identities and profiles
 
