@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from hermes_nostr_gateway import cli, doctor
-from hermes_nostr_gateway.ngit import NGIT_FLOOR
+from hermes_nostr_gateway.ngit import NGIT_FLOOR, NgitError, resolve_target
 
 COMMUNITY = "ab" * 32
 CHANNEL_ID = "cd" * 32
@@ -426,6 +426,77 @@ def test_a_timer_for_another_channel_does_not_cover_this_one(good, monkeypatch, 
     schedule = checks_by_name(capsys)["schedule"]
     assert not schedule["ok"]
     assert CHANNEL_ID in schedule["detail"]
+
+
+def test_a_timer_is_no_pass_for_an_id_keyed_entry_without_a_community(good, monkeypatch,
+                                                                     capsys, tmp_path):
+    """The check and the pass must agree: `resolve_target` refuses what a timer names.
+
+    An id-keyed entry with no `community:` cannot address a notice, and a timer instance is
+    the id and nothing else, so counting that instance as coverage is green while every pass
+    exits non-zero. The failure has to name `community:`, the one thing that fixes it.
+    """
+    tmp_path, home, checkout, _ = good
+    config = write_config(tmp_path, home, checkout, projects=[{
+        "channel": CHANNEL_ID, "path": str(checkout), "project": PROJECT, "board": BOARD}])
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    want_instance(stub_units(monkeypatch, tmp_path), CHANNEL_ID)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    schedule = checks_by_name(capsys)["schedule"]
+    assert not schedule["ok"]
+    assert CHANNEL_ID in schedule["detail"]
+    assert "community:" in schedule["fix"]
+    # Named, but not addressable: not the same failure as having no pass at all.
+    assert "no enabled pass names" not in schedule["detail"]
+
+    # The pass that timer would run, on the config the doctor refused to call covered.
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    with pytest.raises(NgitError, match="no community"):
+        resolve_target(cfg, channel=CHANNEL_ID)
+
+
+def test_a_timer_is_a_pass_once_the_entry_names_its_community(good, monkeypatch, capsys,
+                                                              tmp_path):
+    """The other side of the same rule, proven through the same call the pass makes."""
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(doctor, "cron_sources", lambda: [])
+    want_instance(stub_units(monkeypatch, tmp_path), CHANNEL_ID)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    schedule = checks_by_name(capsys)["schedule"]
+    assert schedule["ok"]
+    assert f"{CHANNEL_ID} (systemd timer" in schedule["detail"]
+
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert resolve_target(cfg, channel=CHANNEL_ID).conversation == CONVERSATION
+
+
+def test_a_crontab_pass_counts_only_when_it_names_the_whole_conversation(good, monkeypatch,
+                                                                        capsys, tmp_path):
+    """Cron is the other scheduler, and on the same entry: the id alone cannot address it,
+    `concord:<community>:<channel>` can -- which is why a crontab line may still count."""
+    tmp_path, home, checkout, _ = good
+    config = write_config(tmp_path, home, checkout, projects=[{
+        "channel": CHANNEL_ID, "path": str(checkout), "project": PROJECT, "board": BOARD}])
+    monkeypatch.setattr(doctor, "SYSTEMD_UNIT_DIRS", ())
+    prefix = f"*/10 * * * * cd {checkout} && hng --config {config} ngit sync --channel "
+
+    monkeypatch.setattr(doctor, "cron_sources",
+                        lambda: [("crontab", f"{prefix}{CHANNEL_ID} --json")])
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    schedule = checks_by_name(capsys)["schedule"]
+    assert not schedule["ok"]
+    assert "community:" in schedule["fix"]
+
+    monkeypatch.setattr(doctor, "cron_sources",
+                        lambda: [("crontab", f"{prefix}{CONVERSATION} --json")])
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    schedule = checks_by_name(capsys)["schedule"]
+    assert schedule["ok"]
+    assert f"{CHANNEL_ID} (crontab)" in schedule["detail"]
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert resolve_target(cfg, channel=CONVERSATION).conversation == CONVERSATION
 
 
 def test_daemon_down_fails_the_socket_and_names_the_fix(good, monkeypatch, capsys, tmp_path):
