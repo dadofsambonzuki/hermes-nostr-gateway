@@ -186,19 +186,26 @@ def _classify(text: str) -> str:
     return ""
 
 
-def _verdict_in(body: str) -> str:
-    """The verdict stated in one comment, if it states one.
+def _verdict_in(body: str) -> Optional[str]:
+    """The verdict stated in one comment: a label, "" for a verdict we cannot read, or None.
 
-    Only the verdict line is read, and only its first few lines are searched: a review's
-    prose contains both words sooner or later ("not approved until ..."), so a whole-body
-    search would turn reasoning into a verdict.
+    The three answers matter. None is "this comment is not a verdict" and the search moves
+    on; "" is "this comment states a verdict and we cannot read it", which must stop the
+    search -- otherwise an older verdict would be published over a newer one nobody parsed.
+
+    Only the first few lines are searched: a review's prose contains both words sooner or
+    later ("not approved until ..."), so a whole-body search turns reasoning into a verdict.
     """
     lines = [line for line in (body or "").splitlines() if line.strip()][:6]
     for line in lines:
         found = _VERDICT_LINE.match(line)
-        if found:
-            return _classify(found.group("rest"))
-    return ""
+        if not found:
+            continue
+        verdict = _classify(found.group("rest"))
+        if verdict:
+            return verdict
+        return ""
+    return None
 
 
 def parse_verdict(bodies: Iterable[str]) -> str:
@@ -211,8 +218,9 @@ def parse_verdict(bodies: Iterable[str]) -> str:
     """
     for body in reversed(list(bodies)):
         verdict = _verdict_in(body)
-        if verdict:
-            return verdict
+        if verdict is None:
+            continue
+        return verdict
     return ""
 
 

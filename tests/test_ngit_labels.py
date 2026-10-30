@@ -121,6 +121,11 @@ def test_the_newest_verdict_wins_and_a_later_merge_line_does_not_erase_it():
     assert labels.parse_verdict(bodies) == labels.APPROVED
 
 
+def test_a_newer_verdict_we_cannot_read_does_not_fall_back_to_an_older_one():
+    """Publishing a stale approval over a verdict nobody parsed is the wrong direction."""
+    assert labels.parse_verdict(["## Verdict: approve", "## Verdict: I have some thoughts"]) == ""
+
+
 def test_no_verdict_at_all_is_empty():
     assert labels.parse_verdict([]) == ""
 
