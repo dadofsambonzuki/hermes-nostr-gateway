@@ -323,6 +323,15 @@ Written as a contract the daemon enforces, not advice for callers:
    `route_unresolved`) is a turn that does not happen — never a fallback to another credential —
    and the frame is left unacknowledged so it is offered again once the route can be honoured.
 
+**A frame the daemon could not answer is retried by resubscribing.** Hermes raises
+`RuntimeStoreError` both for a verdict about the message (`permission_denied`, `not_found`,
+`invalid_params`, `profile_mismatch`, `admission_conflict`) and for the daemon's own condition
+(`session_busy`, `storage_unavailable`, `runtime_draining`, ...). Only a verdict is acked — the
+same frame would be answered the same way, so reconnecting on one is the reconnect storm. A
+condition is left unacked, and since `subscribe` is the only op that re-offers an unacked frame,
+the adapter closes the connection and reconnects so the replay retries it — on the same growing
+backoff, so a condition that lasts is not a retry loop either.
+
 A refusal is part of the contract, not an error to swallow: the adapter passes the code to
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
 attachment the agent cannot see must not read as a message that never had one.

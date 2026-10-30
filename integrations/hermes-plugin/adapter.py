@@ -903,7 +903,13 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
         backoff = 1.0
+        # Whether the last attempt ended with a frame left pending. A healthy subscription
+        # resets the wait between attempts; a pending frame does not, because the daemon is
+        # under a condition and retrying it every second would be the reconnect storm again.
+        retrying = False
         while not self._closing:
+            writer: Optional[asyncio.StreamWriter] = None
+            pending = False
             try:
                 reader, writer = await asyncio.open_unix_connection(str(self._socket))
                 writer.write(b'{"op":"subscribe"}\n')
@@ -912,7 +918,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 if ack.get("type") != "subscribed":
                     raise RuntimeError(f"unexpected subscribe reply: {ack}")
                 self._connected.set()
-                backoff = 1.0
+                if not retrying:
+                    backoff = 1.0
+                retrying = False
                 logger.info("nostr gateway subscribed at %s", self._socket)
                 async for raw in reader:
                     try:
@@ -922,13 +930,37 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     try:
                         await self._frame(frame)
                     except Exception as exc:  # noqa: BLE001 - one frame must not kill the loop
-                        await self._frame_failed(frame, exc)
+                        pending = not await self._frame_failed(frame, exc)
+                        if pending:
+                            # The daemon re-offers an unacked frame from the `subscribe` op
+                            # and from nowhere else, so the connection has to be replaced:
+                            # left open, the frame is held until something unrelated
+                            # disconnects, however long that is.
+                            logger.info("nostr gateway resubscribing so the pending frame "
+                                        "is replayed")
+                            break
+                    else:
+                        # The connection is carrying frames, so the next reconnect starts
+                        # from the bottom of the backoff rather than from wherever a
+                        # condition left it.
+                        backoff = 1.0
+                        retrying = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform
                 logger.warning("nostr gateway connection lost (%s); retrying in %.0fs",
                                exc, backoff)
+            finally:
                 self._connected.clear()
+                if writer is not None:
+                    writer.close()
+                    try:
+                        # A close is a courtesy to the daemon too: its subscription for this
+                        # reader has to end before ours begins, or it keeps a dead writer.
+                        await asyncio.wait_for(writer.wait_closed(), 5)
+                    except (TimeoutError, OSError):
+                        pass
+            retrying = pending
             if self._closing:
                 break
             await asyncio.sleep(backoff)
@@ -951,33 +983,37 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                            frame.get("reason") or "unknown",
                            f": {detail}" if detail else "")
 
-    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> None:
-        """One frame's verdict, so the subscription survives it.
+    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> bool:
+        """One frame's verdict, and whether the subscription can carry on with it.
 
         Letting the exception out of the reader loop tore the socket down, and the daemon
         re-offered the same frame on every reconnect: one refusal became a reconnect storm
         and a repeated apology in the channel. A *verdict* about this frame (Hermes'
         admission codes: `permission_denied`, `not_found`, `invalid_params`,
         `profile_mismatch`, `admission_conflict`) is final — the daemon would answer the
-        same frame the same way — so it is acknowledged and logged. Everything else,
-        including the many `RuntimeStoreError` codes that report the daemon's *condition*
-        (`storage_unavailable`, `session_busy`, `runtime_draining`, ...), is left unacked:
-        the next reconnect replays it instead of the message being dropped unseen.
+        same frame the same way — so it is acknowledged and logged, and the stream continues
+        (`True`). Everything else, including the many `RuntimeStoreError` codes that report
+        the daemon's *condition* (`storage_unavailable`, `session_busy`, `runtime_draining`,
+        ...), is left unacked: the next reconnect replays it instead of the message being
+        dropped unseen. The replay is the daemon's `subscribe` op and nothing else, so that
+        case returns `False` and the caller has to replace the connection rather than read
+        on.
         """
         ident = str(frame.get("id") or "")
         code = refusal_code(exc)
         if code is not None and not is_frame_verdict(code):
             logger.error("nostr frame %s not answered (%s) and stays pending for the next "
                          "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
-            return
+            return False
         if code is not None:
             logger.warning("nostr frame %s refused (%s); acknowledged so it is not replayed",
                            ident[:12] or "(no id)", code)
             if ident and frame.get("type") == "message":
                 await self._ack(ident)
-            return
+            return True
         logger.error("nostr frame %s failed and stays pending for the next reconnect: %s",
                      ident[:12] or "(no id)", exc, exc_info=exc)
+        return False
 
     async def _ack(self, message_id: str, attempts: int = 3) -> bool:
         """Acknowledge a delivered message, retrying without killing the subscription.
