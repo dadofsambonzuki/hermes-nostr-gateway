@@ -449,7 +449,27 @@ Adding a plane must not require touching the socket schema: `plane` is a string 
 own Marmot platform plugin can subscribe to the same `wn-agent` socket; a gateway plane
 attached alongside it would hand the agent every group message twice, so presence of the
 socket is not consent. An idle plane logs why at startup and reports
-`marmot: {enabled: false, reason: …}` on the `status` op.
+`marmot: {enabled: false, error: …, reason: …}` on the `status` op.
+
+It attaches only when three things hold: the opt-in is set, the control socket exists, and
+`wn-agent`'s own `accounts/<label>/account.json` names the key this process signs with. Each
+way of failing is plane-scoped — NIP-17, Concord and ngit keep running — and each shows up in
+`status`/`health`:
+
+| why `enabled: false` | field | is it a choice? |
+|---|---|---|
+| `marmot.enabled` is not `true` | `reason` | yes: the opt-in text, logged at startup |
+| no control socket at the configured path | `reason` | yes: "nothing to attach to" |
+| the account disagrees | `error` | no: broken install or key drift, and stopping group traffic is the point |
+
+The third cause covers a missing account file with no `marmot.account_id_hex` to fall back to,
+two of them with no `marmot.label` to choose, an unreadable file, and a file whose account id
+is not this process's key — the last is the identity drift that would otherwise sign group
+traffic as one npub and DMs as another. `marmot.account_id_hex` is read only when the home
+holds no account file at all (an install in progress); a configured id that contradicts the
+file is refused, never preferred, because the file is the daemon's own answer and the config
+value is a copy of it. See `docs/decisions.md`, "One key, two copies, and the check that makes
+drift loud".
 
 The socket has **one owner** (`docs/marmot-ownership.md`): the gateway is the transport, and
 the Hermes plugin is the carrier only until a clean week has been carried here. Both enabled

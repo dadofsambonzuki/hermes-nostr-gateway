@@ -250,6 +250,58 @@ def marmot_identity_error(account: str, me: str) -> str:
     )
 
 
+def marmot_account_conflict_error(served: str, configured: str) -> str:
+    """The refusal when `marmot.account_id_hex` and wn-agent's own file name different accounts.
+
+    The config key is a *copy* of an id, and a copy is exactly what the identity guard
+    exists to catch: it cannot be trusted to describe the daemon, and comparing it in place
+    of the file is how a re-bootstrapped wn-agent attaches silently. Nor can the
+    disagreement be resolved by preferring one side — there is no way to tell which account
+    the operator meant — so it is refused with both ids in the message.
+    """
+    return (
+        f"marmot.account_id_hex names account {configured[:12]}… but wn-agent's "
+        f"accounts/<label>/account.json serves {served[:12]}…: the configured id would "
+        "have this gateway address one identity while the daemon signs group traffic as "
+        "another. Drop marmot.account_id_hex (wn-agent's file is the source of truth) or "
+        "point it at the account that file names. See docs/decisions.md, \"One key, two "
+        "copies, and the check that makes drift loud\". The Marmot plane is disabled until "
+        "they agree."
+    )
+
+
+def _marmot_account(home: Path, cfg: dict[str, Any]) -> str:
+    """The account wn-agent serves: its own file first, `account_id_hex` only as a fallback.
+
+    Reading the file only when no id was configured inverts the guard: a re-bootstrapped
+    wn-agent (new key on disk, this gateway and its config unchanged) would have the config
+    value compared with this process's key, agree, and attach while the daemon signs group
+    traffic as the new npub. So the file wins whenever the home holds one, and a configured
+    id that disagrees with it is a refusal rather than a preference applied quietly.
+
+    A home with no account file is an install in progress, and there the configured id is
+    the operator's own answer; every other failure — two accounts without a `label`, an
+    unreadable file — stays an error, because a configured id would be a guess dressed as a
+    decision in those cases.
+    """
+    configured = str(cfg.get("account_id_hex") or "").strip().lower()
+    try:
+        served = resolve_account_id(home, cfg.get("label"))
+    except MarmotError as exc:
+        if exc.code != "no_account" or not configured:
+            raise
+        # `no_account` covers both "nothing written yet" and "a file that cannot be read".
+        # Only the first is an install in progress; falling back over a corrupt file would
+        # put the config value back in the guard's seat, which is the bug this replaces.
+        if any((Path(home) / "accounts").glob("*/account.json")):
+            raise
+        return configured
+    if configured and configured != served:
+        raise MarmotError(
+            marmot_account_conflict_error(served, configured), code="account_conflict")
+    return served
+
+
 def _media_error(code: str, message: str) -> dict[str, Any]:
     """One shape for every `media.get` refusal: a code the adapter can branch on."""
     return {"type": "error", "op": "media.get", "code": code, "error": message[:300]}
@@ -481,7 +533,8 @@ class Gateway:
         refused the configuration where both readers are on. Once opted in, a missing
         socket still means
         "nothing to attach to" and stays quiet; a socket that exists but cannot be
-        used (no account file, two of them) disables only this plane and records why
+        used (no account file, two of them, or an account that is not the key this
+        process signs with) disables only this plane and records why
         in `marmot_error` — the NIP-17 planes must not go down because a second
         daemon is mid-install, and a silent disable would look exactly like a
         working plane with nothing to say.
@@ -499,9 +552,11 @@ class Gateway:
             log.info("marmot plane idle: %s", self.marmot_idle)
             return
         try:
-            account = str(cfg.get("account_id_hex") or "").strip() or resolve_account_id(
-                home, cfg.get("label")
-            )
+            # wn-agent's own file, not the config value: `account_id_hex` is a fallback for
+            # a home that holds no account file, and a value that disagrees with one is
+            # itself a refusal (see `_marmot_account`). Comparing the config value instead
+            # is how a re-bootstrapped daemon attaches while signing as a different npub.
+            account = _marmot_account(home, cfg)
             if account.lower() != self.me.lower():
                 self.marmot_error = marmot_identity_error(account, self.me)
                 log.error("marmot plane disabled: %s", self.marmot_error)
