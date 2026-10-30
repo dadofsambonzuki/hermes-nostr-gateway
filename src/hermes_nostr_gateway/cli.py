@@ -1078,8 +1078,11 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
             else:
                 prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
                 if ngit_cfg.labels:
-                    # Published where the bridge reads: a reader that can see the PR can see
-                    # its label, and the retraction of the one it replaces lands there too.
+                    # The same set the PRs are read from, and the same set every time: a
+                    # retraction only holds where it reaches, so the relay list must not
+                    # wander between the label and the retraction that supersedes it. The
+                    # repository's hosting servers come first (see `Ngit.repository`), so a
+                    # chat-only relay refusing the event costs nothing.
                     labeler = labels.LabelPublisher(relays, secret=secret_from(cfg))
     notifier = bridge.DaemonNotifier(
         os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path())))
