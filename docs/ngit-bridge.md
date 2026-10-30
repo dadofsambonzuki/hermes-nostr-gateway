@@ -312,9 +312,10 @@ them. `ngit.labels: false` turns the whole thing off — a deployment that does 
 extra events on its repository's relays publishes none.
 
 Retrofitting is deliberately not done: the first poll after upgrading labels the PRs it
-carries, and an old PR still open is labelled when a revision or a merge puts it back in the
-window. Publishing a label onto every PR the bridge ever announced would be a burst of events
-nobody asked for.
+carries, and an old PR still open is labelled when a revision puts it back in the window.
+Publishing a label onto every PR the bridge ever announced would be a burst of events nobody
+asked for, and a merge is left as it is — its link is closed, and the label a merged PR
+carries is whatever it was decided on.
 
 ## Bot identities and profiles
 

@@ -1489,8 +1489,8 @@ class Sync:
             published = detail.get("label") or ()
             if pr_id not in active and not published and not detail.get("label_pending"):
                 # A PR announced before the bridge published labels. Retrofitting a label
-                # onto every one of them is a burst of events nobody asked for; the next
-                # poll that carries a revision or a merge picks it up.
+                # onto every one of them is a burst of events nobody asked for; a revision
+                # puts it back in the window, and a merge is left alone below.
                 continue
             try:
                 self._one_label(labeler, pr_id, link, detail, tips, report, merged=merged)
