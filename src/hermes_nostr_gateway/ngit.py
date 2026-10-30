@@ -1557,8 +1557,11 @@ class Sync:
         tip = str(detail.get("tip") or "")
         if status == "running" and not detail.get("review_tip"):
             detail["review_tip"] = tip
-        if stated and (stated != str(detail.get("verdict") or "")
-                       or comment_id != int(detail.get("verdict_comment") or 0)):
+        stored_verdict = str(detail.get("verdict") or "")
+        stored_comment = int(detail.get("verdict_comment") or 0)
+        re_anchor = bool(stated) and (
+            stated != stored_verdict or (stored_comment and comment_id != stored_comment))
+        if re_anchor:
             # A new verdict comment re-anchors even when it says the same word: a re-review
             # of a revised tip approves again in the same words, and leaving the anchor on
             # the old tip would keep the PR `stale` for ever.
@@ -1566,6 +1569,11 @@ class Sync:
             detail["verdict_tip"] = str(detail.get("review_tip") or "") or tip
             detail["verdict_comment"] = comment_id
             detail.pop("review_tip", None)
+        elif stated and not stored_comment:
+            # A row written before the comment id was kept. The anchor it already has is
+            # the anchor for that verdict -- re-anchoring it here would pin an old verdict
+            # to whatever tip happens to be current, which is the bug this id prevents.
+            detail["verdict_comment"] = comment_id
         if verdict and detail.get("verdict_tip") and tip and tip != detail["verdict_tip"]:
             # The revision that superseded this verdict is the one the next review reads,
             # so the anchor that belongs to the old one must not outlive it.

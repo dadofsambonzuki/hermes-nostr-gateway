@@ -1488,6 +1488,24 @@ def test_a_second_verdict_on_a_revised_tip_re_anchors(harness):
     assert report.prs["labels"] == 1
 
 
+def test_a_link_from_before_the_verdict_comment_existed_keeps_its_anchor(harness):
+    """An upgrade must not pin an old verdict to whatever tip is current when it lands."""
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", "Verdict: approved")
+    set_review_status(harness, task, "done")
+    harness.sync()
+
+    detail = label_detail(harness, pr.id)
+    detail.pop("verdict_comment", None)
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, state="signalled",
+                                 board=BOARD, detail=detail)
+    harness.prs_data = ngit.PrFeed(revisions=[ngit.Revision(
+        pr_id=pr.id, commit="b0b0" * 10, created_at=2100, event_id="3" * 64)])
+    harness.sync()
+
+    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
+
+
 def test_a_proposal_with_no_tip_tag_is_still_labelled(harness):
     """A kind-1618 that names no commit is still a PR waiting for a review."""
     pr = make_pr("ea", commit="")
