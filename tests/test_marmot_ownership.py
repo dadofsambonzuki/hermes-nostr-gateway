@@ -29,8 +29,9 @@ from test_marmot import ACCOUNT, GROUP, POLICY, FakeWnAgent
 
 
 def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
+    keys = sdk.Keys.generate()
     secret_file = tmp_path / "secret.json"
-    secret_file.write_text(json.dumps({"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()}))
+    secret_file.write_text(json.dumps({"secret_key_hex": keys.secret_key().to_hex()}))
     cfg = {
         "identity": {"secret_file": str(secret_file)},
         "relays": {"read": [], "publish": []},
@@ -41,7 +42,11 @@ def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
         "defaults": POLICY["defaults"],
     }
     if marmot is not None:
-        cfg["marmot"] = marmot
+        # Default the account to the key this gateway signs with: an id that does not
+        # match is a refused plane since the identity guard landed (docs/decisions.md,
+        # "One key, two copies"), and these tests are about the ownership flip, not
+        # about that refusal.
+        cfg["marmot"] = {"account_id_hex": keys.public_key().to_hex(), **marmot}
     return cfg
 
 
@@ -148,8 +153,7 @@ def test_hermes_home_is_the_default_lookup(monkeypatch, tmp_path):
 async def test_status_reports_the_other_reader(tmp_path, no_nak):
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={
-        "enabled": True, "hermes_platform": False, "socket": str(agent.path),
-        "account_id_hex": ACCOUNT}))
+        "enabled": True, "hermes_platform": False, "socket": str(agent.path)}))
     try:
         status = await gateway.status()
         assert "marmot" in status["planes"]
@@ -186,8 +190,7 @@ async def test_a_group_message_still_reaches_the_agent_after_the_flip(tmp_path, 
 
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={
-        "enabled": True, "hermes_platform": False, "socket": str(agent.path),
-        "account_id_hex": ACCOUNT}))
+        "enabled": True, "hermes_platform": False, "socket": str(agent.path)}))
     try:
         await gateway.start()
         await wait_until(lambda: gateway.marmot_worker.connected)

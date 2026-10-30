@@ -20,8 +20,9 @@ from test_marmot import ACCOUNT, GROUP, POLICY, FakeWnAgent, wait_until
 
 
 def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
+    keys = sdk.Keys.generate()
     secret_file = tmp_path / "secret.json"
-    secret_file.write_text(json.dumps({"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()}))
+    secret_file.write_text(json.dumps({"secret_key_hex": keys.secret_key().to_hex()}))
     cfg = {
         "identity": {"secret_file": str(secret_file)},
         "relays": {"read": [], "publish": []},
@@ -36,7 +37,13 @@ def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
         # so a host whose ~/.hermes/config.yaml happens to enable platforms.marmot (as
         # the development box does) cannot change what they prove;
         # test_marmot_ownership.py covers the guard itself.
-        cfg["marmot"] = {"hermes_platform": False, **marmot}
+        #
+        # The account the plane is told to serve is the key this gateway signs with:
+        # a mismatch is a refused plane, not a working one (docs/decisions.md, "One
+        # key, two copies"), so an arbitrary id here would disable the very plane the
+        # file is here to exercise.
+        cfg["marmot"] = {"hermes_platform": False,
+                         "account_id_hex": keys.public_key().to_hex(), **marmot}
     return cfg
 
 
@@ -77,8 +84,7 @@ def no_nak(monkeypatch):
 async def test_a_marmot_message_reaches_a_socket_subscriber(tmp_path, no_nak):
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         reader, writer = await subscribe(gateway.socket_path)
@@ -107,8 +113,7 @@ async def test_a_marmot_message_reaches_a_socket_subscriber(tmp_path, no_nak):
 async def test_send_op_routes_a_marmot_target_through_wn_agent(tmp_path, no_nak):
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         frame = await call(gateway.socket_path,
@@ -141,8 +146,7 @@ async def test_a_repeated_correlation_id_publishes_nothing_new(tmp_path, no_nak)
     """
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         frame = {"op": "send", "to": f"marmot:{GROUP}", "text": "PR is ready",
@@ -163,8 +167,7 @@ async def test_a_repeated_correlation_id_publishes_nothing_new(tmp_path, no_nak)
 async def test_a_bare_group_id_is_also_a_marmot_target(tmp_path, no_nak):
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         frame = await call(gateway.socket_path,
@@ -184,8 +187,7 @@ async def test_group_and_timeline_ops_read_through_the_plane(tmp_path, no_nak):
         "text": "earlier message", "reply_to_message_id_hex": None,
     }]
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         group = await call(gateway.socket_path, {"op": "marmot.group", "group": GROUP})
@@ -206,8 +208,7 @@ async def test_an_unknown_group_is_a_readable_error_not_a_silent_send(tmp_path, 
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     agent.group_info_fail = True
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         await gateway.start()
         frame = await call(gateway.socket_path,
@@ -222,7 +223,7 @@ async def test_an_unknown_group_is_a_readable_error_not_a_silent_send(tmp_path, 
 async def test_without_a_socket_the_plane_is_disabled_and_says_so(tmp_path, no_nak):
     gateway = Gateway(config_for(
         tmp_path, marmot={"enabled": True, "socket": str(tmp_path / "absent.sock"),
-                          "home": str(tmp_path / "nowhere"), "account_id_hex": ACCOUNT}))
+                          "home": str(tmp_path / "nowhere")}))
     try:
         status = await gateway.status()
         assert "marmot" not in status["planes"]
@@ -241,7 +242,8 @@ async def test_a_configured_but_unusable_plane_is_reported_not_hidden(tmp_path, 
     socket.write_text("not really a socket")
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
                                                    "socket": str(socket),
-                                                   "home": str(tmp_path / "empty-home")}))
+                                                   "home": str(tmp_path / "empty-home"),
+                                                   "account_id_hex": ""}))
     try:
         assert gateway.marmot is None
         status = await gateway.status()
@@ -262,8 +264,7 @@ async def test_the_plane_stays_idle_unless_the_config_opt_in_is_true(tmp_path, n
     """
     caplog.set_level(logging.INFO, logger="hng.gateway")
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
-    gateway = Gateway(config_for(tmp_path, marmot={"socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+    gateway = Gateway(config_for(tmp_path, marmot={"socket": str(agent.path)}))
     try:
         assert gateway.marmot is None and gateway.marmot_worker is None
         status = await gateway.status()
@@ -293,8 +294,7 @@ async def test_enabled_true_is_what_attaches_the_same_socket(tmp_path, no_nak):
     """The other side of the guard: one explicit flag and the plane is attached."""
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
     gateway = Gateway(config_for(tmp_path, marmot={"enabled": True,
-                                                   "socket": str(agent.path),
-                                                   "account_id_hex": ACCOUNT}))
+                                                   "socket": str(agent.path)}))
     try:
         assert gateway.marmot is not None and gateway.marmot_worker is not None
         assert gateway.marmot_idle is None
@@ -315,8 +315,7 @@ async def test_a_restarted_gateway_reports_the_chat_before_any_new_event(tmp_pat
     whether wn-agent still confirms it — an empty list is not an answer.
     """
     agent = await FakeWnAgent(tmp_path / "wn-agent.sock").start()
-    cfg = config_for(tmp_path, marmot={"enabled": True, "socket": str(agent.path),
-                                       "account_id_hex": ACCOUNT})
+    cfg = config_for(tmp_path, marmot={"enabled": True, "socket": str(agent.path)})
     first = Gateway(cfg)
     assert first.marmot_worker is not None
     try:
