@@ -42,7 +42,13 @@ def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
         # a mismatch is a refused plane, not a working one (docs/decisions.md, "One
         # key, two copies"), so an arbitrary id here would disable the very plane the
         # file is here to exercise.
+        #
+        # `home` is a directory with no account file — the one case where the configured
+        # id stands alone. Without it the guard reads wn-agent's own
+        # `accounts/*/account.json` from the real `~/.marmot-agents/hermes`, and these
+        # tests would pass or fail on what the developer's host happens to hold.
         cfg["marmot"] = {"hermes_platform": False,
+                         "home": str(tmp_path / "wn-agent-home"),
                          "account_id_hex": keys.public_key().to_hex(), **marmot}
     return cfg
 

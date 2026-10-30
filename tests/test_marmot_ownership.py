@@ -46,7 +46,13 @@ def config_for(tmp_path, *, marmot: dict | None = None) -> dict:
         # match is a refused plane since the identity guard landed (docs/decisions.md,
         # "One key, two copies"), and these tests are about the ownership flip, not
         # about that refusal.
-        cfg["marmot"] = {"account_id_hex": keys.public_key().to_hex(), **marmot}
+        #
+        # `home` is a directory with no account file, which is the one case where the
+        # configured id is used on its own — otherwise the guard reads wn-agent's own
+        # `accounts/*/account.json`, and on a developer box that is the real
+        # `~/.marmot-agents/hermes`, making the test depend on the host.
+        cfg["marmot"] = {"account_id_hex": keys.public_key().to_hex(),
+                         "home": str(tmp_path / "wn-agent-home"), **marmot}
     return cfg
 
 
