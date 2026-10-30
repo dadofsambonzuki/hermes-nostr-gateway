@@ -18,15 +18,8 @@ import pytest
 
 from hermes_nostr_gateway import sdkloop
 
-
-@pytest.fixture(autouse=True)
-def _clean_binding():
-    """Every test starts and ends with no global binding: one process, one global."""
-    sdkloop._HOME = None
-    sdkloop.restore(None)
-    yield
-    sdkloop._HOME = None
-    sdkloop.restore(None)
+#: The binding is process-global. `tests/conftest.py` snapshots and restores it around
+#: every test, so each of these starts from the state the process began in — unbound.
 
 
 def in_a_thread(fn: Callable[[], Any]) -> Any:
