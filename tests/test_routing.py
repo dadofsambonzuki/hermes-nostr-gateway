@@ -602,26 +602,31 @@ async def test_the_adapter_refuses_a_turn_whose_key_is_missing(monkeypatch):
     monkeypatch.delenv("WORK_KEY", raising=False)
     inst = _adapter()
 
-    await inst._deliver(_frame(route={"provider": "p3", "model": "model-b",
-                                      "key": "WORK_KEY", "rule": "channel"}))
+    held = await inst._deliver(_frame(route={"provider": "p3", "model": "model-b",
+                                             "key": "WORK_KEY", "rule": "channel"}))
 
     assert inst.delivered == [], "a turn must not run on another key's credential"
     assert inst.acked == [], "an unacknowledged frame is offered again once the key is there"
+    assert held == adapter._HELD_ROUTE, (
+        "an unacked frame has to be reported to the reader, or it is parked on a live socket"
+    )
 
 
 async def test_the_adapter_refuses_a_route_the_gateway_could_not_resolve():
     inst = _adapter()
 
-    await inst._deliver(_frame(route={"error": "route_unresolved",
-                                      "detail": "no channel", "rule": "channel"}))
+    held = await inst._deliver(_frame(route={"error": "route_unresolved",
+                                             "detail": "no channel", "rule": "channel"}))
 
     assert inst.delivered == [] and inst.acked == []
+    assert held == adapter._HELD_ROUTE
 
 
 async def test_an_unrouted_frame_is_delivered_exactly_as_before():
     inst = _adapter()
+    frame = _frame()
 
-    await inst._deliver(_frame())
+    assert await inst._deliver(frame) is None, "a delivered frame is settled: nothing to hold"
 
     assert inst.delivered and inst.delivered[0].metadata == {}
     await inst.send(chat_id="ab" * 32, content="hi back")

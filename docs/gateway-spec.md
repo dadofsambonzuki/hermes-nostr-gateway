@@ -327,7 +327,8 @@ Written as a contract the daemon enforces, not advice for callers:
    the turn runs, hand the route to the host on the event, and report back with the `send` which
    route the turn actually ran on. A route it cannot honour (`route_key_missing`,
    `route_unresolved`) is a turn that does not happen — never a fallback to another credential —
-   and the frame is left unacknowledged so it is offered again once the route can be honoured.
+   and the frame is left unacknowledged so it is offered again once the route can be honoured
+   (which takes a resubscribe: see below).
 
 **A frame the daemon could not answer is retried without stalling the batch.** Hermes raises
 `RuntimeStoreError` both for a verdict about the message (`permission_denied`, `not_found`,
@@ -343,6 +344,23 @@ a failure of that frame, and it is skipped instead: logged with its reason, left
 acked, because nobody has read it), and the subscription reads on to the next frame. Reconnecting
 for one of those would be worse than useless, because `replay_pending` re-offers oldest-first: a
 frame that never succeeds would hold every frame behind it until it aged out of the replay window.
+
+**A frame that was handled but consumed nothing is held, never acked, and never at the head of
+the batch.** Not every frame left unacked got there by raising: a route the adapter cannot honour
+yet, a digest batch with no home channel, and a `blocked` frame the daemon refused for a route or
+profile it could not resolve (`route_key_missing`, `route_unresolved`, `route_invalid`,
+`profile_unknown`, `profile_invalid` — the refusals whose row it keeps replaying) are all answered
+as far as the adapter can go — logged, left pending, and deliberately not acked, because an ack
+claims Hermes took the message. A `blocked` frame with a policy reason (`not_allowlisted`,
+`rate_limited`, `echo`, `bot_reply_cap`) is settled instead: its row is never replayed, so a hold
+could never be answered and would only cost a reconnect per backoff.
+Those return normally, so nothing fails and nothing is retried unless the adapter says so. It
+reports the hold to its reader, which reads on to the remaining frames of that `subscribe` — a
+hold must not take the batch down with it — and, once the batch is finished, replaces the
+connection, so `subscribe` offers the held frame again on the same growing backoff as a condition.
+Reconnecting at the first held frame instead would re-offer it ahead of every frame behind it
+(`replay_pending` is oldest-first), the starvation the skip rule above exists to prevent; a hold
+that is never reconnected at all is a message parked until something unrelated disconnects.
 
 A refusal is part of the contract, not an error to swallow: the adapter passes the code to
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
