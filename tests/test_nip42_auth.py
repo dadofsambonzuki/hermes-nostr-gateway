@@ -50,6 +50,9 @@ class AuthRelay:
         self.challenge = challenge
         self.auth_events: list[dict] = []
         self.reqs: list[str] = []
+        #: Subscription ids this relay answered with EOSE — i.e. served, which it only
+        #: does for a REQ that arrives on a connection that has already authenticated.
+        self.served: list[str] = []
         self._server: websockets.Server | None = None
         self.url = ""
         self._sockets: list[Any] = []
@@ -78,6 +81,7 @@ class AuthRelay:
                 elif msg[0] == "REQ":
                     self.reqs.append(msg[1])
                     if authed:
+                        self.served.append(msg[1])
                         await ws.send(json.dumps(["EOSE", msg[1]]))
                     else:
                         await ws.send(json.dumps(
@@ -106,23 +110,14 @@ async def auth_relay():
             await relay.stop()
 
 
-@pytest.fixture(autouse=True)
-def _clean_binding():
-    """One process, one global: every test starts and ends with no binding."""
-    sdkloop._HOME = None
-    sdkloop.restore(None)
-    yield
-    sdkloop._HOME = None
-    sdkloop.restore(None)
-
-
-async def wait_for(predicate: Callable[[], Any], timeout: float = 25.0) -> None:
+async def wait_for(predicate: Callable[[], Any], timeout: float = 25.0,
+                   why: str = "condition never became true") -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if predicate():
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("condition never became true")
+    raise AssertionError(why)
 
 
 def _worker(pool: RelayPool, relay: AuthRelay) -> PoolWorker:
@@ -145,9 +140,13 @@ async def test_a_restricted_relay_authenticates_through_the_daemons_loop(auth_re
 
     task = asyncio.create_task(worker.run(lambda _relay, _event: None))
     try:
-        await wait_for(lambda: worker.alive)
-
-        assert relay.auth_events, "the relay never received an AUTH event"
+        # Wait for the thing asserted, not for `alive`: `alive` means the REQ went out,
+        # and the challenge is answered asynchronously on this same loop, so the AUTH can
+        # land a few milliseconds after the subscribe returns — a window that widens on a
+        # loaded machine. Asserting on `alive` read as "the relay never received an AUTH"
+        # in a full run and passed alone, which is a race, not a product fault.
+        await wait_for(lambda: relay.auth_events,
+                       why="the relay never received an AUTH event")
         auth = relay.auth_events[0]
         assert auth["kind"] == 22242
         assert auth["pubkey"] == keys.public_key().to_hex()
@@ -155,8 +154,12 @@ async def test_a_restricted_relay_authenticates_through_the_daemons_loop(auth_re
         assert tags["challenge"] == relay.challenge
         assert tags["relay"] == relay.url
         # `alive` is the relay's answer, not ours: it only serves a REQ it has an AUTH
-        # for, and this one closes anything that arrives before one.
-        assert worker.alive
+        # for, and this one closes anything that arrives before one. So wait for the
+        # EOSE — a REQ served, not merely sent — and for the worker to be holding it.
+        await wait_for(lambda: relay.served,
+                       why="the relay never served a REQ after the handshake")
+        await wait_for(lambda: worker.alive,
+                       why="the worker has no live subscription after authenticating")
     finally:
         worker.stop()
         await asyncio.wait_for(task, timeout=10)
