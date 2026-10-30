@@ -71,7 +71,9 @@ sudo systemctl enable --now hermes-nostr-gateway-ngit@<other-channel-id>.timer
 
 The instance name is the `concord.projects` entry's `channel:` as written when it is keyed by id
 (hex). `systemctl list-timers 'hermes-nostr-gateway-ngit@*'` shows each schedule and its last and
-next run; `hng doctor` counts an enabled instance as that channel's pass and names the unit.
+next run; `hng doctor` counts an enabled instance as that channel's pass and names the unit, once
+the entry declares `community:` — without it the pass cannot address the channel from the id
+alone, and the doctor says so instead of going green.
 
 Crontab still works, and still counts in `hng doctor`, for a host that prefers it:
 

@@ -22,7 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .ngit import NGIT_FLOOR, NGIT_INSTALL_HINT, Ngit, NgitStatus, ngit_status
+from .ngit import (
+    NGIT_FLOOR,
+    NGIT_INSTALL_HINT,
+    Ngit,
+    NgitStatus,
+    looks_hex,
+    ngit_status,
+)
 from .projects import (
     Project,
     ProjectMap,
@@ -371,16 +378,21 @@ def _channel_tokens(project: Project) -> set[str]:
     return {token for token in tokens if token}
 
 
-def _cron_cover(tokens: set[str], sources: list[tuple[str, str]]) -> str:
-    """Which cron source runs an enabled pass naming this channel, or "" for none."""
+def _cron_pass(tokens: set[str], sources: list[tuple[str, str]]) -> tuple[str, str]:
+    """The cron source and the line running an enabled pass naming this channel, or ("", "").
+
+    The line comes back with the source because *how* it names the channel decides whether
+    the pass can address it: `--channel concord:<community>:<channel>` can, `--channel <id>`
+    cannot when the entry declares no community.
+    """
     for name, text in sources:
         for line in text.splitlines():
             stripped = line.lstrip()
             if stripped.startswith("#") or "ngit sync" not in line.lower():
                 continue
             if any(token in line.lower() for token in tokens):
-                return name
-    return ""
+                return name, stripped
+    return "", ""
 
 
 def systemd_units() -> list[str]:
@@ -425,6 +437,22 @@ def _systemd_template(units: list[str]) -> str:
     return ""
 
 
+def _needs_a_conversation(project: Project) -> bool:
+    """The entry is keyed by a channel id and declares no community, so a pass must spell it.
+
+    A notice is addressed by `concord:<community>:<channel>`, and `ngit.resolve_target`
+    refuses an id-only pass against such an entry rather than fail every notice at delivery.
+    A timer instance is named for the id and nothing else, so a timer can never be that
+    pass; a crontab line can, when it names the whole conversation.
+    """
+    return not project.community and looks_hex(project.channel)
+
+
+def _names_conversation(line: str) -> bool:
+    """The pass spells `concord:`, so it carries a community the entry itself does not."""
+    return "concord:" in line.lower()
+
+
 def _schedule_check(mapping: ProjectMap) -> Check:
     """One enabled pass per channel that queues work; either scheduler counts.
 
@@ -434,6 +462,11 @@ def _schedule_check(mapping: ProjectMap) -> Check:
     mid-cutover can see which one is doing the work. A template alone is not a pass -- it
     names no channel and schedules nothing until an instance is enabled -- but it is
     recognised, and the fix then names the instance to enable.
+
+    Covering is not enough on its own: the pass has to be able to address the channel, or
+    this check is green while every pass exits non-zero. An entry keyed by a channel id that
+    declares no `community:` is only addressed by a pass that names the whole conversation,
+    which a timer instance never does -- so that case is reported, not counted.
     """
     queued = [project for project in mapping.all()
               if project.board and not project.config_error]
@@ -443,32 +476,50 @@ def _schedule_check(mapping: ProjectMap) -> Check:
     sources = cron_sources()
     units = systemd_units()
     missing: list[str] = []
+    unaddressable: list[str] = []
     covered: list[str] = []
     for project in queued:
         tokens = _channel_tokens(project)
-        found = _cron_cover(tokens, sources) or _systemd_cover(tokens, units)
-        if found:
+        source, line = _cron_pass(tokens, sources)
+        found = source or _systemd_cover(tokens, units)
+        if found and not (_needs_a_conversation(project) and not _names_conversation(line)):
             covered.append(f"{project.channel} ({found})")
+        elif found:
+            unaddressable.append(project.channel)
         else:
             missing.append(project.channel)
-    if missing:
-        template = _systemd_template(units)
-        if template:
-            base = template.removesuffix("@.timer")
-            enable = ", ".join(f"`systemctl enable --now {base}@{channel}.timer`"
-                               for channel in missing)
-            schedule = f"the timer template is installed; enable one instance per channel: {enable}"
-        else:
-            schedule = ("install deploy/hermes-nostr-gateway-ngit@.{service,timer} and enable "
-                        "one instance per channel (`systemctl enable --now "
-                        "hermes-nostr-gateway-ngit@<channel-id>.timer`)")
-        example = ("*/10 * * * * cd <checkout> && PATH=<dir holding hng>:<dir holding ngit>:"
-                   "$PATH hng --config <config> ngit sync --channel "
-                   "concord:<community-id>:<channel-id> --json")
-        return Check("schedule", False, "no enabled pass names: " + ", ".join(missing),
-                     f"{schedule}, or add one line per channel to crontab (or a Hermes cron "
-                     f"job): {example}. Key the concord.projects entry by the channel id so "
-                     "the pass resolves it")
+    if missing or unaddressable:
+        problems: list[str] = []
+        fix = ""
+        if missing:
+            problems.append("no enabled pass names: " + ", ".join(missing))
+            template = _systemd_template(units)
+            if template:
+                base = template.removesuffix("@.timer")
+                enable = ", ".join(f"`systemctl enable --now {base}@{channel}.timer`"
+                                   for channel in missing)
+                schedule = (f"the timer template is installed; enable one instance per "
+                            f"channel: {enable}")
+            else:
+                schedule = ("install deploy/hermes-nostr-gateway-ngit@.{service,timer} and "
+                            "enable one instance per channel (`systemctl enable --now "
+                            "hermes-nostr-gateway-ngit@<channel-id>.timer`)")
+            example = ("*/10 * * * * cd <checkout> && PATH=<dir holding hng>:<dir holding "
+                       "ngit>:$PATH hng --config <config> ngit sync --channel "
+                       "concord:<community-id>:<channel-id> --json")
+            fix = (f"{schedule}, or add one line per channel to crontab (or a Hermes cron "
+                   f"job): {example}. Key the concord.projects entry by the channel id so "
+                   "the pass resolves it")
+        if unaddressable:
+            problems.append("a pass names, but cannot address (the concord.projects entry "
+                            "declares no `community:`): " + ", ".join(unaddressable))
+            fix = (f"{fix}. " if fix else "") + (
+                "add `community: <community-id>` to each of those entries, because a notice "
+                "is addressed by the whole conversation and the id alone does not spell it; "
+                "or name the whole conversation in the pass (`--channel "
+                "concord:<community-id>:<channel-id>`). Until one of those is done every "
+                "pass exits non-zero")
+        return Check("schedule", False, "; ".join(problems), fix)
     return Check("schedule", True, "a pass covers " + ", ".join(covered))
 
 

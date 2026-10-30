@@ -895,7 +895,8 @@ def _split_conversation(value: str) -> tuple[str, str]:
     return "", text
 
 
-def _looks_hex(value: str) -> bool:
+def looks_hex(value: str) -> bool:
+    """A 64-character hex id, which is how a Concord channel or community is spelled."""
     return len(value) == 64 and set(value.lower()) <= _HEX
 
 
@@ -913,9 +914,9 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     mapping = ProjectMap.from_config(cfg.get("concord") or {})
     community, channel_ref = _split_conversation(conversation)
     project = mapping.resolve(community_id=community,
-                              channel_id=channel_ref if _looks_hex(channel_ref) else "",
-                              channel_name="" if _looks_hex(channel_ref) else channel_ref)
-    if project is None and not community and _looks_hex(channel_ref):
+                              channel_id=channel_ref if looks_hex(channel_ref) else "",
+                              channel_name="" if looks_hex(channel_ref) else channel_ref)
+    if project is None and not community and looks_hex(channel_ref):
         # A scheduled pass names a channel by its id alone -- the systemd timer instance
         # is the id -- and was never told a community, so an entry that declares one still
         # has to resolve. A conversation that names a community keeps its scoping.
@@ -938,7 +939,7 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     address = conversation
     if community and channel_ref:
         address = f"concord:{community}:{channel_ref}"
-    elif _looks_hex(channel_ref):
+    elif looks_hex(channel_ref):
         # A timer pass was told the channel id and nothing else, so the entry's own scope is
         # the only place the community can come from. A notice is addressed by the whole
         # conversation (`concord:<community>:<channel>`), so the id alone is not enough:
