@@ -15,7 +15,7 @@ import yaml
 from . import addressing, sdkloop
 from .bots import BotRegistry, kind0_fetcher
 from .control import ControlConfig
-from .crypto import SdkCrypto
+from .crypto import SdkCrypto, normalize_pubkey
 from .health import (
     DEFAULT_PENDING_STALE_MINUTES,
     default_planes,
@@ -1707,6 +1707,43 @@ class Gateway:
                 seen[row["sender"]] = max(seen.get(row["sender"], 0), row["created_at"])
         return {"peers": [{"pubkey": k, "last_seen": v} for k, v in
                           sorted(seen.items(), key=lambda kv: kv[1], reverse=True)]}
+
+    def authorize(self, *, pubkey: str, conversation: str,
+                  kind: int | None = None) -> dict[str, Any]:
+        """Would a fresh message from `pubkey` in `conversation` still be an instruction?
+
+        Hermes asks this when it recovers a durable turn: the frame it stored carried this
+        daemon's verdict at arrival, and the adapter's role flag vouched for that verdict.
+        A policy edit since then (a `trusted_npubs` entry removed, a rule narrowed) — or a
+        channel that is no longer watched — has to revoke it, so the answer is computed from
+        live state only and never read off the stored row.
+
+        Addressed-ness is not re-derived: only messages that arrived addressed are asked
+        about, so the channel half answers with `mention=True` and the rules decide the
+        rest. A DM asks the rules the way a DM always does. `kind` is the shape of the
+        message, not its verdict; a caller that cannot name one (a turn recovered after the
+        adapter restarted) gets the plane's default.
+        """
+        sender = normalize_pubkey(str(pubkey or "")) if pubkey else ""
+        if not sender:
+            return {"type": "authorized", "authorized": False, "authority": "none",
+                    "why": "no pubkey"}
+        target = str(conversation or "").strip().lower()
+        if is_concord_conversation(target):
+            found = self.concord.channel_for_conversation(target)
+            if found is None:
+                # A channel we no longer watch is not a place anyone may instruct: an
+                # unsubscribed or dissolved community must not keep a stale grant alive.
+                return {"type": "authorized", "authorized": False, "authority": "none",
+                        "why": f"{target[:32]}... is not a channel this daemon watches"}
+            _, stream = found
+            authority = self.policy.authority_for(sender=sender, kind=kind or 9,
+                                                  mention=True, dm=False)
+            return {"type": "authorized", "authorized": authority == "instructions",
+                    "authority": authority, "why": f"addressed in {stream.label}"}
+        authority = self.policy.authority_for(sender=sender, kind=kind or 14, dm=True)
+        return {"type": "authorized", "authority": authority,
+                "authorized": authority == "instructions", "why": "dm"}
 
     def replay_pending(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Re-offer unacknowledged messages, tagged so a consumer can recognise them.

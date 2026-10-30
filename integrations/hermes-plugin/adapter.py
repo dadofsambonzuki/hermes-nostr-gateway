@@ -7,7 +7,9 @@ taken responsibility for a message.
 
 Trust is not decided here. The gateway attaches `authority` to every message; the
 adapter mirrors it into `source.role_authorized`, so a stranger's DM reaches the agent
-as data and never as instructions.
+as data and never as instructions. Hermes does not take that flag's word for a recovered
+turn either: it re-asks the connector (`authorize` over the same socket), and this adapter's
+`reauthorize_native_roles` relays the daemon's *live* answer instead of remembering one.
 
 Delivery is at-least-once in both directions: Hermes' ledger re-sends a reply it could not
 prove landed, and the daemon can have published one whose reply frame never arrived. So the
@@ -160,6 +162,22 @@ def check_requirements() -> bool:
 
 def _short(pubkey: str) -> str:
     return f"{pubkey[:12]}…" if pubkey else "nostr"
+
+
+def refusal_code(exc: BaseException) -> Optional[str]:
+    """Hermes' bounded refusal code for an exception, or None when it is not a refusal.
+
+    A refusal is Hermes' `RuntimeStoreError`, whose `reason` is the wire code
+    (`permission_denied`, `not_found`, ...). Duck-typed on purpose: this adapter is loaded
+    by more than one Hermes build, and it is the code that decides what happens to the
+    frame, not the class name.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    if type(exc).__name__ == "RuntimeStoreError":
+        return str(exc) or "refused"
+    return None
 
 
 # Hermes emits turn-control notices through the platform send path: an empty turn's
@@ -842,6 +860,23 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         """The route the last turn in this conversation ran on, or None when unrouted."""
         return (getattr(self, "_routes", None) or {}).get((chat_id or "").strip().lower())
 
+    def _remember_kind(self, message_id: str, kind: int) -> None:
+        """The rumor kind a message arrived as, for the recovery re-ask.
+
+        Bounded and in-memory: the daemon never needs it to answer, it only sharpens the
+        policy match (`kinds:` in a rule) for the messages this process actually delivered.
+        """
+        kinds = getattr(self, "_kinds", None)
+        if kinds is None:
+            kinds = self._kinds = OrderedDict()
+        kinds[message_id] = int(kind)
+        kinds.move_to_end(message_id)
+        while len(kinds) > 512:
+            kinds.popitem(last=False)
+
+    def _kind_for(self, message_id: str) -> Optional[int]:
+        return (getattr(self, "_kinds", None) or {}).get(message_id or "")
+
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
         backoff = 1.0
@@ -861,20 +896,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                         frame = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if frame.get("type") == "reaction":
-                        # A reaction is a decision on a prompt, never chat (see §approval
-                        # reactions): handle it before anything can turn it into a run.
-                        await self._deliver_reaction(frame, frame.get("id") or "")
-                    elif frame.get("type") == "message":
-                        await self._deliver(frame)
-                    elif frame.get("type") == "blocked":
-                        # Warnings, never user-visible chat (spec §11.6). A blocked
-                        # frame has no content and must never become an agent run.
-                        detail = str(frame.get("detail") or "").strip()
-                        logger.warning("nostr blocked %s… (%s)%s",
-                                       (frame.get("from") or "")[:12],
-                                       frame.get("reason") or "unknown",
-                                       f": {detail}" if detail else "")
+                    try:
+                        await self._frame(frame)
+                    except Exception as exc:  # noqa: BLE001 - one frame must not kill the loop
+                        await self._frame_failed(frame, exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform
@@ -885,6 +910,44 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+    async def _frame(self, frame: dict[str, Any]) -> None:
+        """Route one subscribed frame. Separate from the loop so a failure is catchable."""
+        if frame.get("type") == "reaction":
+            # A reaction is a decision on a prompt, never chat (see §approval
+            # reactions): handle it before anything can turn it into a run.
+            await self._deliver_reaction(frame, frame.get("id") or "")
+        elif frame.get("type") == "message":
+            await self._deliver(frame)
+        elif frame.get("type") == "blocked":
+            # Warnings, never user-visible chat (spec §11.6). A blocked
+            # frame has no content and must never become an agent run.
+            detail = str(frame.get("detail") or "").strip()
+            logger.warning("nostr blocked %s… (%s)%s",
+                           (frame.get("from") or "")[:12],
+                           frame.get("reason") or "unknown",
+                           f": {detail}" if detail else "")
+
+    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> None:
+        """One frame's verdict, so the subscription survives it.
+
+        Letting the exception out of the reader loop tore the socket down, and the daemon
+        re-offered the same frame on every reconnect: one refusal became a reconnect storm
+        and a repeated apology in the channel. A *refusal* (Hermes' bounded `RuntimeStoreError`
+        codes) is final — the same frame would be answered the same way — so it is
+        acknowledged and logged. Anything else is left unacked, so the next reconnect
+        replays it rather than the message being lost.
+        """
+        ident = str(frame.get("id") or "")
+        code = refusal_code(exc)
+        if code is not None:
+            logger.warning("nostr frame %s refused (%s); acknowledged so it is not replayed",
+                           ident[:12] or "(no id)", code)
+            if ident and frame.get("type") == "message":
+                await self._ack(ident)
+            return
+        logger.error("nostr frame %s failed and stays pending for the next reconnect: %s",
+                     ident[:12] or "(no id)", exc, exc_info=exc)
 
     async def _ack(self, message_id: str, attempts: int = 3) -> bool:
         """Acknowledge a delivered message, retrying without killing the subscription.
@@ -926,6 +989,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             self._peers.add(sender.lower())
         if conversation:
             self._peers.add(str(conversation).lower())
+        if message_id:
+            # The recovery re-ask names the same kind the policy matched here; after a
+            # restart the map is empty and the daemon falls back to the plane's default.
+            self._remember_kind(message_id, int(frame.get("kind") or 9))
         # Which identity this conversation's turns run as, decided by the gateway
         # (`profiles:` there). Absent means the receiving profile, which is what keeps the
         # wire unchanged for everything the block does not route.
@@ -1066,6 +1133,43 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
         await self._request({"op": "ack", "ids": [message_id]})
+
+    # -- recovery -------------------------------------------------------
+    async def reauthorize_native_roles(self, source) -> bool:
+        """Hermes' recovery re-ask: does the daemon still hold this sender's grant?
+
+        `role_authorized` mirrors the daemon's verdict at arrival, and Hermes refuses to let
+        that flag vouch for itself on a recovered durable turn: it asks the connector again,
+        with adapter delegation switched off. So the answer has to come from the daemon's
+        *live* policy and channel membership (`authorize`), never from this adapter's memory
+        of the frame. Anything that prevents a fresh yes — no socket, a daemon too old to
+        know the op, a malformed reply — is a no: a stale grant must not survive the check
+        that exists to revoke it.
+        """
+        pubkey = str(getattr(source, "user_id", "") or "")
+        conversation = str(getattr(source, "chat_id", "") or "")
+        if not pubkey or not conversation:
+            return False
+        payload: dict[str, Any] = {"op": "authorize", "pubkey": pubkey,
+                                   "conversation": conversation}
+        kind = self._kind_for(str(getattr(source, "message_id", "") or ""))
+        if kind is not None:
+            payload["kind"] = kind
+        try:
+            reply = await self._request(payload)
+        except Exception as exc:  # noqa: BLE001 - a failed re-check is a refusal
+            logger.warning("nostr re-authorisation for %s failed (%s); refusing",
+                           _short(pubkey), exc)
+            return False
+        if reply.get("type") == "error":
+            logger.warning("nostr daemon cannot re-authorise %s (%s); refusing",
+                           _short(pubkey), reply.get("code") or reply.get("error"))
+            return False
+        if reply.get("type") != "authorized":
+            logger.warning("nostr daemon answered re-authorisation with %r; refusing",
+                           reply.get("type"))
+            return False
+        return reply.get("authorized") is True
 
     # -- outbound -------------------------------------------------------
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
