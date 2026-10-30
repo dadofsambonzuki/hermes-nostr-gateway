@@ -89,6 +89,10 @@ def test_a_verdict_with_no_known_tip_is_not_made_stale_by_one():
 
 # -- the verdict, as reviewers write it -----------------------------------------
 
+def comment(body: str, comment_id: int = 1) -> dict:
+    return {"id": comment_id, "body": body}
+
+
 @pytest.mark.parametrize("body, expected", [
     ("## Verdict: approve", labels.APPROVED),
     ("Verdict: approved", labels.APPROVED),
@@ -102,32 +106,46 @@ def test_a_verdict_with_no_known_tip_is_not_made_stale_by_one():
     ("Verdict: request changes on the second hunk", labels.CHANGES_REQUESTED),
 ])
 def test_a_verdict_line_is_read_in_the_spellings_reviewers_use(body, expected):
-    assert labels.parse_verdict([body]) == expected
+    assert labels.parse_verdict([comment(body)]) == (expected, 1)
 
 
 @pytest.mark.parametrize("body", [
     "",
     "Reviewed the diff and ran the gates. All green.",
     "This is not approved until the second hunk is fixed.",  # prose, not a verdict line
-    "Verdict: I have some thoughts",                         # a verdict we cannot read
 ])
 def test_a_comment_without_a_verdict_line_states_no_verdict(body):
-    assert labels.parse_verdict([body]) == ""
+    assert labels.parse_verdict([comment(body)]) == ("", 0)
+
+
+def test_a_verdict_we_cannot_read_states_no_verdict_but_stops_the_search():
+    assert labels.parse_verdict([comment("Verdict: I have some thoughts")]) == ("", 0)
 
 
 def test_the_newest_verdict_wins_and_a_later_merge_line_does_not_erase_it():
-    bodies = ["## Verdict: changes needed", "fixed the two findings", "## Verdict: approve",
-              "PR abababab merged as dededede: the review is closed by the merge."]
-    assert labels.parse_verdict(bodies) == labels.APPROVED
+    bodies = [comment("## Verdict: changes needed", 1), comment("fixed the two findings", 2),
+              comment("## Verdict: approve", 3),
+              comment("PR abababab merged as dededede: the review is closed by the merge.", 4)]
+    assert labels.parse_verdict(bodies) == (labels.APPROVED, 3)
 
 
 def test_a_newer_verdict_we_cannot_read_does_not_fall_back_to_an_older_one():
     """Publishing a stale approval over a verdict nobody parsed is the wrong direction."""
-    assert labels.parse_verdict(["## Verdict: approve", "## Verdict: I have some thoughts"]) == ""
+    bodies = [comment("## Verdict: approve", 1), comment("## Verdict: I have some thoughts", 2)]
+    assert labels.parse_verdict(bodies) == ("", 0)
+
+
+def test_the_comment_id_tells_two_identical_verdicts_apart():
+    """A re-review approves in the same words; the id is what says it is a new verdict."""
+    first = labels.parse_verdict([comment("## Verdict: approved", 7)])
+    second = labels.parse_verdict([comment("## Verdict: approved", 7),
+                                   comment("## Verdict: approved", 9)])
+    assert first == (labels.APPROVED, 7)
+    assert second == (labels.APPROVED, 9)
 
 
 def test_no_verdict_at_all_is_empty():
-    assert labels.parse_verdict([]) == ""
+    assert labels.parse_verdict([]) == ("", 0)
 
 
 # -- publishing ----------------------------------------------------------------

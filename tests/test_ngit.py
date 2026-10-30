@@ -1463,6 +1463,66 @@ def test_a_pr_first_seen_already_merged_gets_no_label(harness):
     assert harness.label_calls == []
 
 
+def test_a_second_verdict_on_a_revised_tip_re_anchors(harness):
+    """approved -> revision -> stale -> re-approved: the label must come back to `approved`."""
+    pr, task = pr_with_review_task(harness)
+    harness.board.comment(task, "review", "Verdict: approved")
+    set_review_status(harness, task, "done")
+    harness.sync()
+
+    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
+                             event_id="1" * 64)
+    harness.prs_data = ngit.PrFeed(revisions=[revision])
+    harness.sync()
+    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
+
+    # The re-review reads the new tip, and approves it in the same words as the first one.
+    set_review_status(harness, task, "running")
+    harness.sync()
+    harness.board.comment(task, "review", "Verdict: approved")
+    set_review_status(harness, task, "done")
+    report = harness.sync()
+
+    assert harness.label_calls[-1][2] == ("approved",)
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+    assert report.prs["labels"] == 1
+
+
+def test_a_proposal_with_no_tip_tag_is_still_labelled(harness):
+    """A kind-1618 that names no commit is still a PR waiting for a review."""
+    pr = make_pr("ea", commit="")
+    harness.prs_data = ([pr], [])
+
+    harness.sync()
+
+    assert harness.label_calls == [(pr.id, ADDRESS, ("review-required",), ())]
+
+
+def test_a_late_review_task_does_not_drop_the_label_state(harness):
+    """`_note_review` merges into the link's detail; replacing it would lose the event ids."""
+    pr = make_pr("eb", commit="c6")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    assert label_detail(harness, pr.id)["label"] == ["review-required"]
+    # Now the state a link from before review tasks existed is in: signalled, no task,
+    # and a recorded failure to make one.
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)
+    detail = label_detail(harness, pr.id)
+    detail["task_error"] = "database is locked"
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, state="signalled",
+                                 board=BOARD, detail=detail)
+    harness.board.db.execute("UPDATE tasks SET idempotency_key = NULL WHERE id = ?",
+                             (link["task_id"],))
+
+    harness.prs_data = ([pr], [])
+    harness.sync()
+
+    after = label_detail(harness, pr.id)
+    assert after["label"] == ["review-required"]
+    assert after["label_events"] == detail["label_events"]
+    assert harness.task(link["task_id"]) is not None
+
+
 def test_the_label_vocabulary_is_a_config_default():
     assert ngit.BridgeConfig.from_config({}).labels is True
     assert ngit.BridgeConfig.from_config({"labels": False}).labels is False

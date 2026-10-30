@@ -1410,8 +1410,12 @@ class Sync:
 
     def _note_review(self, pr: PullRequest, link: Optional[dict[str, Any]], task_id: str,
                      problem: str) -> None:
-        """Record the task (or why there is none) on the link, so a later poll can retry."""
-        detail = pr_detail(pr, task_error=problem)
+        """Record the task (or why there is none) on the link, so a later poll can retry.
+
+        Merged into what the row already says, not over it: the same blob carries the label
+        state, and replacing it here would drop the event ids a retraction needs.
+        """
+        detail = {**_detail(link or {}), **pr_detail(pr, task_error=problem)}
         self.store.ngit_link_save(
             self.target.key, KIND_PR, pr.id, state=(link["state"] if link else "pending"),
             task_id=task_id or None, board=self.target.board, detail=detail)
@@ -1469,7 +1473,10 @@ class Sync:
             return
         labeler: Labeler = self.labels
         tips = feed.newest_tips()
-        active = set(tips) | {merge.pr_id for merge in feed.merges}
+        # Every proposal the poll carried counts, including one with no `c` tag: the docs
+        # promise a new PR gets its label, and a proposal whose branch has no tip named is
+        # still a PR waiting for a review.
+        active = {pr.id for pr in feed.prs} | {merge.pr_id for merge in feed.merges}
         closed = {merge.pr_id for merge in feed.merges}
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             pr_id = str(link.get("source_id") or "")
@@ -1543,17 +1550,21 @@ class Sync:
         task_id = str(link.get("task_id") or "")
         task = self.board.task(task_id) if task_id else None
         status = str(task.get("status") or "") if task else ""
-        verdict = ""
+        stated, comment_id = ("", 0)
         if task is not None:
-            verdict = parse_verdict(str(comment.get("body") or "")
-                                    for comment in self.board.comments(task_id))
-        verdict = verdict or str(detail.get("verdict") or "")
+            stated, comment_id = parse_verdict(self.board.comments(task_id))
+        verdict = stated or str(detail.get("verdict") or "")
         tip = str(detail.get("tip") or "")
         if status == "running" and not detail.get("review_tip"):
             detail["review_tip"] = tip
-        if verdict and verdict != str(detail.get("verdict") or ""):
-            detail["verdict"] = verdict
+        if stated and (stated != str(detail.get("verdict") or "")
+                       or comment_id != int(detail.get("verdict_comment") or 0)):
+            # A new verdict comment re-anchors even when it says the same word: a re-review
+            # of a revised tip approves again in the same words, and leaving the anchor on
+            # the old tip would keep the PR `stale` for ever.
+            detail["verdict"] = stated
             detail["verdict_tip"] = str(detail.get("review_tip") or "") or tip
+            detail["verdict_comment"] = comment_id
             detail.pop("review_tip", None)
         if verdict and detail.get("verdict_tip") and tip and tip != detail["verdict_tip"]:
             # The revision that superseded this verdict is the one the next review reads,

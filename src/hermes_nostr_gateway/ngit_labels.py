@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import nostr_sdk as sdk
 
@@ -208,20 +208,30 @@ def _verdict_in(body: str) -> Optional[str]:
     return None
 
 
-def parse_verdict(bodies: Iterable[str]) -> str:
-    """The newest verdict stated in a review task's comments, or "".
+def parse_verdict(comments: Iterable[Mapping[str, Any]]) -> tuple[str, int]:
+    """The newest verdict in a review task's comments, and the id of the comment holding it.
 
     The task is the record: a reviewer writes the verdict as a comment, so the newest
     comment that states one is the verdict in force. Reasoning comments and the bridge's own
     merge line state none and are skipped, which is what lets the merge line land on top of
     an approval without erasing it.
+
+    The comment id is returned with the verdict because the words are not enough to say a
+    verdict is new: a re-review of a revised tip approves again in exactly the same words,
+    and the anchor that pairs a verdict with its tip has to move when that happens.
     """
-    for body in reversed(list(bodies)):
-        verdict = _verdict_in(body)
+    for comment in reversed(list(comments)):
+        body = comment.get("body") if isinstance(comment, Mapping) else comment
+        verdict = _verdict_in(str(body or ""))
         if verdict is None:
             continue
-        return verdict
-    return ""
+        if not verdict:
+            # A verdict line we cannot read: newer than anything older, and not a verdict
+            # we can publish, so the search stops with nothing.
+            return "", 0
+        found = int(comment.get("id") or 0) if isinstance(comment, Mapping) else 0
+        return verdict, found
+    return "", 0
 
 
 # -- publishing ---------------------------------------------------------------
