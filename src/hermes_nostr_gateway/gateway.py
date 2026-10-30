@@ -1804,6 +1804,19 @@ class Gateway:
         rest. A DM asks the rules the way a DM always does. `kind` is the shape of the
         message, not its verdict; a caller that cannot name one (a turn recovered after the
         adapter restarted) gets the plane's default.
+
+        The DM half is inferred, and only concord is inferred exactly. Every conversation
+        that is not a concord one is answered as a DM (`dm=True`, kind 14 unless the caller
+        names a kind), while the planes decide at arrival with their own shape: a marmot
+        group uses `dm=<the group is direct>` and kind 9 (`planes/marmot.py`), a nip01
+        mention leaves `dm` unset and carries kind 1 (`planes/nip01.py`), nip04 carries kind
+        4. A rule that keys on `dm` or `kinds` can therefore answer `none` for a recovered
+        turn from one of those planes even though it let the turn in at arrival, and Hermes
+        then revokes it. That is the safe direction — a stale grant must never outlive the
+        check — and it cannot be fixed here without the plane: the ask carries the pubkey,
+        the conversation and the message id (`reauthorize_native_roles`), never the plane
+        the frame arrived on. A caller that does know the shape should pass `kind`; keying
+        this branch per plane means putting the plane on the ask first.
         """
         sender = normalize_pubkey(str(pubkey or "")) if pubkey else ""
         if not sender:
