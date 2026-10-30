@@ -584,8 +584,9 @@ class Gateway:
             plan = await asyncio.wait_for(asyncio.to_thread(
                 watch_plan, self.cfg, self.projects, self.concord.channels(),
                 read_relays=tuple(self.relays_read)), timeout=120)
-        except Exception as exc:  # noqa: BLE001 - cron is still the floor
-            log.warning("ngit watch: no watch plan (%s); cron keeps the bridge moving", exc)
+        except Exception as exc:  # noqa: BLE001 - the scheduled pass is still the floor
+            log.warning("ngit watch: no watch plan (%s); the scheduled pass keeps the bridge "
+                        "moving", exc)
             return
         for skip in plan.skips:
             log.info("ngit watch: not watching %s", skip)
@@ -601,8 +602,9 @@ class Gateway:
             await watcher.run(self._attach_ngit_watch)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - cron is still the floor
-            log.exception("ngit watch: the watcher stopped; cron keeps the bridge moving")
+        except Exception:  # noqa: BLE001 - the scheduled pass is still the floor
+            log.exception("ngit watch: the watcher stopped; the scheduled pass keeps the "
+                          "bridge moving")
 
     def _attach_ngit_watch(self, addresses: tuple[str, ...],
                            handler: Any) -> list[PoolWorker]:
@@ -1655,8 +1657,8 @@ class Gateway:
         # The watcher is an accelerator, so its absence is a note, not a degraded plane --
         # but an operator who asked for it should not have to read a journal to find out.
         if self.ngit_watch is not None and not self.ngit_watch.status().get("alive"):
-            notes.append("ngit watch: no relay subscription is up yet; the cron pass is "
-                         "the only wake")
+            notes.append("ngit watch: no relay subscription is up yet; the scheduled pass "
+                         "is the only trigger")
         elif (self.ngit_watch is None and self.ngit_watch_cfg.explicit
               and not self.ngit_watch_cfg.enabled
               and self.ngit_watch_cfg.reason != "ngit.watch: false"):

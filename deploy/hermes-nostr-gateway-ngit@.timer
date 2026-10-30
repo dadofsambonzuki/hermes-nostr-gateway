@@ -1,0 +1,20 @@
+[Unit]
+Description=Ten-minute ngit bridge pass for channel %i
+
+[Timer]
+# Every ten minutes, the floor under the daemon's watcher: a restart, a relay that did
+# not deliver or a wake lost while the daemon was down is caught here. Persistent=true
+# means a tick missed while the host was down runs at the next opportunity instead of
+# silently dropping a pass.
+OnCalendar=*:0/10
+Persistent=true
+# `hermes-nostr-gateway-ngit@<channel-id>.timer` starts the same-instance service
+# (systemd's default Unit=), so one template schedules every mapped channel. The random
+# delay staggers instances whose calendar lands on the same minute, so two passes do not
+# reach for the board at the same moment; 30s is inside the interval and short enough to
+# be invisible beside a ten-minute tick.
+RandomizedDelaySec=30
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

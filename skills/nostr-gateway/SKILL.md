@@ -40,7 +40,7 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 
 Read-only questions are safe to run at any time: `status`, `health`, `drops`, `recent`,
 `projects`, `route`, `doctor` and `ngit sync --dry-run` write nothing. `ngit sync` without
-`--dry-run` writes tasks, comments, notices and cursors, and is what cron runs.
+`--dry-run` writes tasks, comments, notices and cursors, and is what the scheduled pass runs.
 
 ## Failure vocabulary
 
@@ -75,7 +75,7 @@ Every refusal is a word, and the word decides what to do.
   and never edit the `ngit_*` tables to "fix" a pass. The repository is the source of
   truth; the pass re-reads it and reconciles.
 - **A relay wake never decides.** The watcher subscribes, coalesces and runs the same
-  `hng ngit sync` cron runs. An event only says *something was proposed*; a revision, a
+  `hng ngit sync` the timer runs. An event only says *something was proposed*; a revision, a
   resolution and a merge all arrive as later events, so only the pass may change state.
 - **Notices are queued, then recorded.** A PR notice is written `pending` before it is
   sent and marked delivered only when the daemon took it, so a pass cut off mid-send is
@@ -108,18 +108,22 @@ manual — run `ngit skill install` for the rest.
 
 - Key every `concord.projects` entry by the channel **id** (hex), or by the whole
   `concord:<community-id>:<channel-id>` string. A friendly name resolves inbound messages
-  fine and looks correct, but a cron pass that names the channel by id cannot match it, so
-  every notice fails at 03:00 while manual polls pass.
-- A cron line needs the **binary's directory on `PATH`**: the directory holding `hng`
-  (a virtualenv's `bin`) and the one holding `ngit`. Cron's default `PATH` has neither, and
-  the failure only appears in the log.
+  fine and looks correct, but a scheduled pass that names the channel by id cannot match it,
+  so every notice fails at 03:00 while manual polls pass. A timer instance is the id alone, so
+  the id keying is what lets `hermes-nostr-gateway-ngit@<id>.timer` resolve an entry that
+  declares `community:` — and it must declare it, because a notice is addressed by the whole
+  conversation and the id alone does not spell the community.
+- A scheduled pass needs the **binary's directory on `PATH`**: the directory holding `hng`
+  (a virtualenv's `bin`) and the one holding `ngit`. The unit carries both in
+  `Environment=PATH`; a crontab line has to set the same thing itself, because cron's default
+  `PATH` has neither and the failure only appears in the log.
 - A client must **expand the configured socket path** (`~` and `$VARS`) before connecting,
   exactly as the daemon does. A literal `~` in `socket:` makes a running daemon look down.
 - A worktree task needs its **branch free**: the branch must not already be checked out in
   another worktree and the target path must not exist. Prune stale worktrees
   (`git worktree list`, `git worktree prune`) before dispatching rather than forcing.
 - Pin the bridge's dependency: it shells out to `ngit` and needs a version at or above the
-  floor `doctor` reports. Put that version on `PATH` for cron, not just for your shell.
+  floor `doctor` reports. Put that version on the pass's `PATH`, not just in your shell.
 - Trusted authors are `<npub>` values in `control.trusted_npubs` (and its per-plane
   lists), never names, and relays are `wss://relay.example`-style URLs in `relays.read` /
   `relays.publish` or in an announcement's own hints. Replace every placeholder

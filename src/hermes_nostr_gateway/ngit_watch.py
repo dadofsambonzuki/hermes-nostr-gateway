@@ -9,18 +9,18 @@ as another event (1619), an issue can be resolved or reopened later, and a merge
 kind-1631 that has to be matched against the branch. A subscription can therefore replace
 the *wait*, never the *decision*.
 
-So the ten-minute cron pass stays exactly what it was -- the floor: a restart, a relay that
-did not deliver, a nudge lost while the daemon was down -- and this module only shortens the
-wait. It subscribes to the kinds the bridge reads, for the mapped repositories' `#a`
+So the ten-minute scheduled pass stays exactly what it was -- the floor: a restart, a relay
+that did not deliver, a nudge lost while the daemon was down -- and this module only shortens
+the wait. It subscribes to the kinds the bridge reads, for the mapped repositories' `#a`
 addresses only (never the whole relay), coalesces a channel's events, and runs
-`hng ngit sync --channel <conversation>`: the same command cron runs, with the same store,
+`hng ngit sync --channel <conversation>`: the same command the timer runs, with the same store,
 the same cursor and the same decisions.
 
 Two writers to one cursor is the failure this avoids. The watcher has no store and no board
 and creates nothing; it writes a wake for a channel and starts the pass. Everything the
 pass does is idempotent (idempotency keys on tasks and notices, a link table over event
-ids), so a spurious wake costs one poll -- and a lost nudge costs at most the cron interval,
-because cron is still there.
+ids), so a spurious wake costs one poll -- and a lost nudge costs at most one scheduled
+interval, because the timer is still there.
 
 Where it listens
 ----------------
@@ -501,7 +501,7 @@ class NgitWatcher:
                          outcome.duration_s,
                          f": {_last_line(outcome.output, 200)}" if outcome.output else "")
             else:
-                # cron still runs: a pass that cannot read its checkout is a configuration
+                # the scheduled pass still runs: a pass that cannot read its checkout is a
                 # problem to report, not a reason to stop waking the next one.
                 log.warning("ngit watch: pass for %s exited %d: %s", wake.channel,
                             outcome.exit_code, outcome.error or "no output")

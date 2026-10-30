@@ -915,9 +915,14 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     project = mapping.resolve(community_id=community,
                               channel_id=channel_ref if _looks_hex(channel_ref) else "",
                               channel_name="" if _looks_hex(channel_ref) else channel_ref)
+    if project is None and not community and _looks_hex(channel_ref):
+        # A scheduled pass names a channel by its id alone -- the systemd timer instance
+        # is the id -- and was never told a community, so an entry that declares one still
+        # has to resolve. A conversation that names a community keeps its scoping.
+        project = mapping.resolve_id(channel_ref)
     if project is None:
         # An entry may also be keyed by the whole conversation, which is the one string a
-        # cron job has: `channel: concord:<community>:<channel>`.
+        # crontab pass has: `channel: concord:<community>:<channel>`.
         project = mapping.resolve(community_id=community, channel_name=conversation)
     if project is None:
         known = ", ".join(sorted(p.channel for p in mapping.all())) or "none"
@@ -930,7 +935,22 @@ def resolve_target(cfg: dict[str, Any], *, channel: str, repo: str | None = None
     if not slug:
         raise NgitError(f"channel {project.channel!r} declares no board: set `board:` on its"
                         " concord.projects entry or pass --board")
-    return Target(conversation=conversation, repo=path, board=slug, project=project.project)
+    address = conversation
+    if community and channel_ref:
+        address = f"concord:{community}:{channel_ref}"
+    elif _looks_hex(channel_ref):
+        # A timer pass was told the channel id and nothing else, so the entry's own scope is
+        # the only place the community can come from. A notice is addressed by the whole
+        # conversation (`concord:<community>:<channel>`), so the id alone is not enough:
+        # refuse at the preflight rather than fail every notice at delivery.
+        if not project.community:
+            raise NgitError(
+                f"channel {channel_ref} has no community in its concord.projects entry, so a "
+                "pass named by the id alone cannot address the channel; add `community:` to "
+                f"the entry or pass --channel concord:<community-id>:{channel_ref}")
+        address = (f"concord:{project.community.strip().lower()}:"
+                   f"{project.channel.strip().lower()}")
+    return Target(conversation=address, repo=path, board=slug, project=project.project)
 
 
 def board_path(slug: str, *, home: str | Path | None = None) -> Path:

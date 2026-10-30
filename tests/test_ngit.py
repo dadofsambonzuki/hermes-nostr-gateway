@@ -1294,6 +1294,48 @@ def test_resolve_target_matches_an_entry_keyed_by_the_conversation(tmp_path):
     assert target.repo == repo and target.board == BOARD
 
 
+def test_resolve_target_finds_a_scoped_entry_by_the_bare_channel_id(tmp_path):
+    """A timer instance is named by the id alone, so the id must resolve a scoped entry."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    cfg = {"concord": {"projects": [
+        {"channel": CHANNEL, "community": COMMUNITY, "path": str(repo),
+         "project": PROJECT, "board": BOARD},
+    ]}}
+
+    target = ngit.resolve_target(cfg, channel=CHANNEL)
+
+    assert target.repo == repo and target.board == BOARD
+    # A notice is addressed by the whole conversation, so the id is expanded before the
+    # target is returned: the pass was never told the community, the entry was.
+    assert target.conversation == f"concord:{COMMUNITY}:{CHANNEL}"
+
+
+def test_resolve_target_refuses_a_bare_id_that_cannot_name_its_conversation(tmp_path):
+    """No `community:` and only an id: the notice could not be addressed, so say so first."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    cfg = {"concord": {"projects": [
+        {"channel": CHANNEL, "path": str(repo), "project": PROJECT, "board": BOARD},
+    ]}}
+
+    with pytest.raises(ngit.NgitError, match="cannot address the channel"):
+        ngit.resolve_target(cfg, channel=CHANNEL)
+
+
+def test_resolve_target_keeps_the_community_scoping_for_a_conversation(tmp_path):
+    """A conversation naming another community must not borrow this entry by its id."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    cfg = {"concord": {"projects": [
+        {"channel": CHANNEL, "community": COMMUNITY, "path": str(repo),
+         "project": PROJECT, "board": BOARD},
+    ]}}
+
+    with pytest.raises(ngit.NgitError, match="no concord.projects entry"):
+        ngit.resolve_target(cfg, channel=f"concord:{'ef' * 32}:{CHANNEL}")
+
+
 def test_resolve_target_refuses_an_unmapped_channel():
     with pytest.raises(ngit.NgitError, match="no concord.projects entry"):
         ngit.resolve_target({"concord": {"projects": []}},

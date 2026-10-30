@@ -3,7 +3,7 @@
 The knowledge used to live in six commands run in a remembered order: is the config there,
 does the key read, can the store be written, does the daemon answer, is `ngit` new enough,
 does every mapped checkout carry a NIP-34 address, are the project and board really there,
-is there a cron pass per channel, and what is the watcher doing? Each check here is one of
+is a pass scheduled for each channel, and what is the watcher doing? Each check here is one of
 those questions, reports the answer, and names what to change when it fails.
 
 `run` never raises for a bad host: a broken config, a missing key or a missing `ngit` is a
@@ -33,6 +33,18 @@ from .projects import (
 
 #: How long the daemon gets to answer `status` before the socket check calls it absent.
 DAEMON_TIMEOUT_S = 3.0
+
+#: Where an installed pass timer can live: system units (an operator's install and a package's
+#: own drop), then the user units `systemctl --user` would read.
+SYSTEMD_UNIT_DIRS: tuple[Path, ...] = (
+    Path("/etc/systemd/system"),
+    Path("/usr/lib/systemd/system"),
+    Path.home() / ".config/systemd/user",
+)
+
+#: The unit that runs one pass. One timer instance per mapped channel id, so the instance
+#: name is the channel -- which is also the one string a channel id alone can be named by.
+NGIT_PASS_UNIT = "hermes-nostr-gateway-ngit"
 
 
 @dataclass(frozen=True)
@@ -83,10 +95,67 @@ class Report:
 
 # -- the checks --------------------------------------------------------------
 
+def credential_sources(name: str) -> list[tuple[str, Path]]:
+    """Installed units that load `name`, as (unit name, source file) pairs.
+
+    A credential is only readable inside the unit that loads it, so a hand-run `hng doctor`
+    cannot read the key the daemon reads. What it can check is the other half of the same
+    wiring: a gateway unit names the credential, and the file it points at is there.
+    """
+    found: list[tuple[str, Path]] = []
+    for directory in SYSTEMD_UNIT_DIRS:
+        for path in sorted(directory.glob("hermes-nostr-gateway*.service")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                key, sep, value = line.partition("=")
+                if not sep or key.strip() != "LoadCredential":
+                    continue
+                credential, colon, source = value.partition(":")
+                if colon and credential.strip() == name:
+                    found.append((path.name, Path(source.strip())))
+    return found
+
+
 def _identity_check(cfg: dict[str, Any]) -> Check:
-    """The key, read through the same code `hng serve` uses, so nothing is re-derived."""
+    """The key, read through the same code `hng serve` uses, or proven by the unit's wiring."""
     from .cli import secret_from
 
+    identity = cfg.get("identity") or {}
+    name = str(identity.get("secret_credential") or "").strip()
+    if name and not os.environ.get("CREDENTIALS_DIRECTORY"):
+        # A credential lives in a per-unit tmpfs: a hand-run doctor cannot read it, and
+        # calling that unreadable would fail the preflight on every correctly credentialled
+        # host. Check the wiring instead -- a unit loads it and its source file exists.
+        sources = credential_sources(name)
+        if sources:
+            unit, source = sources[0]
+            try:
+                present = source.exists()
+            except OSError:
+                # A root-only directory (the usual home for the key) stops this user
+                # stat-ing the file; the unit's own root can, which is what matters.
+                present = None
+            if present is False:
+                return Check("identity", False,
+                             f"credential {name!r} is loaded by {unit} from {source}, "
+                             "which is not there",
+                             f"create {source} (root-owned, not world-readable) "
+                             f"before {unit} starts")
+            if present is None:
+                return Check("identity", True,
+                             f"credential {name!r} is loaded by {unit}; {source} is root-only, "
+                             "so this user cannot read it (the unit can)")
+            return Check("identity", True,
+                         f"credential {name!r} is loaded by {unit} from {source}")
+        return Check(
+            "identity", False,
+            f"identity.secret_credential: {name!r} is not loaded by any installed "
+            "hermes-nostr-gateway service",
+            f"add LoadCredential={name}:/path/to/key to the unit that runs the daemon and "
+            "the pass, or set identity.secret_file instead")
     try:
         secret_from(cfg)
     except SystemExit as exc:
@@ -302,43 +371,105 @@ def _channel_tokens(project: Project) -> set[str]:
     return {token for token in tokens if token}
 
 
-def _cron_check(mapping: ProjectMap) -> Check:
-    """One enabled pass per channel that queues work; cron is the floor, not the watcher."""
+def _cron_cover(tokens: set[str], sources: list[tuple[str, str]]) -> str:
+    """Which cron source runs an enabled pass naming this channel, or "" for none."""
+    for name, text in sources:
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#") or "ngit sync" not in line.lower():
+                continue
+            if any(token in line.lower() for token in tokens):
+                return name
+    return ""
+
+
+def systemd_units() -> list[str]:
+    """Installed pass timers, by unit name, from every unit directory that exists.
+
+    An instance is named for its channel (`...@<channel-id>.timer`), and `systemctl enable`
+    leaves a symlink of that name in `timers.target.wants` even though the unit file beside
+    it is the template, so both the directory and its `.wants` children are read. The
+    template comes back too: it is ours, but it names no channel, and the check has to read
+    it as a template rather than mistake `%i` for a channel.
+    """
+    found: dict[str, None] = {}
+    patterns = (f"{NGIT_PASS_UNIT}@*.timer", f"*.wants/{NGIT_PASS_UNIT}@*.timer")
+    for directory in SYSTEMD_UNIT_DIRS:
+        for pattern in patterns:
+            for path in sorted(directory.glob(pattern)):
+                found.setdefault(path.name, None)
+    return list(found)
+
+
+def _unit_instance(unit: str) -> str:
+    """The channel a timer instance is named for; "" when the unit is the template."""
+    stem = unit.removesuffix(".timer")
+    _, at, instance = stem.partition("@")
+    return instance if at else ""
+
+
+def _systemd_cover(tokens: set[str], units: list[str]) -> str:
+    """The timer instance covering this channel, named, or "" when none is installed."""
+    for unit in units:
+        instance = _unit_instance(unit)
+        if instance and instance.lower() in tokens:
+            return f"systemd timer {unit}"
+    return ""
+
+
+def _systemd_template(units: list[str]) -> str:
+    """The pass timer's template (`...@.timer`) when its file is installed, else ""."""
+    for unit in units:
+        if unit.endswith("@.timer"):
+            return unit
+    return ""
+
+
+def _schedule_check(mapping: ProjectMap) -> Check:
+    """One enabled pass per channel that queues work; either scheduler counts.
+
+    The sources are read, not the running scheduler: an uncommented crontab line, or the
+    instance `systemctl enable` leaves in `timers.target.wants`, is the same evidence a
+    human would check. The detail names the scheduler that covered each channel, so a host
+    mid-cutover can see which one is doing the work. A template alone is not a pass -- it
+    names no channel and schedules nothing until an instance is enabled -- but it is
+    recognised, and the fix then names the instance to enable.
+    """
     queued = [project for project in mapping.all()
               if project.board and not project.config_error]
     if not queued:
-        return Check("cron", True,
+        return Check("schedule", True,
                      "no mapped channel queues work, so no bridge pass is needed")
     sources = cron_sources()
+    units = systemd_units()
     missing: list[str] = []
     covered: list[str] = []
     for project in queued:
         tokens = _channel_tokens(project)
-        found = ""
-        for name, text in sources:
-            pass_line = None
-            for line in text.splitlines():
-                stripped = line.lstrip()
-                if stripped.startswith("#") or "ngit sync" not in line.lower():
-                    continue
-                if any(token in line.lower() for token in tokens):
-                    pass_line = line
-                    break
-            if pass_line is not None:
-                found = name
-                break
+        found = _cron_cover(tokens, sources) or _systemd_cover(tokens, units)
         if found:
             covered.append(f"{project.channel} ({found})")
         else:
             missing.append(project.channel)
     if missing:
+        template = _systemd_template(units)
+        if template:
+            base = template.removesuffix("@.timer")
+            enable = ", ".join(f"`systemctl enable --now {base}@{channel}.timer`"
+                               for channel in missing)
+            schedule = f"the timer template is installed; enable one instance per channel: {enable}"
+        else:
+            schedule = ("install deploy/hermes-nostr-gateway-ngit@.{service,timer} and enable "
+                        "one instance per channel (`systemctl enable --now "
+                        "hermes-nostr-gateway-ngit@<channel-id>.timer`)")
         example = ("*/10 * * * * cd <checkout> && PATH=<dir holding hng>:<dir holding ngit>:"
                    "$PATH hng --config <config> ngit sync --channel "
                    "concord:<community-id>:<channel-id> --json")
-        return Check("cron", False, "no enabled pass names: " + ", ".join(missing),
-                     f"add one line per channel to crontab (or a Hermes cron job): {example}. "
-                     "Key the concord.projects entry by the channel id so the pass resolves it")
-    return Check("cron", True, "a pass covers " + ", ".join(covered))
+        return Check("schedule", False, "no enabled pass names: " + ", ".join(missing),
+                     f"{schedule}, or add one line per channel to crontab (or a Hermes cron "
+                     f"job): {example}. Key the concord.projects entry by the channel id so "
+                     "the pass resolves it")
+    return Check("schedule", True, "a pass covers " + ", ".join(covered))
 
 
 def _watcher_check(cfg: dict[str, Any], reply: dict | None, problem: str) -> Check:
@@ -347,26 +478,26 @@ def _watcher_check(cfg: dict[str, Any], reply: dict | None, problem: str) -> Che
 
     wanted = NgitWatchConfig.from_config(cfg)
     if not wanted.enabled:
-        return Check("watcher", True, f"off ({wanted.reason}); cron passes are the floor")
+        return Check("watcher", True, f"off ({wanted.reason}); scheduled passes are the floor")
     if reply is None:
         return Check("watcher", False, f"cannot read watcher state: {problem}",
-                     "start the daemon (`hng --config <config> serve`); the cron passes "
+                     "start the daemon (`hng --config <config> serve`); the scheduled passes "
                      "keep the bridge moving until it is up")
     watch = reply.get("ngit_watch")
     if not isinstance(watch, dict):
         return Check("watcher", False,
                      "the daemon does not report ngit_watch (an older build is running)",
                      "restart the daemon on this build so its status reports the watcher; "
-                     "cron passes are the floor meanwhile")
+                     "scheduled passes are the floor meanwhile")
     if not watch.get("enabled"):
         return Check("watcher", False,
                      f"not watching ({watch.get('reason') or 'no reason given'})",
-                     "fix the reported reason, then restart the daemon; cron passes are the "
-                     "floor meanwhile")
+                     "fix the reported reason, then restart the daemon; scheduled passes are "
+                     "the floor meanwhile")
     if not watch.get("alive"):
         return Check("watcher", False, "enabled, but no relay subscription is up yet",
-                     "check relay reachability and restart the daemon; cron passes are the "
-                     "floor meanwhile")
+                     "check relay reachability and restart the daemon; scheduled passes are "
+                     "the floor meanwhile")
     targets = watch.get("targets") or []
     relays = watch.get("relays") or []
     return Check("watcher", True,
@@ -392,7 +523,7 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
         _checkouts_check(mapping, status),
         projects_check,
         boards_check,
-        _cron_check(mapping),
+        _schedule_check(mapping),
         _watcher_check(cfg, reply, problem),
     )
     return Report(config=str(config_path), checks=checks)

@@ -12,7 +12,7 @@ time, over one socket. A digest batch arrives the same way. A plane fails **per 
 message can be blocked by policy, dropped, or left undelivered and replayed when the adapter
 reconnects, and nothing else waits on it.
 
-**Bridges are batch.** A cron pass reads repository events to a cursor and reconciles them into
+**Bridges are batch.** A scheduled pass reads repository events to a cursor and reconciles them into
 kanban tasks and channel notices. Their durable state is their own — links, cursors, an outbox —
 so a pass can stop halfway and the next one carries on. A bridge fails **per pass**: the cursor
 stays behind the first event it could not deal with, an undelivered notice stays queued, and a
@@ -20,7 +20,7 @@ board that is locked or missing is reported as that pass's error rather than a s
 
 | | **planes** | **bridges** |
 |---|---|---|
-| triggered by | a message arriving | a cron pass |
+| triggered by | a message arriving | a timer tick |
 | rhythm | one message at a time, live | batch, up to a cursor |
 | writes to | the socket (`message`, `blocked`, `delivery`) | kanban tasks, channel notices |
 | state | the store, replayed on reconnect | links, cursors and an outbox of its own |
@@ -139,7 +139,7 @@ records, so a busy daemon delays a notice instead of losing it and a lost acknow
 post twice. The cursor advances past what was queued or delivered and stops short of what was
 deferred, so a backlog is carried, not stepped over.
 
-[`docs/ngit-bridge.md`](docs/ngit-bridge.md) has the configuration, the cron shape and every
+[`docs/ngit-bridge.md`](docs/ngit-bridge.md) has the configuration, the timer units and every
 recovery path.
 
 The ten-minute pass is the floor, not the whole story: `hng serve` also **watches** the mapped
@@ -147,9 +147,10 @@ repositories — a `#a` subscription for kinds 1621/1622/1618/1619/1631, nothing
 `hng ngit sync` when something changes, coalescing a channel's events for 30 seconds and running
 one pass per channel at a time. It is an accelerator, never a second decision-maker: the watcher
 writes no cursor, no task and no notice, and the pass still reads the repository and decides. The
-cron pass stays for restarts, for relays that did not deliver and for a wake lost while the daemon
+timer pass stays for restarts, for relays that did not deliver and for a wake lost while the daemon
 was down, so a missed event costs latency rather than correctness. `ngit.watch: false` is exactly
-the cron-only behaviour, and `hng status` shows what the watcher is doing and what it has woken.
+the scheduled-pass-only behaviour, and `hng status` shows what the watcher is doing and what it has
+woken.
 
 ## Quick start
 
@@ -168,7 +169,8 @@ $EDITOR config.yaml                     # identity.secret_file, relays, policies
 config parses, the identity key reads, the store is writable, the configured socket path expands
 and the daemon answers, `ngit` is on `PATH` at or above its floor, every `concord.projects`
 checkout is a repository carrying a NIP-34 address, each declared project and board exists and is
-bound, cron carries a pass for every channel that queues work, and the watcher reports its state.
+bound, a timer instance or crontab line carries a pass for every channel that queues work, and the
+watcher reports its state.
 Every failing check names its fix; `--json` is the same shape for a script, and the exit code is 1
 when anything failed.
 
@@ -225,19 +227,26 @@ relay down — not on a quiet night and not on `blocked`, because a blocked mess
 working. `--json` gives either as a frame for a script, `--check` exits non-zero on an unhealthy
 relay, an unreachable daemon or a degraded plane, and `--quiet-minutes` sets the silence window.
 
-**The bridge** is a cron pass per channel, staggered so two passes do not reach for the same board
-at the same moment:
+**The bridge** is a systemd timer pass per channel (`deploy/hermes-nostr-gateway-ngit@.timer`),
+staggered so two passes do not reach for the same board at the same moment. The two units ship as
+a template pair; `docs/ngit-bridge.md`, "Running it", has the install and the cutover. One instance
+per mapped channel id:
 
-```cron
-*/10 * * * *    cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel-a> --json >> /var/log/hng-ngit.log 2>&1
+```sh
+sudo systemctl enable --now hermes-nostr-gateway-ngit@<channel-id>.timer
+```
+
+The pass runs under systemd rather than cron because both halves then read the identity the same
+way: the unit carries `LoadCredential=nostr_secret:...`, which a user crontab cannot. A crontab line
+is still counted by `hng doctor` for a host that prefers one, but it only works with
+`identity.secret_file`.
 
 The bridge shells out to `ngit`, so that binary is a pinned dependency: a version at or above
 **3.0.4** must be on `PATH` (the same floor `hng doctor` checks and names, with the install hint).
 A missing or older binary fails at the preflight of `hng ngit sync`, before any pass work — and
 after the configuration has been checked, because a bad config does not depend on what is
-installed.
-5-55/10 * * * * cd /path/to/gateway && hng ngit sync --channel concord:<community>:<channel-b> --json >> /var/log/hng-ngit.log 2>&1
-```
+installed. The unit puts the directory holding `hng` and the one holding `ngit` on `PATH`; a
+crontab line has to do the same itself.
 
 Its health is the pass's report: exit 0 when every message was delivered or queued for the daemon,
 1 when something was refused, unreadable or could not be filed, 2 when the configuration is wrong
