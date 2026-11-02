@@ -20,7 +20,10 @@ identity:
 # See docs/decisions.md, "The slash menu is the host's catalogue".
 advertise:
   publish: false            # true = kind 0 + kind 10304; or a list, e.g. [commands]
-  # name: example-agent     # required for the kind-0 half; `bot: true` is always set
+  # name: example-agent     # required for the kind-0 half; `bot: true` is always set.
+  #                         # Publishing it REPLACES this identity's kind 0 with `name`
+  #                         # plus `fields`, so leave the kind-0 half off where another
+  #                         # process (wn-agent) writes this identity's profile.
   # fields:                 # any extra kind-0 fields (about, picture, nip05, lud16, ...)
   #   about: A placeholder bot.
   # catalogue_file: ~/.local/state/hermes-nostr-gateway/commands.json

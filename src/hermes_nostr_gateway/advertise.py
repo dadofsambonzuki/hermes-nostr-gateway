@@ -335,7 +335,7 @@ def load_catalogue(path: str | Path) -> tuple[list[MenuCommand], list[str]]:
 
 @dataclass(frozen=True)
 class AdvertisementConfig:
-    """What ``profile:`` in the config asks this daemon to advertise.
+    """What ``advertise:`` in the config asks this daemon to advertise.
 
     Off by default. ``publish: true`` advertises both events; a list narrows it, which is
     what lets a deployment publish the command manifest without taking over a kind 0 that
