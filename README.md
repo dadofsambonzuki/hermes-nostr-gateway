@@ -81,6 +81,29 @@ envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, 
 `error`). A `blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
 `route_key_missing`, `route_unresolved`) and never looks like chat.
 
+### The slash menu a client can see (`advertise`)
+
+Hermes dispatches any `/command` it receives on this platform, but a client renders a menu only
+from a bot's **kind-10304** manifest — and only for a conversation member whose **kind 0** says
+`bot: true`. Both are published by this daemon when `advertise.publish` is configured; neither
+changes the wire: selecting a command sends `/name args` as ordinary text.
+
+The catalogue is the host's own, not a list kept here. The Hermes plugin writes
+`hermes_cli.commands_platforms._gateway_available_commands()` (plus plugin commands) to
+`commands.json` beside the socket at startup, and the daemon drops what this plane cannot render
+(`/topic`, `/voice`, `/save`), ranks the rest, and caps it at the client's 64. Publishing is
+skipped when the stored content hash matches, and every publish is *read back* per relay: a
+receipt is not retention.
+
+```
+hng profile show                 # what would be advertised, and what was last published
+hng profile publish              # publish what differs, then report each relay's answer
+hng profile publish --only commands --force
+```
+
+`publish: [commands]` advertises the menu without touching the identity's kind 0, for a
+deployment where another process owns that profile.
+
 ### Holding a message back, or steering it: `/queue` `/q` and `/steer` `/s`
 
 A message that lands while the agent is mid-turn arrives as another instruction, which is either

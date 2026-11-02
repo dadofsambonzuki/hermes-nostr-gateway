@@ -16,7 +16,7 @@ import yaml
 
 from .bots import BotRegistry
 from .control import ControlConfig
-from .crypto import CryptoError, SdkCrypto, parse_secret
+from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret
 from .fetch import fetch_many_blocking, stream_events
 from .health import (
     BAD,
@@ -680,6 +680,179 @@ def _held_concord_channels(cfg: dict[str, Any]) -> list[Any] | None:
     finally:
         store.close()
     return channels_from_invites(rows) or None
+
+
+def _advertisement_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """What the store says was last published, without creating a store that is not there."""
+    configured = str(cfg.get("store") or "").strip()
+    if not configured:
+        return []
+    path = Path(os.path.expanduser(configured))
+    if not path.is_file():
+        return []
+    store = Store(path)
+    try:
+        return store.advertised_all()
+    finally:
+        store.close()
+
+
+def _relay_line(name: str, word: str, error: str | None) -> str:
+    return f"    {name}: {word}" + (f" ({error})" if error else "")
+
+
+def cmd_profile(args) -> int:
+    """Show or publish what this identity advertises to clients.
+
+    Armada renders a bot's slash menu only from a kind-10304 manifest authored by a
+    conversation member whose kind 0 says `bot: true`, so this is the whole discovery
+    surface: the two events, built from the host catalogue, published and read back.
+    """
+    from dataclasses import replace
+
+    from .advertise import (
+        MANIFEST_KIND,
+        PROFILE_KIND,
+        AdvertiseError,
+        AdvertisementConfig,
+        Advertiser,
+        CatalogueError,
+        build_manifest,
+        load_catalogue,
+        resolve_relays,
+    )
+    from .gateway import default_socket_path
+    from .publisher import make_publisher
+
+    cfg = load_config(args.config)
+    socket = Path(os.path.expanduser(
+        str(args.socket or cfg.get("socket") or default_socket_path())))
+    try:
+        advert = AdvertisementConfig.from_config(cfg.get("advertise"), socket_path=socket)
+    except AdvertiseError as exc:
+        print(f"profile: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "catalogue", None):
+        advert = replace(advert, catalogue_file=Path(os.path.expanduser(args.catalogue)))
+
+    secret = secret_from(cfg)
+    crypto = SdkCrypto(secret)
+    me = crypto.our_pubkey()
+    npub = npub_encode(me)
+
+    if getattr(args, "profile_cmd", "show") == "show":
+        catalogue: dict[str, Any] = {"path": str(advert.catalogue_file), "exists": False}
+        try:
+            commands, notes = load_catalogue(advert.catalogue_file)
+        except CatalogueError as exc:
+            catalogue["error"] = str(exc)
+            notes = []
+        else:
+            catalogue.update(exists=True, menu=len(build_manifest(commands).content["commands"]),
+                             warnings=notes)
+        rows = _advertisement_rows(cfg)
+        if args.json:
+            print(json.dumps({"identity": npub, "advertise": {
+                "enabled": advert.enabled, "targets": list(advert.targets),
+                "profile": advert.profile, "catalogue": catalogue,
+                "relays": list(advert.relays)}, "published": rows}, indent=2))
+            return 0
+        print(f"identity:  {npub}")
+        if not advert.enabled:
+            print("profile:   off")
+        else:
+            shown = ", ".join("kind 0" if kind == PROFILE_KIND else "kind 10304"
+                              for kind in advert.targets)
+            print(f"profile:   {shown}")
+        if advert.publishes_profile:
+            print(f"           name {(advert.profile or {}).get('name')!r}, bot true")
+        print(f"catalogue: {catalogue['path']}")
+        if catalogue.get("exists"):
+            print(f"           {catalogue['menu']} command(s) in the menu")
+        else:
+            print(f"           {catalogue.get('error', 'missing')}")
+        for warning in catalogue.get("warnings") or []:
+            print(f"           {warning}")
+        for row in rows:
+            when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(int(row["published_at"])))
+            print(f"published: kind {row['kind']:<5} {row['event_id']}  {when}")
+            for relay, reason in (row.get("refused") or {}).items():
+                print(f"           refused by {relay}: {reason}")
+        if not rows and advert.enabled:
+            print("published: nothing yet")
+        return 0
+
+    targets = advert.targets
+    only = getattr(args, "only", None)
+    if only == "profile":
+        targets = tuple(kind for kind in targets if kind == PROFILE_KIND)
+    elif only == "commands":
+        targets = tuple(kind for kind in targets if kind == MANIFEST_KIND)
+    if not targets:
+        print("profile: nothing to publish; enable it with advertise.publish: true (or a list "
+              "such as [commands]) in the config, or pass --only for a configured target",
+              file=sys.stderr)
+        return 2
+
+    contents: dict[int, dict[str, Any]] = {}
+    warnings: list[str] = []
+    if PROFILE_KIND in targets:
+        if not advert.profile:
+            print("profile: advertise.name is required to publish the kind-0 profile",
+                  file=sys.stderr)
+            return 2
+        contents[PROFILE_KIND] = advert.profile
+    if MANIFEST_KIND in targets:
+        try:
+            commands, notes = load_catalogue(advert.catalogue_file)
+        except CatalogueError as exc:
+            print(f"profile: {exc}", file=sys.stderr)
+            return 2
+        manifest = build_manifest(commands)
+        contents[MANIFEST_KIND] = manifest.content
+        warnings = [*notes, *manifest.warnings]
+
+    store_path = Path(os.path.expanduser(str(cfg.get("store") or "gateway.db")))
+    if not store_path.exists():
+        print(f"profile: no store at {store_path}; start the daemon once first",
+              file=sys.stderr)
+        return 2
+    store = Store(store_path)
+    publisher = make_publisher(cfg, secret)
+
+    async def run() -> tuple[list[str], list[Any]]:
+        try:
+            relays = await resolve_relays((cfg.get("relays") or {}).get("publish") or [],
+                                          advert.relays, me=me, secret=secret)
+            advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
+                                    secret=secret)
+            return relays, await advertiser.publish(contents, relays, force=args.force)
+        finally:
+            await publisher.aclose()
+
+    try:
+        relays, reports = asyncio.run(run())
+    finally:
+        store.close()
+
+    if args.json:
+        print(json.dumps({"identity": npub, "relays": relays, "warnings": warnings,
+                          "reports": [report.as_dict() for report in reports]}, indent=2))
+    else:
+        print(f"identity:  {npub}")
+        for warning in warnings:
+            print(f"warning:   {warning}")
+        for report in reports:
+            print(f"kind {report.kind:<6} {report.status:<9} {report.event_id or '-'}")
+            for relay, (ok_relay, error) in report.published.items():
+                word = "refused" if relay in report.refused else ("ok" if ok_relay else "failed")
+                print(_relay_line(relay, word, error))
+            for relay, verdict in report.readback.items():
+                print(f"    {relay}: {verdict}")
+    ok = all(report.status != "failed" and not report.transient for report in reports)
+    ok = ok and all(verdict == "retained"
+                    for report in reports for verdict in report.readback.values())
+    return 0 if ok else 1
 
 
 def cmd_profiles(args) -> int:
@@ -1364,6 +1537,7 @@ def cmd_serve(args) -> int:
     import os
     import signal
 
+    from .advertise import AdvertiseError
     from .gateway import Gateway, MarmotOwnershipError
     from .routing import RoutingConfigError
 
@@ -1389,6 +1563,11 @@ def cmd_serve(args) -> int:
         # identity, so this is also a start that must not happen. `hng profiles --check`
         # reports the same problems without starting anything.
         print(f"refusing to start: profiles: {exc}", file=sys.stderr)
+        return 2
+    except AdvertiseError as exc:
+        # `advertise.publish` names something this daemon cannot advertise. Publishing
+        # nothing while the config says otherwise is the one outcome a menu must not have.
+        print(f"refusing to start: profile: {exc}", file=sys.stderr)
         return 2
 
     async def run() -> None:
@@ -1518,6 +1697,25 @@ def main(argv: list[str] | None = None) -> int:
                                  "turn as")
     p_profiles.add_argument("--json", action="store_true")
     p_profiles.set_defaults(func=cmd_profiles)
+
+    p_profile = sub.add_parser(
+        "profile", help="what this identity advertises: kind-0 profile + kind-10304 menu")
+    p_profile.add_argument("--socket", help="gateway socket (default: the configured one)")
+    p_profile.add_argument("--json", action="store_true", default=False)
+    profile_sub = p_profile.add_subparsers(dest="profile_cmd")
+    p_profile_show = profile_sub.add_parser(
+        "show", help="what is configured, and what was last published")
+    p_profile_show.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    p_profile_publish = profile_sub.add_parser(
+        "publish", help="publish the profile and command manifest, then read them back")
+    p_profile_publish.add_argument("--force", action="store_true",
+                                   help="publish even when the stored content hash matches")
+    p_profile_publish.add_argument("--catalogue",
+                                   help="read the host command catalogue from this file")
+    p_profile_publish.add_argument("--only", choices=("profile", "commands"),
+                                   help="publish one configured target instead of both")
+    p_profile_publish.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    p_profile.set_defaults(func=cmd_profile, profile_cmd="show")
 
     p_route = sub.add_parser(
         "route", help="which profile (and, when configured, model) a turn uses")

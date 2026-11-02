@@ -44,6 +44,12 @@ The gateway MUST NOT publish profile (0), contact list (3), relay list (10002) o
 kind. A startup check refuses to run if a configured `owned_kinds` entry collides with the
 wn-agent set. If that rule ever has to bend, introduce a signing broker and delete this table.
 
+**One opt-in exception: the advertisement.** `advertise.publish` may let the daemon publish kind 0
+(forced `bot: true`) and the kind-10304 command manifest, because a client discovers a bot's slash
+menu from exactly those two events. It is off by default; where another process (wn-agent) owns the
+identity's kind 0, `publish: [commands]` advertises the menu without writing the profile, so the
+two writers never share it. The reasoning and the command selection are in `docs/decisions.md`.
+
 The key is read from `~/.config/nostr-dm/identities/<npub>.json` (mode 0600, dir 0700,
 `{"npub":…,"secret_hex":…,"transports":["nip17","nip04"]}`). It is then held in memory and
 never passed through argv or the environment. `gateway identity import --from <path>` copies

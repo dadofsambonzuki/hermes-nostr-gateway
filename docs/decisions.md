@@ -296,3 +296,49 @@ a window a two-service restart already covers, and it belongs in a change that s
   the live store — but it makes this process's identity depend on another service's data
   directory. Rejected for that coupling, not for feasibility; if the duplicate is ever retired,
   this is the one-line change, and the check should stay.
+
+## The slash menu is the host's catalogue, and this plane's subset of it
+
+Armada renders a bot's commands only from a replaceable **kind 10304** manifest, discovered per
+conversation from the members whose **kind 0** says `bot: true`. This daemon publishes neither by
+default; `advertise.publish` turns the advertisement on, per event kind. Invocation is unchanged:
+`/name args` is an ordinary message and Hermes' gateway already dispatches it.
+
+**The catalogue is written by Hermes, not copied here.** The gateway does not import Hermes (the
+same rule as `profiles.py` copying the profile grammar), so the plugin — which runs inside Hermes —
+writes `hermes_cli.commands_platforms._gateway_available_commands()` plus the plugin entries to
+`commands.json` beside the socket, and the daemon validates that file. A list maintained in this
+repository would drift, and a menu that offers `/whatever` the host no longer dispatches is worse
+than no menu: the person selects it and gets "unknown command".
+
+**Three commands are not advertised, and the list is a deny-list.** `/topic` (Telegram DM topics),
+`/voice` (an audio surface this plane does not render) and `/save` (writes a file on the host that
+a chat reply cannot carry back) need a platform affordance a Nostr client cannot give. Everything
+else is kept, including `/queue` and `/steer`: those are exactly the words people type. It is a
+deny-list rather than an allow-list so a command Hermes adds tomorrow is advertised without an
+edit here — the failure mode of a stale allow-list is a menu that silently stops growing.
+
+**The menu is ranked, then capped at 64.** Hermes reports more gateway-available commands than the
+client accepts, and a plain truncation would drop `/help` and `/version` because of where they sit
+in the registry. Names in `MENU_PRIORITY` come first (the everyday ones, in the order Telegram's
+menu uses the same idea), then the host catalogue in its own order. Anything past the cap is still
+dispatchable when typed; it is only absent from the menu.
+
+**One identity, one catalogue.** Kind 10304 is replaceable per pubkey, so there is no per-channel
+manifest to build. Per-channel *authorisation* — who may run a command in a shared room — is a
+separate decision and is not part of this one; today Hermes gates by dm/group scope only.
+
+**Kind 0 is opt-in, and can be left to the other writer.** The spec's disjoint-kind table gives
+kind 0 to wn-agent, because two processes rewriting one replaceable profile fight and the last
+write wins. Discovery needs `bot: true`, so this daemon can publish it — but only when configured,
+and `publish: [commands]` exists so a deployment whose kind 0 belongs to another process advertises
+the menu without touching the profile. Where this daemon is the identity's only profile writer,
+`publish: true` publishes both.
+
+**Publishing is judged by the read-back.** A receipt is not retention: the report carries the event
+id and, per relay, whether the newest event for that author+kind is the one just published
+(`retained`), absent, or superseded by a newer write. The stored content hash is what makes a
+restart a no-op when nothing changed. A pending relay — a timeout, a dropped socket — is not
+stored, so the next start retries it; a relay that *refused* the kind (`blocked: only chat related
+events are allowed` from a chat-only relay, for instance) is recorded as a refusal instead, because
+a decision is not an outage and retrying it on every start would never change it.

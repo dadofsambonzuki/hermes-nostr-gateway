@@ -1283,7 +1283,61 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         return json.loads(raw)
 
 
+#: The daemon deliberately does not import Hermes (its `profiles.py` copies Hermes'
+#: profile grammar for the same reason), so the host's gateway-dispatchable commands cross
+#: the boundary as a file beside the gateway socket. This module *does* run inside Hermes,
+#: where `hermes_cli` is importable: writing the catalogue here is what keeps the slash menu
+#: the host's real catalogue instead of a list copied into the daemon and left to drift.
+#: Fully-qualified into `hermes_cli.commands*` on purpose -- it is the same source the
+#: Telegram menu is registered from, so a command that appears there appears here.
+COMMANDS_FILE = "commands.json"
+
+
+def catalogue_path() -> Path:
+    """Where the daemon reads the catalogue: beside the socket it also reads."""
+    configured = os.environ.get("NOSTR_GATEWAY_COMMANDS")
+    if configured:
+        return Path(os.path.expanduser(configured))
+    socket = os.environ.get("NOSTR_GATEWAY_SOCKET") or DEFAULT_SOCKET
+    return Path(os.path.expanduser(socket)).with_name(COMMANDS_FILE)
+
+
+def command_catalogue() -> list[dict[str, Any]]:
+    """The host's gateway-available commands, as plain data for the daemon's builder."""
+    from hermes_cli.commands import _iter_plugin_command_entries
+    from hermes_cli.commands_platforms import _gateway_available_commands
+
+    entries = [{"name": command.name, "description": command.describe(),
+                "args_hint": command.args_hint}
+               for command in _gateway_available_commands()]
+    seen = {entry["name"] for entry in entries}
+    for name, description, hint in _iter_plugin_command_entries():
+        # Plugin commands are dispatchable too; the daemon validates the name grammar and
+        # drops anything the client cannot address, so this stays a faithful copy here.
+        if name not in seen:
+            seen.add(name)
+            entries.append({"name": name, "description": description, "args_hint": hint})
+    return entries
+
+
+def write_command_catalogue(path: Path | None = None) -> Path:
+    """Write the catalogue atomically: a half-written file must not look like a menu."""
+    target = path or catalogue_path()
+    payload = {"source": "hermes", "generated_at": int(time.time()),
+               "commands": command_catalogue()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(target.name + ".tmp")
+    staging.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+    os.replace(staging, target)
+    return target
+
+
 def register(ctx) -> None:
+    try:
+        written = write_command_catalogue()
+        logger.info("wrote the gateway command catalogue: %s", written)
+    except Exception as exc:  # noqa: BLE001 - the platform must load without it
+        logger.warning("could not write the gateway command catalogue: %s", exc)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Nostr",

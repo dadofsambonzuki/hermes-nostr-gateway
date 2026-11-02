@@ -57,6 +57,17 @@ def _retryable(reason: str | None) -> bool:
     return not any(word in text for word in _DECISIONS)
 
 
+def is_permanent_refusal(reason: str | None) -> bool:
+    """True when a relay's answer is a *decision*, not an outage.
+
+    The same classification the durable outbox uses: `blocked`, `invalid`, `restricted`,
+    `not allowed` and friends will not change on a retry. For an advertisement that means
+    this relay will never carry this kind, which the caller records instead of retrying on
+    every start.
+    """
+    return not _retryable(reason)
+
+
 class Publisher(Protocol):
     """What the gateway and the CLI need: per-relay results, never a re-wrap."""
 

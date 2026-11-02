@@ -104,6 +104,19 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+-- What this identity last advertised: its kind-0 profile and its kind-10304 command
+-- manifest. The content hash is the decision -- a restart republishes only when the
+-- stored copy differs -- and the event id is what a per-relay read-back compares against.
+CREATE TABLE IF NOT EXISTS advertised (
+    kind         INTEGER PRIMARY KEY,
+    event_id     TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    published_at INTEGER NOT NULL,
+    -- Relays that refused the kind outright, as JSON {relay: reason}. A refusal is a
+    -- decision, so it is recorded rather than retried on every start.
+    refused      TEXT NOT NULL DEFAULT '{}'
+);
+
 -- Kind-0 claims we have read, so a restart does not refetch every peer and a peer that
 -- is a bot stays one. `bot` is 0/1, never NULL: a profile that said nothing about `bot`
 -- is a human by omission, which is different from a peer we have never looked up (no row).
@@ -493,6 +506,16 @@ class Store:
         for name, kind in _INVITE_COLUMNS.items():
             if name not in invite_cols:
                 self.db.execute(f"ALTER TABLE concord_invites ADD COLUMN {name} {kind}")
+
+        advert_cols = {
+            row["name"] for row in self.db.execute("PRAGMA table_info(advertised)")
+        }
+        if "refused" not in advert_cols:
+            # A store written before the column existed still holds the event id and hash;
+            # the refusals are the only part it could not have recorded.
+            self.db.execute(
+                "ALTER TABLE advertised ADD COLUMN refused TEXT NOT NULL DEFAULT '{}'"
+            )
 
         self.db.execute(
             "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
@@ -1055,6 +1078,45 @@ class Store:
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(value)),
         )
+
+    # -- advertisement (kind 0 + kind 10304) ------------------------------
+    def advertised(self, kind: int) -> dict[str, Any] | None:
+        """The stored copy of one advertised kind, or None when it was never published."""
+        row = self.db.execute(
+            "SELECT * FROM advertised WHERE kind = ?", (int(kind),)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            parsed = json.loads(item.get("refused") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        item["refused"] = parsed if isinstance(parsed, dict) else {}
+        return item
+
+    def record_advertised(self, kind: int, event_id: str, content_hash: str,
+                          published_at: int, refused: dict[str, str] | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO advertised (kind, event_id, content_hash, published_at, refused)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(kind) DO UPDATE SET event_id = excluded.event_id,"
+            " content_hash = excluded.content_hash, published_at = excluded.published_at,"
+            " refused = excluded.refused",
+            (int(kind), str(event_id), str(content_hash), int(published_at),
+             json.dumps(dict(refused or {}), sort_keys=True)),
+        )
+
+    def advertised_all(self) -> list[dict[str, Any]]:
+        rows = []
+        for row in self.db.execute("SELECT * FROM advertised ORDER BY kind"):
+            item = dict(row)
+            try:
+                parsed = json.loads(item.get("refused") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                parsed = {}
+            item["refused"] = parsed if isinstance(parsed, dict) else {}
+            rows.append(item)
+        return rows
 
     def replay_floor(self) -> int:
         """`received_at` below which nothing is ever replayed (0 = no floor)."""
