@@ -481,15 +481,20 @@ duplicate delivery is not something an operator can notice from a status line.
 
 ## 17. Attention policy (feeds and mentions)
 
-Two **independent** dimensions per sender group. Keeping them separate is the whole point: a
-public bot can *hear* strangers without letting them *instruct* it.
+Two **independent** dimensions per sender group, decided by one ordered list of rules. Keeping
+them separate is the point: a correspondent a rule names can be *heard* without being able to
+*instruct*. Who may be heard at all is the other half, and it is closed by default — with
+`reach: drop` as the fallback (built-in and shipped), an unauthorised sender is refused on every
+plane until a rule names them. A public bot's inbox is shut, not merely harmless.
 
 - **reach:** `immediate | digest(interval) | drop`
 - **authority:** `instructions | none`
 
 Built-in groups: `any` (everyone matched), `unknown` (not in any named group). Named groups are
 lists of npubs in config. Rules are ordered, first match wins, and anything unmatched falls to
-`defaults`.
+`defaults`. `any` matches a stranger as readily as anybody else, so a rule that should only reach
+people the config names has to sit *below* a refusal covering `unknown`: the shipped example's
+first rule is exactly that, and `tests/test_example_defaults.py` fails if it moves or is weakened.
 
 ```yaml
 groups:
@@ -497,11 +502,12 @@ groups:
   team:   [npub1…]
   peer:   [npub1example…]
 policies:
-  - match: {group: family, kinds: [1], mention: true}    -> {reach: immediate, authority: instructions}
-  - match: {group: any,    kinds: [1], mention: true}    -> {reach: digest(15m), authority: none}
-  - match: {group: peer,   kinds: [1]}                   -> {reach: digest(60m), authority: instructions}
-  - match: {group: unknown, kinds: [4, 1059]}            -> {reach: digest(60m), authority: none}
-defaults: {reach: digest(15m), authority: none, quota: 60/h}
+  # first: `any` below would otherwise match a stranger too
+  - match: {group: unknown}                           -> {reach: drop, authority: none}
+  - match: {group: family, kinds: [1], mention: true} -> {reach: immediate, authority: instructions}
+  - match: {group: any,    kinds: [1], mention: true} -> {reach: digest(15m), authority: none}
+  - match: {group: peer,   kinds: [1]}                -> {reach: digest(60m), authority: instructions}
+defaults: {reach: drop, authority: none}
 ```
 
 Rules:
@@ -509,13 +515,23 @@ Rules:
 - **Digest** batches over the configured interval: one message carrying a count, the top N items
   (author, time, snippet) and the `why` for each, plus the count of items dropped by quota. A
   digest with nothing in it is not sent — silence is the "nothing happened" signal.
-- **Quota** is per rule per hour; a global floor (default 60 deliveries/hour overall) stops a
-  misconfiguration from spinning the agent.
+- **`defaults` and the built-in.** `defaults` is the rule that matches nothing. Its built-in
+  reach, used when a config has no `defaults:` block, is `drop`; a rule that names no `reach` also
+  refuses. Nothing is digested unless a line of config says `digest`, so an omission cannot turn
+  into a 15-minute timer for strangers.
+- **A refusal leaves evidence.** A dropped message never reaches the agent as chat, but it is not
+  unrecorded: the row is stored, the refusal goes to the adapter as a `blocked` frame carrying its
+  reason (`not_allowlisted` for a `reach: drop`), and `hng drops` — the `drops` op — lists it, with
+  its `why`, for `drops.ttl_hours` (168h by default, then still counted but marked `expired`).
+  "Invisible" is a claim about the agent's attention, not about auditability.
+- **Quota** is per rule per hour via `limit`; the per-sender floor is `rate_limit.per_hour`
+  (default 30, burst 10), which stops one misconfiguration or one flood from spinning the agent.
 - **Dedupe across rules** by event id, so one post matching two rules arrives once, attributed to
   the highest-priority rule.
 - **Authority is not reach.** `authority: none` means the text reaches the agent as *data*; the
   agent must not act on instructions in it, and the adapter marks it as untrusted in the turn.
-  This is what makes a public bot safe: strangers can talk, nobody can instruct.
+  A named correspondent can talk without instructing; a stranger cannot reach the agent at all,
+  so there is nothing for them to instruct with.
 - The policy engine also decides DM delivery (§10 item 1) — one mechanism, not a separate feed
   allowlist bolted on.
 

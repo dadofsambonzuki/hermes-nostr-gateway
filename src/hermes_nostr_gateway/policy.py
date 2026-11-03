@@ -5,9 +5,11 @@ Two independent dimensions, deliberately not collapsed into one "trusted" flag:
     reach      immediate | digest(interval) | drop
     authority  instructions | none
 
-A public bot needs strangers to reach it (so it can answer) without letting them
-instruct it (so they cannot drive tools). Conflating these is how agent bots get
-prompt-injected. See docs/gateway-spec.md §17.
+A public bot has to decide who is heard at all before it decides what they may do.
+Reach and authority are independent: a correspondent a rule names can reach the agent
+without being able to instruct it (so they cannot drive tools), and a sender no rule
+names is refused outright rather than digested. Conflating the two is how agent bots
+get prompt-injected. See docs/gateway-spec.md §17.
 
 A peer that *is itself a bot* (kind 0 `bot: true`, read by `bots.BotRegistry`) gets
 three extra rules: it can never reach the agent immediately, our own text arriving back
@@ -211,8 +213,12 @@ class Policy:
         self._rules: list[_Rule] = []
         for i, raw in enumerate(config.get("policies") or []):
             match = raw.get("match") or {}
+            # A rule that names no reach refuses rather than digests. It is the same
+            # fail-closed choice as `defaults` below: nothing is digested unless a line
+            # in the config says `digest`, so a rule copied without its reach cannot
+            # quietly let an unauthorised sender through on a 15-minute timer.
             reach, interval = _parse_reach(
-                raw.get("reach", raw.get("deliver", "digest(15m)"))
+                raw.get("reach", raw.get("deliver", "drop"))
             )
             authority = str(raw.get("authority", "none")).lower()
             if authority not in ("instructions", "none"):
@@ -234,7 +240,13 @@ class Policy:
                 )
             )
         defaults = config.get("defaults") or {}
-        d_reach, d_interval = _parse_reach(defaults.get("reach", "digest(15m)"))
+        # `drop` is the built-in reach for the rule that matches nothing, so a config that
+        # never wrote a `defaults:` block still refuses an unauthorised sender instead of
+        # digesting them. The shipped config.example.yaml says the same explicitly, and
+        # spec §17 states it as the guarantee: a stranger is not heard until a rule names
+        # them. Refused is not unrecorded — the row is stored as evidence, which is what
+        # `hng drops` lists.
+        d_reach, d_interval = _parse_reach(defaults.get("reach", "drop"))
         self.default = Decision(
             reach=d_reach,
             interval_s=d_interval,

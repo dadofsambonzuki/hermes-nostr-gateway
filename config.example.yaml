@@ -148,6 +148,16 @@ groups:
   peer: ["npub1examplepeernpub000000000000000000000000000000000000000000000"]
 
 policies:
+  # First, because rules are ordered and first match wins: `group: any` below matches a
+  # stranger too, so the refusal has to stand above it. Unauthorised senders are refused
+  # here whatever plane they arrive on: a NIP-17 DM (kind 14 or 1059), a kind-1 mention, a
+  # legacy kind-4 note, a Marmot kind 9. To let one person in, put them in a group and let
+  # a rule below name that group; never weaken this rule. Being named is not enough on its
+  # own: a group with no rule still falls to `defaults`, which is `drop` too.
+  - name: strangers
+    match: {group: unknown}
+    reach: drop
+    authority: none
   - name: family-dms
     match: {group: family, kinds: [14, 1059], dm: true}
     reach: immediate
@@ -165,17 +175,23 @@ policies:
     match: {group: family, kinds: [9]}
     reach: immediate
     authority: instructions
-  - name: anyone-mentions
+  # A mention from somebody already in a named group. `group: any` is safe only because
+  # `strangers` above has already refused everyone else: this rule can digest a colleague,
+  # never a stranger.
+  - name: members-mentions
     match: {group: any, kinds: [1], mention: true}
     reach: digest(15m)
     authority: none
-  - name: unknown-dms
-    match: {group: unknown, kinds: [14, 1059], dm: true}
-    reach: digest(1h)
-    authority: none
 
 defaults:
-  reach: digest(15m)
+  # The rule that matches nothing, and the built-in reach when this block is missing: a
+  # sender no rule covers is refused rather than digested, on every plane, so a fresh
+  # install digests no stranger on any of them. Refused is not silent, though: the row is
+  # kept as evidence, a `blocked` frame carries `reason: not_allowlisted` to the adapter,
+  # and `hng drops` lists the message (with its `why`) for `drops.ttl_hours` (168h above).
+  # The agent is shown the refusal, never the text. Legacy kind-4 DMs in particular cost a
+  # sender nothing, so digesting them just feeds the noise.
+  reach: drop
   authority: none
 
 # Concord: the channel -> work mapping. A channel is a context, not a repository. `path` is
