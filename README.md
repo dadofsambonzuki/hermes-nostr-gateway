@@ -254,7 +254,8 @@ and the pass touched nothing. `--dry-run` reports what would happen and writes n
 
 The rest answer one question each: `hng recent`, `hng drops`, `hng listen --once`,
 `hng send --to <conversation> --text <text>`, `hng media <sha256|url>`, `hng policy-test`,
-`hng concord`, `hng projects`, `hng profiles`, `hng route`, `hng control`, `hng replay-skip`.
+`hng concord`, `hng projects`, `hng profiles`, `hng route`, `hng control`, `hng replay-skip`,
+`hng deps run` / `hng deps dry-run` (dependency proposals; see `docs/deps.md`).
 
 ## What it refuses
 

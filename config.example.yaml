@@ -294,3 +294,26 @@ defaults:
 #     - community: <community id>    # optional; restrict this rule to one community
 #       channel: <channel id or name>
 #       profile: ops
+
+# Dependency proposals (`hng deps`): the weekly pipeline that scans these repositories,
+# bumps what OSV reports at or above the CVSS floor, runs each repository's own gates and
+# publishes what survives as a `pr/deps-<date>` proposal. It is deliberately not part of the
+# daemon's poll loop: a run spends minutes in npm, cargo and docker, and must not be able to
+# stall the relay. It runs as its own systemd oneshot -- `deploy/nostr-deps.service` on
+# `deploy/nostr-deps.timer` -- and `hng deps run --dry-run` reports without writing.
+deps:
+  # One entry per repository a proposal may be made in. `owner` is whoever published the
+  # NIP-34 announcement the `nostr://` remote resolves; `branch` is the branch a proposal is
+  # cut from (NIP-34 carries no target branch).
+  repositories:
+    - name: example-repo
+      owner: <owner npub>
+      branch: main
+  min_severity: 7            # CVSS floor: 7 = high and above
+  workspace: /opt/deps-bot   # the bot's clones, kept across runs and never inside a checkout
+  state_dir: /var/lib/nostr-deps    # last-proposal hashes, so a pending bump is not repeated
+  log: /var/log/nostr-deps.log
+  signer: <deps bot npub>    # signs the proposal push and the scan trigger; never a key file
+  coordinator: <coordinator npub>   # whose name a manual CI run is requested from
+  workflow: .ngit/act/workflows/dependencies.yml
+  open_prs: true             # false = scan, bump and gate, publish nothing
