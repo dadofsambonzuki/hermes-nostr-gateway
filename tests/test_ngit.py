@@ -1619,6 +1619,298 @@ def test_the_label_vocabulary_is_a_config_default():
     assert ngit.BridgeConfig.from_config({"labels": False}).labels is False
 
 
+# -- one card per PR: a revision reopens it, never duplicates -----------------
+
+def pr_links(harness) -> list[dict]:
+    """Every PR link the bridge holds for the one repository, regardless of the PR."""
+    return harness.store.ngit_links(ADDRESS, ngit.KIND_PR)
+
+
+def revision_of(pr, tip: str, *, created_at: int = 2000, event: str = "1") -> ngit.Revision:
+    return ngit.Revision(pr_id=pr.id, commit=tip, created_at=created_at,
+                         event_id=event * 64)
+
+
+def test_two_passes_over_two_revisions_keep_one_card_and_one_link(harness):
+    """The card is the queue, the PR is the record: two revisions, still one of each."""
+    pr = make_pr("f1", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+
+    for number, tip in enumerate(("b" * 40, "c" * 40), start=2):
+        # The worker finished its review and handed the card back.
+        set_review_status(harness, task_id, "review")
+        harness.prs_data = ngit.PrFeed(revisions=[
+            revision_of(pr, tip, created_at=1000 * number, event=str(number))])
+        report = harness.sync()
+
+        assert report.prs["revisions"] == 1 and report.prs["reopened"] == 1
+        assert harness.task(task_id)["status"] == "ready"
+        assert tip in harness.comments(task_id)[-1]["body"]
+        assert len(harness.tasks()) == 1
+        assert len(pr_links(harness)) == 1
+
+    # The link still names the one card, and a quiet pass changes neither count.
+    link = pr_links(harness)[0]
+    assert link["task_id"] == task_id
+    harness.prs_data = ([], [])
+    report = harness.sync()
+    assert report.prs["reopened"] == 0 and report.prs["revisions"] == 0
+    assert len(harness.tasks()) == 1 and len(pr_links(harness)) == 1
+
+
+def test_a_revision_naming_the_same_tip_again_changes_nothing(harness):
+    """A relay replays the window on every reconnect; a replay is not a second revision."""
+    pr = make_pr("f2", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    harness.sync()
+    comments = len(harness.comments(task_id))
+
+    report = harness.sync()
+
+    assert report.prs["revisions"] == 0 and report.prs["reopened"] == 0
+    assert harness.task(task_id)["status"] == "ready"
+    assert len(harness.comments(task_id)) == comments
+
+
+def test_a_second_1618_that_names_its_root_is_read_as_a_revision():
+    """ngit can publish a republished proposal as another 1618 carrying `E`/`P`."""
+    root, update = event_id("d1"), event_id("d2")
+    events = [
+        {"id": root, "kind": ngit.KIND_PR, "pubkey": REPO_OWNER, "created_at": 1000,
+         "tags": [["a", ADDRESS], ["subject", "Add a widget"],
+                  ["branch-name", "pr/widget"], ["c", "a" * 40]]},
+        {"id": update, "kind": ngit.KIND_PR, "pubkey": REPO_OWNER, "created_at": 2000,
+         "tags": [["a", ADDRESS], ["E", root], ["P", REPO_OWNER], ["c", "b" * 40],
+                  ["alt", "git Pull Request Update"]]},
+    ]
+    feed = ngit.RelayPrs(["wss://relay.example"], ADDRESS,
+                         fetcher=lambda **kwargs: events).events(0)
+
+    assert [pr.id for pr in feed.prs] == [root]
+    assert [(revision.pr_id, revision.commit) for revision in feed.revisions] == [
+        (root, "b" * 40)]
+
+
+def test_one_poll_carrying_a_proposal_and_its_republish_makes_one_card(harness):
+    """The first poll must not need a link to know the two events are one PR."""
+    root = make_pr("aa", commit="a" * 40, branch="pr/widget", created_at=1000)
+    repeat = make_pr("ab", commit="b" * 40, branch="pr/widget", created_at=2000)
+    harness.prs_data = ([root, repeat], [])
+
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 1 and len(pr_links(harness)) == 1
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 1
+    task = review_tasks(harness)[0]
+    assert task["idempotency_key"] == f"ngit:pr:{root.id}"
+    assert "b" * 40 in harness.comments(task["id"])[-1]["body"]
+
+
+def test_a_republished_proposal_reopens_the_one_card(harness):
+    """A rebased branch read as a fresh proposal is the same work, not a second PR."""
+    pr = make_pr("f3", commit="a" * 40, branch="pr/widget")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+
+    repeat = make_pr("f4", commit="b" * 40, branch="pr/widget")
+    harness.prs_data = ([repeat], [])
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 1 and len(pr_links(harness)) == 1
+    assert harness.task(task_id)["status"] == "ready"
+    assert report.prs["reopened"] == 1 and report.prs["tasks"] == 0
+    assert "b" * 40 in harness.comments(task_id)[-1]["body"]
+    # No second channel message: the PR was announced when it opened.
+    assert len(harness.messages) == 1
+
+
+def test_a_republished_proposal_of_another_author_is_a_new_pr(harness):
+    """Two authors' `pr/widget` branches are two proposals; only one author's is a repeat."""
+    pr = make_pr("f5", commit="a" * 40, branch="pr/widget")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    set_review_status(harness, review_tasks(harness)[0]["id"], "review")
+
+    other = make_pr("f6", author=STRANGER_HEX, commit="b" * 40, branch="pr/widget")
+    harness.prs_data = ([other], [])
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 2 and len(pr_links(harness)) == 2
+    assert report.prs["tasks"] == 1 and report.prs["reopened"] == 0
+
+
+def test_a_republished_proposal_of_a_merged_pr_is_a_new_pr(harness):
+    """Applied is final: the branch being pushed again is new work, not a revision."""
+    pr = make_pr("f7", commit="a" * 40, branch="pr/widget")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1500)
+    harness.prs_data = ([pr], [merge])
+    harness.sync()
+    assert harness.task(task_id)["status"] == "done"
+
+    repeat = make_pr("f8", commit="b" * 40, branch="pr/widget", created_at=2000)
+    harness.prs_data = ([repeat], [])
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 2 and len(pr_links(harness)) == 2
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
+
+
+def test_a_revision_does_not_edit_a_card_that_is_still_running(harness):
+    """A worker reading the old tip is told the tip moved; its claim is not taken away."""
+    pr = make_pr("f9", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "running")
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "running"
+    assert report.prs["revisions"] == 1 and report.prs["reopened"] == 0
+    assert "b" * 40 in harness.comments(task_id)[-1]["body"]
+
+
+def test_a_revision_does_not_release_a_held_card(harness):
+    """A blocked card waits for a person's authorisation, not for a revision."""
+    pr = make_pr("fa", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "blocked")
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "blocked"
+    assert report.prs["reopened"] == 0
+    # The tip is still recorded: the label and the next pass read the revision.
+    assert label_detail(harness, pr.id)["tip"] == "b" * 40
+
+
+def test_a_done_card_on_a_pr_that_never_merged_reopens(harness):
+    """A verdict finished the review; a new tip puts the same card back in the queue."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.board.comment(task_id, "review", "Verdict: approved")
+    set_review_status(harness, task_id, "done")
+    harness.board.db.execute("UPDATE tasks SET completed_at = 1 WHERE id = ?", (task_id,))
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready" and row["completed_at"] is None
+    assert report.prs["reopened"] == 1
+    assert "b" * 40 in harness.comments(task_id)[-1]["body"]
+
+
+def test_reopening_keeps_the_model_pin_and_resets_the_failure_count(harness):
+    """A revision is not a channel-config change, and it is a fresh attempt."""
+    pr = make_pr("fb", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+    harness.board.db.execute(
+        "UPDATE tasks SET model_override = ?, provider_override = ?,"
+        " consecutive_failures = 3, last_failure_error = 'boom' WHERE id = ?",
+        ("deepseek-v4.1-flash", "opencode-go", task_id))
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready"
+    assert row["model_override"] == "deepseek-v4.1-flash"
+    assert row["provider_override"] == "opencode-go"
+    assert row["consecutive_failures"] == 0
+    assert row["last_failure_error"] is None
+
+
+def test_a_late_update_against_an_applied_pr_changes_nothing(harness):
+    pr = make_pr("fc", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1500)
+    harness.prs_data = ([pr], [merge])
+    harness.sync()
+    assert harness.task(task_id)["status"] == "done"
+    before = [comment["body"] for comment in harness.comments(task_id)]
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "done"
+    assert [comment["body"] for comment in harness.comments(task_id)] == before
+    assert report.prs["reopened"] == 0 and report.prs["revisions"] == 0
+
+
+def test_a_revision_cannot_reopen_while_the_merge_notice_is_still_queued(home, store):
+    """The merge is on the row before the notice lands, so the card cannot be revived."""
+    def down(who, text, key=""):
+        raise ngit.NotifyError("the daemon is not running")
+
+    made = Harness(home, store, notifier=down)
+    try:
+        pr = make_pr("fd", commit="a" * 40)
+        made.prs_data = ([pr], [])
+        made.sync()
+        task_id = review_tasks(made)[0]["id"]
+        merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1500)
+        made.prs_data = ([pr], [merge])
+        made.sync()
+        assert made.task(task_id)["status"] == "done"
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "pending"
+
+        made.prs_data = ngit.PrFeed(revisions=[
+            revision_of(pr, "b" * 40, created_at=2000)])
+        report = made.sync()
+
+        assert made.task(task_id)["status"] == "done"
+        assert report.prs["reopened"] == 0
+    finally:
+        made.close()
+
+
+def test_a_revision_of_a_pr_this_bridge_never_announced_creates_nothing(harness):
+    pr = make_pr("fe", commit="a" * 40)
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+
+    report = harness.sync()
+
+    assert harness.tasks() == [] and pr_links(harness) == []
+    assert report.prs["revisions"] == 0 and report.prs["reopened"] == 0
+
+
+def test_a_dry_run_counts_a_reopen_and_writes_nothing(harness):
+    pr = make_pr("ff", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+    comments = len(harness.comments(task_id))
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])
+    report = harness.sync(dry_run=True)
+
+    assert report.prs["revisions"] == 1 and report.prs["would_reopen"] == 1
+    assert harness.task(task_id)["status"] == "review"
+    assert len(harness.comments(task_id)) == comments
+    assert label_detail(harness, pr.id).get("tip") != "b" * 40
+
+
 # -- the board anchor ---------------------------------------------------------
 
 def test_a_project_board_gives_the_task_a_worktree_and_a_branch(home, store):

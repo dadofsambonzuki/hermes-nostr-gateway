@@ -9,6 +9,8 @@ the same lookup serves the inbound and the outbound half of this module:
     outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
                                    review task on that board (a verdict, never a merge:
                                    merging is the operator's)
+              kind-1619 revision -> reopens that one task with the new tip, as one comment;
+                                   a revision never makes a second card
               kind-1631 applied  -> one "merged as <commit>" follow-up, which also closes
                                    the review task
 
@@ -24,10 +26,10 @@ and nobody's issue is silently worked. The question is durable state -- a task c
 the `ngit_links` row -- not a live turn's memory, so a restart does not forget it and a
 re-poll does not ask twice.
 
-State (the `ngit_*` tables in `store.py`): one link per issue and per PR, carrying the task
-id and the lifecycle the bridge reached, plus a per-repo high-water mark so a poll asks only
-for what is new. A task deleted by hand leaves its `deleted` link behind, so the next sync
-does not silently recreate it; `--recreate` is how an operator asks for it back.
+State (the `ngit_*` tables in `store.py`): one link per issue and per PR root, carrying the
+task id and the lifecycle the bridge reached, plus a per-repo high-water mark so a poll asks
+only for what is new. A task deleted by hand leaves its `deleted` link behind, so the next
+sync does not silently recreate it; `--recreate` is how an operator asks for it back.
 
 A PR notice is queued before it is posted and marked sent only when the daemon took it, so a
 poll that is cut off mid-send (a turn holds the daemon past the socket timeout) leaves the
@@ -59,7 +61,7 @@ import nostr_sdk as sdk
 
 from .control import ControlConfig, as_hex
 from .fetch import fetch_many_blocking
-from .kanban import Anchor, Board, BoardError
+from .kanban import DONE, REVIEW, Anchor, Board, BoardError
 from .ngit_labels import Labeler, parse_verdict, review_labels
 from .projects import ProjectMap, board_dir, hermes_home
 from .store import Store
@@ -315,9 +317,14 @@ class Merge:
 
 @dataclass(frozen=True)
 class Revision:
-    """A kind-1619 update: the PR it belongs to and the tip it moved the PR to."""
+    """A PR update: the PR root it belongs to and the tip it moved the PR to.
 
-    pr_id: str         # hex of the PR event its `E` tag names
+    NIP-34's own spelling is kind 1619 (`E` names the PR, `c` the new tip). A client that
+    republishes a proposal can also send the same tags on a second kind 1618, so the reader
+    decides on the tags, not on the kind alone.
+    """
+
+    pr_id: str         # hex of the PR root event its `E` tag names
     commit: str = ""
     created_at: int = 0
     event_id: str = ""
@@ -328,7 +335,8 @@ class PrFeed:
     """One poll's PR events: proposals, their revisions, and the merges that closed them.
 
     A revision is not a second proposal, so it is not folded into `prs`: the PR keeps its
-    identity, its subject and its review task, and only its tip moves.
+    identity, its subject and its review task, and only its tip moves. That is also why
+    the review task is keyed on the root: one card per PR, for the life of the PR.
     """
 
     prs: list[PullRequest] = field(default_factory=list)
@@ -348,6 +356,22 @@ class PrFeed:
             if seen is None or revision.created_at >= seen[1]:
                 tips[revision.pr_id] = (revision.commit, revision.created_at)
         return tips
+
+
+def newest_revisions(revisions: Sequence[Revision]) -> list[Revision]:
+    """One revision per PR: the newest tip the poll carried.
+
+    An older one replayed by a relay, or re-read because of the cursor's overlap, must
+    not move the tip back and invent a revision that never happened.
+    """
+    newest: dict[str, Revision] = {}
+    for revision in revisions:
+        if not revision.commit:
+            continue
+        seen = newest.get(revision.pr_id)
+        if seen is None or revision.created_at >= seen.created_at:
+            newest[revision.pr_id] = revision
+    return list(newest.values())
 
 
 @dataclass(frozen=True)
@@ -460,7 +484,7 @@ class Report:
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
-        "labels": 0, "label_errors": 0})
+        "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -502,6 +526,9 @@ class Report:
                    + (f", {p['pending']} pending (queued for the next pass)"
                       if p["pending"] else "")
                    + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
+                   + (f", {p['revisions']} revision(s)" if p["revisions"] else "")
+                   + (f", {p['reopened']} card(s) reopened" if p["reopened"] else "")
+                   + (f", {p['would_reopen']} would reopen" if self.dry_run else "")
                    + (f", {p['review_errors']} review failure(s)" if p["review_errors"] else "")
                    + (f", {p['labels']} label(s) published" if p["labels"] else "")
                    + (f", {p['label_errors']} label failure(s)" if p["label_errors"] else "")
@@ -818,19 +845,24 @@ class RelayPrs:
             if not isinstance(event, dict) or not event.get("id"):
                 continue
             kind = int(event.get("kind") or 0)
-            if kind == KIND_PR:
-                pr = pull_request_from_event(event)
-                # A revision (1619) or a re-publish can repeat a subject; the id is the PR.
-                prs[pr.id] = pr
-            elif kind == KIND_PR_REVISION:
+            if kind in (KIND_PR, KIND_PR_REVISION):
+                # A `c` tag with an `E` that names another event is an update, whatever
+                # kind the client published it as: NIP-34 spells it 1619, and a
+                # republished proposal can carry the same tags on a 1618. Only a 1618
+                # with no root reference is a new PR.
                 revision = revision_from_event(event)
-                if revision is None:
+                if revision is not None and revision.pr_id != str(event.get("id") or ""):
+                    seen = revisions.get(revision.pr_id)
+                    if seen is None or revision.created_at >= seen.created_at:
+                        revisions[revision.pr_id] = revision
                     continue
-                seen = revisions.get(revision.pr_id)
-                # Only the newest tip per PR matters: an older one replayed by a relay must
-                # not move the tip back and invent a revision that never happened.
-                if seen is None or revision.created_at >= seen.created_at:
-                    revisions[revision.pr_id] = revision
+                if kind == KIND_PR_REVISION:
+                    # A 1619 that names no root cannot be attached to a PR; guessing at
+                    # one would move a review to the wrong record.
+                    continue
+                pr = pull_request_from_event(event)
+                # A re-publish can repeat a subject; the id is the PR.
+                prs[pr.id] = pr
             elif kind == KIND_APPLIED:
                 merge = merge_from_event(event)
                 if merge is not None:
@@ -982,6 +1014,25 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "",
         *steps,
     ])
+
+
+def revision_note(note: dict[str, Any], revision: Revision) -> str:
+    """The one comment a revision puts on the PR's existing card.
+
+    It names the tip and the event that moved it, and says what that does to a review that
+    was already recorded: a reviewer opening the card after a reopen has to be able to see
+    which commit is current without reading the channel.
+    """
+    subject = str(note.get("subject") or "")
+    where = f'"{subject}"' if subject else f"PR {revision.pr_id[:8]}"
+    lines = [f"Revision: {where} tip is now {revision.commit}"]
+    if revision.event_id:
+        lines[0] += f" (event {revision.event_id})"
+    nevent = str(note.get("nevent") or "")
+    if nevent:
+        lines.append(nevent)
+    lines.append("Review this tip: a verdict recorded before it covers the earlier revision.")
+    return "\n".join(lines)
 
 
 def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> str:
@@ -1288,18 +1339,25 @@ class Sync:
             raise NgitError("no PR source configured")
         start = self._since(since)
         feed = self.prs(start)
-        prs, merges = feed.prs, feed.merges
+        merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
+        # A re-push that a client published as a second proposal is the same work, not a
+        # second PR: fold it onto the root the bridge already has, as a revision. The feed
+        # the rest of the pass sees then has one entry per PR root, which is what makes
+        # "one card per PR" enforceable at all.
+        prs, repeats = self._fold_repeats(feed.prs, applied)
+        feed = PrFeed(prs=prs, merges=merges,
+                      revisions=newest_revisions([*feed.revisions, *repeats]))
         budget = max(1, int(self.config.max_prs or 1))
         if not dry_run:
             self._requeue_stranded(report)
+        report.prs["seen"] += len(feed.prs) + len(repeats)
         #: Events this poll dealt with (reported, queued, or deliberately passed over), and
         #: ones it only saw. The cursor may move past the first set and never the second.
         settled: list[int] = []
         deferred: list[int] = []
 
-        for pr in sorted(prs, key=lambda p: (p.created_at, p.id)):
-            report.prs["seen"] += 1
+        for pr in sorted(feed.prs, key=lambda p: (p.created_at, p.id)):
             link = self.store.ngit_link(self.target.key, KIND_PR, pr.id)
             if link is not None and link["state"] != "pending":
                 report.prs["existing"] += 1
@@ -1352,7 +1410,7 @@ class Sync:
                 report.prs["deferred"] += 1
                 deferred.append(merge.created_at)
                 continue
-            known = next((pr for pr in prs if pr.id == merge.pr_id), None)
+            known = next((pr for pr in feed.prs if pr.id == merge.pr_id), None)
             note = _detail(link)
             nevent = str(note.get("nevent") or "")
             if known is None and note.get("subject"):
@@ -1366,12 +1424,24 @@ class Sync:
             if dry_run:
                 report.prs["would_post"] += 1
                 continue
+            # The merge is written on the row before the notice is queued: `applied` is
+            # final, and a revision that arrives while the notice is still undelivered
+            # must not reopen the card the merge has just closed.
+            if merge.commit and str(note.get("merge") or "") != merge.commit:
+                note["merge"] = merge.commit
+                self._save_detail(link, note, task_id=str(link.get("task_id") or ""))
             self._enqueue(KIND_PR, merge.pr_id, "merged", text)
             # The merge closes the loop: the review task is done, with the merge named on it.
             # A task already completed is a no-op, and this runs even for a link already
             # `merged`, so one that could not be closed on a locked board closes later.
             if known is not None:
                 self._close_review(known, merge, link, report, dry_run=dry_run)
+
+        # A revision reopens the PR's card, one comment naming the new tip. It runs after
+        # the merge loop so an applied PR is never reopened, and before the labels so the
+        # label walk reads the card in the state this pass leaves it.
+        self._revisions(feed, report, dry_run=dry_run)
+        settled.extend(revision.created_at for revision in feed.revisions)
 
         # Labels last: every task the poll just made or closed is state the label walk has
         # to see, and a label that cannot be published must not hold the cursor -- the next
@@ -1388,6 +1458,107 @@ class Sync:
             edge = min(max(settled), *deferred) if deferred else max(settled)
             if edge - CURSOR_OVERLAP_S > start:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
+
+    def _fold_repeats(self, prs: Sequence[PullRequest],
+                      applied: dict[str, Merge]) -> tuple[list[PullRequest], list[Revision]]:
+        """Split proposals into new PRs and repeats of a PR the bridge already has.
+
+        A proposal's identity is its event id, so a re-push that a client published as a
+        *second* 1618 -- a rebased branch read as a fresh proposal -- would otherwise be a
+        second PR, a second card and a second notice. The branch is the work's identity:
+        one author cannot have two live proposals from the same source branch. A proposal
+        whose (author, branch) an existing, unapplied link already names is folded onto
+        that root as a revision; the oldest link wins, because the 1618 that opened the PR
+        is the record. A proposal with no tip names no revision and is left as a PR.
+        """
+        known: dict[tuple[str, str], str] = {}
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            source = str(link.get("source_id") or "")
+            if not source or source in applied or str(link.get("state") or "") == "merged":
+                # Applied is final: the same author pushing the same branch again after a
+                # merge is a new proposal, not a revision of a closed one.
+                continue
+            note = _detail(link)
+            author, branch = str(note.get("author") or ""), str(note.get("branch") or "")
+            if author and branch:
+                known.setdefault((author, branch), source)
+        # The poll's own proposals are folded among themselves too, oldest first: a first
+        # poll that carries both a re-push and the proposal it repeats must still make one
+        # card, not two that the next poll can no longer untangle.
+        for pr in sorted(prs, key=lambda p: (p.created_at, p.id)):
+            if pr.branch and pr.commit:
+                known.setdefault((pr.author, pr.branch), pr.id)
+        fresh: list[PullRequest] = []
+        repeats: list[Revision] = []
+        for pr in prs:
+            root = known.get((pr.author, pr.branch)) if pr.branch and pr.commit else None
+            if root and root != pr.id:
+                repeats.append(Revision(pr_id=root, commit=pr.commit,
+                                        created_at=pr.created_at, event_id=pr.id))
+                continue
+            fresh.append(pr)
+        return fresh, repeats
+
+    def _revisions(self, feed: PrFeed, report: Report, *, dry_run: bool) -> None:
+        """Reopen the PR's card for a new tip; a revision never creates a card.
+
+        The card is the queue and the PR is the record: one PR root has one card for the
+        life of the PR, so a revision re-queues that card (`review`/`done` -> `ready`) with
+        one comment naming the new tip and leaves the link row -- and its task id -- where
+        they are. A card that is already queued or running is left in place: it is about
+        to read, or is reading, the tip the comment names. `applied` is final, and a
+        revision older than the tip the row already knows is a replay, not news.
+        """
+        if not feed.revisions:
+            return
+        applied = {merge.pr_id for merge in feed.merges}
+        for revision in sorted(feed.revisions, key=lambda r: (r.created_at, r.pr_id)):
+            link = self.store.ngit_link(self.target.key, KIND_PR, revision.pr_id)
+            if link is None:
+                continue  # never announced: the channel was not told, so nothing reopens
+            note = _detail(link)
+            if (str(link.get("state") or "") == "merged" or revision.pr_id in applied
+                    or note.get("merge")):
+                continue  # applied: a late update cannot reopen a finished PR
+            tip = str(revision.commit or "")
+            if not tip or tip == str(note.get("tip") or ""):
+                continue
+            if revision.created_at < int(note.get("tip_at") or 0):
+                continue  # a replayed older revision must not move the tip back
+            report.prs["revisions"] += 1
+            note["tip"], note["tip_at"] = tip, int(revision.created_at)
+            task_id = self._review_anchor(link)
+            task = self.board.task(task_id) if task_id else None
+            status = str(task.get("status") or "") if task else ""
+            if dry_run:
+                if status in (REVIEW, DONE):
+                    report.prs["would_reopen"] += 1
+                continue
+            if task_id and status in (REVIEW, DONE, "ready", "running"):
+                text = revision_note(note, revision)
+                try:
+                    if status in (REVIEW, DONE):
+                        if self.board.reopen(task_id, author="ngit", comment=text):
+                            report.prs["reopened"] += 1
+                            log.info("ngit: reopened %s for PR %s at %s",
+                                     task_id, revision.pr_id[:8], tip[:12])
+                        else:
+                            # The card moved under us (a worker finished it, a person
+                            # archived it). The tip stays unrecorded so the next pass
+                            # decides from the state it actually finds.
+                            continue
+                    else:
+                        self.board.comment(task_id, "ngit", text)
+                except (BoardError, sqlite3.Error) as exc:
+                    # The tip is not recorded, so the next pass tries the card again
+                    # instead of believing a comment that never landed.
+                    report.prs["review_errors"] += 1
+                    report.errors.append(f"revision of PR {revision.pr_id[:8]}: {exc}")
+                    continue
+            # No card to reopen (a PR announced with reviews off, or a task deleted by
+            # hand), or one waiting on a human: the tip is still recorded, so the label
+            # and any later pass read it.
+            self._save_detail(link, note, task_id=task_id)
 
     def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool) -> tuple[str, str]:
         """One review task for this PR, or the reason there is none.

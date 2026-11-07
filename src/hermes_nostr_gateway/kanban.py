@@ -25,7 +25,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .projects import load_registry
 
@@ -37,6 +37,7 @@ _BRANCH_SAFE = re.compile(r"[^a-z0-9._-]+")
 #: Statuses the default workflow defines, plus the archive column.
 READY = "ready"
 BLOCKED = "blocked"
+REVIEW = "review"
 DONE = "done"
 
 
@@ -272,6 +273,63 @@ class Board:
         rowid = int(cur.lastrowid or 0)
         self._event(task_id, "commented", {"author": author, "len": len(body)})
         return rowid
+
+    def reopen(self, task_id: str, *, author: str = "ngit", comment: str = "",
+               statuses: Sequence[str] = (REVIEW, DONE)) -> bool:
+        """Put a reviewed or finished card back in the queue, with the reason on it.
+
+        A revision is news about a PR that already has a card, so that card is reopened
+        instead of a second one being made. `ready` is the state the dispatcher claims: the
+        kernel's own review reopen does the same (`review` -> `ready`), and writing the
+        literal `running` would leave a card no worker had claimed and nobody would spawn.
+
+        The operator's per-task pin is deliberately untouched: `model_override` /
+        `provider_override` were set on this card by a person, and a revision is not a
+        channel-config change -- the profile's model moves every card that was never pinned,
+        which is the right place for it. `consecutive_failures` is reset, because a reopen
+        is a fresh attempt at the same work; that is the opposite of the kernel's review
+        reopen (which treats review as "not a success signal"), so this is the bridge's
+        own decision and is recorded as one.
+
+        False when the card was not in one of `statuses`: a card already queued or running
+        is left to finish the tip it started on, and a blocked card is waiting for a human,
+        not for a revision.
+        """
+        now = int(time.time())
+        allowed = tuple(dict.fromkeys(str(status) for status in statuses))
+        if not allowed:
+            return False
+        marks = ", ".join("?" * len(allowed))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT status FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
+            if row is None or str(row["status"]) not in allowed:
+                self.db.execute("ROLLBACK")
+                return False
+            prior = str(row["status"])
+            self.db.execute(
+                "UPDATE tasks SET status = ?, completed_at = NULL, claim_lock = NULL,"
+                " claim_expires = NULL, current_run_id = NULL, worker_pid = NULL,"
+                " consecutive_failures = 0, last_failure_error = NULL"
+                f" WHERE id = ? AND status IN ({marks})",
+                (READY, str(task_id), *allowed),
+            )
+            if comment:
+                self.db.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at)"
+                    " VALUES (?,?,?,?)", (str(task_id), author or "ngit", comment, now))
+            self.db.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (str(task_id), None, "review_reopened",
+                 json.dumps({"status": READY, "from": prior, "by": author or "ngit"},
+                            separators=(",", ":")), now))
+            self.db.execute("COMMIT")
+            return True
+        except sqlite3.Error:
+            self.db.execute("ROLLBACK")
+            raise
 
     def release(self, task_id: str, *, author: str = "", comment: str = "") -> bool:
         """`blocked` -> `ready`, with the decision recorded in the same transaction.

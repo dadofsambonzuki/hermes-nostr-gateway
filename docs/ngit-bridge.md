@@ -242,12 +242,36 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 
 ## Outbound: PRs signalled for review
 
+**The card is the queue, the PR is the record.** One PR root — the kind-1618 that opened it —
+maps to exactly one task for the life of the PR. A re-poll, a retry, a second proposal for the
+same branch and a revision all land on that one card; none of them makes a second.
+
 - A kind-1618 event posts one message — the PR's subject, its author npub, the branch and the
   nevent, "ready for review" — and creates one **review task** on the board, keyed
-  `ngit:pr:<event id>`. Deduped by PR id (`ngit_links`), so the same PR is never announced
-  twice, and the idempotency key means a re-poll cannot make a second task either.
-- The task is titled `Review PR <first 8 of the event id>: <subject>` and its body names the
-  PR's event id and nevent, the repository address, the author, the source branch
+  `ngit:pr:<root event id>`. Deduped by PR root (`ngit_links`), so the same PR is never
+  announced twice, and the idempotency key means a re-poll cannot make a second task either.
+  A re-push that a client published as a *second* 1618 is folded back onto the root (same
+  author, same source branch) and read as a revision: the oldest proposal is the root, because
+  that is the event the PR opened with.
+- A **revision** is an event, not an observation: kind 1619 (`E` names the PR, `c` the new
+  tip), or a republished proposal carrying the same `E`/`P`/`c` tags. It reopens the PR's one
+  card — `review`/`done` -> `ready` — with one comment naming the new tip and the event that
+  moved it. A card already `ready` or `running` only gets the comment (the queue, or the
+  worker reading it, now knows which tip is current); a `blocked` card is waiting for a
+  person's authorisation and is not released by a revision; an `archived` one is left alone.
+  A branch that moved without an event changes nothing: the tip the bridge knows is the tip
+  an event published.
+- **Reopening is not a fresh start in every respect.** `consecutive_failures` is reset — the
+  attempt is new — but `model_override`/`provider_override` are untouched: a person pinned
+  that card, and a revision is not a channel-config change. The profile's own model still
+  decides every card that was never pinned.
+- A revision is filtered before it can reopen anything. A PR the bridge never announced has
+  no card to reopen; an `applied` PR is final — a late update event cannot revive it, and the
+  merge commit is written on the row as soon as the merge is seen, so a notice still queued
+  does not leave a window; and a revision older than the tip the row already knows is a relay
+  replay, not news.
+- The task is titled `Review PR <first 8 of the root event id>: <subject>` and its body names
+  the PR's event id and nevent, the repository address, the author, the source branch
   (`branch-name`) and the target branch — NIP-34 carries no target tag, so it is the
   checkout's default branch, read from git. The brief: check the proposal out
   (`ngit pr checkout <nevent>`), read the diff, run the repository's gates (`ruff check`,
@@ -432,9 +456,11 @@ In the gateway store (`store.py`):
   `ready`, `held`, `asked`, `authorised`, `declined`, `deleted` for issues; `pending`,
   `signalled`, `merged` for PRs. `pending` means the notice is not confirmed; `asked` is written
   only once the question reached the channel.
-  `signalled`, `merged` for PRs. A PR's row carries the review task's id, which is what a
-  merge completes; its `note` keeps the PR's nevent, subject, author and branches so a later
-  poll can act on a merge whose event it no longer carries.
+  A PR has **one row per root event id**, and its task id stays with that root for the life
+  of the PR — a revision updates the row rather than adding one. The `note` keeps the PR's
+  nevent, subject, author, branches, the tip an event last named (`tip`, `tip_at`) and the
+  merge commit once a status event names one, so a later poll can act on news whose event it
+  no longer carries.
 - `ngit_comments` — which comment has been copied onto which task.
 - `ngit_cursors` — the last event time each repo's PR poll reached, with a 5-minute overlap so
   clock skew cannot skip an event; the link table, not the cursor, prevents a duplicate.
@@ -469,7 +495,9 @@ Recovery:
 - Retrofitting review tasks for PRs announced before this bridge made them. A PR already
   `signalled` with no task stays that way: the channel was told what happened at the time, and
   a change of behaviour is not a reason to rewrite it.
-- PR revisions (kind 1619), drafts (1633) and labelling: the channel gets one signal per PR and
-  one per merge.
+- PR revisions are handled as events only (kind 1619, or a republished proposal carrying its
+  tags): a branch that moved without publishing one changes nothing. Drafts (1633) are not
+  read, and the channel gets one signal per PR and one per merge — a revision reopens the
+  card, it does not post.
 - Any per-issue visibility rule. A private repository keeps everything derived from it private;
   the bridge carries no second set of rules.
