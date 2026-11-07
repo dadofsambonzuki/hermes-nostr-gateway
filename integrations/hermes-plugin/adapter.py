@@ -1331,6 +1331,15 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 COMMANDS_FILE = "commands.json"
 
 
+class CatalogueEmpty(RuntimeError):
+    """The host registry answered with no commands at all.
+
+    Not a normal state: `_gateway_available_commands()` always offers at least `/help`. An
+    empty answer means the import above resolved to something that no longer lists
+    commands, and writing it would replace a working menu with nothing.
+    """
+
+
 def catalogue_path() -> Path:
     """Where the daemon reads the catalogue: beside the socket it also reads."""
     configured = os.environ.get("NOSTR_GATEWAY_COMMANDS")
@@ -1338,6 +1347,40 @@ def catalogue_path() -> Path:
         return Path(os.path.expanduser(configured))
     socket = os.environ.get("NOSTR_GATEWAY_SOCKET") or DEFAULT_SOCKET
     return Path(os.path.expanduser(socket)).with_name(COMMANDS_FILE)
+
+
+def catalogue_status_path(path: Path | None = None) -> Path:
+    """Where the last write's outcome is recorded, beside the catalogue it describes."""
+    target = path or catalogue_path()
+    return target.with_name(target.stem + ".status.json")
+
+
+def _write_json_atomic(target: Path, payload: dict[str, Any]) -> None:
+    """One file, one rename: a reader never sees half of it."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(target.name + ".tmp")
+    staging.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+    os.replace(staging, target)
+
+
+def record_catalogue_status(path: Path | None = None, *, ok: bool, commands: int = 0,
+                            error: str | None = None) -> Path:
+    """Record what the last write did, where the daemon's `status` verb can read it.
+
+    A `logger.warning` is not enough: this runs inside Hermes, where nobody is watching, and
+    an upstream rename (`_gateway_available_commands`, `_iter_plugin_command_entries`) would
+    leave the slash menu empty with nothing an operator looks at saying why. The daemon
+    reads this file beside the catalogue and reports it.
+    """
+    target = catalogue_status_path(path)
+    payload: dict[str, Any] = {"source": "hermes", "ok": bool(ok),
+                               "generated_at": int(time.time()),
+                               "catalogue": str(path or catalogue_path()),
+                               "commands": int(commands)}
+    if error:
+        payload["error"] = str(error)[:500]
+    _write_json_atomic(target, payload)
+    return target
 
 
 def command_catalogue() -> list[dict[str, Any]]:
@@ -1358,24 +1401,33 @@ def command_catalogue() -> list[dict[str, Any]]:
     return entries
 
 
-def write_command_catalogue(path: Path | None = None) -> Path:
+def write_command_catalogue(path: Path | None = None, *,
+                            entries: list[dict[str, Any]] | None = None) -> Path:
     """Write the catalogue atomically: a half-written file must not look like a menu."""
     target = path or catalogue_path()
-    payload = {"source": "hermes", "generated_at": int(time.time()),
-               "commands": command_catalogue()}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.with_name(target.name + ".tmp")
-    staging.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
-    os.replace(staging, target)
+    commands = command_catalogue() if entries is None else list(entries)
+    if not commands:
+        raise CatalogueEmpty("the host registry returned no gateway commands")
+    payload = {"source": "hermes", "generated_at": int(time.time()), "commands": commands}
+    _write_json_atomic(target, payload)
     return target
 
 
 def register(ctx) -> None:
+    target = catalogue_path()
     try:
-        written = write_command_catalogue()
-        logger.info("wrote the gateway command catalogue: %s", written)
+        entries = command_catalogue()
+        written = write_command_catalogue(target, entries=entries)
+        record_catalogue_status(target, ok=True, commands=len(entries))
+        logger.info("wrote the gateway command catalogue: %s (%d commands)",
+                    written, len(entries))
     except Exception as exc:  # noqa: BLE001 - the platform must load without it
         logger.warning("could not write the gateway command catalogue: %s", exc)
+        try:
+            record_catalogue_status(target, ok=False,
+                                    error=f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - recording the failure must not break the load
+            logger.warning("could not record the catalogue failure either", exc_info=True)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Nostr",

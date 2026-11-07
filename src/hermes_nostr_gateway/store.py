@@ -117,6 +117,20 @@ CREATE TABLE IF NOT EXISTS advertised (
     refused      TEXT NOT NULL DEFAULT '{}'
 );
 
+-- Relays still owed an advertisement: the last attempt failed for a *condition* (a rate
+-- limit, an outage), not a judgement, so the copy is not a refusal and must be retried --
+-- but with a backoff, and only so many times. One row per kind and relay; `attempts` is
+-- the bound and `next_at` the earliest moment a retry is due. Recording this separately
+-- from `advertised.refused` is the whole point: a rate-limited relay is not a refusal.
+CREATE TABLE IF NOT EXISTS advertised_retry (
+    kind     INTEGER NOT NULL,
+    relay    TEXT NOT NULL,
+    reason   TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    next_at  INTEGER NOT NULL,
+    PRIMARY KEY (kind, relay)
+);
+
 -- Kind-0 claims we have read, so a restart does not refetch every peer and a peer that
 -- is a bot stays one. `bot` is 0/1, never NULL: a profile that said nothing about `bot`
 -- is a human by omission, which is different from a peer we have never looked up (no row).
@@ -1106,6 +1120,40 @@ class Store:
              json.dumps(dict(refused or {}), sort_keys=True)),
         )
 
+    def advertised_retries(self, kind: int) -> dict[str, dict[str, Any]]:
+        """Relays still owed this kind, with the backoff state of each.
+
+        A row here means the last attempt failed for a *condition* -- a rate limit, an
+        outage -- so this is a debt, never a refusal: the copy is retried once `next_at`
+        has passed, and `attempts` bounds how often.
+        """
+        rows = self.db.execute(
+            "SELECT relay, reason, attempts, next_at FROM advertised_retry WHERE kind = ?"
+            " ORDER BY relay", (int(kind),)).fetchall()
+        return {str(row["relay"]): {"reason": str(row["reason"]),
+                                   "attempts": int(row["attempts"]),
+                                   "next_at": int(row["next_at"])}
+                for row in rows}
+
+    def record_advertised_retry(self, kind: int, relay: str, reason: str,
+                                attempts: int, next_at: int) -> None:
+        """Remember one relay's transient failure and when its next attempt is due."""
+        self.db.execute(
+            "INSERT INTO advertised_retry (kind, relay, reason, attempts, next_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(kind, relay) DO UPDATE SET reason = excluded.reason,"
+            " attempts = excluded.attempts, next_at = excluded.next_at",
+            (int(kind), str(relay), str(reason), max(1, int(attempts)), int(next_at)),
+        )
+
+    def clear_advertised_retry(self, kind: int, relay: str | None = None) -> None:
+        """Drop a relay's debt -- because it accepted the copy, or was refused outright."""
+        if relay is None:
+            self.db.execute("DELETE FROM advertised_retry WHERE kind = ?", (int(kind),))
+        else:
+            self.db.execute("DELETE FROM advertised_retry WHERE kind = ? AND relay = ?",
+                            (int(kind), str(relay)))
+
     def advertised_all(self) -> list[dict[str, Any]]:
         rows = []
         for row in self.db.execute("SELECT * FROM advertised ORDER BY kind"):
@@ -1115,6 +1163,9 @@ class Store:
             except (TypeError, json.JSONDecodeError):
                 parsed = {}
             item["refused"] = parsed if isinstance(parsed, dict) else {}
+            # Relays still owed this copy: a transient failure, not a refusal, so a reader
+            # that only looked at `refused` would call a rate-limited relay done for good.
+            item["retrying"] = self.advertised_retries(item["kind"])
             rows.append(item)
         return rows
 

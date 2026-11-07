@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from .crypto import sign_event
-from .publisher import is_permanent_refusal
+from .publisher import is_already_held, is_permanent_refusal
 
 log = logging.getLogger("hng.advertise")
 
@@ -312,6 +312,45 @@ def select_menu(entries: Iterable[Mapping[str, Any]]) -> tuple[list[MenuCommand]
     return commands, warnings
 
 
+def catalogue_status_path(path: str | Path) -> Path:
+    """Where the Hermes plugin records how its last catalogue write went.
+
+    Beside the catalogue rather than inside the daemon's store: the plugin runs inside
+    Hermes and never imports this package, so a file is the only channel it has.
+    """
+    location = Path(os.path.expanduser(str(path)))
+    return location.with_name(location.stem + ".status.json")
+
+
+def catalogue_status(path: str | Path) -> dict[str, Any] | None:
+    """The plugin's record of its last write, or None when it left none.
+
+    Best-effort by design: a missing, unreadable or malformed record means "no
+    information", never an error -- the catalogue file itself is still the thing that
+    matters, and a status reader must not be able to fail a publish.
+    """
+    location = catalogue_status_path(path)
+    try:
+        raw = json.loads(location.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    status = dict(raw)
+    status["ok"] = bool(status.get("ok"))
+    status["path"] = str(location)
+    return status
+
+
+def _status_note(path: str | Path) -> str:
+    """One clause for a CatalogueError: why the plugin's last write failed, if it said."""
+    status = catalogue_status(path)
+    if not status or status.get("ok"):
+        return ""
+    error = _collapse(status.get("error")) or "no reason recorded"
+    return f"; the plugin's last write failed: {_clip(error, 300)}"
+
+
 def load_catalogue(path: str | Path) -> tuple[list[MenuCommand], list[str]]:
     """Read the Hermes-side catalogue file: ``{"commands": [...]}`` or a bare list."""
     location = Path(os.path.expanduser(str(path)))
@@ -320,9 +359,10 @@ def load_catalogue(path: str | Path) -> tuple[list[MenuCommand], list[str]]:
     except FileNotFoundError as exc:
         raise CatalogueError(
             f"no command catalogue at {location}: the Hermes plugin writes it when Hermes "
-            "starts (or point advertise.catalogue_file at one)") from exc
+            f"starts (or point advertise.catalogue_file at one){_status_note(location)}") from exc
     except (OSError, json.JSONDecodeError) as exc:
-        raise CatalogueError(f"{location}: cannot read the command catalogue: {exc}") from exc
+        raise CatalogueError(f"{location}: cannot read the command catalogue: {exc}"
+                             f"{_status_note(location)}") from exc
     entries = raw.get("commands") if isinstance(raw, Mapping) else raw
     if not isinstance(entries, list):
         raise CatalogueError(f"{location}: expected a list of commands or {{'commands': [...]}}")
@@ -330,7 +370,26 @@ def load_catalogue(path: str | Path) -> tuple[list[MenuCommand], list[str]]:
     if len(clean) != len(entries):
         log.warning("%s: ignored %d non-object catalogue entr(ies)",
                     location, len(entries) - len(clean))
+    if not clean:
+        raise CatalogueError(f"{location}: the command catalogue is empty{_status_note(location)}")
     return select_menu(clean)
+
+
+def catalogue_report(path: str | Path) -> dict[str, Any]:
+    """What `hng status` needs to say about the catalogue, without ever raising."""
+    location = Path(os.path.expanduser(str(path)))
+    report: dict[str, Any] = {"path": str(location), "exists": location.is_file(),
+                              "status": catalogue_status(location)}
+    if report["exists"]:
+        try:
+            commands, notes = load_catalogue(location)
+        except CatalogueError as exc:
+            report["error"] = str(exc)
+        else:
+            report.update(commands=len(commands),
+                          menu=len(build_manifest(commands).content["commands"]),
+                          warnings=notes)
+    return report
 
 
 @dataclass(frozen=True)
@@ -410,6 +469,22 @@ class AdvertisementConfig:
         return f"{', '.join(names)} -> {self.catalogue_file}"
 
 
+#: How a transient answer is retried. An advertisement is a background fact, not a message,
+#: so a relay that is throttling is left alone for a while instead of being hammered: the
+#: first retry is due a minute later, each further attempt doubles the wait, and after
+#: MAX_RETRY_ATTEMPTS the relay is recorded as refused, so a relay that answers "busy"
+#: forever stops costing a send on every start. The attempt count and the due time live in
+#: the store, so a restart resumes the backoff rather than resetting it.
+RETRY_BASE_S = 60.0
+RETRY_CAP_S = 3600.0
+MAX_RETRY_ATTEMPTS = 6
+
+
+def retry_delay(attempts: int) -> float:
+    """Seconds to wait after the *attempts*-th consecutive transient failure."""
+    return min(RETRY_CAP_S, RETRY_BASE_S * (2 ** max(0, int(attempts) - 1)))
+
+
 @dataclass
 class KindReport:
     """What happened to one event kind: the id, the receipts and the read-back."""
@@ -421,15 +496,16 @@ class KindReport:
     published: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
     readback: dict[str, str] = field(default_factory=dict)
     refused: dict[str, str] = field(default_factory=dict)
+    retrying: dict[str, dict[str, Any]] = field(default_factory=dict)
     stored: bool = False
     warnings: list[str] = field(default_factory=list)
 
     @property
     def transient(self) -> dict[str, str]:
-        """Relays that failed for a reason a retry could change; a refusal is not one."""
+        """Relays that failed for a condition a retry could clear; a refusal is not one."""
         return {relay: reason or "unknown"
                 for relay, (ok, reason) in self.published.items()
-                if not ok and relay not in self.refused}
+                if not ok and relay not in self.refused and not is_already_held(reason)}
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -441,6 +517,7 @@ class KindReport:
                           for relay, (ok, error) in self.published.items()},
             "readback": self.readback,
             "refused": self.refused,
+            "retrying": self.retrying,
             "stored": self.stored,
             "warnings": self.warnings,
         }
@@ -515,45 +592,109 @@ class Advertiser:
 
     async def publish(self, contents: Mapping[int, Mapping[str, Any]],
                       relays: Sequence[str], *, force: bool = False) -> list[KindReport]:
-        """Publish each content whose stored copy differs, then read every relay back."""
+        """Publish each content whose stored copy differs, then read every relay back.
+
+        A relay is skipped when it is still backing off from a transient failure, so a rate
+        limit costs a wait rather than a send on every start; ``force`` ignores that, which
+        is what an operator asking for a re-publish means.
+        """
         targets = list(dict.fromkeys(str(relay).strip() for relay in relays if str(relay)))
         reports: list[KindReport] = []
+        now = int(self._clock())
         for kind, content in contents.items():
             digest = content_hash(content)
             stored = self.store.advertised(kind)
-            if stored and stored.get("content_hash") == digest and not force:
-                reports.append(KindReport(kind=kind, content_hash=digest, status="unchanged",
-                                          event_id=stored.get("event_id"), stored=True))
-                continue
             if not targets:
                 reports.append(KindReport(kind=kind, content_hash=digest, status="failed",
                                           warnings=["no relays to publish to"]))
                 continue
-            created_at = int(self._clock())
+            pending = self.store.advertised_retries(kind)
+            # A relay dropped from the publish set is no longer owed anything: its backoff
+            # row would otherwise sit there and surface in `hng status` forever.
+            for relay in [relay for relay in pending if relay not in targets]:
+                self.store.clear_advertised_retry(kind, relay)
+                pending.pop(relay)
+            due = {relay: state for relay, state in pending.items() if state["next_at"] <= now}
+            waiting = {relay: state for relay, state in pending.items()
+                       if state["next_at"] > now}
+            same = bool(stored) and stored.get("content_hash") == digest and not force
+            if force:
+                resend = list(targets)
+            elif same:
+                # The copy is stored and unchanged: only the relays still owed it are sent
+                # to, and only once their backoff has run out.
+                resend = [relay for relay in targets if relay in due]
+            else:
+                resend = [relay for relay in targets if relay not in waiting]
+            if not resend:
+                if same:
+                    reports.append(KindReport(kind=kind, content_hash=digest,
+                                              status="unchanged", stored=True,
+                                              event_id=stored.get("event_id"),
+                                              retrying=waiting))
+                else:
+                    # Every target is backing off and nothing has been recorded yet: this is
+                    # a deferred publish, not a success, so `hng status` can say so.
+                    reports.append(KindReport(
+                        kind=kind, content_hash=digest, status="failed", retrying=waiting,
+                        warnings=[f"every target relay is backing off after a transient "
+                                  f"failure ({len(waiting)} relay(s))"]))
+                continue
+            # A retry of an unchanged copy reuses the stored `created_at`, so the event id
+            # stays the one a relay may already hold and the read-back still compares like
+            # with like. A changed copy is a new event.
+            created_at = int(stored["published_at"]) if same else int(now)
             event = sign_event({"kind": kind, "content": canonical_json(content), "tags": [],
                                 "created_at": created_at}, self.crypto.keys)
-            results = await self.publisher.publish(event, targets)
-            accepted = [relay for relay, (ok, _error) in results.items() if ok]
-            refused = {relay: reason or "refused"
-                       for relay, (ok, reason) in results.items()
-                       if not ok and is_permanent_refusal(reason)}
+            results = await self.publisher.publish(event, resend)
+            accepted = [relay for relay, (ok, reason) in results.items()
+                        if ok or is_already_held(reason)]
+            prior_refused = dict(stored.get("refused") or {}) if stored else {}
+            refused = {relay: reason for relay, reason in prior_refused.items()
+                       if relay not in results}
+            refused.update({relay: reason or "refused"
+                            for relay, (ok, reason) in results.items()
+                            if not ok and is_permanent_refusal(reason)})
             report = KindReport(kind=kind, content_hash=digest, status="failed",
-                                event_id=event["id"], published=results, refused=refused)
-            if not accepted:
-                reports.append(report)
-                continue
-            verdicts = await asyncio.gather(*(self._read(relay, kind) for relay in accepted))
-            report.readback = {
-                relay: _verdict(found, event["id"], created_at)
-                for relay, found in zip(accepted, verdicts, strict=True)
-            }
-            report.status = "published" if len(accepted) == len(results) else "partial"
-            # A relay that refused this kind has made a decision, not had an outage: record
-            # the copy so the next start does not publish into the same refusal. A transient
-            # failure is deliberately not stored, so the next start retries those relays.
-            if not report.transient:
+                                event_id=event["id"], published=results)
+            report.refused = refused
+            # A transient answer is a debt, not a verdict: it is remembered with a backoff
+            # so the next publish retries it, and forgotten once the relay accepts, refuses
+            # or runs out of attempts.
+            for relay, (_ok, reason) in results.items():
+                if relay in accepted or relay in refused:
+                    self.store.clear_advertised_retry(kind, relay)
+                    continue
+                attempts = int(pending.get(relay, {}).get("attempts", 0)) + 1
+                if attempts >= MAX_RETRY_ATTEMPTS:
+                    report.refused[relay] = (f"{reason or 'unknown'} "
+                                             f"(gave up after {attempts} attempts)")
+                    report.warnings.append(
+                        f"{relay}: still failing after {attempts} attempts; recorded as a "
+                        f"refusal rather than retried on every start")
+                    self.store.clear_advertised_retry(kind, relay)
+                else:
+                    self.store.record_advertised_retry(kind, relay, reason or "unknown",
+                                                       attempts,
+                                                       now + retry_delay(attempts))
+            report.retrying = {relay: state
+                               for relay, state in self.store.advertised_retries(kind).items()
+                               if relay in targets}
+            if accepted:
+                verdicts = await asyncio.gather(*(self._read(relay, kind)
+                                                  for relay in accepted))
+                report.readback = {
+                    relay: _verdict(found, event["id"], created_at)
+                    for relay, found in zip(accepted, verdicts, strict=True)
+                }
+                report.status = "published" if len(accepted) == len(results) else "partial"
+            # Record (or keep) the copy when at least one relay has it, when every relay has
+            # given a verdict (accepted, held or refused), or when this was a retry of the
+            # stored copy -- a relay that ran out of attempts must not drop its refusal out
+            # of the record just because nothing else was sent to in the same pass.
+            if accepted or same or not report.transient:
                 self.store.record_advertised(kind, event["id"], digest, created_at,
-                                             refused=refused)
+                                             refused=report.refused)
                 report.stored = True
             reports.append(report)
         return reports

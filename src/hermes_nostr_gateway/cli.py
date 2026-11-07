@@ -423,6 +423,7 @@ def cmd_status(args) -> int:
         ]
 
     stale = stale_rows({"relay_stats": stats["relays"]}, set(relays) | set(publish))
+    menu = _menu_status(cfg, socket_path)
 
     if args.json:
         print(json.dumps({
@@ -439,6 +440,7 @@ def cmd_status(args) -> int:
             "invites_held": stats["invites_held"],
             "media": stats.get("media") or {},
             "wraps": store.wrap_counts(),
+            "menu": menu,
             "relays": [verdict.as_dict() for verdict in verdicts],
             "not_in_config": stale,
             # The daemon's watcher, as it reports itself: absent from an older daemon, which
@@ -460,6 +462,9 @@ def cmd_status(args) -> int:
     wraps = store.wrap_counts()
     print(f"retry:    {wraps.get('pending', 0) + wraps.get('failed', 0)} wrap(s) retryable, "
           f"{wraps.get('expired', 0)} expired, {wraps.get('sent', 0)} sent")
+    if menu:
+        for line in _menu_lines(menu, now):
+            print(line)
     if frame is None:
         print(f"daemon:   not running ({socket_path}: {problem})")
         print("relays:   (no live worker state; the daemon answers this question)")
@@ -682,6 +687,43 @@ def _held_concord_channels(cfg: dict[str, Any]) -> list[Any] | None:
     return channels_from_invites(rows) or None
 
 
+def _menu_status(cfg: dict[str, Any], socket_path: Path) -> dict[str, Any] | None:
+    """What Hermes last managed to write as this plane's command catalogue.
+
+    ``None`` when there is nothing to say: the menu is not advertised and the plugin has
+    never left a record, which is every deployment that does not use this feature. A record
+    that exists is reported even when advertising is off, because a failed write is the
+    failure nobody would otherwise see.
+    """
+    from .advertise import AdvertiseError, AdvertisementConfig, catalogue_report
+
+    try:
+        advert = AdvertisementConfig.from_config(cfg.get("advertise"), socket_path=socket_path)
+    except AdvertiseError:
+        return None
+    report = catalogue_report(advert.catalogue_file)
+    if not advert.publishes_commands and not report.get("status"):
+        return None
+    return report
+
+
+def _menu_lines(menu: dict[str, Any], now: float) -> list[str]:
+    """The `menu:` lines `hng status` prints: the file it reads and how the write went."""
+    status = menu.get("status") or {}
+    written = status.get("generated_at")
+    age = f", written {human_age(now - int(written))} ago" if written else ""
+    if menu.get("exists"):
+        lines = [f"menu:     {menu.get('menu', 0)} command(s) from {menu['path']}{age}"]
+    else:
+        lines = [f"menu:     no catalogue at {menu['path']}"]
+    if status and not status.get("ok"):
+        lines.append(f"          the Hermes plugin's last write failed: "
+                     f"{status.get('error') or 'no reason recorded'}")
+    elif menu.get("error"):
+        lines.append(f"          {menu['error']}")
+    return lines
+
+
 def _advertisement_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     """What the store says was last published, without creating a store that is not there."""
     configured = str(cfg.get("store") or "").strip()
@@ -712,6 +754,7 @@ def cmd_profile(args) -> int:
 
     from .advertise import (
         MANIFEST_KIND,
+        MAX_RETRY_ATTEMPTS,
         PROFILE_KIND,
         AdvertiseError,
         AdvertisementConfig,
@@ -722,7 +765,7 @@ def cmd_profile(args) -> int:
         resolve_relays,
     )
     from .gateway import default_socket_path
-    from .publisher import make_publisher
+    from .publisher import is_already_held, make_publisher
 
     cfg = load_config(args.config)
     socket = Path(os.path.expanduser(
@@ -778,6 +821,12 @@ def cmd_profile(args) -> int:
             print(f"published: kind {row['kind']:<5} {row['event_id']}  {when}")
             for relay, reason in (row.get("refused") or {}).items():
                 print(f"           refused by {relay}: {reason}")
+            for relay, state in (row.get("retrying") or {}).items():
+                # A rate limit is a condition: say when the retry is due rather than
+                # leaving the relay looking like it refused the kind.
+                due = max(0, int(state.get("next_at") or 0) - int(time.time()))
+                print(f"           retrying {relay} in {human_age(due)}: {state.get('reason')} "
+                      f"(attempt {state.get('attempts')}/{MAX_RETRY_ATTEMPTS})")
         if not rows and advert.enabled:
             print("published: nothing yet")
         return 0
@@ -845,8 +894,19 @@ def cmd_profile(args) -> int:
         for report in reports:
             print(f"kind {report.kind:<6} {report.status:<9} {report.event_id or '-'}")
             for relay, (ok_relay, error) in report.published.items():
-                word = "refused" if relay in report.refused else ("ok" if ok_relay else "failed")
+                if relay in report.refused:
+                    word = "refused"
+                elif ok_relay:
+                    word = "ok"
+                elif is_already_held(error):
+                    word = "held"
+                else:
+                    word = "failed"
                 print(_relay_line(relay, word, error))
+            for relay, state in report.retrying.items():
+                due = max(0, int(state.get("next_at") or 0) - int(time.time()))
+                print(f"    {relay}: retrying in {human_age(due)}, attempt "
+                      f"{state.get('attempts')}/{MAX_RETRY_ATTEMPTS}: {state.get('reason')}")
             for relay, verdict in report.readback.items():
                 print(f"    {relay}: {verdict}")
     ok = all(report.status != "failed" and not report.transient for report in reports)

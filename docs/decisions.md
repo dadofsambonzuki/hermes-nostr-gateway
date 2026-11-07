@@ -338,7 +338,32 @@ the menu without touching the profile. Where this daemon is the identity's only 
 **Publishing is judged by the read-back.** A receipt is not retention: the report carries the event
 id and, per relay, whether the newest event for that author+kind is the one just published
 (`retained`), absent, or superseded by a newer write. The stored content hash is what makes a
-restart a no-op when nothing changed. A pending relay — a timeout, a dropped socket — is not
-stored, so the next start retries it; a relay that *refused* the kind (`blocked: only chat related
-events are allowed` from a chat-only relay, for instance) is recorded as a refusal instead, because
-a decision is not an outage and retrying it on every start would never change it.
+restart a no-op when nothing changed.
+
+**A relay's `OK` answer is one of three things, never a binary.** `publisher.classify()` sorts the
+NIP-01 answers, and the advertisement acts on the sort rather than on the fact of failure:
+
+- **Refused** — `blocked`, `invalid`, `restricted`, `not allowed`, `pow:`, and `auth-required`
+  surviving the in-process authentication. A judgement about the event or the key: it is recorded
+  in `advertised.refused` and never tried again, because retrying it on every start would never
+  change the answer. (The client's own `authentication failed` is *not* a refusal: it is how the
+  relay asks for AUTH, and the next send answers it.)
+- **Transient** — `rate-limit`, `error:`, `unavailable`, `busy`, a timeout, a dropped socket, and
+  anything unrecognised. A condition, not a verdict: the relay is recorded in `advertised_retry`
+  with its attempt count and the moment the next attempt is due (one minute, doubling, capped at
+  an hour, six attempts in all), and retried once it is due. After the sixth attempt it is
+  recorded as a refusal so a relay that answers "busy" forever stops costing a send on every
+  start. Unrecognised answers are transient on purpose: mis-reading a condition as a refusal
+  cannot be undone, while mis-reading a refusal as transient costs one bounded retry.
+- **Held** — `duplicate:`. The relay already stores this exact event id: an idempotent success,
+  counted as accepted and confirmed by the read-back like any other.
+
+Recording a rate limit as a refusal was a real regression: the first `rate-limited: slow down`
+froze that relay out of every later publish, and the daemon reported `partial` with no send on
+the next start. The rule above is what the code does; `tests/test_advertise.py` drives a
+rate-limited relay through the publisher, the backoff and the retry, and a refused one through
+"recorded, not retried".
+
+An unchanged copy is only re-sent to relays whose backoff has run out (or when `force` is asked
+for), and the retry re-signs with the stored `created_at`, so the event id a relay may already
+hold stays the one being sent. A relay dropped from the publish set loses its backoff row.

@@ -11,6 +11,7 @@ Placeholders only: no real identity, relay or host belongs in this file.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import nostr_sdk as sdk
@@ -20,6 +21,7 @@ from hermes_nostr_gateway.advertise import (
     MANIFEST_KIND,
     MAX_COMMANDS,
     MAX_DESCRIPTION,
+    MAX_RETRY_ATTEMPTS,
     PROFILE_KIND,
     AdvertiseError,
     AdvertisementConfig,
@@ -27,9 +29,11 @@ from hermes_nostr_gateway.advertise import (
     CatalogueError,
     build_manifest,
     build_profile,
+    catalogue_report,
     content_hash,
     load_catalogue,
     resolve_relays,
+    retry_delay,
     select_menu,
 )
 from hermes_nostr_gateway.crypto import SdkCrypto
@@ -193,12 +197,14 @@ def test_a_missing_catalogue_names_the_path(tmp_path):
 class FakePublisher:
     def __init__(self, fail: dict[str, str] | None = None):
         self.events: list[dict] = []
+        self.sent: list[tuple[dict, list[str]]] = []
         self.calls = 0
         self.fail = fail or {}
 
     async def publish(self, event: dict, relays):
         self.calls += 1
         self.events.append(event)
+        self.sent.append((event, list(relays)))
         return {relay: (relay not in self.fail, self.fail.get(relay)) for relay in relays}
 
     async def aclose(self) -> None:
@@ -285,7 +291,8 @@ async def test_changed_content_is_republished(crypto, store):
     assert [report.status for report in reports] == ["unchanged", "published"]
 
 
-async def test_a_partial_publish_is_not_stored_so_the_next_start_retries(crypto, store):
+async def test_a_partial_publish_records_the_copy_and_owes_the_failed_relay(crypto, store):
+    """A transient failure is a debt, not a refusal: the copy is kept and the relay retried."""
     publisher = FakePublisher(fail={RELAYS[1]: "timeout"})
     advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
                             reader=FakeReader(publisher))
@@ -293,10 +300,115 @@ async def test_a_partial_publish_is_not_stored_so_the_next_start_retries(crypto,
     reports = await advertiser.publish(contents(), RELAYS)
 
     assert all(report.status == "partial" for report in reports)
-    assert all(report.transient for report in reports)
-    assert store.advertised(PROFILE_KIND) is None
+    assert all(report.refused == {} for report in reports), "a timeout is not a refusal"
+    assert all(report.transient == {RELAYS[1]: "timeout"} for report in reports)
+    stored = store.advertised(PROFILE_KIND)
+    assert stored is not None, "one relay serves it: the copy is real and worth keeping"
+    assert stored["refused"] == {}
+    owed = store.advertised_retries(PROFILE_KIND)
+    assert owed[RELAYS[1]]["attempts"] == 1
+    assert owed[RELAYS[1]]["next_at"] > stored["published_at"]
+
+
+async def test_a_backing_off_relay_is_not_hammered_on_the_next_publish(crypto, store):
+    clock = [1_700_000_000.0]
+    publisher = FakePublisher(fail={RELAYS[1]: "rate-limited: slow down"})
+    advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
+                            reader=FakeReader(publisher), clock=lambda: clock[0])
+    await advertiser.publish(contents(), RELAYS)
+    calls = publisher.calls
+    stored_id = store.advertised(PROFILE_KIND)["event_id"]
+
     reports = await advertiser.publish(contents(), RELAYS)
-    assert [report.status for report in reports] == ["partial", "partial"]
+
+    assert publisher.calls == calls, "a relay inside its backoff was sent to anyway"
+    assert [report.status for report in reports] == ["unchanged", "unchanged"]
+    assert all(RELAYS[1] in report.retrying for report in reports)
+
+    # The backoff has run out and the relay is well again: only the relay that is owed the
+    # copy is sent to, and it is the *same* event, not a new advertisement.
+    clock[0] += retry_delay(1) + 1
+    publisher.fail = {}
+    reports = await advertiser.publish(contents(), RELAYS)
+
+    assert len(publisher.sent) == 4, "the already-served relays were sent to again"
+    assert all(relays == [RELAYS[1]] for _event, relays in publisher.sent[2:])
+    for event, _relays in publisher.sent[2:]:
+        # The retry re-signs with the stored `created_at`, so the id a relay may already
+        # hold is the one sent: a retry, not a second advertisement.
+        assert event["id"] == store.advertised(int(event["kind"]))["event_id"]
+    profile_retry = [event for event, _relays in publisher.sent[2:]
+                     if int(event["kind"]) == PROFILE_KIND]
+    assert [event["id"] for event in profile_retry] == [stored_id]
+    assert [report.status for report in reports] == ["published", "published"]
+    assert store.advertised_retries(PROFILE_KIND) == {}
+
+
+async def test_a_rate_limited_relay_is_retried_and_never_recorded_as_a_refusal(crypto, store):
+    """The regression this fixes: `rate-limited` used to be stored and never retried."""
+    reason = "rate-limited: slow down"
+    publisher = FakePublisher(fail={RELAYS[0]: reason})
+    clock = [1_700_000_000.0]
+    advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
+                            reader=FakeReader(publisher), clock=lambda: clock[0])
+    only_manifest = {MANIFEST_KIND: contents()[MANIFEST_KIND]}
+
+    reports = await advertiser.publish(only_manifest, RELAYS)
+
+    assert reports[0].status == "partial"
+    assert reports[0].refused == {}, "a rate limit is a condition, not a decision"
+    assert store.advertised(MANIFEST_KIND)["refused"] == {}
+
+    clock[0] += retry_delay(1) + 1
+    publisher.fail = {}
+    reports = await advertiser.publish(only_manifest, RELAYS)
+
+    assert publisher.calls == 2, "the rate-limited relay was never retried"
+    assert reports[0].status == "published"
+    assert reports[0].readback[RELAYS[0]] == "retained"
+
+
+async def test_a_transient_failure_that_never_clears_is_bounded(crypto, store):
+    """A relay that answers "busy" forever stops being retried: the backoff has a bound."""
+    clock = [1_700_000_000.0]
+    publisher = FakePublisher(fail={RELAYS[0]: "busy: try again later"})
+    advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
+                            reader=FakeReader(publisher), clock=lambda: clock[0])
+    only_manifest = {MANIFEST_KIND: contents()[MANIFEST_KIND]}
+
+    reports = await advertiser.publish(only_manifest, RELAYS)
+    for _attempt in range(1, MAX_RETRY_ATTEMPTS):
+        assert reports[0].refused == {}
+        clock[0] += retry_delay(MAX_RETRY_ATTEMPTS) + 1
+        reports = await advertiser.publish(only_manifest, RELAYS)
+
+    assert publisher.calls == MAX_RETRY_ATTEMPTS
+    assert RELAYS[0] in reports[0].refused
+    assert "gave up after" in reports[0].refused[RELAYS[0]]
+    assert any("still failing" in warning for warning in reports[0].warnings)
+    assert store.advertised_retries(MANIFEST_KIND) == {}
+    assert store.advertised(MANIFEST_KIND)["refused"] == reports[0].refused, (
+        "a relay that ran out of attempts must stay in the record as refused")
+    # And now it is a refusal, so a later publish does not try it again.
+    calls = publisher.calls
+    clock[0] += retry_delay(MAX_RETRY_ATTEMPTS) + 1
+    reports = await advertiser.publish(only_manifest, RELAYS)
+    assert publisher.calls == calls
+
+
+async def test_a_duplicate_answer_is_a_success_not_a_refusal(crypto, store):
+    """`duplicate:` means the relay already stores this id: nothing left to do there."""
+    publisher = FakePublisher(fail={RELAYS[0]: "duplicate: already have this event"})
+    advertiser = Advertiser(crypto=crypto, publisher=publisher, store=store,
+                            reader=FakeReader(publisher))
+    only_manifest = {MANIFEST_KIND: contents()[MANIFEST_KIND]}
+
+    reports = await advertiser.publish(only_manifest, RELAYS)
+
+    assert reports[0].refused == {}
+    assert reports[0].retrying == {}
+    assert reports[0].status == "published"
+    assert reports[0].readback[RELAYS[0]] == "retained"
 
 
 async def test_a_relay_that_refuses_the_kind_is_recorded_not_retried(crypto, store):
@@ -482,6 +594,65 @@ def test_cli_publish_refuses_when_advertising_is_off(tmp_path, capsys):
 
     assert cli.main(["--config", path, "profile", "publish"]) == 2
     assert "advertise.publish" in capsys.readouterr().err
+
+
+def test_cli_status_shows_the_menu_the_plugin_wrote(tmp_path, capsys):
+    from hermes_nostr_gateway import cli
+
+    path, config = write_config(tmp_path, {"publish": ["commands"]})
+    target = Path(config["socket"]).with_name("commands.json")
+    target.write_text(json.dumps({"commands": [command("help"), command("topic")]}))
+    target.with_name("commands.status.json").write_text(json.dumps(
+        {"source": "hermes", "ok": True, "generated_at": int(time.time()) - 90,
+         "catalogue": str(target), "commands": 2}))
+
+    assert cli.main(["--config", path, "status"]) == 0
+
+    out = capsys.readouterr().out
+    assert "menu:" in out
+    assert "1 command(s) from" in out, "the menu count is what the manifest would carry"
+    assert "written" in out and "ago" in out
+
+
+def test_cli_status_shows_a_failed_catalogue_write(tmp_path, capsys):
+    """The failure the plugin used to swallow: visible in `hng status`, not only a log line."""
+    from hermes_nostr_gateway import cli
+
+    path, config = write_config(tmp_path, {"publish": ["commands"]})
+    target = Path(config["socket"]).with_name("commands.json")
+    target.with_name("commands.status.json").write_text(json.dumps(
+        {"source": "hermes", "ok": False, "generated_at": int(time.time()) - 120,
+         "catalogue": str(target), "commands": 0,
+         "error": "ImportError: cannot import name '_gateway_available_commands'"}))
+
+    assert cli.main(["--config", path, "status"]) == 0
+
+    out = capsys.readouterr().out
+    assert "no catalogue at" in out
+    assert "last write failed" in out
+    assert "_gateway_available_commands" in out, "the upstream rename must be named"
+
+
+def test_cli_status_says_nothing_about_a_menu_that_was_never_used(tmp_path, capsys):
+    from hermes_nostr_gateway import cli
+
+    path, _config = write_config(tmp_path, {"publish": False})
+
+    assert cli.main(["--config", path, "status"]) == 0
+
+    assert "menu:" not in capsys.readouterr().out
+
+
+def test_the_report_survives_a_status_file_that_is_not_json(tmp_path):
+    """A status reader must never be able to fail a publish."""
+    target = tmp_path / "commands.json"
+    target.write_text(json.dumps({"commands": [command("help")]}))
+    target.with_name("commands.status.json").write_text("not json at all")
+
+    report = catalogue_report(target)
+
+    assert report["exists"] is True and report["status"] is None
+    assert report["menu"] == 1
 
 
 # -- the daemon --------------------------------------------------------------

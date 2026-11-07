@@ -95,6 +95,11 @@ The catalogue is the host's own, not a list kept here. The Hermes plugin writes
 skipped when the stored content hash matches, and every publish is *read back* per relay: a
 receipt is not retention.
 
+A relay that answers with a rate limit or an outage is owed the copy, not refused it: the attempt
+is remembered with a backoff (a minute, doubling, six attempts) and retried when it is due, and
+`hng profile show` says when that is. `hng status` also reports the catalogue the plugin wrote and,
+when its last write failed, why — a renamed private Hermes import must not empty the menu silently.
+
 ```
 hng profile show                 # what would be advertised, and what was last published
 hng profile publish              # publish what differs, then report each relay's answer

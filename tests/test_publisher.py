@@ -20,9 +20,41 @@ import pytest
 import websockets
 
 from hermes_nostr_gateway.gateway import Gateway
-from hermes_nostr_gateway.publisher import BindingsPublisher, make_publisher
+from hermes_nostr_gateway.publisher import (
+    BindingsPublisher,
+    Outcome,
+    classify,
+    is_already_held,
+    is_permanent_refusal,
+    make_publisher,
+)
 
 PEER = "ab" * 32
+
+
+def test_an_answer_is_a_judgement_a_condition_or_already_held():
+    """The classification the advertisement and the outbox both act on.
+
+    A rate limit used to land in the refusal set, which meant a throttled relay was never
+    retried for that kind. These are the words NIP-01 and this client actually produce.
+    """
+    for transient in ("rate-limited: slow down", "rate-limit: 30/min", "error: internal",
+                      "service unavailable", "busy, try again later", "timeout",
+                      "authentication failed", "a phrase nobody has seen before", ""):
+        assert classify(transient) is Outcome.TRANSIENT, transient
+
+    for refused in ("blocked: not in the web of trust", "invalid: bad signature",
+                    "restricted: members only", "not allowed: chat kinds only",
+                    "pow: difficulty 20 required", "auth-required: authenticate"):
+        assert classify(refused) is Outcome.REFUSED, refused
+
+    for held in ("duplicate: already have this event", "already exists"):
+        assert classify(held) is Outcome.HELD, held
+
+    assert is_permanent_refusal("rate-limited: slow down") is False
+    assert is_permanent_refusal("blocked: no") is True
+    assert is_already_held("duplicate: already have this event") is True
+    assert is_already_held("rate-limited: slow down") is False
 
 
 class LocalRelay:
@@ -196,6 +228,26 @@ async def test_a_relay_rejection_is_not_retried(relay_factory, no_subprocess):
     assert not ok
     assert "blocked" in (error or "")
     assert len(strict.frames) == 1, "a rejection was retried"
+
+
+async def test_a_rate_limited_relay_is_retried_with_the_same_bytes(relay_factory, no_subprocess):
+    """A rate limit is a condition, not a judgement: one more send of the same event."""
+    keys = sdk.Keys.generate()
+    busy = await relay_factory(reject="rate-limited: slow down")
+    event = signed_note(keys)
+
+    publisher = BindingsPublisher(keys.secret_key().to_hex(), ok_timeout=1,
+                                  attempts=2, retry_delay=0.01)
+    try:
+        results = await publisher.publish(event, [busy.url])
+    finally:
+        await publisher.aclose()
+
+    ok, error = results[busy.url]
+    assert not ok
+    assert "rate-limit" in (error or "")
+    assert len(busy.frames) == 2, "a rate limit was treated as a refusal"
+    assert busy.frames[0] == busy.frames[1], "a retry changed the event bytes"
 
 
 async def test_a_restricted_relay_authenticates_in_process(relay_factory, no_subprocess):
