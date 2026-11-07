@@ -1457,6 +1457,18 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def ngit_links(self, repo: str, kind: int) -> list[dict[str, Any]]:
+        """Every link this repo has for one kind, oldest first.
+
+        The label walk needs the PRs a poll did not carry: a review task can be dispatched,
+        and finish, between two passes, and the PR's own events may all predate both.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM ngit_links WHERE repo = ? AND kind = ? ORDER BY created_at, source_id",
+            (str(repo), int(kind)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def ngit_link_save(self, repo: str, kind: int, source_id: str, *, state: str,
                        task_id: str | None = None, board: str = "",
                        detail: dict[str, Any] | None = None) -> None:
