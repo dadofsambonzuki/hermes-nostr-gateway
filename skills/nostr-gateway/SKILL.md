@@ -85,6 +85,20 @@ Every refusal is a word, and the word decides what to do.
 - **Review tasks are keyed `ngit:pr:<event id>`.** The key is what makes a re-poll or a
   wake idempotent: the board refuses a second task with the same key. Do not rename it.
 
+## Changing this repository
+
+- **Merge a PR with `scripts/merge_pr.sh <pr-id>`**, not with `git merge`: an ngit fetch prunes
+  `pr/*` refs to `master`, so the branch is not there to merge. The script applies the PR to a
+  fresh worktree, runs the gates on the merged tree and pushes, in one command.
+- **Gate the merged tree.** PRs touching `README.md`, `gateway.py` or `cli.py` merge clean alone
+  and can still disagree together.
+- **One command per sub-procedure, output clipped at the source.** A status check costs the same
+  as an answer; run four of them and you have paid for four answers.
+- **Delegate sweeps to a worker and keep the decisions.** A disposable context can run the merge
+  queue; the thread should hold the judgement calls.
+- **Reviews are cheap — keep them.** Measured here: every review combined was ~1.4% of the tokens
+  the main conversation spent on itself.
+
 ## The ngit CLI it drives
 
 The bridge shells out to `ngit`; these are the parts it depends on, not a copy of the CLI's
