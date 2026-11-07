@@ -138,7 +138,7 @@ class Harness:
 
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
-                 notifier=None, prs=((), ()), labeler=None):
+                 notifier=None, prs=((), ()), labeler=None, state=None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -150,6 +150,12 @@ class Harness:
         self.since_seen: list[int] = []
         self.label_calls: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
         self.labeler = labeler or self._label
+        #: What the relays say about a PR: the verdict comment and the labels it carries.
+        self.verdicts: dict[str, ngit_labels.Verdict] = {}
+        self.carried: dict[str, tuple[ngit_labels.Label, ...]] = {}
+        self.readings: dict[str, tuple[tuple[str, str, int], ...]] = {}
+        self.read_calls: list[tuple[str, ...]] = []
+        self.state = state or self._state
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
         self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0)
@@ -173,6 +179,16 @@ class Harness:
             return self.prs_data
         return ngit.PrFeed(*self.prs_data)
 
+    def _state(self, pr_ids):
+        """The relay read: whatever the test put in `verdicts`, `carried` and `readings`."""
+        self.read_calls.append(tuple(pr_ids))
+        return ngit.ReadState(
+            prs={pr: ngit.PrRead(verdict=self.verdicts.get(pr),
+                                 labels=self.carried.get(pr, ()),
+                                 readings=self.readings.get(pr, ()))
+                 for pr in pr_ids},
+            relays=("wss://relay.example",))
+
     def _label(self, pr_id: str, address: str, add, retract=()):
         """Record what the sync asked to publish, and say it landed."""
         self.label_calls.append((pr_id, address, tuple(add), tuple(retract)))
@@ -185,7 +201,7 @@ class Harness:
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
             prs=self.prs, notify=self.notifier, anchor=self.anchor,
-            labels=self.labeler)
+            labels=self.labeler, state=self.state)
         return sync.run(**kwargs)
 
     def task(self, task_id: str):
@@ -1457,6 +1473,31 @@ def set_review_status(harness, task_id: str, status: str, *, force: bool = False
     harness.board.db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
+def hand_queued_review_task(harness, pr, *, subject: str = "re-review") -> str:
+    """A review card the bridge did not make: what a reviewer queues for a revision."""
+    return harness.board.create(
+        title=f"Review PR {pr.id[:8]}: {subject}",
+        body=f"Re-review of PR `{pr.id}`: review the tip, then report a verdict.",
+        assignee="review", status="ready", created_by="holly")
+
+
+def review_verdict(harness, pr_id: str, label: str, *, event_id: str = "",
+                   created_at: int = 2000, relay: str = "wss://relay.example") -> str:
+    """One verdict comment on the PR root, as a reviewer publishes it."""
+    event_id = event_id or (label[:1] or "v").ljust(64, "0")
+    harness.verdicts[pr_id] = ngit_labels.Verdict(label=label, event_id=event_id,
+                                                  created_at=created_at, relay=relay)
+    return event_id
+
+
+def carry_label(harness, pr_id: str, value: str, event_id: str, *,
+                relay: str = "wss://relay.example") -> None:
+    """A label event already on a relay: what an earlier writer left behind."""
+    harness.carried[pr_id] = (*harness.carried.get(pr_id, ()),
+                              ngit_labels.Label(value=value, event_id=event_id,
+                                                created_at=1000, relay=relay))
+
+
 def pr_with_review_task(harness, seed: str = "e1", *, commit: str = "c0ffee") -> tuple:
     pr = make_pr(seed, commit=commit)
     harness.prs_data = ([pr], [])
@@ -1479,85 +1520,174 @@ def test_a_new_pr_is_labelled_review_required_exactly_once(harness):
     assert report.prs["labels"] == 0
 
 
-def test_starting_the_review_flips_it_to_in_review_and_retracts_the_old_label(harness):
-    pr, task = pr_with_review_task(harness)
-    first = tuple(label_detail(harness, pr.id)["label_events"])
+def test_a_new_verdict_replaces_the_previous_label_rather_than_adding_to_it(harness):
+    """changes-requested -> approved: the PR carries exactly {approved} afterwards."""
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "changes-requested", event_id="c" * 64, created_at=1000)
+    harness.prs_data = ([], [])
+    harness.sync()
+    assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
+    changes = tuple(label_detail(harness, pr.id)["label_events"])
 
-    set_review_status(harness, task, "running")
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
     report = harness.sync()
 
-    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("in-review",), first)
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("approved",), changes)
+    assert set(label_detail(harness, pr.id)["label"]) == {"approved"}
     assert report.prs["labels"] == 1
-    assert label_detail(harness, pr.id)["label"] == ["in-review"]
 
 
-@pytest.mark.parametrize("body, expected", [
-    ("## Verdict: approved", "approved"),
-    ("## Verdict: changes needed at a9c6139", "changes-requested"),
-])
-def test_a_verdict_flips_the_label_and_retracts_the_one_before(harness, body, expected):
-    pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", body)
-    set_review_status(harness, task, "review")
-    previous = tuple(label_detail(harness, pr.id)["label_events"])
+def test_a_label_left_over_from_a_previous_writer_is_corrected_by_one_pass(harness):
+    """The old writer's `in-review` is in the link row and on the relay; one pass fixes it."""
+    pr, _task = pr_with_review_task(harness)
+    old = "o" * 64
+    carry_label(harness, pr.id, "in-review", old)
+    detail = label_detail(harness, pr.id)
+    detail["label"] = ["in-review"]
+    detail["label_events"] = [old]
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, state="signalled",
+                                 board=BOARD, detail=detail)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("approved",), (old,))
+    assert set(label_detail(harness, pr.id)["label"]) == {"approved"}
+    assert report.prs["labels"] == 1
+
+
+def test_a_label_the_link_row_never_recorded_is_still_retracted(harness):
+    """A label event only the relay knows about is what a different writer leaves behind."""
+    pr, _task = pr_with_review_task(harness)
+    foreign = "s" * 64
+    carry_label(harness, pr.id, "stale", foreign)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
 
     harness.sync()
 
-    assert harness.label_calls[-1] == (pr.id, ADDRESS, (expected,), previous)
-    assert label_detail(harness, pr.id)["label"] == [expected]
+    retracted = harness.label_calls[-1][3]
+    assert foreign in retracted
+    assert set(label_detail(harness, pr.id)["label"]) == {"approved"}
 
 
-def test_a_revision_after_an_approval_needs_review_and_is_stale(harness):
-    pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "review")
+def test_no_verdict_and_no_review_card_carries_no_label(harness):
+    """Reviews turned off: no card, no verdict, no label -- and a leftover is removed."""
+    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    pr = make_pr("f1", commit="c1")
+    harness.prs_data = ([pr], [])
+    leftover = "r" * 64
+    carry_label(harness, pr.id, "review-required", leftover)
+
+    report = harness.sync()
+
+    assert harness.label_calls == [(pr.id, ADDRESS, (), (leftover,))]
+    assert label_detail(harness, pr.id)["label"] == []
+    assert report.prs["labels"] == 0
+
+
+def test_no_verdict_and_no_review_card_publishes_nothing_when_there_is_nothing_to_remove(harness):
+    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    pr = make_pr("f2", commit="c2")
+    harness.prs_data = ([pr], [])
+
+    harness.sync()
+
+    assert harness.label_calls == []
+
+
+def test_a_revision_after_a_verdict_needs_review_not_a_second_label(harness):
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.prs_data = ([], [])
     harness.sync()
     approved = tuple(label_detail(harness, pr.id)["label_events"])
 
-    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
+    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=3000,
                              event_id="1" * 64)
     harness.prs_data = ngit.PrFeed(revisions=[revision])
     report = harness.sync()
 
-    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("review-required", "stale"), approved)
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("review-required",), approved)
+    assert label_detail(harness, pr.id)["label"] == ["review-required"]
     assert report.prs["labels"] == 1
-    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
 
 
-def test_a_revision_after_changes_requested_needs_review_without_stale(harness):
-    pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", "Verdict: changes needed at a9c6139")
-    set_review_status(harness, task, "review")
+def test_a_re_review_verdict_moves_the_label_and_the_anchor(harness):
+    """The newest verdict comment is the one in force, not the first one published."""
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "changes-requested", event_id="c" * 64, created_at=2000)
+    harness.sync()
+    changes = tuple(label_detail(harness, pr.id)["label_events"])
+
+    review_verdict(harness, pr.id, "approved", event_id="b" * 64, created_at=4000)
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("approved",), changes)
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+    assert report.prs["labels"] == 1
+
+
+def test_relay_disagreement_newest_verdict_wins_and_the_pass_names_the_relay(harness):
+    pr, _task = pr_with_review_task(harness)
+    harness.readings[pr.id] = (("wss://relay.example", "changes-requested", 1000),
+                               ("wss://other.example", "approved", 2000))
+    harness.verdicts[pr.id] = ngit_labels.Verdict(
+        label="approved", event_id="a" * 64, created_at=2000, relay="wss://other.example")
+
+    report = harness.sync()
+
+    assert harness.label_calls[-1][2] == ("approved",)
+    assert label_detail(harness, pr.id)["label_relay"] == "wss://other.example"
+    notes = "\n".join(report.notes)
+    assert "wss://other.example" in notes and "disagreed" in notes
+
+
+def test_an_unreadable_newest_verdict_leaves_the_label_alone_and_says_why(harness):
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.sync()
+    published = len(harness.label_calls)
+
+    harness.verdicts[pr.id] = ngit_labels.Verdict(
+        label="", event_id="u" * 64, created_at=3000, relay="wss://relay.example",
+        readable=False)
+    report = harness.sync()
+
+    assert len(harness.label_calls) == published
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+    notes = "\n".join(report.notes)
+    assert "u" * 64 in notes and "cannot be read" in notes
+
+
+def test_a_pr_the_relay_read_did_not_answer_for_keeps_its_label(harness):
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.sync()
+    published = len(harness.label_calls)
+
+    harness.state = lambda pr_ids: ngit.ReadState(errors=("relay read failed",))
+    report = harness.sync()
+
+    assert len(harness.label_calls) == published
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+    assert any("left as it is" in note for note in report.notes)
+
+
+def test_the_relay_state_is_read_once_for_the_whole_pass(harness):
+    pr, _task = pr_with_review_task(harness)
+    other = make_pr("f3", commit="c3", branch="pr/other")
+    harness.prs_data = ([other], [])
+    harness.read_calls.clear()
+
     harness.sync()
 
-    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
-                             event_id="1" * 64)
-    harness.prs_data = ngit.PrFeed(revisions=[revision])
-    harness.sync()
-
-    assert harness.label_calls[-1][2] == ("review-required",)
-
-
-def test_a_revision_of_a_pr_a_poll_did_not_carry_still_moves_the_label(home, store):
-    """The task can finish between two passes; the label must not need the PR event again."""
-    made = Harness(home, store)
-    pr, task = pr_with_review_task(made, "e2")
-    made.board.comment(task, "review", "Verdict: approved")
-    set_review_status(made, task, "review")
-    made.sync()
-
-    made.prs_data = ngit.PrFeed(revisions=[ngit.Revision(
-        pr_id=pr.id, commit="beef" * 10, created_at=2500, event_id="2" * 64)])
-    made.sync()
-    label = label_detail(made, pr.id)["label"]
-    made.close()
-
-    assert label == ["review-required", "stale"]
+    assert harness.read_calls == [(pr.id, other.id)]
 
 
 def test_a_merge_leaves_the_last_verdict_in_place_and_closes_the_task(harness):
     pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", "Verdict: approved")
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
     harness.sync()
     published = len(harness.label_calls)
 
@@ -1570,23 +1700,6 @@ def test_a_merge_leaves_the_last_verdict_in_place_and_closes_the_task(harness):
     # No new label: a merge does not rewrite the verdict it was decided on.
     assert len(harness.label_calls) == published
     assert label_detail(harness, pr.id)["label"] == ["approved"]
-
-
-def test_a_merge_closes_the_review_task_whose_verdict_is_in_force(harness):
-    """The merge closes the newest review card, not the first one the link was made with."""
-    pr, first = pr_with_review_task(harness)
-    harness.board.comment(first, "review", "Verdict: changes-requested")
-    set_review_status(harness, first, "review")
-    harness.sync()
-
-    second = hand_queued_review_task(harness, pr)
-    set_review_status(harness, second, "running")
-    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=3000)
-    harness.prs_data = ([pr], [merge])
-    harness.sync()
-
-    assert harness.task(second)["status"] == "done"
-    assert "merged as" in harness.comments(second)[-1]["body"]
 
 
 def test_a_label_that_could_not_be_published_is_retried_not_believed(home, store):
@@ -1663,49 +1776,6 @@ def test_a_pr_first_seen_already_merged_gets_no_label(harness):
     assert harness.label_calls == []
 
 
-def test_a_second_verdict_on_a_revised_tip_re_anchors(harness):
-    """approved -> revision -> stale -> re-approved: the label must come back to `approved`."""
-    pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "review")
-    harness.sync()
-
-    revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
-                             event_id="1" * 64)
-    harness.prs_data = ngit.PrFeed(revisions=[revision])
-    harness.sync()
-    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
-
-    # The re-review reads the new tip, and approves it in the same words as the first one.
-    set_review_status(harness, task, "running")
-    harness.sync()
-    harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "review")
-    report = harness.sync()
-
-    assert harness.label_calls[-1][2] == ("approved",)
-    assert label_detail(harness, pr.id)["label"] == ["approved"]
-    assert report.prs["labels"] == 1
-
-
-def test_a_link_from_before_the_verdict_comment_existed_keeps_its_anchor(harness):
-    """An upgrade must not pin an old verdict to whatever tip is current when it lands."""
-    pr, task = pr_with_review_task(harness)
-    harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "review")
-    harness.sync()
-
-    detail = label_detail(harness, pr.id)
-    detail.pop("verdict_comment", None)
-    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, state="signalled",
-                                 board=BOARD, detail=detail)
-    harness.prs_data = ngit.PrFeed(revisions=[ngit.Revision(
-        pr_id=pr.id, commit="b0b0" * 10, created_at=2100, event_id="3" * 64)])
-    harness.sync()
-
-    assert label_detail(harness, pr.id)["label"] == ["review-required", "stale"]
-
-
 def test_a_proposal_with_no_tip_tag_is_still_labelled(harness):
     """A kind-1618 that names no commit is still a PR waiting for a review."""
     pr = make_pr("ea", commit="")
@@ -1747,54 +1817,6 @@ def test_a_late_review_task_does_not_drop_the_label_state(harness):
     assert after["label"] == ["review-required"]
     assert after["label_events"] == detail["label_events"]
     assert harness.task(link["task_id"]) is not None
-
-
-def hand_queued_review_task(harness, pr, *, subject: str = "re-review") -> str:
-    """A review card the bridge did not make: what a reviewer queues for a revision."""
-    return harness.board.create(
-        title=f"Review PR {pr.id[:8]}: {subject}",
-        body=f"Re-review of PR `{pr.id}`: review the tip, then report a verdict.",
-        assignee="review", status="ready", created_by="holly")
-
-
-def test_a_re_review_task_moves_the_label_and_the_anchor(harness):
-    """The newest review's verdict is the one in force, not the first round's."""
-    pr, first = pr_with_review_task(harness)
-    harness.board.comment(first, "review", "Verdict: approved")
-    set_review_status(harness, first, "review")
-    harness.sync()
-    approved = tuple(label_detail(harness, pr.id)["label_events"])
-    assert label_detail(harness, pr.id)["label"] == ["approved"]
-
-    # The revision is re-reviewed on a card the bridge never made, and asks for changes.
-    second = hand_queued_review_task(harness, pr)
-    harness.board.comment(second, "review", "Verdict: changes-requested")
-    set_review_status(harness, second, "review")
-    harness.prs_data = ([], [])
-    report = harness.sync()
-
-    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("changes-requested",), approved)
-    assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
-    # The link names the task whose verdict is in force, so a merge closes that one.
-    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"] == second
-    assert report.prs["labels"] == 1
-
-
-def test_a_running_re_review_reads_in_review_not_the_verdict_it_replaces(harness):
-    """A new review round has no verdict yet: the round before it must not speak for it."""
-    pr, first = pr_with_review_task(harness)
-    harness.board.comment(first, "review", "Verdict: changes-requested")
-    set_review_status(harness, first, "review")
-    harness.sync()
-    assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
-
-    second = hand_queued_review_task(harness, pr)
-    set_review_status(harness, second, "running")
-    harness.prs_data = ([], [])
-    harness.sync()
-
-    assert harness.label_calls[-1][2] == ("in-review",)
-    assert label_detail(harness, pr.id)["label"] == ["in-review"]
 
 
 def test_the_label_vocabulary_is_a_config_default():
@@ -2563,4 +2585,87 @@ def test_ngit_status_names_the_fix_when_the_binary_is_unusable(monkeypatch, prob
     assert expected in status.problem
     assert ngit.NGIT_FLOOR in status.problem
     assert ngit.NGIT_INSTALL_HINT in status.problem
+
+
+# -- the relay read the label pass is derived from ----------------------------
+
+LABEL_PR = "ab" * 32
+
+
+def relay_comment(relay: str, *, event_id: str, body: str, created_at: int) -> tuple[str, dict]:
+    return (relay, {"id": event_id, "kind": ngit.KIND_COMMENT, "content": body,
+                    "created_at": created_at, "relay": relay,
+                    "tags": [["E", LABEL_PR], ["K", "1618"]]})
+
+
+def relay_label(relay: str, *, value: str, event_id: str, pr_id: str = LABEL_PR,
+                namespace: str = "#t") -> tuple[str, dict]:
+    return (relay, {"id": event_id, "kind": ngit_labels.KIND_LABEL, "content": "",
+                    "created_at": 1000, "relay": relay,
+                    "tags": [["L", namespace], ["l", value, namespace], ["e", pr_id]]})
+
+
+def test_the_relay_read_takes_the_newest_verdict_and_keeps_each_relay_s_answer():
+    calls: list[dict] = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        if kwargs["kinds"] == [ngit.KIND_COMMENT]:
+            return [relay_comment("wss://a.example", event_id="c" * 64,
+                                  body="Verdict: changes-requested", created_at=1000),
+                    relay_comment("wss://b.example", event_id="d" * 64,
+                                  body="Verdict: approved", created_at=2000)]
+        return [relay_label("wss://a.example", value="in-review", event_id="l" * 64)]
+
+    reader = ngit.RelayLabels(["wss://a.example", "wss://b.example"], ADDRESS, fetcher=fetch)
+    read = reader.read([LABEL_PR]).prs[LABEL_PR]
+
+    assert read.verdict is not None
+    assert (read.verdict.label, read.verdict.relay) == ("approved", "wss://b.example")
+    assert read.relay == "wss://b.example"
+    assert [label.value for label in read.labels] == ["in-review"]
+    assert "wss://a.example" in read.disagreement()
+    # One filter per PR, one request per relay per kind: the relay that answered is kept.
+    assert calls[0]["tag"] == "E" and calls[0]["values"] == [LABEL_PR]
+    assert calls[1]["tag"] == "e" and calls[1]["a_tag"] == ADDRESS
+
+
+def test_a_label_for_another_pr_or_another_namespace_is_not_this_pr_s():
+    def fetch(**kwargs):
+        if kwargs["kinds"] == [ngit.KIND_COMMENT]:
+            return []
+        return [relay_label("wss://a.example", value="approved", event_id="l" * 64,
+                            pr_id="cd" * 32),
+                relay_label("wss://a.example", value="approved", event_id="m" * 64,
+                            namespace="#other")]
+
+    reader = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch)
+    read = reader.read([LABEL_PR]).prs[LABEL_PR]
+
+    assert read.labels == ()
+
+
+def test_a_read_with_no_relays_is_an_error_not_an_empty_answer():
+    read = ngit.RelayLabels([], ADDRESS).read([LABEL_PR])
+    assert read.prs == {}
+    assert any("empty" in problem for problem in read.errors)
+
+
+def test_a_read_that_finds_nothing_is_an_answer_not_an_error():
+    """A repo whose open PRs have no comments yet is quiet, not failing."""
+    def fetch(**kwargs):
+        return []
+
+    read = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch).read([LABEL_PR])
+    assert read.errors == ()
+    assert read.prs[LABEL_PR].verdict is None and read.prs[LABEL_PR].labels == ()
+
+
+def test_a_reader_that_raises_is_an_error_not_an_exception():
+    def fetch(**kwargs):
+        raise OSError("relay hung up")
+
+    read = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch).read([LABEL_PR])
+    assert read.prs == {}
+    assert any("OSError" in problem for problem in read.errors)
 

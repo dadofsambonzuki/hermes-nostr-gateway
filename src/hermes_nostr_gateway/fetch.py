@@ -195,6 +195,79 @@ def fetch_many_blocking(**kwargs: Any) -> list[dict[str, Any]]:
         return pool.submit(lambda: sdkloop.run_isolated(fetch_many(**kwargs))).result()
 
 
+async def fetch_tagged(*, relays: Iterable[str], kinds: Sequence[int], tag: str,
+                       values: Sequence[str], limit: int = 50, a_tag: str | None = None,
+                       timeout: float = 8.0,
+                       secret: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+    """Events matching one tag per value, asked of every relay separately.
+
+    Used where the relay that answered is part of the answer: the label pass has to say
+    which relay's verdict it read, and `fetch_many` merges every relay's events into one
+    list without saying where they came from. One filter per value (`#E=<pr>` for each PR)
+    keeps this to one REQ per relay per kind, and a relay that refuses or times out costs
+    only its own events -- the others still answer.
+    """
+    urls = [str(url) for url in relays if url]
+    wanted = [str(value) for value in values if str(value or "").strip()]
+    if not urls or not wanted:
+        return []
+    filters = [_tag_filter(kinds, tag, value, limit, a_tag) for value in wanted]
+    client = _client(secret)
+    out: list[tuple[str, dict[str, Any]]] = []
+    try:
+        for url in urls:
+            try:
+                await client.add_relay(sdk.RelayUrl.parse(url))
+            except Exception:  # noqa: BLE001 - one bad URL must not lose the read
+                log.debug("fetch: cannot add relay %s", url)
+        await client.connect()
+        for url in urls:
+            try:
+                events = await asyncio.wait_for(
+                    client.fetch_events(sdk.ReqTarget.single(sdk.RelayUrl.parse(url), filters),
+                                        dt.timedelta(seconds=timeout)),
+                    timeout + 2)
+            except Exception as exc:  # noqa: BLE001 - one relay down is reported by omission
+                log.debug("fetch: %s on %s failed: %s", kinds, url, exc)
+                continue
+            for event in events:
+                try:
+                    raw = json.loads(event.as_json())
+                except Exception:  # noqa: BLE001
+                    continue
+                raw["relay"] = url
+                out.append((url, raw))
+    finally:
+        try:
+            await client.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def fetch_tagged_blocking(**kwargs: Any) -> list[tuple[str, dict[str, Any]]]:
+    """`fetch_tagged` for callers that are not async; one-shot loop, binding restored."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return sdkloop.run_isolated(fetch_tagged(**kwargs))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: sdkloop.run_isolated(fetch_tagged(**kwargs))).result()
+
+
+def _tag_filter(kinds: Sequence[int], tag: str, value: str, limit: int,
+                a_tag: str | None = None) -> sdk.Filter:
+    """One filter for `#<tag>=<value>`, with the address tag when there is one."""
+    filt = sdk.Filter().kinds([sdk.Kind(int(kind)) for kind in kinds])
+    if limit:
+        filt = filt.limit(int(limit))
+    if tag:
+        filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord(tag)), str(value))
+    if a_tag:
+        filt = filt.custom_tag(sdk.SingleLetterTag.from_byte(ord("a")), str(a_tag))
+    return filt
+
+
 async def stream_events(*, relays: Iterable[str], kinds: Sequence[int],
                         author: str | None = None, p_tag: str | None = None,
                         since_days: int = 3, on_event,

@@ -432,3 +432,27 @@ and the kernel has no completion extension point a bridge can register. The boar
 place both completion paths meet, and the guard is installed next to the rows this bridge
 already writes. A kernel schema rebuild can drop the trigger; the next pass re-installs it from
 the link, so the rule heals rather than silently lapsing.
+
+## Three labels, one writer
+
+A PR's review state is one of three words — `review-required`, `changes-requested`, `approved`
+— and the label pass is the only thing that writes it. `in-review` and `stale` are retired: an
+open PR with a review card already *is* in review, and a revision that leaves a verdict behind
+means `review-required`, in one word rather than two labels a reader has to combine.
+
+**The verdict is read from the PR root.** A reviewer publishes its verdict as a NIP-22
+kind-1111 comment on the PR and reports the same verdict on the task, naming the event id. The
+newest comment wins. The card is the queue; the PR is the record, and a label derived from the
+card would say something a reader of the PR cannot check. The review brief says so.
+
+**The pass corrects, it does not append.** It reads the label events the PR carries off the
+same relays it publishes to, publishes the one that belongs there and retracts every other one
+— including a leftover from an earlier writer that this bridge's link row never recorded. That
+is what makes a leftover a one-pass fix; a writer that only retracted events it remembered
+would leave the column with a history nobody could trust.
+
+**Unknown is not stale.** A newest verdict the parser cannot read leaves the label untouched
+and records the event and relay; so does a relay read that failed, and a PR the pass has
+labelled but cannot read a verdict for. Falling back to an older approval is the one direction
+that can publish permission nobody gave. Relays that disagree are read per relay: the newest
+verdict wins, and the pass says which relay it read and which relays saw something else.

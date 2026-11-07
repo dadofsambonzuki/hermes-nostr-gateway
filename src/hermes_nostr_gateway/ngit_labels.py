@@ -1,20 +1,26 @@
 """A pull request's review state, published as a NIP-34 label on the PR itself.
 
-`ngit pr list` has a LABELS column, and every proposal this bridge announced left it empty:
-"waiting for a review", "approved", "changes asked for" lived in task comments that nobody
-outside the board reads. This module is the vocabulary and the wire format for putting that
-state where the author already is.
+Three words, one namespace, one writer:
 
-Five words, one namespace:
+    review-required    no verdict yet, or a tip newer than the last verdict
+    changes-requested  the newest verdict asks for changes
+    approved           the newest verdict approves it
 
-    review-required    a PR with no verdict yet (what a new PR gets)
-    in-review          a reviewer is working on it
-    approved           verdict recorded; merging is the operator's
-    changes-requested  verdict recorded with findings
-    stale              a revision landed after the verdict it was given
+`#in-review` is gone on purpose. An open PR with a review card already *is* in review, and
+a second word for "a reviewer is looking at it" says nothing a reader cannot see on the
+board. `#stale` is gone with it: a tip newer than the last verdict means `review-required`,
+which is the same fact in the one word a reader has to look at -- and two labels for one
+PR is how the column accumulated a history nobody could read.
 
-Three things were measured against ngit 3.0.5 rather than assumed, because each one decides
-how the bridge must publish:
+The verdict is read from the **PR root**, not from the board. A reviewer publishes its
+verdict as a NIP-22 kind-1111 comment on the PR (root `E` = the PR id), and the newest one
+wins. The board card is the queue; the PR is the record. A reader who never sees the board
+still sees the verdict the label is derived from, and a verdict the reviewer recorded on
+the card but never published leaves the label where it is rather than inventing a state the
+PR's own readers cannot check.
+
+Three things about the format were measured against ngit 3.0.5 rather than assumed, because
+each one decides how the bridge must publish:
 
 * **The namespace is `#t`, or nobody sees the label.** `ngit pr list` merges kind-1985
   hashtag labels with the inline `t` tags a proposal may carry. A label event published with
@@ -32,10 +38,10 @@ how the bridge must publish:
   reader's cache, not a second source of truth here: the label events on the relays are the
   state, and this module publishes exactly one live label per PR.
 
-The verdict is not stored here either. It is read from the review task the bridge already
-creates (its comments), and this module turns it into a label. Publishing the same label
-twice is pointless -- a reader would see one event either way -- so the caller publishes on
-change only, and the link row remembers what it last published.
+A label this bridge did not write is corrected the same way it writes its own: the pass
+reads the live label events off the relays, publishes the one that belongs there and
+retracts every other one -- including `in-review` and `stale` left by an earlier writer.
+That is what makes the pass the only writer: no cleanup follows it by hand.
 """
 
 from __future__ import annotations
@@ -54,31 +60,75 @@ from .publisher import publish as publish_events
 KIND_LABEL = 1985
 KIND_DELETION = 5
 
+#: A verdict is a NIP-22 comment. ngit 3.0.5 publishes `ngit pr comment` as this kind
+#: (`src/lib/git_events.rs`, `KIND_COMMENT`), and no ngit release ever wrote 1622.
+KIND_COMMENT = 1111
+
 #: The one namespace. `#t` is what ngit displays and filters on; see the module docstring.
 NAMESPACE = "#t"
 
 REVIEW_REQUIRED = "review-required"
-IN_REVIEW = "in-review"
 APPROVED = "approved"
 CHANGES_REQUESTED = "changes-requested"
-STALE = "stale"
 
-#: The vocabulary, in the order a reader sees a PR move through it.
-LABELS = (REVIEW_REQUIRED, IN_REVIEW, APPROVED, CHANGES_REQUESTED, STALE)
+#: The vocabulary, and the whole of it. One label per PR, never two.
+LABELS = (REVIEW_REQUIRED, CHANGES_REQUESTED, APPROVED)
 
 #: One line of content per label: NIP-32 allows the label event to say why, and a reader who
 #: sees the event without the CLI (a relay dump, another client) should not have to guess.
 CONTENT = {
-    REVIEW_REQUIRED: "This pull request needs a review before it can be merged.",
-    IN_REVIEW: "A review of this pull request is in progress.",
-    APPROVED: "A review approved this revision; merging is the maintainer's decision.",
+    REVIEW_REQUIRED: "This pull request needs a review of its current tip before it can be merged.",
     CHANGES_REQUESTED: "A review asked for changes; see the review comments on this proposal.",
-    STALE: "A revision landed after this pull request was reviewed.",
+    APPROVED: "A review approved this revision; merging is the maintainer's decision.",
 }
 
 #: A verdict line: `Verdict: approved`, `## Verdict: changes needed`, `**VERDICT:** ...`.
 _VERDICT_LINE = re.compile(
     r"^\s*(?:#+\s*)?\**\s*verdict\s*\**\s*:?\s*\**\s*(?P<rest>.*)$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The newest verdict a PR root carries, and the event that states it.
+
+    `readable` is separate from `label` on purpose: a comment that states a verdict in
+    words this module does not recognise is newer than the last one it *could* read, and
+    falling back to an older approval over it is the one direction that could publish a
+    green light nobody gave. The caller leaves the label untouched and says why.
+    """
+
+    label: str = ""
+    event_id: str = ""
+    created_at: int = 0
+    relay: str = ""
+    readable: bool = True
+
+
+@dataclass(frozen=True)
+class Label:
+    """One live kind-1985 label event on a PR, as a relay served it."""
+
+    value: str
+    event_id: str
+    created_at: int = 0
+    relay: str = ""
+
+
+@dataclass(frozen=True)
+class VerdictAnchor:
+    """A verdict and the tip it was given for: the state `review_labels` reads.
+
+    `tip` empty means "the tip this verdict covers is not known", and a verdict with no
+    known tip is never treated as superseded -- the conservative direction is to keep an
+    approval that cannot be shown to be stale rather than to withdraw one that can't be
+    shown to be current. Every verdict that arrives with a tip or a time anchors to one.
+    """
+
+    label: str
+    event_id: str = ""
+    created_at: int = 0
+    relay: str = ""
+    tip: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,32 +190,111 @@ def retraction_event(event_id: str, *, created_at: Optional[int] = None) -> dict
     }
 
 
+def live_label(event: Mapping[str, Any]) -> Optional[Label]:
+    """One relay event as the label it carries, or None when it is not one of ours.
+
+    Only the `#t` namespace counts: a kind-1985 in a namespace of another tool is not this
+    PR's review state, and retracting it would be the bridge deleting someone else's work.
+    """
+    if int(event.get("kind") or 0) != KIND_LABEL:
+        return None
+    tags = event.get("tags") or ()
+    namespaces = {tag[1] for tag in tags
+                  if isinstance(tag, (list, tuple)) and len(tag) >= 2 and tag[0] == "L"}
+    if NAMESPACE not in namespaces:
+        return None
+    value = next((str(tag[1]) for tag in tags
+                  if isinstance(tag, (list, tuple)) and len(tag) >= 3
+                  and tag[0] == "l" and str(tag[2]) == NAMESPACE), "")
+    if not value:
+        return None
+    return Label(value=value, event_id=str(event.get("id") or ""),
+                 created_at=int(event.get("created_at") or 0),
+                 relay=str(event.get("relay") or ""))
+
+
 # -- the state ----------------------------------------------------------------
 
-def review_labels(*, verdict: str = "", task_status: str = "", tip: str = "",
-                  verdict_tip: str = "", merged: bool = False) -> Optional[tuple[str, ...]]:
-    """The labels the PR should carry now, or None when it is not ours to change.
+def review_labels(*, verdict: Optional[VerdictAnchor] = None, review_card: bool = False,
+                  tip: str = "", tip_at: int = 0, labelled: bool = False,
+                  merged: bool = False) -> Optional[tuple[str, ...]]:
+    """The label the PR should carry now, or None when it is not ours to change.
 
-    `None` is the merged case: a merge leaves the last verdict in place, because the verdict
-    is what the merge was decided on and rewriting it afterwards would lose that.
+    `None` is "leave it alone": a merged PR keeps the label it was decided on, and a PR
+    that already carries a label but whose verdict could not be read keeps that label
+    rather than being rewritten from a read that did not happen.
 
     The revision rule comes before the verdict rule on purpose: a verdict covers the tip it
-    was given for, so a tip that is no longer that one leaves the PR needing review again --
-    with `stale` alongside when the superseded verdict was an approval, because that is the
-    case where a reader could otherwise merge something nobody reviewed.
+    was given for, so a tip that is no longer that one leaves the PR needing review again.
+    The tip a verdict covered is known from the anchor, and when this pass is the first to
+    see an old verdict next to a newer tip event, the times say the same thing.
+
+    `()` is a *decided* state, not an absence: there is no verdict and no review card, so
+    the PR carries no label at all and any label left on it is retracted.
     """
     if merged:
         return None
-    if verdict and verdict_tip and tip and tip != verdict_tip:
-        return (REVIEW_REQUIRED, STALE) if verdict == APPROVED else (REVIEW_REQUIRED,)
-    if verdict:
-        return (verdict,)
-    if task_status == "running":
-        return (IN_REVIEW,)
-    # Ready, in the review lane, blocked on authorisation, or finished without a verdict
-    # that can be read: either way nobody has recorded a verdict, and `review-required` is
-    # the label that cannot be mistaken for permission to merge.
-    return (REVIEW_REQUIRED,)
+    if verdict is not None:
+        reviewed = verdict.tip
+        if reviewed and tip and reviewed == tip:
+            # The tip is the one that was reviewed, whatever else has been published since.
+            return (verdict.label,)
+        if reviewed and tip and reviewed != tip:
+            return (REVIEW_REQUIRED,)
+        if tip_at and verdict.created_at and verdict.created_at < tip_at:
+            # This pass saw the verdict and the newer tip for the first time: the reviewer
+            # read an earlier commit, so the verdict does not cover the one on the PR now.
+            return (REVIEW_REQUIRED,)
+        return (verdict.label,)
+    if review_card:
+        # A first label for a card nobody has reviewed yet. Once a label is there and the
+        # verdict cannot be read, "review-required" would be a guess about a read that did
+        # not happen -- so the label stays where it is until a verdict actually lands.
+        return None if labelled else (REVIEW_REQUIRED,)
+    return ()
+
+
+def anchor_verdict(stored: Mapping[str, Any], verdict: Optional[Verdict],
+                   *, tip: str = "", tip_at: int = 0) -> Optional[VerdictAnchor]:
+    """The verdict in force and the tip it covers, re-anchored to its own event.
+
+    The event id is the anchor: two verdicts can say the same word, and a re-review of a
+    revised tip approves again in exactly the words the first one used, so moving the
+    anchor on the words alone would pin a fresh approval to the old tip and read `stale`
+    for ever. A new event id re-anchors; the same one keeps the tip it was first anchored
+    to.
+
+    A verdict newer than the tip event we know about covers that tip. A verdict older than
+    the tip event does not cover it -- an earlier tip is what the reviewer read, and this
+    pass did not see it, so the anchor's tip stays unknown rather than claiming the current
+    one.
+    """
+    if verdict is None or not verdict.readable:
+        return None
+    if (stored.get("verdict_event") == verdict.event_id
+            and str(stored.get("verdict") or "") == verdict.label):
+        return VerdictAnchor(
+            label=verdict.label, event_id=verdict.event_id,
+            created_at=int(stored.get("verdict_at") or verdict.created_at),
+            relay=str(stored.get("verdict_relay") or verdict.relay),
+            tip=str(stored.get("verdict_tip") or ""))
+    covered = ""
+    if not tip_at or not verdict.created_at or tip_at <= verdict.created_at:
+        covered = tip
+    return VerdictAnchor(label=verdict.label, event_id=verdict.event_id,
+                         created_at=verdict.created_at, relay=verdict.relay, tip=covered)
+
+
+#: The link-detail keys a verdict anchor is written to. One list so a caller clearing the
+#: anchor for a new review round cannot miss one and leave half a verdict behind.
+ANCHOR_KEYS = ("verdict", "verdict_event", "verdict_at", "verdict_relay", "verdict_tip")
+
+
+def anchor_detail(anchor: VerdictAnchor) -> dict[str, Any]:
+    """The link-detail fields for an anchor: what the next pass re-reads to stay quiet."""
+    return {"verdict": anchor.label, "verdict_event": anchor.event_id,
+            "verdict_at": anchor.created_at, "verdict_relay": anchor.relay,
+            "verdict_tip": anchor.tip}
 
 
 def _classify(text: str) -> str:
@@ -208,30 +337,46 @@ def _verdict_in(body: str) -> Optional[str]:
     return None
 
 
-def parse_verdict(comments: Iterable[Mapping[str, Any]]) -> tuple[str, int]:
-    """The newest verdict in a review task's comments, and the id of the comment holding it.
+def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
+    """The newest verdict among a PR root's kind-1111 comments, or None for no verdict.
 
-    The task is the record: a reviewer writes the verdict as a comment, so the newest
-    comment that states one is the verdict in force. Reasoning comments and the bridge's own
-    merge line state none and are skipped, which is what lets the merge line land on top of
-    an approval without erasing it.
-
-    The comment id is returned with the verdict because the words are not enough to say a
-    verdict is new: a re-review of a revised tip approves again in exactly the same words,
-    and the anchor that pairs a verdict with its tip has to move when that happens.
+    Newest is by `created_at`, then by event id: a relay replaying an older comment must
+    not outrank a newer one, and two comments stamped the same second need an order that
+    does not depend on which relay answered first. Prose comments are skipped -- that is
+    what lets a review's reasoning, and the bridge's own merge line, sit above a verdict
+    without erasing it. A verdict-looking line nobody can parse stops the search and comes
+    back marked unreadable.
     """
-    for comment in reversed(list(comments)):
-        body = comment.get("body") if isinstance(comment, Mapping) else comment
-        verdict = _verdict_in(str(body or ""))
-        if verdict is None:
+    comments = []
+    for event in events or ():
+        if not isinstance(event, Mapping):
             continue
-        if not verdict:
-            # A verdict line we cannot read: newer than anything older, and not a verdict
-            # we can publish, so the search stops with nothing.
-            return "", 0
-        found = int(comment.get("id") or 0) if isinstance(comment, Mapping) else 0
-        return verdict, found
-    return "", 0
+        kind = event.get("kind")
+        if kind is not None and int(kind or 0) != KIND_COMMENT:
+            continue
+        comments.append(event)
+    comments.sort(key=lambda event: (int(event.get("created_at") or 0),
+                                     str(event.get("id") or "")), reverse=True)
+    for event in comments:
+        stated = _verdict_in(str(event.get("content") or ""))
+        if stated is None:
+            continue
+        return Verdict(label=stated, event_id=str(event.get("id") or ""),
+                       created_at=int(event.get("created_at") or 0),
+                       relay=str(event.get("relay") or ""), readable=bool(stated))
+    return None
+
+
+def unmanaged(labels: Iterable[Label], desired: Sequence[str]) -> list[Label]:
+    """The live labels that do not belong: anything not in the desired set.
+
+    This is the correction path, and it is why the pass reads the relays before it writes:
+    a label an earlier writer left (`in-review`, `stale`, a second word from a version that
+    had more of them) is not in this bridge's link row, but it is still on the PR. Every
+    one of those is retracted by the same pass that publishes the right label.
+    """
+    wanted = set(desired)
+    return [label for label in labels if label.value not in wanted]
 
 
 # -- publishing ---------------------------------------------------------------
@@ -247,14 +392,17 @@ def _signer(secret: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
 
 
 class LabelPublisher:
-    """Publish one PR's labels, retracting the ones they replace.
+    """Publish one PR's label, retracting every label event it replaces.
 
-    Four events at most per state change (two labels in the `stale` case, plus two
-    retractions), each signed once and sent to every relay in the read set -- the same set
-    the bridge reads the PR from, so a reader that can see the PR can see its label. The
+    Each event is signed once and sent to every relay in the read set -- the same set the
+    bridge reads the PR from, so a reader that can see the PR can see its label. The
     retraction has to reach every one of them: a relay that kept the old label keeps showing
     it, which is the whole reason the superseded event is deleted rather than left to be
     out-ranked.
+
+    `add` empty with `retract` non-empty is a real state, not a no-op: the PR should carry
+    no label at all, and the leftovers are removed. A publish with nothing to do succeeds
+    without sending anything.
     """
 
     def __init__(self, relays: Sequence[str], *, secret: str = "",
@@ -307,7 +455,9 @@ class LabelPublisher:
                 continue
             kept.append(str(signed.get("id") or ""))
             accepted = ok if accepted is None else (accepted & ok)
-        if not kept or accepted is None:
+        if add and not kept:
+            # Nothing a reader needs landed. The old label is still there, so the row must
+            # keep saying what readers see and the next pass tries again.
             return LabelResult(ok=False, retracted=not retract, relays=0,
                                error="; ".join(errors) or "nothing to publish")
 
@@ -321,10 +471,13 @@ class LabelPublisher:
                 errors.append(f"retract {event_id[:8]}: {type(exc).__name__}: {exc}"[:200])
                 retracted = False
                 continue
-            if not any(good for good, _ in results.values()):
+            ok = {relay for relay, (good, _) in results.items() if good}
+            if not ok:
                 retracted = False
                 reason = next((why for good, why in results.values() if not good),
                               "no relay accepted it")
                 errors.append(f"retract {event_id[:8]}: {reason}"[:200])
+                continue
+            accepted = ok if accepted is None else (accepted & ok)
         return LabelResult(ok=True, events=tuple(kept), retracted=retracted,
-                           relays=len(accepted), error="; ".join(errors))
+                           relays=len(accepted or ()), error="; ".join(errors))

@@ -177,3 +177,37 @@ async def test_no_relays_means_no_client_and_no_lookup(monkeypatch, relays):
     assert await fetch.fetch_many(relays=relays, kinds=[1059]) == []
     assert await fetch.fetch_first(relays=relays, kinds=[1059]) is None
     await fetch.stream_events(relays=relays, kinds=[1059], on_event=on_event)
+
+
+# -- one tag per value, and the relay that answered it ------------------------
+
+ADDRESS = f"30617:{'ee' * 32}:example-repo"
+
+
+def test_a_tagged_filter_carries_the_value_and_the_repository():
+    spec = json.loads(fetch._tag_filter([1111], "E", "ab" * 32, 50, ADDRESS).as_json())
+    assert spec == {"kinds": [1111], "limit": 50, "#E": ["ab" * 32], "#a": [ADDRESS]}
+
+
+async def test_fetch_tagged_asks_each_relay_separately_and_keeps_its_answer(monkeypatch):
+    event = FakeEvent({"id": "a" * 64, "kind": 1111, "tags": []})
+    client = FakeClient(events=[event])
+    monkeypatch.setattr(fetch, "_client", lambda _secret=None: client)
+
+    rows = await fetch.fetch_tagged(relays=["wss://one.example", "wss://two.example"],
+                                    kinds=[1111], tag="E", values=["ab" * 32, "cd" * 32])
+
+    assert [relay for relay, _ in rows] == ["wss://one.example", "wss://two.example"]
+    assert [event["relay"] for _, event in rows] == ["wss://one.example", "wss://two.example"]
+    assert len(client.fetched) == 2, "one REQ per relay, not one per relay per value"
+    assert client.shutdowns == 1
+
+
+async def test_fetch_tagged_with_nothing_to_ask_does_not_build_a_client(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a read with no values must not build a client")
+
+    monkeypatch.setattr(fetch, "_client", refuse)
+
+    assert await fetch.fetch_tagged(relays=["wss://one.example"], kinds=[1111],
+                                    tag="E", values=[]) == []

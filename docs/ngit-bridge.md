@@ -339,29 +339,46 @@ same branch and a revision all land on that one card; none of them makes a secon
 
 `ngit pr list` has a LABELS column, and it is where a reader looks before opening anything. The
 bridge keeps it current, so "waiting on a review", "approved" and "changes asked for" are on
-the PR rather than only in a task comment. Five words, one namespace:
+the PR rather than only in a task comment. Three words, one namespace, and one label per PR:
 
 | label | when |
 | --- | --- |
-| `review-required` | the PR has no verdict yet — what a new PR gets |
-| `in-review` | its review task is running, so a reviewer has it |
-| `approved` | the verdict is an approval; merging is still the operator's |
-| `changes-requested` | the verdict asked for changes |
-| `stale` | a revision (`kind 1619`) landed after an approval, so the approval no longer covers the tip |
+| `review-required` | no verdict yet, or a revision since the last one — what a new PR gets |
+| `changes-requested` | the newest verdict asks for changes |
+| `approved` | the newest verdict approves it; merging is still the operator's |
 
-The state is **not** kept in the bridge: it is read from the review task that speaks for the
-PR — the **newest** one on the board: its status, and the verdict line in its comments
-(`Verdict: approved` or `Verdict: changes-requested`, which the task brief asks for) — plus
-the PR's tip. Newest matters because a revision is reviewed on a later card: the bridge makes
-one review task per PR, and a re-review is queued as a second card in the same shape (a title
-of `Review PR <first 8>: …` and the PR's event id in the body), so reading only the first
-card would leave the first verdict in force for ever. The card whose verdict is in force is
-the one the link names, which is the task a merge completes. The link row remembers only what
-was last published, so a poll publishes on change and a quiet poll publishes nothing. A merge
-leaves the last verdict in place: it is the verdict the merge was decided on, and a
-`stale`-free `approved` on a merged PR is the record of that. A revision after an approval
-gives `review-required` **and** `stale`; after a `changes-requested` it is `review-required`
-alone, because nothing was ever approved.
+`in-review` is deliberately gone: an open PR with a review card already *is* in review, and a
+second word for "a reviewer is looking at it" says nothing a reader cannot see on the board.
+`stale` is gone the same way — a revision after a verdict means `review-required`, which says
+the same thing in the one word a reader has to look at.
+
+**The verdict is read from the PR root, not from the board.** A reviewer publishes its verdict
+as a NIP-22 kind-1111 comment on the PR (`ngit pr comment ...`; root `E` = the PR) and reports
+the same verdict on the task, naming the comment's event id. The newest verdict comment wins.
+The card is the queue and the PR is the record: a reader of the label can fetch the comment it
+was derived from, and a verdict recorded only on the card leaves the label where it was rather
+than publishing a state the PR itself does not carry.
+
+**One writer.** The label pass — the sync that walks `ngit_links` — is the only thing that
+writes a label. It reads each open PR's verdict comments and the label events the PR currently
+carries off the same relay set it publishes to, decides the one label that belongs there,
+publishes it and retracts every other label event the PR carries — including one an earlier
+writer left (`in-review`, `stale`, a second word from a version with more of them) and one this
+bridge's link row never recorded. That is what makes a leftover a one-pass correction rather
+than a manual cleanup. The link row only remembers what this pass published, so a poll with no
+news publishes nothing. A merge leaves the last verdict in place: it is the verdict the merge
+was decided on.
+
+**A verdict that cannot be read does not fall back.** If the newest comment states a verdict in
+words the bridge does not recognise, the label is left untouched and the pass records the event
+id and the relay: publishing an older approval over a verdict nobody parsed is the wrong
+direction. The same holds when the relay read itself fails, or a PR the pass already labelled
+has no verdict it can read any more — the row keeps what readers see and the next poll tries
+again.
+
+**Relays can disagree.** The read is per relay, so two relays holding different newest verdicts
+(one of them missed an event) is visible: the newest `created_at` wins, the pass records which
+relay's verdict it used, and a note names the relays that saw something else.
 
 Two things about the format were measured against ngit 3.0.5 and decide how it is published:
 
@@ -372,6 +389,10 @@ Two things about the format were measured against ngit 3.0.5 and decide how it i
   `approved` over `review-required` shows both. The bridge therefore retracts the label it is
   replacing with a NIP-09 kind-5, sent to every relay it published the label to. Without that
   the column accumulates a history and a superseded `approved` still reads as a green light.
+
+A PR with no verdict and no review card carries **no label at all** (reviews turned off, or a
+card that could not be made): nothing says a review is coming, and a label would be the bridge
+inventing one. Any label left on such a PR is retracted.
 
 A reader with a cached checkout may still show the previous label until ngit refreshes its
 `.git/nostr-cache.lmdb`: the events on the relays are the state, and the cache is a copy of
