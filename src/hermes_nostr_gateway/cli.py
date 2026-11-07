@@ -480,6 +480,9 @@ def cmd_status(args) -> int:
             print(f"ngit:     watching {len(watch.get('targets') or [])} channel repo(s) on "
                   f"{len(watch.get('relays') or [])} relay(s); "
                   f"{watch.get('passes', 0)} pass(es) woken"
+                  # A comment carries no repository address: it is matched by its root, so
+                  # this is the number that says the comment path can attribute anything.
+                  + (f", {watch['roots']} comment root(s) known" if watch.get("roots") else "")
                   + (f", {len(due)} wake(s) due" if due else ""))
         elif watch.get("reason"):
             print(f"ngit:     not watching ({watch['reason']})")

@@ -1504,6 +1504,20 @@ class Store:
         )
         return cur.rowcount > 0
 
+    def ngit_roots(self, repo: str) -> tuple[str, ...]:
+        """Every issue and PR event id the bridge has linked for this repository.
+
+        The watcher's comment subscription cannot name a repository -- a NIP-22 comment
+        carries no `a` tag, only the root event it replies to -- so these ids are how a
+        comment is attributed to a channel. Read-only, and deliberately so: the pass owns
+        the table, this only asks it what a comment could refer to.
+        """
+        rows = self.db.execute(
+            "SELECT source_id FROM ngit_links WHERE repo = ? AND kind IN (?, ?)",
+            (str(repo), 1621, 1618),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows if row and row[0])
+
     def ngit_comment_seen(self, repo: str, source_id: str, comment_id: str) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM ngit_comments WHERE repo = ? AND source_id = ? AND comment_id = ?",

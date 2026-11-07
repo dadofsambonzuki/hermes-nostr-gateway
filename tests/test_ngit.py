@@ -57,7 +57,7 @@ def make_issue(seed: str, *, author: str = TRUSTED_HEX, subject: str = "Fix the 
 def make_comment(seed: str, *, author: str = STRANGER_HEX, body: str = "Same here.",
                  created_at: int = 1) -> ngit.Comment:
     identifier = event_id(seed)
-    return ngit.Comment(id=nevent(identifier, kind=ngit.KIND_ISSUE_COMMENT),
+    return ngit.Comment(id=nevent(identifier, kind=ngit.KIND_COMMENT),
                         hex=identifier, author=npub(author), body=body,
                         created_at=created_at)
 
@@ -1752,7 +1752,7 @@ def test_issue_view_json_carries_the_body_and_comments():
         "author": npub(TRUSTED_HEX), "id": ref.id, "subject": "A subject",
         "description": "The body.", "comment_count": 1, "status": "open",
         "comments": [{"author": npub(STRANGER_HEX), "body": "A comment",
-                      "created_at": 7, "id": nevent(event_id("d3"), ngit.KIND_ISSUE_COMMENT),
+                      "created_at": 7, "id": nevent(event_id("d3"), ngit.KIND_COMMENT),
                       "reply_to": None}],
     }, ref)
 

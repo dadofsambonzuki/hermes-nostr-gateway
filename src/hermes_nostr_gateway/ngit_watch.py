@@ -16,8 +16,18 @@ addresses only (never the whole relay), coalesces a channel's events, and runs
 `hng ngit sync --channel <conversation>`: the same command the timer runs, with the same store,
 the same cursor and the same decisions.
 
-Two writers to one cursor is the failure this avoids. The watcher has no store and no board
-and creates nothing; it writes a wake for a channel and starts the pass. Everything the
+Comments are a second filter, because they cannot be part of the first: `ngit issue comment`
+and `ngit pr comment` publish NIP-22 kind 1111, which carries root-scope `E`/`K`/`P` and
+parent `e`/`k`/`p` and **no `a` tag at all**. A `#a` subscription can therefore never match
+one. So comments are asked for by root kind (`#K`: an issue or a PR) and attributed to a
+repository here, by the root event id: the ids the pass has already linked are read from the
+store when the plan is built, and an issue or PR event that arrives while we are listening
+teaches its own id. A comment whose root nobody knows is ignored, and the scheduled pass
+still reads it.
+
+Two writers to one cursor is the failure this avoids. The watcher writes no store, no board and
+no cursor and creates nothing: it reads the link table once, for the issue and PR ids a comment
+can name, and otherwise only writes a wake for a channel and starts the pass. Everything the
 pass does is idempotent (idempotency keys on tasks and notices, a link table over event
 ids), so a spurious wake costs one poll -- and a lost nudge costs at most one scheduled
 interval, because the timer is still there.
@@ -48,8 +58,8 @@ from typing import Any, Awaitable, Callable, Iterable, Optional, Sequence
 from .ngit import (
     DEFAULT_WATCH_DEBOUNCE_S,
     KIND_APPLIED,
+    KIND_COMMENT,
     KIND_ISSUE,
-    KIND_ISSUE_COMMENT,
     KIND_PR,
     BridgeConfig,
     Ngit,
@@ -66,7 +76,20 @@ KIND_PR_UPDATE = 1619
 #: What a mapped repository's subscription asks for. Narrow on purpose: these kinds plus a
 #: `#a` address, never a kind on its own. Status kinds other than `applied` (closed, draft,
 #: reopened) change nothing the pass acts on, so they are not worth a wake.
-WATCH_KINDS = (KIND_ISSUE, KIND_ISSUE_COMMENT, KIND_PR, KIND_PR_UPDATE, KIND_APPLIED)
+WATCH_KINDS = (KIND_ISSUE, KIND_PR, KIND_PR_UPDATE, KIND_APPLIED)
+
+#: Comments are the one thing the `#a` filter cannot see. ngit 3.0.5 publishes every comment
+#: as NIP-22 kind 1111 -- root-scope `E`/`K`/`P`, parent `e`/`k`/`p`, no `a` -- so a comment
+#: gets its own subscription, and the watcher attributes it to a repository by its root id.
+COMMENT_KINDS = (KIND_COMMENT,)
+
+#: The root kinds a comment can hang off: an issue or a PR. `#K` is the root scope, so it
+#: holds for a reply to a comment (`k` = 1111) as well as for a top-level one.
+COMMENT_ROOT_KINDS = (str(KIND_ISSUE), str(KIND_PR))
+
+#: The kinds whose own event id is a comment's root. A revision (1619) names the PR and a
+#: merge (1631) names the PR's commit, so neither is one.
+ROOT_KINDS = (KIND_ISSUE, KIND_PR)
 
 #: A wake is delayed by at most this many debounce intervals: a channel that keeps trickling
 #: events must still get a pass, or a busy repository would starve its own watcher.
@@ -99,6 +122,9 @@ class WatchTarget:
     channel: str        # `concord:<community>:<channel>`, what `--channel` takes
     repo: Path
     board: str
+    #: The issue and PR event ids this repository's pass has already linked. A comment
+    #: names only its root, so these are how one is attributed to a repository.
+    roots: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,14 +209,33 @@ def _repo_ref(path: Path) -> Any:
     return Ngit(path).repository()
 
 
+def _no_known_roots(_address: str) -> Sequence[str]:
+    """No link table to ask (a CLI, a test): a comment wakes only once its root is seen."""
+    return ()
+
+
+def _roots_of(known_roots: Callable[[str], Sequence[str]], address: str) -> tuple[str, ...]:
+    """The root ids the pass knows for this repository, or none if the lookup fails."""
+    try:
+        return tuple(dict.fromkeys(str(root) for root in known_roots(address) or () if root))
+    except Exception as exc:  # noqa: BLE001 - a broken lookup must not stop the watcher
+        log.warning("ngit watch: cannot read known roots for %s: %s", address, exc)
+        return ()
+
+
 def watch_plan(cfg: dict[str, Any], projects: ProjectMap, streams: Sequence[Any], *,
                read_relays: Sequence[str] = (),
-               repo_ref: Callable[[Path], Any] = _repo_ref) -> WatchPlan:
+               repo_ref: Callable[[Path], Any] = _repo_ref,
+               known_roots: Callable[[str], Sequence[str]] = _no_known_roots) -> WatchPlan:
     """Which repositories to listen for, on which relays, or why none.
 
     Blocking on purpose (`ngit repo --json` is a child process per checkout), so the daemon
     builds this in a thread. Every mapping that declares a board is a candidate: a channel
     with no board is manual work, and nothing about it would be woken.
+
+    `known_roots` answers an address's issue and PR event ids -- the ids a NIP-22 comment
+    can name as its root. It is a read of the pass's own link table, injected so a test
+    does not need a store; the watcher writes nothing back.
     """
     settings = BridgeConfig.from_config((cfg or {}).get("ngit"))
     config = NgitWatchConfig.from_config(cfg)
@@ -220,7 +265,8 @@ def watch_plan(cfg: dict[str, Any], projects: ProjectMap, streams: Sequence[Any]
                         " (no NIP-34 address): PRs and issues are not watched here")
             continue
         targets.append(WatchTarget(address=repository.address, channel=channel,
-                                   repo=project.path, board=project.board))
+                                   repo=project.path, board=project.board,
+                                   roots=_roots_of(known_roots, repository.address)))
         hints.extend(getattr(repository, "relays", ()) or ())
 
     if not targets:
@@ -399,6 +445,13 @@ class NgitWatcher:
         for target in plan.targets:
             self._channels[target.address] = (*self._channels.get(target.address, ()),
                                               target.channel)
+        #: Comment root id -> repository address. Seeded from the link table the plan read,
+        #: then extended by every issue and PR event that arrives: a comment names only its
+        #: root, so this is the whole of what attributes one to a repository.
+        self._roots: dict[str, str] = {}
+        for target in plan.targets:
+            for root in target.roots:
+                self._roots.setdefault(str(root), target.address)
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -414,8 +467,18 @@ class NgitWatcher:
 
         Nothing here reads the event's content, author or status. That is the point: the
         event is evidence that *something* changed, and the pass is what decides what.
+
+        Two ways to name a repository, because the events are shaped differently. An issue,
+        PR, revision or merge carries `a` and is matched on it. A NIP-22 comment carries no
+        `a` at all -- only its root (`E`), which is the issue or PR it replies to -- so it
+        is matched against the ids this watcher has learned.
         """
         addresses = _repositories_of(event)
+        if addresses:
+            self._learn_root(event, addresses)
+        else:
+            address = self._roots.get(_root_of(event), "")
+            addresses = (address,) if address else ()
         if not addresses:
             return
         channels = tuple(dict.fromkeys(
@@ -432,6 +495,26 @@ class NgitWatcher:
         self.events += 1
         for channel in channels:
             self.wake(channel)
+
+    def _learn_root(self, event: dict[str, Any], addresses: tuple[str, ...]) -> None:
+        """Remember an issue's or PR's id, so a comment on it can be attributed later.
+
+        The plan seeds this from the link table; this is the part that arrives after the
+        plan was built -- an issue filed a minute ago, whose first comment is in no link
+        yet. Only the kinds whose own id is a root: a revision names its PR, a merge names
+        the commit, and neither can be a comment's `E`.
+        """
+        if int(event.get("kind") or 0) not in ROOT_KINDS:
+            return
+        event_id = str(event.get("id") or "")
+        if not event_id or event_id in self._roots:
+            return
+        # Only an address this watcher maps: a multi-maintainer announcement names several,
+        # and remembering one that has no channel would attribute the next comment to a
+        # repository with no pass to wake.
+        for address in addresses:
+            if address in self._channels:
+                self._roots[event_id] = address
 
     def wake(self, channel: str) -> None:
         """Coalesce one wake for a channel, delaying it by the debounce.
@@ -524,9 +607,10 @@ class NgitWatcher:
     async def run(self, attach: Callable[[tuple[str, ...], Any], Any]) -> None:
         """Subscribe for the plan's addresses, then wake passes until stopped.
 
-        `attach(addresses, handler)` is the daemon's: it builds one read worker per relay
-        for those `#a` addresses and hands every event back here. Kept as a callback so the
-        watcher itself knows nothing about the pool, NIP-42 or reconnects.
+        `attach(addresses, handler)` is the daemon's: it builds the read workers for those
+        `#a` addresses, and for comments by root kind, and hands every event back here.
+        Kept as a callback so the watcher itself knows nothing about the pool, NIP-42 or
+        reconnects.
         """
         addresses = tuple(sorted({target.address for target in self.plan.targets}))
         self.started_at = self._now()
@@ -581,6 +665,9 @@ class NgitWatcher:
             "channels": [wake.as_dict(now=now) for wake in self._wakes.values()],
             "events": self.events,
             "passes": self.passes,
+            #: How many issue and PR ids a comment can be attributed to. A comment whose
+            #: root is not here is ignored, so this is the evidence the fix is working.
+            "roots": len(self._roots),
             "alive": any(getattr(worker, "alive", False) for worker in self._workers),
             "workers": [str(getattr(worker, "subscription_id", ""))
                         for worker in self._workers],
@@ -589,14 +676,17 @@ class NgitWatcher:
 
 
 def _repositories_of(event: dict[str, Any]) -> tuple[str, ...]:
-    """Every NIP-34 repository address an event names, in tag order.
+    """Every NIP-34 repository address an event names with an `a` tag, in tag order.
 
-    Kinds 1621, 1622, 1618, 1619 and 1631 all carry `a: 30617:<pubkey>:<identifier>`;
+    Kinds 1621, 1618, 1619 and 1631 all carry `a: 30617:<pubkey>:<identifier>`;
     1631's is optional in NIP-34 and ngit publishes it, which is what lets a merge wake
     the channel. A repository with several maintainers is announced under one address per
     maintainer and ngit tags all of them, so an event matches if *any* `a` names a mapped
     repository -- reading only the first would depend on tag order. The relay hint a tag
     may carry as a third element is not part of the match.
+
+    Empty means "this event names no repository", which is the normal answer for a NIP-22
+    comment: it is scoped by its root event (`E`) instead, see `_root_of`.
     """
     out: list[str] = []
     for tag in event.get("tags") or []:
@@ -605,3 +695,19 @@ def _repositories_of(event: dict[str, Any]) -> tuple[str, ...]:
             if value.startswith("30617:") and value not in out:
                 out.append(value)
     return tuple(out)
+
+
+def _root_of(event: dict[str, Any]) -> str:
+    """The event a NIP-22 comment hangs off: its root `E`, else the parent it replies to.
+
+    NIP-22 scopes a comment with `E`/`K`/`P` (the thread's root) and `e`/`k`/`p` (what it
+    replies to). For a top-level comment both name the issue or PR; for a reply to another
+    comment only `E` does, so it is read first. Empty for an event with neither.
+    """
+    for name in ("E", "e"):
+        for tag in event.get("tags") or []:
+            if isinstance(tag, (list, tuple)) and len(tag) >= 2 and tag[0] == name:
+                value = str(tag[1] or "").strip()
+                if value:
+                    return value
+    return ""
