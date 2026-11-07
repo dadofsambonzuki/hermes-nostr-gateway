@@ -58,6 +58,7 @@ from typing import Any, Awaitable, Callable, Iterable, Optional, Sequence
 from .ngit import (
     DEFAULT_WATCH_DEBOUNCE_S,
     KIND_APPLIED,
+    KIND_CLOSED,
     KIND_COMMENT,
     KIND_ISSUE,
     KIND_PR,
@@ -74,9 +75,9 @@ log = logging.getLogger("hng.ngit.watch")
 KIND_PR_UPDATE = 1619
 
 #: What a mapped repository's subscription asks for. Narrow on purpose: these kinds plus a
-#: `#a` address, never a kind on its own. Status kinds other than `applied` (closed, draft,
-#: reopened) change nothing the pass acts on, so they are not worth a wake.
-WATCH_KINDS = (KIND_ISSUE, KIND_PR, KIND_PR_UPDATE, KIND_APPLIED)
+#: `#a` address, never a kind on its own. Status kinds other than `applied` and `closed`
+#: (draft, reopened) change nothing the pass acts on, so they are not worth a wake.
+WATCH_KINDS = (KIND_ISSUE, KIND_PR, KIND_PR_UPDATE, KIND_APPLIED, KIND_CLOSED)
 
 #: Comments are the one thing the `#a` filter cannot see. ngit 3.0.5 publishes every comment
 #: as NIP-22 kind 1111 -- root-scope `E`/`K`/`P`, parent `e`/`k`/`p`, no `a` -- so a comment

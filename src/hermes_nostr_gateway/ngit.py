@@ -11,8 +11,15 @@ the same lookup serves the inbound and the outbound half of this module:
                                    merging is the operator's)
               kind-1619 revision -> reopens that one task with the new tip, as one comment;
                                    a revision never makes a second card
-              kind-1631 applied  -> one "merged as <commit>" follow-up, which also closes
-                                   the review task
+              kind-1631 applied  -> one "merged as <commit>" follow-up, which also completes
+                                   every card the PR owns, naming the merge commit
+              kind-1632 closed   -> blocks the PR's cards for a person, naming the event:
+                                   a close is not a merge and cannot finish a card
+
+**`done` requires `applied`.** A PR card whose PR is still open cannot be completed by
+anyone -- the agent's tool, `hermes kanban complete`, or `--force` -- because the bridge
+installs a guard on the board itself (`ngit_guard`). A merge releases it; a close keeps it
+refusing. A worker finishes at `review`; the merge finishes the card.
 
 A review task is a task like any other: the bridge names the PR, says which profile it is
 dispatched to, and stops there. The model is the board's to decide -- the board's default,
@@ -49,6 +56,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -61,7 +69,7 @@ import nostr_sdk as sdk
 
 from .control import ControlConfig, as_hex
 from .fetch import fetch_many_blocking
-from .kanban import DONE, REVIEW, Anchor, Board, BoardError
+from .kanban import BLOCKED, DONE, REVIEW, Anchor, Board, BoardError
 from .ngit_labels import Labeler, parse_verdict, review_labels
 from .projects import ProjectMap, board_dir, hermes_home
 from .store import Store
@@ -76,6 +84,10 @@ KIND_PR = 1618
 #: tip (`ngit_labels`, `stale`).
 KIND_PR_REVISION = 1619
 KIND_APPLIED = 1631
+#: A kind-1632 `closed` status: the proposal was withdrawn, or a rebase orphaned it and a
+#: maintainer closed it. It is not a merge, so it cannot finish a card -- it hands the card
+#: to a person with the closing event named.
+KIND_CLOSED = 1632
 
 #: A comment is NIP-22, not NIP-34: ngit 3.0.5 publishes `ngit issue comment` and
 #: `ngit pr comment` as kind 1111 (`src/lib/git_events.rs`, `KIND_COMMENT`), and no ngit
@@ -99,7 +111,7 @@ TRUSTED_PLANE = "concord"
 #: retry is correct); `asked` means it did (asking again is not). For a PR, `pending` is the
 #: same idea: it is known, and its notice is either queued or posted but not yet confirmed.
 ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted"})
-PR_STATES = frozenset({"pending", "signalled", "merged"})
+PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
 
 #: Seconds of overlap on a relay cursor. Relays apply `since` inclusively and clocks drift;
 #: the link table, not the cursor, is what stops a replayed event being reported twice.
@@ -316,6 +328,15 @@ class Merge:
 
 
 @dataclass(frozen=True)
+class Closed:
+    """A kind-1632 closed status for a PR: no merge, so no card can be finished by it."""
+
+    pr_id: str         # hex of the root PR event
+    event_id: str = ""
+    created_at: int = 0
+
+
+@dataclass(frozen=True)
 class Revision:
     """A PR update: the PR root it belongs to and the tip it moved the PR to.
 
@@ -342,6 +363,8 @@ class PrFeed:
     prs: list[PullRequest] = field(default_factory=list)
     merges: list[Merge] = field(default_factory=list)
     revisions: list[Revision] = field(default_factory=list)
+    #: Kind-1632 closes: a PR that stopped without landing. They cannot finish a card.
+    closed: list[Closed] = field(default_factory=list)
 
     def newest_tips(self) -> dict[str, tuple[str, int]]:
         """Each PR's tip from this poll, with the time of the event that named it."""
@@ -484,7 +507,8 @@ class Report:
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
-        "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0})
+        "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
+        "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -523,11 +547,16 @@ class Report:
                    + (f", {i['would_create']} would be created" if self.dry_run else ""))
         out.append(f"prs:     {p['seen']} seen, {p['signalled']} signalled,"
                    f" {p['merged']} merged, {p['existing']} known"
+                   + (f", {p['closed']} closed" if p["closed"] else "")
                    + (f", {p['pending']} pending (queued for the next pass)"
                       if p["pending"] else "")
                    + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
                    + (f", {p['revisions']} revision(s)" if p["revisions"] else "")
                    + (f", {p['reopened']} card(s) reopened" if p["reopened"] else "")
+                   + (f", {p['completed']} card(s) completed by a merge" if p["completed"] else "")
+                   + (f", {p['unblocked']} card(s) released by a merge" if p["unblocked"] else "")
+                   + (f", {p['blocked']} card(s) blocked by a close" if p["blocked"] else "")
+                   + (f", {p['would_close']} would close" if self.dry_run else "")
                    + (f", {p['would_reopen']} would reopen" if self.dry_run else "")
                    + (f", {p['review_errors']} review failure(s)" if p["review_errors"] else "")
                    + (f", {p['labels']} label(s) published" if p["labels"] else "")
@@ -689,6 +718,20 @@ def merge_from_event(event: dict[str, Any]) -> Optional[Merge]:
                  created_at=int(event.get("created_at") or 0))
 
 
+def closed_from_event(event: dict[str, Any]) -> Optional[Closed]:
+    """A kind-1632 closed status: the PR it names and the event that closed it.
+
+    A close is not a merge and cannot finish a card, but it is not noise either: the card
+    must stop waiting for a merge that will never come and hand itself to a person, with the
+    closing event named so the reason can be read.
+    """
+    pr_id = event_hex(_root_id(event))
+    if not pr_id:
+        return None
+    return Closed(pr_id=pr_id, event_id=str(event.get("id") or ""),
+                  created_at=int(event.get("created_at") or 0))
+
+
 def revision_from_event(event: dict[str, Any]) -> Optional[Revision]:
     """A kind-1619 PR update: the PR its `E` tag names, and the tip its `c` tag moves to.
 
@@ -829,18 +872,19 @@ class RelayPrs:
         self.secret = secret
 
     def events(self, since: int) -> PrFeed:
-        """Every PR, revision and applied-status event newer than `since`, deduped by id."""
+        """Every PR, revision, applied and closed-status event newer than `since`."""
         if not self.relays:
             raise NgitError("ngit.relays (or relays.read) is empty: nowhere to read PR events")
         if not self.address:
             raise NgitError("this checkout has no NIP-34 address: no PRs to read")
         raw = self._fetch(relays=self.relays,
-                          kinds=[KIND_PR, KIND_PR_REVISION, KIND_APPLIED],
+                          kinds=[KIND_PR, KIND_PR_REVISION, KIND_APPLIED, KIND_CLOSED],
                           a_tag=self.address, since=int(since), limit=500,
                           secret=self.secret)
         prs: dict[str, PullRequest] = {}
         merges: dict[str, Merge] = {}
         revisions: dict[str, Revision] = {}
+        closed: dict[str, Closed] = {}
         for event in raw or []:
             if not isinstance(event, dict) or not event.get("id"):
                 continue
@@ -867,8 +911,14 @@ class RelayPrs:
                 merge = merge_from_event(event)
                 if merge is not None:
                     merges[merge.pr_id] = merge
+            elif kind == KIND_CLOSED:
+                stopped = closed_from_event(event)
+                if stopped is not None:
+                    seen = closed.get(stopped.pr_id)
+                    if seen is None or stopped.created_at >= seen.created_at:
+                        closed[stopped.pr_id] = stopped
         return PrFeed(prs=list(prs.values()), merges=list(merges.values()),
-                      revisions=list(revisions.values()))
+                      revisions=list(revisions.values()), closed=list(closed.values()))
 
 
 # -- posting into the channel -------------------------------------------------
@@ -1012,6 +1062,13 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "Review this PR and report a verdict. Do not merge it: merging is the operator's,",
         "or a follow-up task. This task ends with a verdict, not a merge.",
         "",
+        "This card is finished by the merge, not by you: `done` requires the PR to be",
+        "`applied`, and the bridge completes the card when it sees the merge commit. **Do",
+        "not call kanban_complete** -- the board will refuse it. Record the verdict as a",
+        "comment, then park the card with `kanban_block`, putting the verdict and the tip it",
+        "covers in the reason. The bridge reads the verdict line and publishes it as the PR's",
+        "label either way; a person re-queues the work on a changes-requested verdict.",
+        "",
         *steps,
     ])
 
@@ -1040,6 +1097,18 @@ def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> st
     if pr is None:
         return f"PR {nevent or merge.pr_id} {how}"
     return f'PR "{pr.subject}" by {pr.author} {how}\n{pr.nevent or nevent}'
+
+
+def closed_message(pr: PullRequest, stopped: Closed) -> str:
+    """One line for a PR that stopped without landing: not a merge, and not silence.
+
+    The channel was told the PR was ready for review; leaving that as the last word would
+    make a withdrawn proposal read as one still waiting. The closing event is named so a
+    reader can see who closed it and why.
+    """
+    by = f" (event {stopped.event_id})" if stopped.event_id else ""
+    return (f'PR "{pr.subject}" by {pr.author} was closed without a merge{by}\n'
+            f"{pr.nevent}")
 
 
 # -- resolving a channel to its repo and board --------------------------------
@@ -1150,7 +1219,11 @@ Notifier = Callable[[str, str, str], None]
 def notice_state(kind: int, notice: str) -> str:
     """The link state a notice earns once the daemon has taken it."""
     if int(kind) == KIND_PR:
-        return "merged" if notice == "merged" else "signalled"
+        if notice == "merged":
+            return "merged"
+        if notice == "closed":
+            return "closed"
+        return "signalled"
     return "asked" if notice == "question" else "ready"
 
 
@@ -1341,13 +1414,16 @@ class Sync:
         feed = self.prs(start)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
+        closed = {stopped.pr_id: stopped for stopped in feed.closed}
         # A re-push that a client published as a second proposal is the same work, not a
         # second PR: fold it onto the root the bridge already has, as a revision. The feed
         # the rest of the pass sees then has one entry per PR root, which is what makes
         # "one card per PR" enforceable at all.
-        prs, repeats = self._fold_repeats(feed.prs, applied)
+        prs, repeats = self._fold_repeats(feed.prs, applied,
+                                          {stopped.pr_id for stopped in feed.closed})
         feed = PrFeed(prs=prs, merges=merges,
-                      revisions=newest_revisions([*feed.revisions, *repeats]))
+                      revisions=newest_revisions([*feed.revisions, *repeats]),
+                      closed=feed.closed)
         budget = max(1, int(self.config.max_prs or 1))
         if not dry_run:
             self._requeue_stranded(report)
@@ -1377,6 +1453,7 @@ class Sync:
                 deferred.append(pr.created_at)
                 continue
             merge = applied.get(pr.id)
+            stopped = closed.get(pr.id)
             budget -= 1
             settled.append(pr.created_at)
             if dry_run:
@@ -1386,10 +1463,14 @@ class Sync:
             # be written must not cost the channel its notice, so the failure comes back as
             # a line in the notice and is retried -- without a second message -- later.
             task_id, problem = ("", "")
-            if merge is None and self.config.reviews:
+            if merge is None and stopped is None and self.config.reviews:
                 task_id, problem = self._review_task(pr, report, dry_run=dry_run)
-            text = (merged_message(pr, merge) if merge is not None
-                    else ready_message(pr, review_task=task_id, problem=problem))
+            if merge is not None:
+                text = merged_message(pr, merge)
+            elif stopped is not None:
+                text = closed_message(pr, stopped)
+            else:
+                text = ready_message(pr, review_task=task_id, problem=problem)
             # `pending` is the lifecycle of a notice that has not been confirmed yet; the row
             # is its claim, and only a daemon receipt moves the link past it. The review
             # outcome is written here, with the claim: saving the link again afterwards would
@@ -1397,7 +1478,9 @@ class Sync:
             self.store.ngit_link_save(
                 self.target.key, KIND_PR, pr.id, board=self.target.board, state="pending",
                 task_id=task_id or None, detail=pr_detail(pr, task_error=problem))
-            self._enqueue(KIND_PR, pr.id, "merged" if merge is not None else "ready", text)
+            notice = "merged" if merge is not None else ("closed" if stopped is not None
+                                                         else "ready")
+            self._enqueue(KIND_PR, pr.id, notice, text)
 
         for merge in sorted(merges, key=lambda m: (m.created_at, m.pr_id)):
             link = self.store.ngit_link(self.target.key, KIND_PR, merge.pr_id)
@@ -1431,17 +1514,50 @@ class Sync:
                 note["merge"] = merge.commit
                 self._save_detail(link, note, task_id=str(link.get("task_id") or ""))
             self._enqueue(KIND_PR, merge.pr_id, "merged", text)
-            # The merge closes the loop: the review task is done, with the merge named on it.
-            # A task already completed is a no-op, and this runs even for a link already
-            # `merged`, so one that could not be closed on a locked board closes later.
-            if known is not None:
-                self._close_review(known, merge, link, report, dry_run=dry_run)
+            # The merge closes the loop: every card about this PR is done, with the merge
+            # named on it. A task already completed is a no-op, and this runs even for a
+            # link already `merged`, so one that could not be closed on a locked board
+            # closes later.
+            self._close_pr_cards(known, merge, link, report, dry_run=dry_run)
+
+        # A close is not a merge: the card cannot be finished by it. It is blocked for a
+        # person with the closing event named, and its guard refuses a completion that
+        # would otherwise read as work delivered.
+        for stopped in sorted(feed.closed, key=lambda c: (c.created_at, c.pr_id)):
+            link = self.store.ngit_link(self.target.key, KIND_PR, stopped.pr_id)
+            if link is None:
+                settled.append(stopped.created_at)
+                continue
+            note = _detail(link)
+            if str(link.get("state") or "") == "merged" or note.get("merge"):
+                # Applied is final: a late or stale close cannot undo a merge that landed.
+                settled.append(stopped.created_at)
+                continue
+            if budget <= 0:
+                report.prs["deferred"] += 1
+                deferred.append(stopped.created_at)
+                continue
+            budget -= 1
+            settled.append(stopped.created_at)
+            if dry_run:
+                report.prs["would_close"] += 1
+                continue
+            # A queued "ready for review" line for a PR that has since been closed is
+            # noise: nothing is being hidden, the line never landed.
+            self.store.ngit_notice_drop(self.target.key, stopped.pr_id)
+            self.store.ngit_link_state(self.target.key, KIND_PR, stopped.pr_id, "closed")
+            self._close_pr_cards_closed(stopped, link, report, dry_run=dry_run)
 
         # A revision reopens the PR's card, one comment naming the new tip. It runs after
         # the merge loop so an applied PR is never reopened, and before the labels so the
         # label walk reads the card in the state this pass leaves it.
         self._revisions(feed, report, dry_run=dry_run)
         settled.extend(revision.created_at for revision in feed.revisions)
+
+        # The guard follows the link: open PRs refuse completion, applied ones allow it,
+        # closed ones refuse it and name the closing event. Last, so it sees the state this
+        # pass actually left the cards in.
+        self._guards(feed, report, dry_run=dry_run)
 
         # Labels last: every task the poll just made or closed is state the label walk has
         # to see, and a label that cannot be published must not hold the cursor -- the next
@@ -1460,7 +1576,8 @@ class Sync:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
 
     def _fold_repeats(self, prs: Sequence[PullRequest],
-                      applied: dict[str, Merge]) -> tuple[list[PullRequest], list[Revision]]:
+                      applied: dict[str, Merge],
+                      closed: set[str] | None = None) -> tuple[list[PullRequest], list[Revision]]:
         """Split proposals into new PRs and repeats of a PR the bridge already has.
 
         A proposal's identity is its event id, so a re-push that a client published as a
@@ -1471,12 +1588,14 @@ class Sync:
         that root as a revision; the oldest link wins, because the 1618 that opened the PR
         is the record. A proposal with no tip names no revision and is left as a PR.
         """
+        closed = closed or set()
         known: dict[tuple[str, str], str] = {}
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             source = str(link.get("source_id") or "")
-            if not source or source in applied or str(link.get("state") or "") == "merged":
-                # Applied is final: the same author pushing the same branch again after a
-                # merge is a new proposal, not a revision of a closed one.
+            if (not source or source in applied or source in closed
+                    or str(link.get("state") or "") in ("merged", "closed")):
+                # Applied and closed are final: the same author pushing the same branch
+                # again afterwards is a new proposal, not a revision of a finished one.
                 continue
             note = _detail(link)
             author, branch = str(note.get("author") or ""), str(note.get("branch") or "")
@@ -1512,14 +1631,16 @@ class Sync:
         if not feed.revisions:
             return
         applied = {merge.pr_id for merge in feed.merges}
+        closed = {stopped.pr_id for stopped in feed.closed}
         for revision in sorted(feed.revisions, key=lambda r: (r.created_at, r.pr_id)):
             link = self.store.ngit_link(self.target.key, KIND_PR, revision.pr_id)
             if link is None:
                 continue  # never announced: the channel was not told, so nothing reopens
             note = _detail(link)
-            if (str(link.get("state") or "") == "merged" or revision.pr_id in applied
+            if (str(link.get("state") or "") in ("merged", "closed")
+                    or revision.pr_id in applied or revision.pr_id in closed
                     or note.get("merge")):
-                continue  # applied: a late update cannot reopen a finished PR
+                continue  # applied or closed: a late update cannot reopen a finished PR
             tip = str(revision.commit or "")
             if not tip or tip == str(note.get("tip") or ""):
                 continue
@@ -1583,6 +1704,15 @@ class Sync:
             report.errors.append(f"review task for PR {pr.id[:8]}: {exc}")
             log.warning("ngit: no review task for %s: %s", pr.id[:8], exc)
             return "", str(exc)[:200]
+        # The card is the PR's, and its PR is open: from this moment completion refuses
+        # until a merge is applied. Guarding at creation (rather than only on the next
+        # pass) closes the window in which a worker could finish the card first. A guard
+        # that cannot be written is reported, not fatal: the card still exists, and the
+        # next pass installs the guard from the link.
+        try:
+            self.board.guard_pr(task_id, pr_id=pr.id, state="open", tip=pr.commit)
+        except BoardError as exc:
+            report.errors.append(f"guard for review task {task_id}: {exc}")
         report.prs["tasks"] += 1
         log.info("ngit: review task %s for PR %s", task_id, pr.id[:8])
         return task_id, ""
@@ -1629,29 +1759,196 @@ class Sync:
         found = self.board.review_task(str(link.get("source_id") or ""))
         return str(found["id"]) if found is not None else str(link.get("task_id") or "")
 
-    def _close_review(self, pr: PullRequest | None, merge: Merge, link: dict[str, Any],
-                      report: Report, *, dry_run: bool) -> None:
-        """Complete the PR's review task, naming the merge. Idempotent."""
+    def _pr_cards(self, link: dict[str, Any], pr_id: str,
+                  nevent: str = "") -> list[dict[str, Any]]:
+        """The PR's cards: what the board's own identities find, plus the link's anchor.
+
+        `pr_cards` matches by the bridge's key and the brief's title; the link is the
+        authority on which card speaks for the PR even if a person renamed it, so its task
+        id (and the newest review card) are unioned in. Archived cards are not returned.
+        """
+        cards = self.board.pr_cards(pr_id, nevent)
+        seen = {str(card.get("id") or "") for card in cards}
+        for extra in (self._review_anchor(link), str(link.get("task_id") or "")):
+            if not extra or extra in seen:
+                continue
+            task = self.board.task(extra)
+            if task is not None and str(task.get("status") or "") != "archived":
+                cards.append(task)
+                seen.add(extra)
+        return cards
+
+    def _close_pr_cards(self, pr: PullRequest | None, merge: Merge, link: dict[str, Any],
+                        report: Report, *, dry_run: bool) -> None:
+        """Finish every card this PR owns, naming the merge. Idempotent.
+
+        `done` requires `applied`: the guard is released on each card (the merge commit is
+        the proof), and only then is the card completed. A 1631 that names no commit is not
+        enough -- a card that says "merged" without saying *what* landed cannot be audited
+        -- so the card stays open and the pass says why.
+
+        The set is `_pr_cards`, not the newest review task: one PR root can still have more
+        than one card on a board with history (a re-review filed by hand under the brief's
+        title, a duplicate from before one-card-per-root), and a merge finishes all of them.
+        """
         if dry_run:
             return
-        how = f"merged as {merge.commit}" if merge.commit else "merged"
-        what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
         nevent = str(_detail(link).get("nevent") or "")
-        task_id = ""
+        if not merge.commit:
+            report.notes.append(
+                f"PR {merge.pr_id[:8]} is applied without a commit id: its card stays open")
+            return
+        how = f"merged as {merge.commit}"
+        what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
+        cards = self._pr_cards(link, merge.pr_id, nevent)
+        for card in cards:
+            task_id = str(card.get("id") or "")
+            status = str(card.get("status") or "")
+            if not task_id or status in (DONE, "archived"):
+                continue
+            try:
+                self.board.release_guard(task_id, merge_commit=merge.commit)
+                if self.board.complete(
+                    task_id, author="ngit",
+                    comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
+                            + f"\nThe merge was published as status {merge.pr_id}; this card"
+                            " is closed by it.",
+                    result=f"PR {merge.pr_id} {how}: the card is closed by the merge.",
+                ):
+                    report.prs["completed"] += 1
+                    log.info("ngit: completed %s for merged PR %s", task_id, merge.pr_id[:8])
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"PR card {task_id} for merged PR {merge.pr_id[:8]}: {exc}")
+        self._unblock_premise_cards(merge, nevent, report)
+
+    def _unblock_premise_cards(self, merge: Merge, nevent: str, report: Report) -> None:
+        """Release cards whose own words say they were waiting for this PR's merge.
+
+        A card filed "after PR X merges" is blocked on a fact, not on a person: once the
+        merge exists the fact is true, and leaving it blocked hides work that is now ready.
+        The match is the card's own premise text (`after PR <short> merges`, `blocked on …
+        PR <short>`), never a bare mention of the PR: a card that merely talks about it is
+        not waiting for it.
+        """
+        how = f"merged as {merge.commit}"
+        for card in self._premise_cards(merge.pr_id, nevent):
+            task_id = str(card.get("id") or "")
+            try:
+                if self.board.release(
+                    task_id, author="ngit",
+                    comment=f"PR {merge.pr_id[:8]} {how}: the merge this card waited for is"
+                            " applied. The card is released; any human condition in its body"
+                            " still stands.",
+                ):
+                    report.prs["unblocked"] += 1
+                    log.info("ngit: released %s after merge of PR %s", task_id,
+                             merge.pr_id[:8])
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"premise card {task_id} for PR {merge.pr_id[:8]}: {exc}")
+
+    def _premise_cards(self, pr_id: str, nevent: str = "") -> list[dict[str, Any]]:
+        """Blocked cards whose body names this PR as the thing they wait for.
+
+        Two spellings, both the card's own: `after PR <short> merges`, and a `blocked on …`
+        line that names the PR *and* a merge. A bare mention of the PR is not a premise --
+        a card can talk about a PR it is not waiting for -- so the line has to say both.
+        """
+        short = re.escape(str(pr_id or "")[:8])
+        if not short:
+            return []
+        after = re.compile(rf"(?i)after\s+PR\s+{short}\b")
+        waiting = re.compile(rf"(?i)blocked\s+on[^\n]*PR\s+{short}\b")
+        found: list[dict[str, Any]] = []
+        for card in self.board.blocked_cards():
+            text = f"{card.get('title') or ''}\n{card.get('body') or ''}"
+            for line in text.splitlines():
+                lower = line.lower()
+                if "merge" not in lower:
+                    continue
+                if after.search(line) or (nevent and "after" in lower and nevent in line):
+                    found.append(card)
+                    break
+                if waiting.search(line) or (nevent and "blocked on" in lower
+                                            and nevent in line):
+                    found.append(card)
+                    break
+        return found
+
+    def _close_pr_cards_closed(self, stopped: Closed, link: dict[str, Any],
+                               report: Report, *, dry_run: bool) -> None:
+        """A PR closed without a merge: block its cards for a human, naming the event.
+
+        Decision: a close does **not** complete the card as `closed`. Completion means the
+        work landed; a close means it did not, and a person has to decide what happens to
+        the work (drop it, reopen the proposal, or file it differently). The guard keeps
+        refusing completion with the closing event named.
+        """
+        if dry_run:
+            return
+        nevent = str(_detail(link).get("nevent") or "")
+        cards = self._pr_cards(link, stopped.pr_id, nevent)
+        for card in cards:
+            task_id = str(card.get("id") or "")
+            status = str(card.get("status") or "")
+            if not task_id or status in (DONE, "archived"):
+                continue
+            try:
+                self.board.close_guard(task_id, event_id=stopped.event_id)
+                if status == BLOCKED:
+                    continue  # already waiting for a person; the guard says why now
+                self.board.block(
+                    task_id, kind="dependency", author="ngit",
+                    comment=f"PR {stopped.pr_id[:8]} was closed without a merge"
+                            + (f" (event {stopped.event_id})" if stopped.event_id else "")
+                            + ".\nNothing landed, so this card cannot be completed by it."
+                            " A person decides: reopen the proposal, re-file the work, or"
+                            " drop the card.",
+                )
+                report.prs["blocked"] += 1
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"PR card {task_id} for closed PR {stopped.pr_id[:8]}: {exc}")
+
+    def _guards(self, feed: PrFeed, report: Report, *, dry_run: bool) -> None:
+        """Keep the board's `done requires applied` guard in step with the link table.
+
+        One row and one trigger per open PR card; released on a merge, closed on a 1632,
+        pruned when the card is gone or finished. A dry run writes nothing.
+        """
+        if dry_run:
+            return
+        applied = {merge.pr_id: merge for merge in feed.merges}
+        closed = {stopped.pr_id: stopped for stopped in feed.closed}
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            pr_id = str(link.get("source_id") or "")
+            note = _detail(link)
+            nevent = str(note.get("nevent") or "")
+            state = str(link.get("state") or "")
+            merge = applied.get(pr_id)
+            stopped = closed.get(pr_id)
+            try:
+                cards = self._pr_cards(link, pr_id, nevent)
+                if merge is not None and merge.commit:
+                    for card in cards:
+                        self.board.release_guard(str(card["id"]), merge_commit=merge.commit)
+                elif stopped is not None or state == "closed":
+                    event_id = (stopped.event_id if stopped is not None
+                                else str(note.get("closed") or ""))
+                    for card in cards:
+                        self.board.close_guard(str(card["id"]), event_id=event_id)
+                elif state != "merged" and not note.get("merge"):
+                    tip = str(note.get("tip") or note.get("commit") or "")
+                    for card in cards:
+                        self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip)
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"guard for PR {pr_id[:8]}: {exc}")
         try:
-            task_id = self._review_anchor(link)
-            if not task_id:
-                return
-            self.board.complete(
-                task_id, author="ngit",
-                comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
-                        + f"\nThe merge was published as status {merge.pr_id}; this review"
-                        " is closed by it.",
-                result=f"PR {merge.pr_id} {how}: the review is closed by the merge.")
+            self.board.prune_guards()
         except (BoardError, sqlite3.Error) as exc:
-            report.prs["review_errors"] += 1
-            where = f"review task {task_id}" if task_id else f"review task for PR {merge.pr_id[:8]}"
-            report.errors.append(f"{where}: {exc}")
+            report.errors.append(f"guard prune: {exc}")
 
     # -- labels ----------------------------------------------------------
 
@@ -1673,13 +1970,16 @@ class Sync:
         # still a PR waiting for a review.
         active = {pr.id for pr in feed.prs} | {merge.pr_id for merge in feed.merges}
         closed = {merge.pr_id for merge in feed.merges}
+        stopped = {item.pr_id for item in feed.closed}
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             pr_id = str(link.get("source_id") or "")
             detail = _detail(link)
-            merged = str(link.get("state") or "") == "merged" or pr_id in closed
-            if str(link.get("state") or "") == "merged":
-                # A merge leaves the label it was decided on: there is nothing left to
-                # publish, and skipping closed PRs keeps this walk to the live ones.
+            merged = (str(link.get("state") or "") in ("merged", "closed")
+                      or pr_id in closed or pr_id in stopped)
+            if str(link.get("state") or "") in ("merged", "closed"):
+                # A merge -- or a close -- leaves the label it was decided on: there is
+                # nothing left to publish, and skipping finished PRs keeps this walk to
+                # the live ones.
                 continue
             published = detail.get("label") or ()
             if pr_id not in active and not published and not detail.get("label_pending"):
@@ -1828,9 +2128,9 @@ class Sync:
 
         A merge supersedes a review line that has not gone out yet: telling the channel a PR
         is ready for review after it has already merged is noise, and the review line never
-        landed, so nothing is being hidden.
+        landed, so nothing is being hidden. A close supersedes it for the same reason.
         """
-        if notice == "merged":
+        if notice in ("merged", "closed"):
             self.store.ngit_notice_drop(self.target.key, source_id)
         return self.store.ngit_notice_put(
             self.target.key, kind, source_id, notice,
@@ -1901,7 +2201,7 @@ class Sync:
                                         state=state)
             report.posted += 1
             if int(row["kind"]) == KIND_PR:
-                report.prs["merged" if state == "merged" else "signalled"] += 1
+                report.prs[state if state in ("merged", "closed") else "signalled"] += 1
 
 
 def _detail(link: dict[str, Any]) -> dict[str, Any]:

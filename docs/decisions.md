@@ -400,3 +400,35 @@ or building a worktree from a shell the dispatcher never marked — and that is 
 not promise to stop a determined worker, it turns an accidental merge into a deliberate one. The
 durable answer is still identity; it is recorded here so the hook is never mistaken for a
 boundary.
+
+## `done` requires `applied`
+
+A card that carries a PR link is finished by the merge, not by a worker. `hermes kanban
+complete` is the worker's word, and a worker's word is not a merge: a card that read `done` on
+an open PR made the board report work as finished that a human still had to land.
+
+**The rule.** Completion of a PR-backed card requires the link to be `applied` with a merge
+commit id. The bridge enforces it on the board itself (`ngit_guard`): one row per PR card and
+one `BEFORE UPDATE OF status` trigger whose refusal names the state it saw — `PR <short> is
+open at <tip>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
+covers the agent's tool and the CLI without either knowing the bridge exists. A merge releases
+the guard; a close keeps it refusing.
+
+**A worker finishes at `review`.** The reviewer records a verdict as a comment and parks the
+card with `kanban_block` (the review lane's own approval tool, `kanban_complete`, is exactly
+what the guard refuses); the card then waits for the merge, and the bridge completes it with
+the merge commit in the result and a comment on the card. A merge completes **every** card the
+PR owns, including a re-review a person filed, and releases any card whose own premise was
+`after PR X merges`.
+
+**Two decisions.** A card with no PR link — ops, docs, a fix card — is completed by its worker
+exactly as before: there is no link row to check, and inventing a gate for it would make the
+board lie in the other direction. A PR closed without a merge (kind 1632) does **not** complete
+the card as `closed`: it blocks it with `block_kind=dependency`, names the closing event, and
+leaves the decision to a person. Completion means the work landed; a close means it did not.
+
+Why the trigger rather than a kernel hook: the gateway and Hermes are separate distributions,
+and the kernel has no completion extension point a bridge can register. The board is the one
+place both completion paths meet, and the guard is installed next to the rows this bridge
+already writes. A kernel schema rebuild can drop the trigger; the next pass re-installs it from
+the link, so the rule heals rather than silently lapsing.

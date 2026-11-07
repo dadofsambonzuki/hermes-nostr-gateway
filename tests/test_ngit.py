@@ -6,6 +6,8 @@ Placeholders only: keys, channel ids, repo names and board slugs here are invent
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -1172,6 +1174,178 @@ def test_a_pr_first_seen_merged_gets_one_message_and_no_review_task(harness):
     assert "merged as " + "e" * 40 in harness.messages[0][1]
 
 
+# -- `done` requires `applied` ------------------------------------------------
+
+def guard_triggers(harness) -> list[str]:
+    """The per-card completion triggers the bridge installed on the board."""
+    rows = harness.board.db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        " AND name LIKE 'ngit_pr_done_%' ORDER BY name").fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def test_an_open_pr_card_refuses_completion_at_the_board(harness):
+    """The board itself refuses: the CLI and the agent's tool both write this UPDATE."""
+    pr, task_id = pr_with_review_task(harness)
+
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+
+    message = str(refused.value)
+    assert pr.id[:8] in message and "open at c0ffee" in message
+    assert "kanban_block" in message  # the reviewer's remaining terminal action
+    assert harness.task(task_id)["status"] == "ready"
+
+
+def test_a_card_with_no_pr_link_is_completed_as_before(harness):
+    """Decision: ops and docs cards carry no link row, so the guard does not touch them."""
+    pr_with_review_task(harness)  # a guard is installed for that PR's card
+    plain = harness.board.create(title="Write the note", body="No PR here.",
+                                 assignee="default", status="ready")
+
+    assert harness.board.complete(plain, author="worker", result="written") is True
+    assert harness.task(plain)["status"] == "done"
+
+
+def test_a_merge_releases_the_guard_and_names_the_commit(harness):
+    pr, task_id = pr_with_review_task(harness)
+    assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]
+
+    merge = ngit.Merge(pr_id=pr.id, commit="a" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done"
+    assert "a" * 40 in str(row["result"])
+    # Nothing is left to refuse: the guard and its trigger are gone.
+    assert guard_triggers(harness) == []
+    assert report.prs["completed"] == 1
+
+
+def test_a_merge_completes_every_card_for_the_pr_root(harness):
+    """Including a card a person filed: the merge finishes the PR's cards, not one anchor."""
+    pr, first = pr_with_review_task(harness)
+    second = hand_queued_review_task(harness, pr)
+
+    merge = ngit.Merge(pr_id=pr.id, commit="b" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    report = harness.sync()
+
+    assert harness.task(first)["status"] == "done"
+    assert harness.task(second)["status"] == "done"
+    assert "b" * 40 in str(harness.task(second)["result"])
+    assert report.prs["completed"] == 2
+
+
+def test_a_merge_completes_a_parked_review_card(harness):
+    """A reviewer parks the card (the only terminal action the guard leaves it); the merge closes it."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.board.comment(task_id, "review", "Verdict: approved")
+    assert harness.board.block(task_id, kind="dependency", author="review",
+                               comment="approved at c0ffee; waiting for the merge") is True
+
+    merge = ngit.Merge(pr_id=pr.id, commit="e" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done" and "e" * 40 in str(row["result"])
+
+
+def test_a_merge_unblocks_a_card_that_waited_on_it(harness):
+    """`after PR X merges` is a fact, not a person: the merge releases the card."""
+    pr, _task = pr_with_review_task(harness)
+    waiting = harness.board.create(
+        title=f"After PR {pr.id[:8]} merges: mirror the guard",
+        body="Stage the same shape the PR ships.", assignee="default", status="blocked")
+
+    merge = ngit.Merge(pr_id=pr.id, commit="c" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    report = harness.sync()
+
+    assert harness.task(waiting)["status"] == "ready"
+    assert any("merged as " + "c" * 40 in c["body"] for c in harness.comments(waiting))
+    assert report.prs["unblocked"] == 1
+
+
+def test_a_merge_leaves_a_blocked_card_that_only_mentions_the_pr_alone(harness):
+    pr, _task = pr_with_review_task(harness)
+    other = harness.board.create(
+        title="Something else",
+        body=f"Related to PR {pr.id[:8]}, but blocked on a person's decision.",
+        assignee="default", status="blocked")
+
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    harness.sync()
+
+    assert harness.task(other)["status"] == "blocked"
+
+
+def test_a_merge_without_a_commit_leaves_the_card_open(harness):
+    """`applied` without a merge commit is not evidence: the card cannot name what landed."""
+    pr, task_id = pr_with_review_task(harness)
+    merge = ngit.Merge(pr_id=pr.id, commit="", created_at=1100)
+    harness.prs_data = ([], [merge])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] != "done"
+    assert any("without a commit" in note for note in report.notes)
+
+
+def test_a_closed_pr_blocks_the_card_with_the_closing_event(harness):
+    """A close is not a merge: the card waits for a person, and says which event closed it."""
+    pr, task_id = pr_with_review_task(harness)
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1200)
+    harness.prs_data = ngit.PrFeed(closed=[stopped])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "blocked" and row["block_kind"] == "dependency"
+    assert any("9" * 64 in c["body"] for c in harness.comments(task_id))
+    assert report.prs["blocked"] == 1
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    assert "closed without a merge" in str(refused.value)
+
+
+def test_a_close_after_a_merge_does_not_undo_it(harness):
+    """Applied is final: a stale 1632 cannot reopen or block a card a merge finished."""
+    pr, task_id = pr_with_review_task(harness)
+    merge = ngit.Merge(pr_id=pr.id, commit="f" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+    harness.sync()
+    assert harness.task(task_id)["status"] == "done"
+
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1200)
+    harness.prs_data = ngit.PrFeed(closed=[stopped])
+    harness.sync()
+
+    assert harness.task(task_id)["status"] == "done"
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "merged"
+
+
+def test_the_cli_refuses_an_open_pr_card(harness):
+    """The acceptance command, run for real against the harness board."""
+    hermes = shutil.which("hermes")
+    if not hermes:
+        pytest.skip("the hermes CLI is not installed on this host")
+    pr, task_id = pr_with_review_task(harness)
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK",
+                          "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME")}
+    env["HERMES_KANBAN_HOME"] = str(harness.home)
+
+    done = subprocess.run(
+        [hermes, "kanban", "--board", BOARD, "complete", task_id, "--summary", "probe"],
+        capture_output=True, text=True, env=env, timeout=120)
+
+    assert done.returncode != 0
+    assert pr.id[:8] in done.stderr and "open at c0ffee" in done.stderr
+    assert harness.task(task_id)["status"] == "ready"
+
+
 def test_a_task_that_cannot_be_made_still_posts_the_notice(home, store):
     pr = make_pr("b8")
     made = Harness(home, store, prs=([pr], []))
@@ -1270,7 +1444,16 @@ def label_detail(harness, pr_id: str) -> dict:
     return json.loads(link.get("detail") or "{}")
 
 
-def set_review_status(harness, task_id: str, status: str) -> None:
+def set_review_status(harness, task_id: str, status: str, *, force: bool = False) -> None:
+    """Move a card the way the board would, except where a test is simulating history.
+
+    `done` on a PR card is refused by the guard now (`done` requires `applied`), so the
+    label tests use `review` -- the state a finished review actually sits in until its
+    merge lands. `force=True` drops that card's trigger first, for the one test that
+    simulates a card completed before the guard existed.
+    """
+    if force:
+        harness.board.db.execute(f"DROP TRIGGER IF EXISTS ngit_pr_done_{task_id}")
     harness.board.db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
@@ -1315,7 +1498,7 @@ def test_starting_the_review_flips_it_to_in_review_and_retracts_the_old_label(ha
 def test_a_verdict_flips_the_label_and_retracts_the_one_before(harness, body, expected):
     pr, task = pr_with_review_task(harness)
     harness.board.comment(task, "review", body)
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     previous = tuple(label_detail(harness, pr.id)["label_events"])
 
     harness.sync()
@@ -1327,7 +1510,7 @@ def test_a_verdict_flips_the_label_and_retracts_the_one_before(harness, body, ex
 def test_a_revision_after_an_approval_needs_review_and_is_stale(harness):
     pr, task = pr_with_review_task(harness)
     harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     harness.sync()
     approved = tuple(label_detail(harness, pr.id)["label_events"])
 
@@ -1344,7 +1527,7 @@ def test_a_revision_after_an_approval_needs_review_and_is_stale(harness):
 def test_a_revision_after_changes_requested_needs_review_without_stale(harness):
     pr, task = pr_with_review_task(harness)
     harness.board.comment(task, "review", "Verdict: changes needed at a9c6139")
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     harness.sync()
 
     revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
@@ -1360,7 +1543,7 @@ def test_a_revision_of_a_pr_a_poll_did_not_carry_still_moves_the_label(home, sto
     made = Harness(home, store)
     pr, task = pr_with_review_task(made, "e2")
     made.board.comment(task, "review", "Verdict: approved")
-    set_review_status(made, task, "done")
+    set_review_status(made, task, "review")
     made.sync()
 
     made.prs_data = ngit.PrFeed(revisions=[ngit.Revision(
@@ -1393,7 +1576,7 @@ def test_a_merge_closes_the_review_task_whose_verdict_is_in_force(harness):
     """The merge closes the newest review card, not the first one the link was made with."""
     pr, first = pr_with_review_task(harness)
     harness.board.comment(first, "review", "Verdict: changes-requested")
-    set_review_status(harness, first, "done")
+    set_review_status(harness, first, "review")
     harness.sync()
 
     second = hand_queued_review_task(harness, pr)
@@ -1484,7 +1667,7 @@ def test_a_second_verdict_on_a_revised_tip_re_anchors(harness):
     """approved -> revision -> stale -> re-approved: the label must come back to `approved`."""
     pr, task = pr_with_review_task(harness)
     harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     harness.sync()
 
     revision = ngit.Revision(pr_id=pr.id, commit="d1ff" * 10, created_at=2000,
@@ -1497,7 +1680,7 @@ def test_a_second_verdict_on_a_revised_tip_re_anchors(harness):
     set_review_status(harness, task, "running")
     harness.sync()
     harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     report = harness.sync()
 
     assert harness.label_calls[-1][2] == ("approved",)
@@ -1509,7 +1692,7 @@ def test_a_link_from_before_the_verdict_comment_existed_keeps_its_anchor(harness
     """An upgrade must not pin an old verdict to whatever tip is current when it lands."""
     pr, task = pr_with_review_task(harness)
     harness.board.comment(task, "review", "Verdict: approved")
-    set_review_status(harness, task, "done")
+    set_review_status(harness, task, "review")
     harness.sync()
 
     detail = label_detail(harness, pr.id)
@@ -1578,7 +1761,7 @@ def test_a_re_review_task_moves_the_label_and_the_anchor(harness):
     """The newest review's verdict is the one in force, not the first round's."""
     pr, first = pr_with_review_task(harness)
     harness.board.comment(first, "review", "Verdict: approved")
-    set_review_status(harness, first, "done")
+    set_review_status(harness, first, "review")
     harness.sync()
     approved = tuple(label_detail(harness, pr.id)["label_events"])
     assert label_detail(harness, pr.id)["label"] == ["approved"]
@@ -1586,7 +1769,7 @@ def test_a_re_review_task_moves_the_label_and_the_anchor(harness):
     # The revision is re-reviewed on a card the bridge never made, and asks for changes.
     second = hand_queued_review_task(harness, pr)
     harness.board.comment(second, "review", "Verdict: changes-requested")
-    set_review_status(harness, second, "done")
+    set_review_status(harness, second, "review")
     harness.prs_data = ([], [])
     report = harness.sync()
 
@@ -1601,7 +1784,7 @@ def test_a_running_re_review_reads_in_review_not_the_verdict_it_replaces(harness
     """A new review round has no verdict yet: the round before it must not speak for it."""
     pr, first = pr_with_review_task(harness)
     harness.board.comment(first, "review", "Verdict: changes-requested")
-    set_review_status(harness, first, "done")
+    set_review_status(harness, first, "review")
     harness.sync()
     assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
 
@@ -1800,10 +1983,14 @@ def test_a_revision_does_not_release_a_held_card(harness):
 
 
 def test_a_done_card_on_a_pr_that_never_merged_reopens(harness):
-    """A verdict finished the review; a new tip puts the same card back in the queue."""
+    """A card finished before the guard existed is still reopened by a new tip.
+
+    The `done` state here is written past the guard on purpose: it is history, not a move a
+    worker can make now.
+    """
     pr, task_id = pr_with_review_task(harness)
     harness.board.comment(task_id, "review", "Verdict: approved")
-    set_review_status(harness, task_id, "done")
+    set_review_status(harness, task_id, "done", force=True)
     harness.board.db.execute("UPDATE tasks SET completed_at = 1 WHERE id = ?", (task_id,))
 
     harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=2000)])

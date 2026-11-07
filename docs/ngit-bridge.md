@@ -291,11 +291,37 @@ same branch and a revision all land on that one card; none of them makes a secon
   (NIP-34's `merge-commit` tag, or `merge-commit-id` — the spelling ngit 3.0.4 actually
   publishes, one oid for a merge commit and every commit the push added for a fast-forward —
   or the first `applied-as-commits` value when the proposal was applied as patches), and
-  completes the review task with a comment naming the merge. A merge that arrives for a task
-  already completed is a no-op: nothing is written twice.
+  **completes every card the PR owns** — the bridge's review task, a re-review filed by hand
+  under the brief's title, and any duplicate history left behind — with a result naming the
+  merge commit and a comment saying what landed. A merge that arrives for a card already
+  completed is a no-op: nothing is written twice. A 1631 that names **no commit** is not
+  evidence and completes nothing: the card stays open and the pass says why.
+- **`done` requires `applied`.** A card whose PR is still open cannot be completed by anyone
+  — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not `--force`.
+  The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
+  `ngit_pr_guards` and one `BEFORE UPDATE OF status` trigger whose message is the refusal a
+  person reads (`PR <short> is open at <tip> -- a merge is the only thing that completes a
+  PR card`). A merge releases the guard (the commit is the proof) and the completion
+  succeeds; a close keeps it refusing and names the closing event. A card with no PR link —
+  ops, docs, a fix card — is untouched.
+- **A worker finishes at `review`.** The review brief says so, and the guard enforces it: the
+  reviewer records a verdict as a comment and **parks the card** with `kanban_block` instead of
+  completing it — the review lane's own approval tool is `kanban_complete`, which the guard
+  refuses, so the brief names the parking action and the refusal repeats it. The merge completes
+  the parked card; a changes-requested verdict leaves a person to re-queue the work, and the
+  label pass publishes either verdict.
+- A kind-1632 **closed** status is not a merge and never completes a card. The PR's cards are
+  blocked with `block_kind=dependency`, a comment naming the closing event, and a guard that
+  refuses completion — a person decides whether the work is re-filed, re-proposed or dropped.
+  A queued "ready for review" line for a closed PR is dropped rather than posted.
+- A card whose own premise is `after PR <short> merges` (or a `blocked on … PR <short>` line
+  that names the merge) is **released** when the merge lands, with the commit named in the
+  comment: the fact it waited on is now true. A blocked card that merely mentions the PR is
+  left alone — a mention is not a premise, and any human condition in the released card's body
+  still stands.
 - A PR first seen *already* applied gets one message, the merged line — not a fake "ready for
   review" followed by a merge, and not a replay of history. There is nothing to review, so no
-  task is made.
+  task is made. A PR first seen already **closed** gets one closed line, and no task.
 - The two halves fail independently. A task that cannot be made (a locked board, a missing
   database) still gets the PR its notice, with `no review task: <why>` as the last line; the
   cursor does not move past it, so a later poll makes the task and posts nothing — the

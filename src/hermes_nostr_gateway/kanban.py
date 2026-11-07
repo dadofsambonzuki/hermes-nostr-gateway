@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from . import ngit_guard
 from .projects import load_registry
 
 #: The branch the kernel derives for a project-linked task: `<slug>/<task-id>[-<title>]`.
@@ -146,6 +147,43 @@ class Board:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def pr_cards(self, pr_id: str, nevent: str = "") -> list[dict[str, Any]]:
+        """Every live card that *is* this PR's card, oldest first.
+
+        One PR root has one card for the life of the PR, but the board can hold more than
+        one when history got there first: cards filed before one-card-per-root, or a
+        re-review queued by hand under the brief's own title. A merge finishes all of them,
+        so this returns the whole set rather than the newest anchor.
+
+        The identities are the ones `review_task` already trusts: the bridge's idempotency
+        key (bare or per-tip), or the review brief's title with the PR's event id / nevent in
+        the body. A bare mention of the PR elsewhere is deliberately not a match -- a card
+        that talks about a PR is not necessarily finished when that PR lands.
+        """
+        pr_id = str(pr_id or "")
+        if not pr_id:
+            return []
+        clauses = ["idempotency_key = ?", "idempotency_key LIKE ?",
+                   "(title LIKE ? AND body LIKE ?)"]
+        params: list[Any] = [f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%",
+                             f"Review PR {pr_id[:8]}:%", f"%{pr_id}%"]
+        if nevent:
+            clauses.append("(title LIKE ? AND body LIKE ?)")
+            params.extend([f"Review PR {pr_id[:8]}:%", f"%{nevent}%"])
+        rows = self.db.execute(
+            "SELECT * FROM tasks WHERE status != 'archived' AND ("
+            + " OR ".join(clauses) + ") ORDER BY created_at, rowid",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def blocked_cards(self) -> list[dict[str, Any]]:
+        """Every blocked card, for a caller that matches its own premise text."""
+        rows = self.db.execute(
+            "SELECT * FROM tasks WHERE status = 'blocked' ORDER BY created_at, rowid"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def comments(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
@@ -238,7 +276,7 @@ class Board:
             cur = self.db.execute(
                 "UPDATE tasks SET status = ?, completed_at = ?, result = ?,"
                 " claim_lock = NULL, claim_expires = NULL, current_run_id = NULL,"
-                " consecutive_failures = 0"
+                " consecutive_failures = 0, block_kind = NULL, block_recurrences = 0"
                 " WHERE id = ? AND status NOT IN ('done', 'archived')",
                 (DONE, now, summary or None, str(task_id)),
             )
@@ -377,6 +415,83 @@ class Board:
             )
         except sqlite3.Error:  # noqa: BLE001 - an event is a nicety, not the write itself
             pass
+
+    def block(self, task_id: str, *, kind: str = "dependency", author: str = "ngit",
+              comment: str = "") -> bool:
+        """`* -> blocked`, with the reason in the same transaction.
+
+        The kernel's own `block` writes `block_kind` so a re-block loop can be detected; this
+        does the same, and takes the comment as the record of *why* (the CLI has no
+        `--reason` flag either). False when the card is already terminal.
+        """
+        now = int(time.time())
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self.db.execute(
+                "UPDATE tasks SET status = ?, block_kind = ?, completed_at = NULL"
+                " WHERE id = ? AND status NOT IN ('done', 'archived')",
+                (BLOCKED, str(kind or "dependency"), str(task_id)),
+            )
+            if cur.rowcount != 1:
+                self.db.execute("ROLLBACK")
+                return False
+            if comment:
+                self.db.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at)"
+                    " VALUES (?,?,?,?)", (str(task_id), author or "ngit", comment, now))
+            self.db.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (str(task_id), None, "blocked",
+                 json.dumps({"kind": str(kind or "dependency"), "by": author or "ngit"},
+                            separators=(",", ":")), now),
+            )
+            self.db.execute("COMMIT")
+            return True
+        except sqlite3.Error:
+            self.db.execute("ROLLBACK")
+            raise
+
+    # -- the `done` requires `applied` guard -------------------------------
+
+    def guard_pr(self, task_id: str, *, pr_id: str, state: str, tip: str = "",
+                 merge_commit: str = "", detail: str = "") -> None:
+        """Record a card's PR state on the board, and make completion refuse while it holds.
+
+        The guard is a trigger on `tasks`, so both completion paths -- the agent's
+        `kanban_complete` tool and the CLI's `hermes kanban complete` -- are refused without
+        either of them knowing this bridge exists. See `ngit_guard`.
+        """
+        try:
+            ngit_guard.guard(self.db, task_id, pr_id=pr_id, state=state, tip=tip,
+                             merge_commit=merge_commit, detail=detail)
+        except sqlite3.Error as exc:
+            raise BoardError(f"could not guard {task_id} on {self.path}: {exc}") from exc
+
+    def release_guard(self, task_id: str, *, merge_commit: str = "") -> None:
+        """The PR is applied: the card may now be completed."""
+        try:
+            ngit_guard.release(self.db, task_id, merge_commit=merge_commit)
+        except sqlite3.Error as exc:
+            raise BoardError(f"could not release {task_id} on {self.path}: {exc}") from exc
+
+    def close_guard(self, task_id: str, *, event_id: str = "") -> None:
+        """The PR was closed without a merge: completion stays refused, naming the event."""
+        try:
+            ngit_guard.close(self.db, task_id, event_id=event_id)
+        except sqlite3.Error as exc:
+            raise BoardError(f"could not close {task_id} on {self.path}: {exc}") from exc
+
+    def guard_state(self, task_id: str) -> Optional[dict[str, Any]]:
+        """The guard on one card, or None when the board does not guard it."""
+        return ngit_guard.state_of(self.db, task_id)
+
+    def prune_guards(self) -> int:
+        """Drop guards whose card is gone or finished; returns how many."""
+        try:
+            return ngit_guard.prune(self.db)
+        except sqlite3.Error:
+            return 0
 
     def close(self) -> None:
         try:
