@@ -363,9 +363,13 @@ Rules that keep the pairing honest:
 
   The command reports a signed event, not a relay's acceptance: read the thread back **from a
   relay** before calling the verdict published. Read it by the kind the command actually
-  published: on ngit 3.0.5 that is a NIP-22 `kind: 1111` event whose `e` tag is the PR, not the
-  `kind: 1622` an older ngit wrote — a 1622 filter returns nothing and reads exactly like a
-  comment no relay kept. Query the author and the kind, then match the `e` tag to the PR
+  published: `ngit pr comment` publishes a NIP-22 `kind: 1111` whose uppercase root tags
+  (`E`/`K`/`P`) name the PR, and whose lowercase parent tags (`e`/`k`/`p`) name it too for a
+  top-level comment — `--reply-to` points the parent tags at the answered comment, so it is the
+  root `E` that always names the PR. A `kind: 1622` filter returns nothing and reads exactly
+  like a comment no relay kept: no ngit release ever wrote 1622 (comment publishing arrived in
+  2.3.0 and was NIP-22 from the start), and the 1622s in this repository's history were
+  hand-published by the bots. Query the author and the kind, then match the root tag to the PR
   (`nak req -k 1111 -a <bot npub> <repository relay>`); a comment that only exists in the local
   view is not on the PR, and a relay that does not know the identity yet is the usual reason.
 
