@@ -302,9 +302,12 @@ Rules that keep the pairing honest:
   ```
 
   The command reports a signed event, not a relay's acceptance: read the thread back **from a
-  relay** (a kind-1622 filter on the repository address) before calling the verdict published.
-  A comment that only exists in the local view is not on the PR, and a relay that does not
-  know the identity yet is the usual reason.
+  relay** before calling the verdict published. Read it by the kind the command actually
+  published: on ngit 3.0.5 that is a NIP-22 `kind: 1111` event whose `e` tag is the PR, not the
+  `kind: 1622` an older ngit wrote — a 1622 filter returns nothing and reads exactly like a
+  comment no relay kept. Query the author and the kind, then match the `e` tag to the PR
+  (`nak req -k 1111 -a <bot npub> <repository relay>`); a comment that only exists in the local
+  view is not on the PR, and a relay that does not know the identity yet is the usual reason.
 
 - **The profile must exist before the config names it.** `review_assignee: review` on a host
   with no `review` profile files a task that nothing will pick up. Create the profile first,
