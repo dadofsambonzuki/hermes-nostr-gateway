@@ -151,9 +151,10 @@ policies:
   # First, because rules are ordered and first match wins: `group: any` below matches a
   # stranger too, so the refusal has to stand above it. Unauthorised senders are refused
   # here whatever plane they arrive on: a NIP-17 DM (kind 14 or 1059), a kind-1 mention, a
-  # legacy kind-4 note, a Marmot kind 9. To let one person in, put them in a group and let
-  # a rule below name that group; never weaken this rule. Being named is not enough on its
-  # own: a group with no rule still falls to `defaults`, which is `drop` too.
+  # legacy kind-4 note, a Marmot or Concord kind 9. To let one person in, put them in a
+  # group and let a rule below name that group; never weaken this rule. Being named is not
+  # enough on its own — a rule has to match the plane and kind too, and anything no
+  # wildcard rule matches falls to `defaults`, which is `drop` as well.
   - name: strangers
     match: {group: unknown}
     reach: drop

@@ -5,8 +5,8 @@ rules matched a stranger first. `unknown-dms` digested their kind-14/1059 DMs an
 `anyone-mentions` — `group: any` matches a stranger as readily as a colleague — digested their
 kind-1 mentions. The engine was right and the shipped rules were wrong, so this test parses
 `config.example.yaml` the way the daemon does and asks the policy what happens to somebody no
-group names. Revert the example's `strangers` rule, or move it below a wildcard rule, and these
-fail.
+group names. Revert the example's `strangers` rule, move it below a wildcard rule, or restore
+the digest fallback in `Policy`, and these fail.
 """
 
 from pathlib import Path
@@ -16,7 +16,7 @@ import yaml
 
 from hermes_nostr_gateway.cli import normalise_groups
 from hermes_nostr_gateway.policy import Policy
-from hermes_nostr_gateway.store import drops_ttl_seconds
+from hermes_nostr_gateway.store import Inbound, Store, drops_ttl_seconds
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.yaml"
 
@@ -71,15 +71,42 @@ def test_a_stranger_is_dropped(policy, kind, kwargs):
     assert decision.authority == "none"
 
 
-def test_a_dropped_stranger_is_still_recorded_as_not_allowlisted(policy):
+def test_a_dropped_stranger_is_still_recorded_as_not_allowlisted(example, policy, tmp_path):
     """`invisible` is about the agent's attention: the refusal itself is stored evidence.
 
     A `reach: drop` carries no `blocked_reason`, and the store's own CASE reads that as
-    `not_allowlisted` — the reason `hng drops` shows, for `drops.ttl_hours`.
+    `not_allowlisted` — the reason `hng drops` shows, for `drops.ttl_hours`. So this writes
+    the refused row the way the daemon does and reads it back through the op that lists it.
     """
     decision = policy.decide(sender=STRANGER, kind=14, dm=True)
     assert decision.reach == "drop"
     assert decision.blocked_reason is None
+
+    with Store(tmp_path / "drops.db") as store:
+        assert store.add(Inbound(
+            id="ab" * 32, wrapper_id="cd" * 32, sender=STRANGER, kind=14,
+            created_at=1_700_000_000, content="let me in", conversation=STRANGER,
+            reply_to=None, plane="nip17", reach=decision.reach,
+            authority=decision.authority, rule=decision.rule, why=decision.why,
+            blocked_reason=decision.blocked_reason,
+        ))
+        listed = store.drops(ttl_s=drops_ttl_seconds(example["drops"]))
+    assert listed["total"] == 1
+    assert listed["live"] == 1
+    assert listed["drops"][0]["reason"] == "not_allowlisted"
+
+
+def test_a_rule_with_no_reach_refuses_rather_than_digests():
+    """The per-rule fallback in `Policy`, not just the example: an omission is not a timer.
+
+    Reverting `policy.py`'s no-`reach` fallback to `digest(15m)` leaves every other test in
+    this file green, because the shipped example states a `reach` on every rule.
+    """
+    decision = Policy({"policies": [{"match": {}}]}).decide(
+        sender=STRANGER, kind=14, dm=True)
+    assert decision.reach == "drop", decision.why
+    assert decision.deliverable is False
+    assert decision.authority == "none"
 
 
 def test_the_example_keeps_drops_for_a_week(example):

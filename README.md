@@ -60,8 +60,8 @@ Under them:
 - **One policy.** Reach (`immediate`, `digest(<interval>)`, `drop`) and authority
   (`instructions`, `none`) are decided per message from sender, plane and kind — in one place,
   not per transport. The two are independent: a correspondent a rule names can reach the agent
-  and still not instruct it, and with `defaults: drop` a stranger reaches neither until a rule
-  names them.
+  and still not instruct it, and a stranger reaches neither — the shipped config's first rule
+  refuses `group: unknown` above every wildcard, with `defaults: drop` beneath it.
 - **One adapter.** `integrations/hermes-plugin/` is the Hermes platform plugin. It maps frames
   onto Hermes' platform contract and `authority` onto `source.role_authorized`, and it owns the
   outbound replay guard, so a reply Hermes redelivers is not published twice.

@@ -483,9 +483,12 @@ duplicate delivery is not something an operator can notice from a status line.
 
 Two **independent** dimensions per sender group, decided by one ordered list of rules. Keeping
 them separate is the point: a correspondent a rule names can be *heard* without being able to
-*instruct*. Who may be heard at all is the other half, and it is closed by default — with
-`reach: drop` as the fallback (built-in and shipped), an unauthorised sender is refused on every
-plane until a rule names them. A public bot's inbox is shut, not merely harmless.
+*instruct*. Who may be heard at all is the other half, and it is closed by default from two
+directions: the engine refuses what no rule matches (`defaults` is `drop`, and a rule that names
+no `reach` refuses too), and the shipped example's first rule refuses `group: unknown` above
+every wildcard. The fallback alone cannot carry that guarantee — a wildcard like `any` matches a
+stranger without naming them — so the two are what refuse an unauthorised sender on every plane
+until a rule names them. A public bot's inbox is shut, not merely harmless.
 
 - **reach:** `immediate | digest(interval) | drop`
 - **authority:** `instructions | none`
