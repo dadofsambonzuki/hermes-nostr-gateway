@@ -268,7 +268,11 @@ def test_status_fails_where_the_guard_is_not_installed(tmp_path: Path) -> None:
 
 
 def test_merge_pr_refuses_a_card_workspace(tmp_path: Path) -> None:
-    """The documented merge route is not a way around the push guard."""
+    """The documented merge route is not a way around the push guard.
+
+    Run with bash because that is the script's shebang: `/bin/sh` is dash on the CI image and
+    rejects `set -o pipefail`, which would test the shell rather than the guard.
+    """
     made = make_repo(tmp_path, card=False)
     scripts = made.repo / "scripts"
     scripts.mkdir()
@@ -276,7 +280,7 @@ def test_merge_pr_refuses_a_card_workspace(tmp_path: Path) -> None:
     shutil.copy2(GUARD, scripts / "worker_push_guard.sh")
 
     refused = subprocess.run(
-        ["/bin/sh", str(scripts / "merge_pr.sh"), "deadbeef"],
+        ["bash", str(scripts / "merge_pr.sh"), "deadbeef"],
         cwd=made.repo,
         env=clean_env(HERMES_KANBAN_WORKSPACE=str(made.repo)),
         capture_output=True,
