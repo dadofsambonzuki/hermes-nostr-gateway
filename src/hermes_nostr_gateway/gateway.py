@@ -13,6 +13,16 @@ import nostr_sdk as sdk
 import yaml
 
 from . import addressing, sdkloop
+from .advertise import (
+    MANIFEST_KIND,
+    PROFILE_KIND,
+    AdvertisementConfig,
+    Advertiser,
+    CatalogueError,
+    build_manifest,
+    load_catalogue,
+    resolve_relays,
+)
 from .bots import BotRegistry, kind0_fetcher
 from .control import ControlConfig
 from .crypto import SdkCrypto, normalize_pubkey
@@ -442,6 +452,14 @@ class Gateway:
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
+        #: What this identity advertises to clients: its kind-0 profile (so a client's
+        #: `bot: true` discovery step finds it) and the kind-10304 command manifest Armada
+        #: renders the slash menu from. Off unless `advertise.publish` asks for it, and a
+        #: target list this cannot parse is a config error rather than a quiet no-op.
+        self.advertise_cfg = AdvertisementConfig.from_config(
+            cfg.get("advertise"), socket_path=self.socket_path)
+        self.advertiser = Advertiser(crypto=self.crypto, publisher=self.publisher,
+                                     store=self.store, secret=self._secret)
         #: Where this process was configured, so a child it starts reads the same file
         #: rather than whatever `hng` would find on its own. Set by `hng serve`.
         self.config_path = Path(config_path) if config_path else None
@@ -908,6 +926,10 @@ class Gateway:
         # The publish set is known up front: connect it once, rather than paying a
         # handshake per relay on the first message.
         await self.publisher.warm(self.relays_publish)
+        if self.advertise_cfg.enabled:
+            # Not a gate on startup: the daemon reads relays whether or not one of them
+            # accepts an advertisement, and an unchanged stored copy skips the publish.
+            self._tasks.append(asyncio.create_task(self._publish_advertisement()))
         for relay in self.relays_read:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
@@ -945,6 +967,62 @@ class Gateway:
         if self.marmot_worker is not None:
             self._tasks.append(asyncio.create_task(self._guard_marmot(self.marmot_worker)))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
+
+    # -- advertisement (kind 0 + kind 10304) -----------------------------
+    async def advertisement_relays(self) -> list[str]:
+        """Where the profile and manifest go; the rule lives in `advertise.resolve_relays`."""
+        return await resolve_relays(self.relays_publish, self.advertise_cfg.relays,
+                                    me=self.me, secret=self._secret)
+
+    def advertisement_contents(self) -> tuple[dict[int, dict[str, Any]], list[str]]:
+        """The two contents this configuration asks for, and what building them dropped."""
+        contents: dict[int, dict[str, Any]] = {}
+        warnings: list[str] = []
+        if self.advertise_cfg.publishes_profile and self.advertise_cfg.profile:
+            contents[PROFILE_KIND] = self.advertise_cfg.profile
+        if self.advertise_cfg.publishes_commands:
+            try:
+                commands, notes = load_catalogue(self.advertise_cfg.catalogue_file)
+            except CatalogueError as exc:
+                warnings.append(str(exc))
+            else:
+                manifest = build_manifest(commands)
+                contents[MANIFEST_KIND] = manifest.content
+                warnings.extend(notes + manifest.warnings)
+        return contents, warnings
+
+    async def publish_advertisement(self, *, force: bool = False) -> list[Any]:
+        """Publish what differs; the report is the per-relay truth, not a success flag."""
+        contents, warnings = self.advertisement_contents()
+        for warning in warnings:
+            log.warning("advertise: %s", warning)
+        if not contents:
+            log.warning("advertise: nothing to publish (%s)", self.advertise_cfg.describe())
+            return []
+        relays = await self.advertisement_relays()
+        reports = await self.advertiser.publish(contents, relays, force=force)
+        for report in reports:
+            log.info("advertise kind %d: %s %s relays=%s readback=%s refused=%s retrying=%s",
+                     report.kind, report.status, report.event_id or "-",
+                     len(report.published), report.readback or {}, report.refused or {},
+                     report.retrying or {})
+        return reports
+
+    async def _publish_advertisement(self) -> None:
+        try:
+            await self.publish_advertisement()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an advertisement must not take the daemon down
+            log.exception("advertise: publish failed")
+
+    def advertisement_status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.advertise_cfg.enabled,
+            "targets": list(self.advertise_cfg.targets),
+            "catalogue": str(self.advertise_cfg.catalogue_file or ""),
+            "published": self.store.advertised_all(),
+        }
 
     def _load_follows(self) -> tuple[str, ...]:
         """Our kind-3 contact list: what 'feeds' means, as opposed to the firehose."""
@@ -1630,6 +1708,10 @@ class Gateway:
             # Which publish transport is running, and how it has fared: `mode: bindings`
             # is the in-process client, so a status read cannot be mistaken for a child.
             "publish": self.publisher.stats(),
+            # What clients are told this identity can do: the stored kind 0 / kind 10304
+            # copies and their hashes, so `status` answers "is the menu published?" without
+            # a relay query.
+            "advertised": self.advertisement_status(),
             "peer_inbox": {
                 "enabled": self.peer_cfg.enabled,
                 "max_extra": self.peer_cfg.max_extra,
