@@ -10,9 +10,15 @@ The other half is just as load-bearing: a verdict about the frame is final, so i
 the subscription stays up. Making every failure reconnect is the reconnect storm the verdict
 branch was written to stop.
 
-Both are driven through the real `_reader_loop` against the real `SocketServer`, because the
+The third case is why the two were not enough. A failure that is neither a verdict nor the
+daemon's condition fails the same way on every attempt, and since the replay is oldest-first a
+reconnect re-offers it ahead of everything else: one poisoned frame holds the whole batch until
+it ages out of the replay window. So it is skipped — left pending, never acked, named in the log
+— and the reader carries on to the next frame.
+
+All of it is driven through the real `_reader_loop` against the real `SocketServer`, because the
 defect is in the loop's control flow: a test that calls `_frame_failed` directly cannot see
-whether the subscription was reset.
+whether the subscription was reset or the next frame delivered.
 """
 
 import asyncio
@@ -27,6 +33,14 @@ adapter = load_adapter("nostr_adapter_pending_replay")
 
 MESSAGE_ID = "99" * 32
 SECOND_ID = "77" * 32
+
+#: The daemon's conditions: the bounded set that is worth replacing the connection for. Anything
+#: else that fails a frame is that frame's own failure and must not cost the batch.
+TRANSIENT_CODES = [
+    "session_busy", "storage_unavailable", "runtime_draining",
+    "runtime_coordination_required", "worker_not_live", "worker_control_backpressure",
+    "launch_credentials_unavailable", "model_resolution_failed",
+]
 
 
 class RuntimeStoreError(ValueError):
@@ -170,24 +184,86 @@ async def test_a_condition_that_lasts_backs_off_instead_of_looping(tmp_path, mon
     assert waits == [1.0, 2.0, 4.0], "a lasting condition must back off, not retry in a loop"
 
 
-async def test_only_a_verdict_tells_the_loop_to_read_on():
-    """`_frame_failed`'s return value is the loop's only signal: True means the stream goes on.
+async def test_a_frame_that_always_fails_does_not_stall_the_frames_behind_it(tmp_path, caplog):
+    """Two pending frames, the first deterministically broken: the second must be delivered.
 
-    Unit-level because the loop tests above cannot reach the plain-exception branch: Hermes
-    raises plenty of things that are not `RuntimeStoreError` at all, and none of them is a
-    verdict about the frame.
+    The starvation, measured on the daemon's own contract. `replay_pending` offers oldest-first
+    and a reconnect starts the batch again, so replacing the subscription for a frame that can
+    never succeed means the frames behind it are never reached — they age out of the replay
+    window unanswered (120 minutes by default). A failure that is neither a verdict nor a
+    condition is therefore skipped: named in the log, left pending, and read past.
+    """
+    daemon = ConditionDaemon(_frame(), _frame(SECOND_ID))
+    server = SocketServer(tmp_path / "p.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "p.sock")
+    attempts, delivered = [], []
+
+    async def handle_message(event):
+        attempts.append(event.message_id)
+        if event.message_id == MESSAGE_ID:
+            # Deterministic: the same frame fails the same way on every attempt, forever.
+            raise ValueError("this frame is broken")
+        delivered.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await daemon.wait_settled(SECOND_ID)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert attempts == [MESSAGE_ID, SECOND_ID], "the frame behind the broken one was never offered"
+    assert delivered == [SECOND_ID]
+    assert daemon.acks == [SECOND_ID]
+    assert [f["id"] for f in daemon.pending] == [MESSAGE_ID], (
+        "a skipped frame stays pending for a later pass: it must not be acked, and not be lost"
+    )
+    assert daemon.subscriptions == 1, (
+        "a deterministic failure must not resubscribe: the replay would re-offer it first, ahead "
+        "of every frame behind it"
+    )
+    assert MESSAGE_ID[:12] in caplog.text and "skipped" in caplog.text, (
+        "the skipped frame has to be named in the log so an operator can find it"
+    )
+
+
+async def test_only_a_verdict_tells_the_loop_to_read_on():
+    """`_frame_failed`'s answer is the loop's only signal, and it has three values, not two.
+
+    Unit-level because the loop tests above cannot reach the classification on its own: Hermes
+    raises plenty of things that are not `RuntimeStoreError` at all, and a newer Hermes can raise
+    a code this adapter has never seen. Neither is a verdict about the frame, and neither is one
+    of the conditions that is worth replacing the connection for.
     """
     inst = _reader_adapter("/nonexistent")
+    acked = []
 
     async def ack(message_id, attempts=3):
+        acked.append(message_id)
         return True
 
     inst._ack = ack
     frame = _frame()
 
-    assert await inst._frame_failed(frame, RuntimeStoreError("permission_denied")) is True
-    assert await inst._frame_failed(frame, RuntimeStoreError("session_busy")) is False
-    assert await inst._frame_failed(frame, TimeoutError("db is locked")) is False
+    # A verdict is final: acked, and the stream carries on.
+    assert await inst._frame_failed(frame, RuntimeStoreError("permission_denied")) is \
+        adapter.FrameOutcome.CONTINUE
+    # The daemon's condition: unacked, and worth a reconnect.
+    for code in TRANSIENT_CODES:
+        assert await inst._frame_failed(frame, RuntimeStoreError(code)) is \
+            adapter.FrameOutcome.RETRY, code
+    # Neither: a failure of this frame. Skipped, never acked, never a reconnect.
+    assert await inst._frame_failed(frame, TimeoutError("db is locked")) is \
+        adapter.FrameOutcome.SKIP
+    assert await inst._frame_failed(frame, RuntimeStoreError("a_code_from_a_newer_hermes")) is \
+        adapter.FrameOutcome.SKIP
+    assert acked == [MESSAGE_ID], "only a verdict acks: a skipped frame must stay pending"
 
 
 async def test_a_verdict_acks_without_resetting_the_subscription(tmp_path):

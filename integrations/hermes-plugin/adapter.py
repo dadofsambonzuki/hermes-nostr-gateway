@@ -43,6 +43,7 @@ import logging
 import os
 import time
 from collections import OrderedDict, deque
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -196,11 +197,48 @@ def refusal_code(exc: BaseException) -> Optional[str]:
 def is_frame_verdict(code: Optional[str]) -> bool:
     """Whether a refusal code is final for this frame rather than a condition to retry.
 
-    Only the codes Hermes' admission path raises to refuse a *message* are verdicts; an
-    unknown code (a newer Hermes, a code this adapter has not seen) is treated as a
-    condition, because leaving a frame pending is recoverable and acking it is not.
+    Only the codes Hermes' admission path raises to refuse a *message* are verdicts. A code
+    that is neither a verdict nor a condition (`is_transient_condition`) is this frame's own
+    failure: it stays pending, and the reader skips past it rather than holding the whole
+    subscription for it (see `_frame_failed`).
     """
     return code in _FRAME_VERDICT_CODES
+
+
+#: The daemon's *condition*, as opposed to anything about the frame: "come back in a moment".
+#: The same frame may well run on the next attempt, so it is left unacked and the subscription
+#: is replaced so `subscribe` replays it. The set is Hermes' own bounded one, and deliberately
+#: closed: a code that is not here is a failure of the frame, and one frame must not be able to
+#: stop every frame behind it (`replay_pending` re-offers oldest-first) until the replay window
+#: expires (120 minutes by default).
+_TRANSIENT_CONDITION_CODES = frozenset({
+    "session_busy",
+    "storage_unavailable",
+    "runtime_draining",
+    "runtime_coordination_required",
+    "worker_not_live",
+    "worker_control_backpressure",
+    "launch_credentials_unavailable",
+    "model_resolution_failed",
+})
+
+
+def is_transient_condition(code: Optional[str]) -> bool:
+    """Whether a refusal code is the daemon's condition — worth another attempt — or the frame's."""
+    return code in _TRANSIENT_CONDITION_CODES
+
+
+class FrameOutcome(str, Enum):
+    """What one failed frame means for the subscription carrying it.
+
+    `CONTINUE` — the frame is settled (a verdict, which is acked); read on.
+    `RETRY` — the daemon is under a condition; replace the connection so the replay retries it.
+    `SKIP` — this frame fails the same way every time; leave it pending, log why, read on.
+    """
+
+    CONTINUE = "continue"
+    RETRY = "retry"
+    SKIP = "skip"
 
 
 # Hermes emits turn-control notices through the platform send path: an empty turn's
@@ -930,15 +968,19 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     try:
                         await self._frame(frame)
                     except Exception as exc:  # noqa: BLE001 - one frame must not kill the loop
-                        pending = not await self._frame_failed(frame, exc)
-                        if pending:
+                        outcome = await self._frame_failed(frame, exc)
+                        if outcome is FrameOutcome.RETRY:
                             # The daemon re-offers an unacked frame from the `subscribe` op
                             # and from nowhere else, so the connection has to be replaced:
                             # left open, the frame is held until something unrelated
                             # disconnects, however long that is.
                             logger.info("nostr gateway resubscribing so the pending frame "
                                         "is replayed")
+                            pending = True
                             break
+                        # A skipped frame leaves the subscription healthy: reading on is what
+                        # delivers the frames queued behind it instead of letting the one
+                        # frame that cannot succeed hold them until the replay window ends.
                     else:
                         # The connection is carrying frames, so the next reconnect starts
                         # from the bottom of the backoff rather than from wherever a
@@ -983,37 +1025,46 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                            frame.get("reason") or "unknown",
                            f": {detail}" if detail else "")
 
-    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> bool:
-        """One frame's verdict, and whether the subscription can carry on with it.
+    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> FrameOutcome:
+        """One frame's verdict, and what the subscription has to do next.
 
         Letting the exception out of the reader loop tore the socket down, and the daemon
         re-offered the same frame on every reconnect: one refusal became a reconnect storm
         and a repeated apology in the channel. A *verdict* about this frame (Hermes'
         admission codes: `permission_denied`, `not_found`, `invalid_params`,
         `profile_mismatch`, `admission_conflict`) is final — the daemon would answer the
-        same frame the same way — so it is acknowledged and logged, and the stream continues
-        (`True`). Everything else, including the many `RuntimeStoreError` codes that report
-        the daemon's *condition* (`storage_unavailable`, `session_busy`, `runtime_draining`,
-        ...), is left unacked: the next reconnect replays it instead of the message being
-        dropped unseen. The replay is the daemon's `subscribe` op and nothing else, so that
-        case returns `False` and the caller has to replace the connection rather than read
-        on.
+        same frame the same way — so it is acknowledged, logged, and the stream continues
+        (`CONTINUE`). The replay is the daemon's `subscribe` op and nothing else, so a
+        *condition* (`is_transient_condition`) returns `RETRY` and the caller has to replace
+        the connection rather than read on.
+
+        Everything else — a plain exception, a code this adapter does not know — is a
+        failure of this frame, and it is the difference between one broken message and a
+        stalled batch. Replacing the connection for it would re-offer it *first*, ahead of
+        every frame behind it (`replay_pending` is oldest-first), so the rest of the batch
+        would wait out the replay window behind the one frame that never succeeds. Acking it
+        is worse: the message would be dropped unseen. So it is `SKIP`: logged with its
+        reason, left pending (a later reconnect offers it again), and the reader carries on
+        to the next frame on the same subscription.
         """
         ident = str(frame.get("id") or "")
         code = refusal_code(exc)
-        if code is not None and not is_frame_verdict(code):
-            logger.error("nostr frame %s not answered (%s) and stays pending for the next "
-                         "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
-            return False
-        if code is not None:
+        if code is not None and is_frame_verdict(code):
             logger.warning("nostr frame %s refused (%s); acknowledged so it is not replayed",
                            ident[:12] or "(no id)", code)
             if ident and frame.get("type") == "message":
                 await self._ack(ident)
-            return True
-        logger.error("nostr frame %s failed and stays pending for the next reconnect: %s",
-                     ident[:12] or "(no id)", exc, exc_info=exc)
-        return False
+            return FrameOutcome.CONTINUE
+        if code is not None and is_transient_condition(code):
+            logger.error("nostr frame %s not answered (%s) and stays pending for the next "
+                         "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
+            return FrameOutcome.RETRY
+        # Not a verdict and not a condition: the same frame would fail the same way again, so
+        # it is skipped rather than retried — but never acked, because nobody has read it.
+        logger.error("nostr frame %s skipped (%s) and stays pending for a later pass; the "
+                     "subscription reads on to the next frame: %s",
+                     ident[:12] or "(no id)", code or type(exc).__name__, exc, exc_info=exc)
+        return FrameOutcome.SKIP
 
     async def _ack(self, message_id: str, attempts: int = 3) -> bool:
         """Acknowledge a delivered message, retrying without killing the subscription.
