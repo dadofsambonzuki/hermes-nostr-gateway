@@ -103,3 +103,54 @@ def test_the_timer_is_what_gets_enabled():
     assert one(unit, "Install", "WantedBy") == "timers.target"
     assert "Unit" not in unit.get("Timer", {}), (
         "no Unit= override: the default same-instance service is the pair shipped here")
+
+
+# -- the dependency oneshot ---------------------------------------------------
+#
+# A run spends minutes in npm, cargo and docker, so it is deliberately its own unit: the
+# daemon must never be able to stall behind it.
+
+DEPS_SERVICE = DEPLOY / "nostr-deps.service"
+DEPS_TIMER = DEPLOY / "nostr-deps.timer"
+
+
+def test_the_dependency_run_is_a_oneshot_through_hng():
+    unit = sections(DEPS_SERVICE)
+    assert one(unit, "Service", "Type") == "oneshot"
+    exec_start = one(unit, "Service", "ExecStart")
+    assert exec_start.endswith("hng deps run"), exec_start
+    assert "nostr-deps-weekly" not in exec_start, "the shell pipeline is retired, not wrapped"
+    assert one(unit, "Service", "WorkingDirectory"), "config.yaml is found through the cwd"
+
+
+def test_the_dependency_run_is_not_the_daemons_unit():
+    text = DEPS_SERVICE.read_text()
+    assert "hermes-nostr-gateway.service" not in text
+    assert one(sections(DEPS_SERVICE), "Unit", "Description").lower().startswith("daily")
+
+
+def test_the_dependency_run_gets_its_whole_hour():
+    timeout = int(one(sections(DEPS_SERVICE), "Service", "TimeoutStartSec"))
+    assert 30 * 60 <= timeout <= 2 * 60 * 60
+
+
+def test_the_dependency_run_may_write_only_where_it_must():
+    unit = sections(DEPS_SERVICE)
+    writable = " ".join(unit.get("Service", {}).get("ReadWritePaths", []))
+    assert "/opt/deps-bot" in writable, "the workspace and its clones"
+    assert "/var/lib/nostr-deps" in writable, "state and caches"
+    assert "/var/log/nostr-deps.log" in writable
+    path = environment(unit, "PATH")
+    assert "/.local/bin" in path, "ngit comes from the operator's local bin"
+    assert "/usr/local/bin" in path, "osv-scanner lives there"
+    assert "/.venv/bin/hng" in one(unit, "Service", "ExecStart"), (
+        "hng comes from the checkout's virtualenv")
+
+
+def test_the_dependency_timer_is_daily_and_survives_downtime():
+    unit = sections(DEPS_TIMER)
+    assert re.fullmatch(r"(\*-\*-\*|Mon-Sun|\*-\*-\* [0-9:]+)", one(unit, "Timer", "OnCalendar"))
+    assert "06:17" in one(unit, "Timer", "OnCalendar")
+    assert one(unit, "Timer", "Persistent") == "true"
+    assert one(unit, "Timer", "Unit") == "nostr-deps.service"
+    assert one(unit, "Install", "WantedBy") == "timers.target"

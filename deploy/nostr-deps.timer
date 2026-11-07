@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily dependency scan and bump proposals for the Nostr repositories
+
+[Timer]
+# Every morning, before the working day: proposals are waiting to be reviewed
+# rather than arriving mid-task. Persistent=true means a missed run (host down)
+# happens at the next opportunity instead of being skipped for the day.
+OnCalendar=*-*-* 06:17
+RandomizedDelaySec=30m
+Persistent=true
+Unit=nostr-deps.service
+
+[Install]
+WantedBy=timers.target

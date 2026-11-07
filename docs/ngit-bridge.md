@@ -341,8 +341,10 @@ own Hermes profile. The default profile stays the box's general-purpose agent an
 bot's signature.
 
 - **deps** — dependency proposals. The role's identity signs the `pr/deps-*` branches and the
-  CI triggers; the weekly unit that scans, builds and pushes holds it, so the role needs no
-  profile of its own.
+  CI triggers; the scheduled unit that scans, builds and pushes holds it, so the role needs no
+  profile of its own. The pipeline is `hng deps run`, configured from the gateway's `deps:`
+  block and kept as its own oneshot (see `docs/deps.md`) — never a pass in the daemon's poll
+  loop.
 - **review** — PR verdicts. It has both: an identity to sign with and a profile the bridge
   dispatches its tasks to (`ngit.review_assignee: review`). The profile is what makes a review
   cheap or careful — its model is set once, and there is no per-task or per-config model to

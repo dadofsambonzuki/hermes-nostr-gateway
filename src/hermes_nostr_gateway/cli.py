@@ -1363,6 +1363,20 @@ def cmd_ngit_answer(cfg: dict[str, Any], args) -> int:
     return 0
 
 
+def cmd_deps(args) -> int:
+    """The weekly dependency pipeline: a separate oneshot, never the daemon's poll loop."""
+    from .deps import DepsConfigError, load_deps_config, run_deps
+
+    cfg = load_config(args.config)
+    try:
+        deps = load_deps_config(cfg)
+    except DepsConfigError as exc:
+        print(f"deps: {exc}", file=sys.stderr)
+        return 2
+    dry_run = bool(getattr(args, "dry_run", False) or getattr(args, "deps_cmd", "") == "dry-run")
+    return run_deps(deps, dry_run=dry_run, only_repo=getattr(args, "repo", None))
+
+
 def cmd_control(args) -> int:
     """Where a confirmation goes per plane, and who is trusted enough not to need one."""
     cfg = load_config(args.config)
@@ -1835,6 +1849,20 @@ def main(argv: list[str] | None = None) -> int:
     p_ngit_answer.add_argument("--reason", default="", help="why, for a no")
     p_ngit_answer.add_argument("--json", action="store_true")
     p_ngit_answer.set_defaults(func=cmd_ngit)
+
+    p_deps = sub.add_parser(
+        "deps", help="dependency proposals: scan, gate and push a pr/deps-* branch")
+    deps_sub = p_deps.add_subparsers(dest="deps_cmd", required=True)
+    p_deps_run = deps_sub.add_parser("run", help="one run over every configured repository")
+    p_deps_run.add_argument("--dry-run", action="store_true",
+                            help="report what would be proposed; push nothing, record nothing")
+    p_deps_run.add_argument("--repo", default=None,
+                            help="only this repository (a deps.repositories name)")
+    p_deps_run.set_defaults(func=cmd_deps)
+    p_deps_dry = deps_sub.add_parser("dry-run", help="same as `deps run --dry-run`")
+    p_deps_dry.add_argument("--repo", default=None,
+                            help="only this repository (a deps.repositories name)")
+    p_deps_dry.set_defaults(func=cmd_deps)
 
     p_control = sub.add_parser("control", help="where confirmations go, and who is trusted")
     p_control.add_argument("--json", action="store_true")

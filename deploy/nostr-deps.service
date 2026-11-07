@@ -1,0 +1,30 @@
+# The scheduled dependency pipeline, as its own oneshot.
+#
+# Deliberately not part of the daemon: a run spends minutes in npm, cargo and docker and
+# must never be able to stall the relay. `hng deps run` reads `deps:` from the gateway's
+# config.yaml, works in /opt/deps-bot and publishes a pr/deps-<date> proposal per repository.
+[Unit]
+Description=Daily dependency scan and bump proposals for the Nostr repositories
+Documentation=file:///home/ubuntu/Projects/hermes-nostr-gateway/docs/deps.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/hermes-nostr-gateway
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NPM_CONFIG_CACHE=/var/lib/nostr-deps/npm-cache
+Environment=NGIT_CACHE_DIR=/var/lib/nostr-deps/ngit-cache
+ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng deps run
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle
+
+# The run writes only inside its own workspace, its state and the log.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/deps-bot /var/lib/nostr-deps /var/log/nostr-deps.log /tmp
+PrivateTmp=false
