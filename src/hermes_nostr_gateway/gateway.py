@@ -1002,9 +1002,10 @@ class Gateway:
         relays = await self.advertisement_relays()
         reports = await self.advertiser.publish(contents, relays, force=force)
         for report in reports:
-            log.info("advertise kind %d: %s %s relays=%s readback=%s refused=%s", report.kind,
-                     report.status, report.event_id or "-", len(report.published),
-                     report.readback or {}, report.refused or {})
+            log.info("advertise kind %d: %s %s relays=%s readback=%s refused=%s retrying=%s",
+                     report.kind, report.status, report.event_id or "-",
+                     len(report.published), report.readback or {}, report.refused or {},
+                     report.retrying or {})
         return reports
 
     async def _publish_advertisement(self) -> None:
