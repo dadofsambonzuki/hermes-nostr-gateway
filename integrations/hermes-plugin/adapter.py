@@ -164,20 +164,43 @@ def _short(pubkey: str) -> str:
     return f"{pubkey[:12]}…" if pubkey else "nostr"
 
 
+# Hermes raises `RuntimeStoreError` for verdicts *and* for conditions, and only a verdict is
+# about the frame. A condition (`storage_unavailable`, `session_busy`, `runtime_draining`,
+# `worker_not_live`, ...) means the daemon could not answer yet: the same frame may well run
+# on the next reconnect, so acknowledging it would drop a message nobody read. Hermes itself
+# re-raises every code but `queue_full` (`gateway/session_ingress.py`), so the adapter is
+# what has to tell the two apart.
+_FRAME_VERDICT_CODES = frozenset({
+    "permission_denied", "not_found", "invalid_params", "profile_mismatch", "admission_conflict",
+})
+
+
 def refusal_code(exc: BaseException) -> Optional[str]:
     """Hermes' bounded refusal code for an exception, or None when it is not a refusal.
 
     A refusal is Hermes' `RuntimeStoreError`, whose `reason` is the wire code
-    (`permission_denied`, `not_found`, ...). Duck-typed on purpose: this adapter is loaded
-    by more than one Hermes build, and it is the code that decides what happens to the
-    frame, not the class name.
+    (`permission_denied`, `not_found`, ...). The class name is the test and `.reason` is
+    read only from that shape: plenty of exceptions carry a `reason` attribute, and one of
+    those must never be mistaken for a verdict about the frame. Duck-typed on purpose:
+    this adapter is loaded by more than one Hermes build, and it is the code that decides
+    what happens to the frame, not the class object.
     """
+    if type(exc).__name__ != "RuntimeStoreError":
+        return None
     reason = getattr(exc, "reason", None)
     if isinstance(reason, str) and reason:
         return reason
-    if type(exc).__name__ == "RuntimeStoreError":
-        return str(exc) or "refused"
-    return None
+    return str(exc) or "refused"
+
+
+def is_frame_verdict(code: Optional[str]) -> bool:
+    """Whether a refusal code is final for this frame rather than a condition to retry.
+
+    Only the codes Hermes' admission path raises to refuse a *message* are verdicts; an
+    unknown code (a newer Hermes, a code this adapter has not seen) is treated as a
+    condition, because leaving a frame pending is recoverable and acking it is not.
+    """
+    return code in _FRAME_VERDICT_CODES
 
 
 # Hermes emits turn-control notices through the platform send path: an empty turn's
@@ -933,13 +956,20 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 
         Letting the exception out of the reader loop tore the socket down, and the daemon
         re-offered the same frame on every reconnect: one refusal became a reconnect storm
-        and a repeated apology in the channel. A *refusal* (Hermes' bounded `RuntimeStoreError`
-        codes) is final — the same frame would be answered the same way — so it is
-        acknowledged and logged. Anything else is left unacked, so the next reconnect
-        replays it rather than the message being lost.
+        and a repeated apology in the channel. A *verdict* about this frame (Hermes'
+        admission codes: `permission_denied`, `not_found`, `invalid_params`,
+        `profile_mismatch`, `admission_conflict`) is final — the daemon would answer the
+        same frame the same way — so it is acknowledged and logged. Everything else,
+        including the many `RuntimeStoreError` codes that report the daemon's *condition*
+        (`storage_unavailable`, `session_busy`, `runtime_draining`, ...), is left unacked:
+        the next reconnect replays it instead of the message being dropped unseen.
         """
         ident = str(frame.get("id") or "")
         code = refusal_code(exc)
+        if code is not None and not is_frame_verdict(code):
+            logger.error("nostr frame %s not answered (%s) and stays pending for the next "
+                         "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
+            return
         if code is not None:
             logger.warning("nostr frame %s refused (%s); acknowledged so it is not replayed",
                            ident[:12] or "(no id)", code)
@@ -1160,6 +1190,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - a failed re-check is a refusal
             logger.warning("nostr re-authorisation for %s failed (%s); refusing",
                            _short(pubkey), exc)
+            return False
+        if not isinstance(reply, dict):
+            # A reply that parsed but is not a decision is still a no. Hermes does not catch
+            # what this method raises (`gateway/session_ingress_context.py`), so letting an
+            # AttributeError out here would surface as a turn error instead of the refusal
+            # the check exists to produce.
+            logger.warning("nostr daemon answered re-authorisation with a non-object (%s); "
+                           "refusing", type(reply).__name__)
             return False
         if reply.get("type") == "error":
             logger.warning("nostr daemon cannot re-authorise %s (%s); refusing",
