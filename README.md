@@ -81,6 +81,34 @@ envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, 
 `error`). A `blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
 `route_key_missing`, `route_unresolved`) and never looks like chat.
 
+### The slash menu a client can see (`advertise`)
+
+Hermes dispatches any `/command` it receives on this platform, but a client renders a menu only
+from a bot's **kind-10304** manifest — and only for a conversation member whose **kind 0** says
+`bot: true`. Both are published by this daemon when `advertise.publish` is configured; neither
+changes the wire: selecting a command sends `/name args` as ordinary text.
+
+The catalogue is the host's own, not a list kept here. The Hermes plugin writes
+`hermes_cli.commands_platforms._gateway_available_commands()` (plus plugin commands) to
+`commands.json` beside the socket at startup, and the daemon drops what this plane cannot render
+(`/topic`, `/voice`, `/save`), ranks the rest, and caps it at the client's 64. Publishing is
+skipped when the stored content hash matches, and every publish is *read back* per relay: a
+receipt is not retention.
+
+A relay that answers with a rate limit or an outage is owed the copy, not refused it: the attempt
+is remembered with a backoff (a minute, doubling, six attempts) and retried when it is due, and
+`hng profile show` says when that is. `hng status` also reports the catalogue the plugin wrote and,
+when its last write failed, why — a renamed private Hermes import must not empty the menu silently.
+
+```
+hng profile show                 # what would be advertised, and what was last published
+hng profile publish              # publish what differs, then report each relay's answer
+hng profile publish --only commands --force
+```
+
+`publish: [commands]` advertises the menu without touching the identity's kind 0, for a
+deployment where another process owns that profile.
+
 ### Holding a message back, or steering it: `/queue` `/q` and `/steer` `/s`
 
 A message that lands while the agent is mid-turn arrives as another instruction, which is either
@@ -119,7 +147,7 @@ supplies the checkout and the board:
 | event | becomes |
 |---|---|
 | kind-1621 issue | a task on the channel's board |
-| kind-1622 comment | a comment on that task, in `created_at` order, once |
+| kind-1111 comment | a comment on that task, in `created_at` order, once |
 | kind-1618 PR | one notice in the channel, and one review task on the board |
 | kind-1631 applied | a `merged as <commit>` follow-up; it completes the review task |
 
@@ -143,7 +171,9 @@ deferred, so a backlog is carried, not stepped over.
 recovery path.
 
 The ten-minute pass is the floor, not the whole story: `hng serve` also **watches** the mapped
-repositories — a `#a` subscription for kinds 1621/1622/1618/1619/1631, nothing else — and wakes
+repositories — a `#a` subscription for kinds 1621/1618/1619/1631, plus a `#K` one for the NIP-22
+kind-1111 comments (`ngit` publishes comments without an `a` tag, so they can never match the
+first filter), nothing else — and wakes
 `hng ngit sync` when something changes, coalescing a channel's events for 30 seconds and running
 one pass per channel at a time. It is an accelerator, never a second decision-maker: the watcher
 writes no cursor, no task and no notice, and the pass still reads the repository and decides. The

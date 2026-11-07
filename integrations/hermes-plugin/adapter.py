@@ -43,6 +43,7 @@ import logging
 import os
 import time
 from collections import OrderedDict, deque
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -196,11 +197,48 @@ def refusal_code(exc: BaseException) -> Optional[str]:
 def is_frame_verdict(code: Optional[str]) -> bool:
     """Whether a refusal code is final for this frame rather than a condition to retry.
 
-    Only the codes Hermes' admission path raises to refuse a *message* are verdicts; an
-    unknown code (a newer Hermes, a code this adapter has not seen) is treated as a
-    condition, because leaving a frame pending is recoverable and acking it is not.
+    Only the codes Hermes' admission path raises to refuse a *message* are verdicts. A code
+    that is neither a verdict nor a condition (`is_transient_condition`) is this frame's own
+    failure: it stays pending, and the reader skips past it rather than holding the whole
+    subscription for it (see `_frame_failed`).
     """
     return code in _FRAME_VERDICT_CODES
+
+
+#: The daemon's *condition*, as opposed to anything about the frame: "come back in a moment".
+#: The same frame may well run on the next attempt, so it is left unacked and the subscription
+#: is replaced so `subscribe` replays it. The set is Hermes' own bounded one, and deliberately
+#: closed: a code that is not here is a failure of the frame, and one frame must not be able to
+#: stop every frame behind it (`replay_pending` re-offers oldest-first) until the replay window
+#: expires (120 minutes by default).
+_TRANSIENT_CONDITION_CODES = frozenset({
+    "session_busy",
+    "storage_unavailable",
+    "runtime_draining",
+    "runtime_coordination_required",
+    "worker_not_live",
+    "worker_control_backpressure",
+    "launch_credentials_unavailable",
+    "model_resolution_failed",
+})
+
+
+def is_transient_condition(code: Optional[str]) -> bool:
+    """Whether a refusal code is the daemon's condition — worth another attempt — or the frame's."""
+    return code in _TRANSIENT_CONDITION_CODES
+
+
+class FrameOutcome(str, Enum):
+    """What one failed frame means for the subscription carrying it.
+
+    `CONTINUE` — the frame is settled (a verdict, which is acked); read on.
+    `RETRY` — the daemon is under a condition; replace the connection so the replay retries it.
+    `SKIP` — this frame fails the same way every time; leave it pending, log why, read on.
+    """
+
+    CONTINUE = "continue"
+    RETRY = "retry"
+    SKIP = "skip"
 
 
 # Hermes emits turn-control notices through the platform send path: an empty turn's
@@ -903,7 +941,13 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     # -- inbound --------------------------------------------------------
     async def _reader_loop(self) -> None:
         backoff = 1.0
+        # Whether the last attempt ended with a frame left pending. A healthy subscription
+        # resets the wait between attempts; a pending frame does not, because the daemon is
+        # under a condition and retrying it every second would be the reconnect storm again.
+        retrying = False
         while not self._closing:
+            writer: Optional[asyncio.StreamWriter] = None
+            pending = False
             try:
                 reader, writer = await asyncio.open_unix_connection(str(self._socket))
                 writer.write(b'{"op":"subscribe"}\n')
@@ -912,7 +956,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 if ack.get("type") != "subscribed":
                     raise RuntimeError(f"unexpected subscribe reply: {ack}")
                 self._connected.set()
-                backoff = 1.0
+                if not retrying:
+                    backoff = 1.0
+                retrying = False
                 logger.info("nostr gateway subscribed at %s", self._socket)
                 async for raw in reader:
                     try:
@@ -922,13 +968,41 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     try:
                         await self._frame(frame)
                     except Exception as exc:  # noqa: BLE001 - one frame must not kill the loop
-                        await self._frame_failed(frame, exc)
+                        outcome = await self._frame_failed(frame, exc)
+                        if outcome is FrameOutcome.RETRY:
+                            # The daemon re-offers an unacked frame from the `subscribe` op
+                            # and from nowhere else, so the connection has to be replaced:
+                            # left open, the frame is held until something unrelated
+                            # disconnects, however long that is.
+                            logger.info("nostr gateway resubscribing so the pending frame "
+                                        "is replayed")
+                            pending = True
+                            break
+                        # A skipped frame leaves the subscription healthy: reading on is what
+                        # delivers the frames queued behind it instead of letting the one
+                        # frame that cannot succeed hold them until the replay window ends.
+                    else:
+                        # The connection is carrying frames, so the next reconnect starts
+                        # from the bottom of the backoff rather than from wherever a
+                        # condition left it.
+                        backoff = 1.0
+                        retrying = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform
                 logger.warning("nostr gateway connection lost (%s); retrying in %.0fs",
                                exc, backoff)
+            finally:
                 self._connected.clear()
+                if writer is not None:
+                    writer.close()
+                    try:
+                        # A close is a courtesy to the daemon too: its subscription for this
+                        # reader has to end before ours begins, or it keeps a dead writer.
+                        await asyncio.wait_for(writer.wait_closed(), 5)
+                    except (TimeoutError, OSError):
+                        pass
+            retrying = pending
             if self._closing:
                 break
             await asyncio.sleep(backoff)
@@ -951,33 +1025,46 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                            frame.get("reason") or "unknown",
                            f": {detail}" if detail else "")
 
-    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> None:
-        """One frame's verdict, so the subscription survives it.
+    async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> FrameOutcome:
+        """One frame's verdict, and what the subscription has to do next.
 
         Letting the exception out of the reader loop tore the socket down, and the daemon
         re-offered the same frame on every reconnect: one refusal became a reconnect storm
         and a repeated apology in the channel. A *verdict* about this frame (Hermes'
         admission codes: `permission_denied`, `not_found`, `invalid_params`,
         `profile_mismatch`, `admission_conflict`) is final — the daemon would answer the
-        same frame the same way — so it is acknowledged and logged. Everything else,
-        including the many `RuntimeStoreError` codes that report the daemon's *condition*
-        (`storage_unavailable`, `session_busy`, `runtime_draining`, ...), is left unacked:
-        the next reconnect replays it instead of the message being dropped unseen.
+        same frame the same way — so it is acknowledged, logged, and the stream continues
+        (`CONTINUE`). The replay is the daemon's `subscribe` op and nothing else, so a
+        *condition* (`is_transient_condition`) returns `RETRY` and the caller has to replace
+        the connection rather than read on.
+
+        Everything else — a plain exception, a code this adapter does not know — is a
+        failure of this frame, and it is the difference between one broken message and a
+        stalled batch. Replacing the connection for it would re-offer it *first*, ahead of
+        every frame behind it (`replay_pending` is oldest-first), so the rest of the batch
+        would wait out the replay window behind the one frame that never succeeds. Acking it
+        is worse: the message would be dropped unseen. So it is `SKIP`: logged with its
+        reason, left pending (a later reconnect offers it again), and the reader carries on
+        to the next frame on the same subscription.
         """
         ident = str(frame.get("id") or "")
         code = refusal_code(exc)
-        if code is not None and not is_frame_verdict(code):
-            logger.error("nostr frame %s not answered (%s) and stays pending for the next "
-                         "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
-            return
-        if code is not None:
+        if code is not None and is_frame_verdict(code):
             logger.warning("nostr frame %s refused (%s); acknowledged so it is not replayed",
                            ident[:12] or "(no id)", code)
             if ident and frame.get("type") == "message":
                 await self._ack(ident)
-            return
-        logger.error("nostr frame %s failed and stays pending for the next reconnect: %s",
-                     ident[:12] or "(no id)", exc, exc_info=exc)
+            return FrameOutcome.CONTINUE
+        if code is not None and is_transient_condition(code):
+            logger.error("nostr frame %s not answered (%s) and stays pending for the next "
+                         "reconnect: %s", ident[:12] or "(no id)", code, exc, exc_info=exc)
+            return FrameOutcome.RETRY
+        # Not a verdict and not a condition: the same frame would fail the same way again, so
+        # it is skipped rather than retried — but never acked, because nobody has read it.
+        logger.error("nostr frame %s skipped (%s) and stays pending for a later pass; the "
+                     "subscription reads on to the next frame: %s",
+                     ident[:12] or "(no id)", code or type(exc).__name__, exc, exc_info=exc)
+        return FrameOutcome.SKIP
 
     async def _ack(self, message_id: str, attempts: int = 3) -> bool:
         """Acknowledge a delivered message, retrying without killing the subscription.
@@ -1321,7 +1408,113 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         return json.loads(raw)
 
 
+#: The daemon deliberately does not import Hermes (its `profiles.py` copies Hermes'
+#: profile grammar for the same reason), so the host's gateway-dispatchable commands cross
+#: the boundary as a file beside the gateway socket. This module *does* run inside Hermes,
+#: where `hermes_cli` is importable: writing the catalogue here is what keeps the slash menu
+#: the host's real catalogue instead of a list copied into the daemon and left to drift.
+#: Fully-qualified into `hermes_cli.commands*` on purpose -- it is the same source the
+#: Telegram menu is registered from, so a command that appears there appears here.
+COMMANDS_FILE = "commands.json"
+
+
+class CatalogueEmpty(RuntimeError):
+    """The host registry answered with no commands at all.
+
+    Not a normal state: `_gateway_available_commands()` always offers at least `/help`. An
+    empty answer means the import above resolved to something that no longer lists
+    commands, and writing it would replace a working menu with nothing.
+    """
+
+
+def catalogue_path() -> Path:
+    """Where the daemon reads the catalogue: beside the socket it also reads."""
+    configured = os.environ.get("NOSTR_GATEWAY_COMMANDS")
+    if configured:
+        return Path(os.path.expanduser(configured))
+    socket = os.environ.get("NOSTR_GATEWAY_SOCKET") or DEFAULT_SOCKET
+    return Path(os.path.expanduser(socket)).with_name(COMMANDS_FILE)
+
+
+def catalogue_status_path(path: Path | None = None) -> Path:
+    """Where the last write's outcome is recorded, beside the catalogue it describes."""
+    target = path or catalogue_path()
+    return target.with_name(target.stem + ".status.json")
+
+
+def _write_json_atomic(target: Path, payload: dict[str, Any]) -> None:
+    """One file, one rename: a reader never sees half of it."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(target.name + ".tmp")
+    staging.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+    os.replace(staging, target)
+
+
+def record_catalogue_status(path: Path | None = None, *, ok: bool, commands: int = 0,
+                            error: str | None = None) -> Path:
+    """Record what the last write did, where the daemon's `status` verb can read it.
+
+    A `logger.warning` is not enough: this runs inside Hermes, where nobody is watching, and
+    an upstream rename (`_gateway_available_commands`, `_iter_plugin_command_entries`) would
+    leave the slash menu empty with nothing an operator looks at saying why. The daemon
+    reads this file beside the catalogue and reports it.
+    """
+    target = catalogue_status_path(path)
+    payload: dict[str, Any] = {"source": "hermes", "ok": bool(ok),
+                               "generated_at": int(time.time()),
+                               "catalogue": str(path or catalogue_path()),
+                               "commands": int(commands)}
+    if error:
+        payload["error"] = str(error)[:500]
+    _write_json_atomic(target, payload)
+    return target
+
+
+def command_catalogue() -> list[dict[str, Any]]:
+    """The host's gateway-available commands, as plain data for the daemon's builder."""
+    from hermes_cli.commands import _iter_plugin_command_entries
+    from hermes_cli.commands_platforms import _gateway_available_commands
+
+    entries = [{"name": command.name, "description": command.describe(),
+                "args_hint": command.args_hint}
+               for command in _gateway_available_commands()]
+    seen = {entry["name"] for entry in entries}
+    for name, description, hint in _iter_plugin_command_entries():
+        # Plugin commands are dispatchable too; the daemon validates the name grammar and
+        # drops anything the client cannot address, so this stays a faithful copy here.
+        if name not in seen:
+            seen.add(name)
+            entries.append({"name": name, "description": description, "args_hint": hint})
+    return entries
+
+
+def write_command_catalogue(path: Path | None = None, *,
+                            entries: list[dict[str, Any]] | None = None) -> Path:
+    """Write the catalogue atomically: a half-written file must not look like a menu."""
+    target = path or catalogue_path()
+    commands = command_catalogue() if entries is None else list(entries)
+    if not commands:
+        raise CatalogueEmpty("the host registry returned no gateway commands")
+    payload = {"source": "hermes", "generated_at": int(time.time()), "commands": commands}
+    _write_json_atomic(target, payload)
+    return target
+
+
 def register(ctx) -> None:
+    target = catalogue_path()
+    try:
+        entries = command_catalogue()
+        written = write_command_catalogue(target, entries=entries)
+        record_catalogue_status(target, ok=True, commands=len(entries))
+        logger.info("wrote the gateway command catalogue: %s (%d commands)",
+                    written, len(entries))
+    except Exception as exc:  # noqa: BLE001 - the platform must load without it
+        logger.warning("could not write the gateway command catalogue: %s", exc)
+        try:
+            record_catalogue_status(target, ok=False,
+                                    error=f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - recording the failure must not break the load
+            logger.warning("could not record the catalogue failure either", exc_info=True)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Nostr",

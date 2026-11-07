@@ -13,6 +13,16 @@ import nostr_sdk as sdk
 import yaml
 
 from . import addressing, sdkloop
+from .advertise import (
+    MANIFEST_KIND,
+    PROFILE_KIND,
+    AdvertisementConfig,
+    Advertiser,
+    CatalogueError,
+    build_manifest,
+    load_catalogue,
+    resolve_relays,
+)
 from .bots import BotRegistry, kind0_fetcher
 from .control import ControlConfig
 from .crypto import SdkCrypto, normalize_pubkey
@@ -24,6 +34,8 @@ from .health import (
 )
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .ngit_watch import (
+    COMMENT_KINDS,
+    COMMENT_ROOT_KINDS,
     WATCH_KINDS,
     WATCH_SINCE_DAYS,
     NgitWatchConfig,
@@ -442,6 +454,14 @@ class Gateway:
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
+        #: What this identity advertises to clients: its kind-0 profile (so a client's
+        #: `bot: true` discovery step finds it) and the kind-10304 command manifest Armada
+        #: renders the slash menu from. Off unless `advertise.publish` asks for it, and a
+        #: target list this cannot parse is a config error rather than a quiet no-op.
+        self.advertise_cfg = AdvertisementConfig.from_config(
+            cfg.get("advertise"), socket_path=self.socket_path)
+        self.advertiser = Advertiser(crypto=self.crypto, publisher=self.publisher,
+                                     store=self.store, secret=self._secret)
         #: Where this process was configured, so a child it starts reads the same file
         #: rather than whatever `hng` would find on its own. Set by `hng serve`.
         self.config_path = Path(config_path) if config_path else None
@@ -510,8 +530,8 @@ class Gateway:
 
     def _new_worker(self, relay: str, *, kinds: tuple[int, ...],
                     p_tag: str | None = None, authors: tuple[str, ...] = (),
-                    a_tags: tuple[str, ...] = (), purpose: str = "dm",
-                    since_days: int = 3) -> PoolWorker:
+                    a_tags: tuple[str, ...] = (), root_kinds: tuple[str, ...] = (),
+                    purpose: str = "dm", since_days: int = 3) -> PoolWorker:
         """Build a read worker: one relay's subscription set on the shared client.
 
         `PoolWorker` is the only read transport now. Its counters and `live_state()` are
@@ -519,8 +539,9 @@ class Gateway:
         not branch on how the events arrive.
         """
         return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
-                          authors=authors, a_tags=a_tags, purpose=purpose,
-                          since_days=since_days, on_refusal=self._note_refusal)
+                          authors=authors, a_tags=a_tags, root_kinds=root_kinds,
+                          purpose=purpose, since_days=since_days,
+                          on_refusal=self._note_refusal)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -662,7 +683,8 @@ class Gateway:
         try:
             plan = await asyncio.wait_for(asyncio.to_thread(
                 watch_plan, self.cfg, self.projects, self.concord.channels(),
-                read_relays=tuple(self.relays_read)), timeout=120)
+                read_relays=tuple(self.relays_read),
+                known_roots=self.store.ngit_roots), timeout=120)
         except Exception as exc:  # noqa: BLE001 - the scheduled pass is still the floor
             log.warning("ngit watch: no watch plan (%s); the scheduled pass keeps the bridge "
                         "moving", exc)
@@ -687,12 +709,17 @@ class Gateway:
 
     def _attach_ngit_watch(self, addresses: tuple[str, ...],
                            handler: Any) -> list[PoolWorker]:
-        """One narrowed read worker per relay, for the mapped repositories' `#a` addresses.
+        """Narrowed read workers per relay: the repositories, and their comments.
 
         The watcher is an accelerator, so its workers are ordinary pool workers: same
         NIP-42, same reconnects, same counters in `status`/`health` -- only the filter and
         the handler differ. The handler is the watcher's own, so a repository event never
         falls through to the message planes.
+
+        Comments are a second subscription, not another kind in the first: ngit publishes
+        them as NIP-22 kind 1111, which carries no `a` tag, so a `#a` filter can never
+        match one. `#K` (the root's kind) is what narrows this one to comments on issues
+        and PRs; which repository that is, the watcher decides by the root event id.
         """
         watcher = self.ngit_watch
         relays = watcher.plan.relays if watcher is not None else ()
@@ -703,6 +730,13 @@ class Gateway:
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker, handler)))
             workers.append(worker)
+            comments = self._new_worker(relay, kinds=COMMENT_KINDS,
+                                        root_kinds=COMMENT_ROOT_KINDS,
+                                        purpose="ngit-comments",
+                                        since_days=WATCH_SINCE_DAYS)
+            self.workers.append(comments)
+            self._tasks.append(asyncio.create_task(self._guarded(comments, handler)))
+            workers.append(comments)
         return workers
 
     # -- invites: join on a trusted word, hold for a human ----------------
@@ -908,6 +942,10 @@ class Gateway:
         # The publish set is known up front: connect it once, rather than paying a
         # handshake per relay on the first message.
         await self.publisher.warm(self.relays_publish)
+        if self.advertise_cfg.enabled:
+            # Not a gate on startup: the daemon reads relays whether or not one of them
+            # accepts an advertisement, and an unchanged stored copy skips the publish.
+            self._tasks.append(asyncio.create_task(self._publish_advertisement()))
         for relay in self.relays_read:
             # ONE subscription per relay for every inbound kind we care about.
             # One connection per plane is what tripped our own relay's limiter (429)
@@ -945,6 +983,62 @@ class Gateway:
         if self.marmot_worker is not None:
             self._tasks.append(asyncio.create_task(self._guard_marmot(self.marmot_worker)))
         log.info("gateway up: %s on %d relays", self.me, len(self.workers))
+
+    # -- advertisement (kind 0 + kind 10304) -----------------------------
+    async def advertisement_relays(self) -> list[str]:
+        """Where the profile and manifest go; the rule lives in `advertise.resolve_relays`."""
+        return await resolve_relays(self.relays_publish, self.advertise_cfg.relays,
+                                    me=self.me, secret=self._secret)
+
+    def advertisement_contents(self) -> tuple[dict[int, dict[str, Any]], list[str]]:
+        """The two contents this configuration asks for, and what building them dropped."""
+        contents: dict[int, dict[str, Any]] = {}
+        warnings: list[str] = []
+        if self.advertise_cfg.publishes_profile and self.advertise_cfg.profile:
+            contents[PROFILE_KIND] = self.advertise_cfg.profile
+        if self.advertise_cfg.publishes_commands:
+            try:
+                commands, notes = load_catalogue(self.advertise_cfg.catalogue_file)
+            except CatalogueError as exc:
+                warnings.append(str(exc))
+            else:
+                manifest = build_manifest(commands)
+                contents[MANIFEST_KIND] = manifest.content
+                warnings.extend(notes + manifest.warnings)
+        return contents, warnings
+
+    async def publish_advertisement(self, *, force: bool = False) -> list[Any]:
+        """Publish what differs; the report is the per-relay truth, not a success flag."""
+        contents, warnings = self.advertisement_contents()
+        for warning in warnings:
+            log.warning("advertise: %s", warning)
+        if not contents:
+            log.warning("advertise: nothing to publish (%s)", self.advertise_cfg.describe())
+            return []
+        relays = await self.advertisement_relays()
+        reports = await self.advertiser.publish(contents, relays, force=force)
+        for report in reports:
+            log.info("advertise kind %d: %s %s relays=%s readback=%s refused=%s retrying=%s",
+                     report.kind, report.status, report.event_id or "-",
+                     len(report.published), report.readback or {}, report.refused or {},
+                     report.retrying or {})
+        return reports
+
+    async def _publish_advertisement(self) -> None:
+        try:
+            await self.publish_advertisement()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an advertisement must not take the daemon down
+            log.exception("advertise: publish failed")
+
+    def advertisement_status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.advertise_cfg.enabled,
+            "targets": list(self.advertise_cfg.targets),
+            "catalogue": str(self.advertise_cfg.catalogue_file or ""),
+            "published": self.store.advertised_all(),
+        }
 
     def _load_follows(self) -> tuple[str, ...]:
         """Our kind-3 contact list: what 'feeds' means, as opposed to the firehose."""
@@ -1630,6 +1724,10 @@ class Gateway:
             # Which publish transport is running, and how it has fared: `mode: bindings`
             # is the in-process client, so a status read cannot be mistaken for a child.
             "publish": self.publisher.stats(),
+            # What clients are told this identity can do: the stored kind 0 / kind 10304
+            # copies and their hashes, so `status` answers "is the menu published?" without
+            # a relay query.
+            "advertised": self.advertisement_status(),
             "peer_inbox": {
                 "enabled": self.peer_cfg.enabled,
                 "max_extra": self.peer_cfg.max_extra,

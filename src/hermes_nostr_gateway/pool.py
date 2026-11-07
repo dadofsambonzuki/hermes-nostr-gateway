@@ -131,7 +131,8 @@ class PoolWorker:
 
     def __init__(self, pool: "RelayPool", relay: str, me: str, *,
                  kinds: tuple[int, ...] = (1059,), authors: tuple[str, ...] = (),
-                 p_tag: str | None = None, a_tags: tuple[str, ...] = (), auth: bool = True,
+                 p_tag: str | None = None, a_tags: tuple[str, ...] = (),
+                 root_kinds: tuple[str, ...] = (), auth: bool = True,
                  since_days: int = 3,
                  on_refusal: RefusalHandler | None = None, purpose: str = "dm"):
         self.pool = pool
@@ -149,6 +150,11 @@ class PoolWorker:
         #: whole kind. Empty means "no address filter", never "match nothing".
         self.a_tags = tuple(str(value).strip() for value in a_tags
                             if str(value or "").strip())
+        #: `#K` values: NIP-22's root scope, the kind of the event a comment hangs off. A
+        #: comment names no repository address, so this is what selects one class of them
+        #: (comments on issues and PRs) without asking a relay for the whole kind.
+        self.root_kinds = tuple(str(value).strip() for value in root_kinds
+                                if str(value or "").strip())
         self.auth = auth
         self.since_days = since_days
         self.me = (me or "").strip()
@@ -206,6 +212,9 @@ class PoolWorker:
             # REQ a relay receives is the one an operator would write by hand.
             filt = filt.custom_tags(sdk.SingleLetterTag.from_byte(ord("a")),
                                     list(self.a_tags))
+        if self.root_kinds:
+            filt = filt.custom_tags(sdk.SingleLetterTag.from_byte(ord("K")),
+                                    list(self.root_kinds))
         for author in self.authors:
             filt = filt.author(sdk.PublicKey.parse(author))
         # Only the recent window: without this every resubscribe replays the relay's
@@ -267,6 +276,7 @@ class PoolWorker:
             "refused_kinds": sorted(self.refused),
             "p_tag": bool(self.p_tag),
             "a_tags": len(self.a_tags),
+            "root_kinds": list(self.root_kinds),
             "authors": len(self.authors),
             "events": self.events,
             "alive": self.alive,

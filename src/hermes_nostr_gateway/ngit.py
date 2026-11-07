@@ -5,7 +5,7 @@ work belongs to; it now also says which board that work queues on (see `projects
 the same lookup serves the inbound and the outbound half of this module:
 
     inbound   kind-1621 issue    -> a task on the channel's board
-              kind-1622 comment  -> a task comment, in the order the issue carries them
+              kind-1111 comment  -> a task comment, in the order the issue carries them
     outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
                                    review task on that board (a verdict, never a merge:
                                    merging is the operator's)
@@ -60,6 +60,7 @@ import nostr_sdk as sdk
 from .control import ControlConfig, as_hex
 from .fetch import fetch_many_blocking
 from .kanban import Anchor, Board, BoardError
+from .ngit_labels import Labeler, parse_verdict, review_labels
 from .projects import ProjectMap, board_dir, hermes_home
 from .store import Store
 
@@ -67,9 +68,19 @@ log = logging.getLogger("hng.ngit")
 
 #: NIP-34 kinds this bridge reads. 1630-1633 are the status kinds; only `applied` is news.
 KIND_ISSUE = 1621
-KIND_ISSUE_COMMENT = 1622
 KIND_PR = 1618
+#: A revision: `E` names the PR it updates, `c` the new tip. It is how a PR grows commits,
+#: so it is the only event that can tell the bridge a review's verdict no longer covers the
+#: tip (`ngit_labels`, `stale`).
+KIND_PR_REVISION = 1619
 KIND_APPLIED = 1631
+
+#: A comment is NIP-22, not NIP-34: ngit 3.0.5 publishes `ngit issue comment` and
+#: `ngit pr comment` as kind 1111 (`src/lib/git_events.rs`, `KIND_COMMENT`), and no ngit
+#: release ever wrote 1622 -- the 1622s this bridge used to look for were hand-published.
+#: Reading is kind-agnostic (`ngit issue view --comments` returns them either way); this
+#: constant is for the watcher's subscription, which has to name a kind.
+KIND_COMMENT = 1111
 
 #: How a kind-1631 names the commit(s) it landed, most specific first. NIP-34 spells a merge
 #: `merge-commit`; ngit 3.0.4 writes `merge-commit-id` instead -- one oid for a merge commit,
@@ -254,7 +265,8 @@ class NotifyBusy(NotifyError):
 
 @dataclass(frozen=True)
 class Comment:
-    """One kind-1622 reply on an issue, as `ngit issue view --comments --json` reports it."""
+    """One NIP-22 kind-1111 reply on an issue, as `ngit issue view --comments --json`
+    reports it."""
 
     id: str            # nevent, or the hex id when it could not be encoded
     hex: str
@@ -299,6 +311,43 @@ class Merge:
     pr_id: str         # hex of the root PR event
     commit: str = ""
     created_at: int = 0
+
+
+@dataclass(frozen=True)
+class Revision:
+    """A kind-1619 update: the PR it belongs to and the tip it moved the PR to."""
+
+    pr_id: str         # hex of the PR event its `E` tag names
+    commit: str = ""
+    created_at: int = 0
+    event_id: str = ""
+
+
+@dataclass(frozen=True)
+class PrFeed:
+    """One poll's PR events: proposals, their revisions, and the merges that closed them.
+
+    A revision is not a second proposal, so it is not folded into `prs`: the PR keeps its
+    identity, its subject and its review task, and only its tip moves.
+    """
+
+    prs: list[PullRequest] = field(default_factory=list)
+    merges: list[Merge] = field(default_factory=list)
+    revisions: list[Revision] = field(default_factory=list)
+
+    def newest_tips(self) -> dict[str, tuple[str, int]]:
+        """Each PR's tip from this poll, with the time of the event that named it."""
+        tips: dict[str, tuple[str, int]] = {}
+        for pr in self.prs:
+            if pr.commit:
+                tips[pr.id] = (pr.commit, pr.created_at)
+        for revision in self.revisions:
+            if not revision.commit:
+                continue
+            seen = tips.get(revision.pr_id)
+            if seen is None or revision.created_at >= seen[1]:
+                tips[revision.pr_id] = (revision.commit, revision.created_at)
+        return tips
 
 
 @dataclass(frozen=True)
@@ -347,6 +396,10 @@ class BridgeConfig:
     watch: bool | None = None
     #: How long the watcher coalesces a channel's events before running its pass.
     watch_debounce_s: float = DEFAULT_WATCH_DEBOUNCE_S
+    #: Whether each PR's review state is published on the PR as a NIP-34 label. On by
+    #: default -- the LABELS column is what a reader looks at -- and off for a deployment
+    #: that does not want the extra events on its repository's relays.
+    labels: bool = True
 
     @classmethod
     def from_config(cls, raw: Any) -> "BridgeConfig":
@@ -386,6 +439,7 @@ class BridgeConfig:
             max_prs=max(1, int(block.get("max_prs", 10) or 1)),
             watch=None if watch is None else bool(watch),
             watch_debounce_s=debounce,
+            labels=bool(block.get("labels", True)),
         )
 
 
@@ -405,7 +459,8 @@ class Report:
         "would_post": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
-        "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0})
+        "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
+        "labels": 0, "label_errors": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -448,6 +503,8 @@ class Report:
                       if p["pending"] else "")
                    + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
                    + (f", {p['review_errors']} review failure(s)" if p["review_errors"] else "")
+                   + (f", {p['labels']} label(s) published" if p["labels"] else "")
+                   + (f", {p['label_errors']} label failure(s)" if p["label_errors"] else "")
                    + (f", {p['deferred']} waiting for the next poll" if p["deferred"] else "")
                    + (f", {p['would_post']} would be posted" if self.dry_run else ""))
         out.append(f"posted:  {self.posted} channel message(s)"
@@ -605,6 +662,21 @@ def merge_from_event(event: dict[str, Any]) -> Optional[Merge]:
                  created_at=int(event.get("created_at") or 0))
 
 
+def revision_from_event(event: dict[str, Any]) -> Optional[Revision]:
+    """A kind-1619 PR update: the PR its `E` tag names, and the tip its `c` tag moves to.
+
+    NIP-34 spells the reference `E` (NIP-22); an event without one cannot be attached to a
+    PR and is ignored rather than guessed at.
+    """
+    pr_id = event_hex(_tag(event, "E"))
+    commit = _tag(event, "c")
+    if not pr_id or not commit:
+        return None
+    return Revision(pr_id=pr_id, commit=commit,
+                    created_at=int(event.get("created_at") or 0),
+                    event_id=str(event.get("id") or ""))
+
+
 # -- reading a checkout through ngit -----------------------------------------
 
 def run_ngit(repo: Path, args: Sequence[str], *, timeout: float = 120.0) -> Any:
@@ -647,6 +719,16 @@ class RepoRef:
     relays: tuple[str, ...] = ()
 
 
+def _relay_url(host: str) -> str:
+    """A hosting server as a relay URL: `ngit repo --json` names them without a scheme."""
+    value = (host or "").strip()
+    if not value:
+        return ""
+    if "://" in value:
+        return value
+    return f"wss://{value}"
+
+
 class Ngit:
     """The `ngit` CLI, as this bridge uses it: a repo's address and its issues."""
 
@@ -669,6 +751,10 @@ class Ngit:
             return RepoRef()
         if not isinstance(data, dict) or not data.get("is_nostr_repo"):
             return RepoRef()
+        # The servers that host this repository are the relays its events live on -- and a
+        # retracted label has to reach every one of them, so they are read from the checkout
+        # rather than left to the announcement's hints alone.
+        hosts = tuple(_relay_url(str(host)) for host in _as_list(data.get("grasp_servers")))
         coordinate = str(data.get("coordinate") or "").strip()
         if coordinate:
             try:
@@ -677,15 +763,17 @@ class Ngit:
                 address = (f"{found.kind()}:{found.public_key().to_hex()}:"
                            f"{found.identifier()}")
                 # The naddr carries the announcement's relay hints, which is exactly the
-                # read set for its issues and PRs (NIP-34).
+                # read set for its issues and PRs (NIP-34); the hosting servers are the
+                # rest of it.
+                hints = tuple(str(url) for url in parsed.relays())
                 return RepoRef(address=address,
-                               relays=tuple(str(url) for url in parsed.relays()))
+                               relays=tuple(dict.fromkeys((*hints, *[h for h in hosts if h]))))
             except Exception:  # noqa: BLE001 - fall through to the explicit fields
                 log.debug("ngit: could not decode repo coordinate %s", coordinate[:24])
         owner = as_hex(str(data.get("selected_maintainer") or ""))
         identifier = str(data.get("identifier") or "").strip()
         address = f"30617:{owner}:{identifier}" if owner and identifier else ""
-        return RepoRef(address=address)
+        return RepoRef(address=address, relays=tuple(h for h in hosts if h))
 
     def issues(self) -> list[Issue]:
         data = self._run(self.repo, ["issue", "list"])
@@ -713,17 +801,19 @@ class RelayPrs:
         self._fetch = fetcher
         self.secret = secret
 
-    def events(self, since: int) -> tuple[list[PullRequest], list[Merge]]:
-        """Every PR and applied-status event newer than `since`, deduped by event id."""
+    def events(self, since: int) -> PrFeed:
+        """Every PR, revision and applied-status event newer than `since`, deduped by id."""
         if not self.relays:
             raise NgitError("ngit.relays (or relays.read) is empty: nowhere to read PR events")
         if not self.address:
             raise NgitError("this checkout has no NIP-34 address: no PRs to read")
-        raw = self._fetch(relays=self.relays, kinds=[KIND_PR, KIND_APPLIED],
+        raw = self._fetch(relays=self.relays,
+                          kinds=[KIND_PR, KIND_PR_REVISION, KIND_APPLIED],
                           a_tag=self.address, since=int(since), limit=500,
                           secret=self.secret)
         prs: dict[str, PullRequest] = {}
         merges: dict[str, Merge] = {}
+        revisions: dict[str, Revision] = {}
         for event in raw or []:
             if not isinstance(event, dict) or not event.get("id"):
                 continue
@@ -732,11 +822,21 @@ class RelayPrs:
                 pr = pull_request_from_event(event)
                 # A revision (1619) or a re-publish can repeat a subject; the id is the PR.
                 prs[pr.id] = pr
+            elif kind == KIND_PR_REVISION:
+                revision = revision_from_event(event)
+                if revision is None:
+                    continue
+                seen = revisions.get(revision.pr_id)
+                # Only the newest tip per PR matters: an older one replayed by a relay must
+                # not move the tip back and invent a revision that never happened.
+                if seen is None or revision.created_at >= seen.created_at:
+                    revisions[revision.pr_id] = revision
             elif kind == KIND_APPLIED:
                 merge = merge_from_event(event)
                 if merge is not None:
                     merges[merge.pr_id] = merge
-        return list(prs.values()), list(merges.values())
+        return PrFeed(prs=list(prs.values()), merges=list(merges.values()),
+                      revisions=list(revisions.values()))
 
 
 # -- posting into the channel -------------------------------------------------
@@ -856,6 +956,13 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "3. Report a verdict with reasons on this task -- merge, or changes needed -- and",
         "   say what the gates could not catch: behaviour, tests that do not exercise the",
         "   change, and anything the PR leaves out.",
+        "4. Start that comment with exactly one of these lines:",
+        "",
+        "       Verdict: approved",
+        "       Verdict: changes-requested",
+        "",
+        "   The bridge reads that line and publishes the verdict on the PR as a label, so",
+        "   the vocabulary is the one thing here that has to be spelled as written.",
     ]
     return "\n".join([
         f'PR "{pr.subject}" by {pr.author}',
@@ -983,7 +1090,7 @@ def default_branch(repo: Path) -> str:
 
 IssueSource = Callable[[], list[Issue]]
 DetailSource = Callable[[Issue], Issue]
-PrSource = Callable[[int], tuple[list[PullRequest], list[Merge]]]
+PrSource = Callable[[int], PrFeed]
 #: `notify(conversation, text, key)`: post one channel message, and let the daemon answer a
 #: repeated `key` with the message it already published instead of posting it twice.
 Notifier = Callable[[str, str, str], None]
@@ -1009,7 +1116,7 @@ class Sync:
                  config: BridgeConfig, target: Target, issues: IssueSource,
                  detail: DetailSource, prs: PrSource | None = None,
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
-                 now: Callable[[], float] = time.time):
+                 labels: Optional[Labeler] = None, now: Callable[[], float] = time.time):
         self.store = store
         self.board = board
         self.control = control
@@ -1020,6 +1127,7 @@ class Sync:
         self.prs = prs
         self.notify = notify
         self.anchor = anchor or Anchor()
+        self.labels = labels
         self._now = now
 
     # -- entry point -----------------------------------------------------
@@ -1179,7 +1287,8 @@ class Sync:
         if self.prs is None:
             raise NgitError("no PR source configured")
         start = self._since(since)
-        prs, merges = self.prs(start)
+        feed = self.prs(start)
+        prs, merges = feed.prs, feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         budget = max(1, int(self.config.max_prs or 1))
         if not dry_run:
@@ -1264,6 +1373,12 @@ class Sync:
             if known is not None:
                 self._close_review(known, merge, link, report, dry_run=dry_run)
 
+        # Labels last: every task the poll just made or closed is state the label walk has
+        # to see, and a label that cannot be published must not hold the cursor -- the next
+        # poll retries it from the link, which still records the label it last published.
+        if not dry_run:
+            self._labels(feed, report)
+
         # The cursor promises that everything before it has been dealt with. A queued notice
         # counts: it is durable, and the next poll delivers it. A deferred event does not --
         # it was seen and not decided on -- so the cursor stops short of the earliest one and
@@ -1303,8 +1418,12 @@ class Sync:
 
     def _note_review(self, pr: PullRequest, link: Optional[dict[str, Any]], task_id: str,
                      problem: str) -> None:
-        """Record the task (or why there is none) on the link, so a later poll can retry."""
-        detail = pr_detail(pr, task_error=problem)
+        """Record the task (or why there is none) on the link, so a later poll can retry.
+
+        Merged into what the row already says, not over it: the same blob carries the label
+        state, and replacing it here would drop the event ids a retraction needs.
+        """
+        detail = {**_detail(link or {}), **pr_detail(pr, task_error=problem)}
         self.store.ngit_link_save(
             self.target.key, KIND_PR, pr.id, state=(link["state"] if link else "pending"),
             task_id=task_id or None, board=self.target.board, detail=detail)
@@ -1328,16 +1447,30 @@ class Sync:
         if task_id:
             log.info("ngit: late review task %s for PR %s", task_id, pr.id[:8])
 
+    def _review_anchor(self, link: dict[str, Any]) -> str:
+        """The review task that speaks for this PR: the newest one the board holds.
+
+        The link names the first, and every later review is a card the bridge did not make
+        -- hand-queued in this deployment, under the title and the brief the bridge writes.
+        Reading the stored id alone would keep the first verdict in force for ever, so the
+        board is asked which review task is the current one.
+        """
+        found = self.board.review_task(str(link.get("source_id") or ""))
+        return str(found["id"]) if found is not None else str(link.get("task_id") or "")
+
     def _close_review(self, pr: PullRequest | None, merge: Merge, link: dict[str, Any],
                       report: Report, *, dry_run: bool) -> None:
         """Complete the PR's review task, naming the merge. Idempotent."""
-        task_id = str(link.get("task_id") or "")
-        if not task_id or dry_run:
+        if dry_run:
             return
         how = f"merged as {merge.commit}" if merge.commit else "merged"
         what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
         nevent = str(_detail(link).get("nevent") or "")
+        task_id = ""
         try:
+            task_id = self._review_anchor(link)
+            if not task_id:
+                return
             self.board.complete(
                 task_id, author="ngit",
                 comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
@@ -1346,7 +1479,156 @@ class Sync:
                 result=f"PR {merge.pr_id} {how}: the review is closed by the merge.")
         except (BoardError, sqlite3.Error) as exc:
             report.prs["review_errors"] += 1
-            report.errors.append(f"review task {task_id} for PR {merge.pr_id[:8]}: {exc}")
+            where = f"review task {task_id}" if task_id else f"review task for PR {merge.pr_id[:8]}"
+            report.errors.append(f"{where}: {exc}")
+
+    # -- labels ----------------------------------------------------------
+
+    def _labels(self, feed: PrFeed, report: Report) -> None:
+        """Publish each PR's review state as a label, on change only.
+
+        The state is not kept here: it is read from the review task that speaks for the PR --
+        the newest one the board holds, whether the bridge made it or a reviewer queued a
+        re-review by hand -- from its status and the verdict in its comments, plus the PR's
+        tip. The link row only remembers what was last published and the tip a verdict was
+        given for, which is what makes a poll with nothing new publish nothing.
+        """
+        if self.labels is None or not self.config.labels or not self.target.address:
+            return
+        labeler: Labeler = self.labels
+        tips = feed.newest_tips()
+        # Every proposal the poll carried counts, including one with no `c` tag: the docs
+        # promise a new PR gets its label, and a proposal whose branch has no tip named is
+        # still a PR waiting for a review.
+        active = {pr.id for pr in feed.prs} | {merge.pr_id for merge in feed.merges}
+        closed = {merge.pr_id for merge in feed.merges}
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            pr_id = str(link.get("source_id") or "")
+            detail = _detail(link)
+            merged = str(link.get("state") or "") == "merged" or pr_id in closed
+            if str(link.get("state") or "") == "merged":
+                # A merge leaves the label it was decided on: there is nothing left to
+                # publish, and skipping closed PRs keeps this walk to the live ones.
+                continue
+            published = detail.get("label") or ()
+            if pr_id not in active and not published and not detail.get("label_pending"):
+                # A PR announced before the bridge published labels. Retrofitting a label
+                # onto every one of them is a burst of events nobody asked for; a revision
+                # puts it back in the window, and a merge is left alone below.
+                continue
+            try:
+                self._one_label(labeler, pr_id, link, detail, tips, report, merged=merged)
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["label_errors"] += 1
+                report.errors.append(f"label {pr_id[:8]}: {exc}")
+
+    def _one_label(self, labeler: Labeler, pr_id: str, link: dict[str, Any],
+                   detail: dict[str, Any], tips: dict[str, tuple[str, int]],
+                   report: Report, *, merged: bool) -> None:
+        """Decide one PR's labels, publish them when they changed, and record what it did."""
+        tip, tip_at = tips.get(pr_id, (str(detail.get("tip") or ""),
+                                      int(detail.get("tip_at") or 0)))
+        detail["tip"], detail["tip_at"] = tip, tip_at
+        status, verdict, task_id = self._review_state(link, detail)
+        desired = review_labels(verdict=verdict, task_status=status, tip=tip,
+                                verdict_tip=str(detail.get("verdict_tip") or ""),
+                                merged=merged)
+        if desired is None or tuple(desired) == tuple(detail.get("label") or ()):
+            self._save_detail(link, detail, task_id=task_id)
+            return
+        retract = [str(event) for event in (detail.get("label_events") or ()) if event]
+        try:
+            result = labeler(pr_id, self.target.address, desired, retract)
+        except Exception as exc:  # noqa: BLE001 - a publisher may raise; the pass may not die
+            report.prs["label_errors"] += 1
+            report.errors.append(f"label {pr_id[:8]}: {type(exc).__name__}: {exc}"[:200])
+            return
+        if not result.ok:
+            # Nothing was published, so the link still says what readers see: the next poll
+            # tries again rather than believing a label that never landed. `label_pending`
+            # is what keeps that promise when the PR's own events are no longer in the poll.
+            report.prs["label_errors"] += 1
+            report.errors.append(
+                f"label {pr_id[:8]} ({', '.join(desired)}): {result.error}"[:200])
+            detail["label_pending"] = list(desired)
+            self._save_detail(link, detail, task_id=task_id)
+            return
+        detail["label"] = list(desired)
+        detail["label_events"] = list(result.events)
+        detail.pop("label_pending", None)
+        report.prs["labels"] += 1
+        if not result.retracted:
+            report.notes.append(
+                f"label {pr_id[:8]}: the superseded label could not be retracted"
+                f" ({result.error}); a reader may see both")
+        log.info("ngit: PR %s labelled %s", pr_id[:8], ", ".join(desired))
+        self._save_detail(link, detail, task_id=task_id)
+
+    def _review_state(self, link: dict[str, Any],
+                      detail: dict[str, Any]) -> tuple[str, str, str]:
+        """The review task's status, its verdict, and its id.
+
+        The verdict is the task's, not this module's: a reviewer writes it as a comment.
+        `review_tip` is the tip the review started from, so a verdict recorded after a
+        revision speaks for the revision the reviewer actually read.
+
+        A newer review task starts a new round: the anchors the previous round recorded --
+        its verdict, its comment, the tip it covered -- say nothing about the new card, and
+        keeping them would pin a fresh review to a verdict it never gave. They are dropped,
+        and this round's own verdict re-anchors the label when it lands.
+        """
+        task_id = self._review_anchor(link)
+        if task_id and task_id != str(link.get("task_id") or ""):
+            for previous in ("verdict", "verdict_comment", "verdict_tip", "review_tip"):
+                detail.pop(previous, None)
+        task = self.board.task(task_id) if task_id else None
+        status = str(task.get("status") or "") if task else ""
+        stated, comment_id = ("", 0)
+        if task is not None:
+            stated, comment_id = parse_verdict(self.board.comments(task_id))
+        verdict = stated or str(detail.get("verdict") or "")
+        tip = str(detail.get("tip") or "")
+        if status == "running" and not detail.get("review_tip"):
+            detail["review_tip"] = tip
+        stored_verdict = str(detail.get("verdict") or "")
+        stored_comment = int(detail.get("verdict_comment") or 0)
+        re_anchor = bool(stated) and (
+            stated != stored_verdict or (stored_comment and comment_id != stored_comment))
+        if re_anchor:
+            # A new verdict comment re-anchors even when it says the same word: a re-review
+            # of a revised tip approves again in the same words, and leaving the anchor on
+            # the old tip would keep the PR `stale` for ever.
+            detail["verdict"] = stated
+            detail["verdict_tip"] = str(detail.get("review_tip") or "") or tip
+            detail["verdict_comment"] = comment_id
+            detail.pop("review_tip", None)
+        elif stated and not stored_comment:
+            # A row written before the comment id was kept. The anchor it already has is
+            # the anchor for that verdict -- re-anchoring it here would pin an old verdict
+            # to whatever tip happens to be current, which is the bug this id prevents.
+            detail["verdict_comment"] = comment_id
+        if verdict and detail.get("verdict_tip") and tip and tip != detail["verdict_tip"]:
+            # The revision that superseded this verdict is the one the next review reads,
+            # so the anchor that belongs to the old one must not outlive it.
+            detail.pop("review_tip", None)
+        return status, verdict, task_id
+
+    def _save_detail(self, link: dict[str, Any], detail: dict[str, Any], *,
+                     task_id: str = "") -> None:
+        """Write the link's note, and the task it anchors to, when either changed.
+
+        A poll with no news writes nothing. The task id is written when the anchor moved: a
+        review card the bridge did not make becomes the PR's review task as soon as a label
+        pass has read it, so the row names the task whose verdict is in force -- and the one
+        a merge completes.
+        """
+        repoint = bool(task_id) and task_id != str(link.get("task_id") or "")
+        if not repoint and (json.dumps(detail, sort_keys=True)
+                            == json.dumps(_detail(link), sort_keys=True)):
+            return
+        self.store.ngit_link_save(self.target.key, KIND_PR, str(link.get("source_id") or ""),
+                                  state=str(link.get("state") or "pending"),
+                                  task_id=task_id or None, detail=detail)
 
     def _since(self, override: int | None) -> int:
         """Where this poll starts reading.

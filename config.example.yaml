@@ -12,6 +12,27 @@ identity:
   # secret_credential: nostr_secret
   # secret_env: NOSTR_SECRET_KEY   # hand-run CLI only: an env var is the weakest of the three
 
+# What this identity advertises to clients. Off by default: a deployment that does not want
+# a slash menu should not publish one. Armada renders a bot's commands only from a
+# replaceable kind-10304 manifest, discovered per conversation from members whose kind 0
+# says `bot: true`; invocation is an ordinary `/name args` message either way. This is
+# `advertise:`, not `profiles:` -- the latter is the profile-routing table further down.
+# See docs/decisions.md, "The slash menu is the host's catalogue".
+advertise:
+  publish: false            # true = kind 0 + kind 10304; or a list, e.g. [commands]
+  # name: example-agent     # required for the kind-0 half; `bot: true` is always set.
+  #                         # Publishing it REPLACES this identity's kind 0 with `name`
+  #                         # plus `fields`, so leave the kind-0 half off where another
+  #                         # process (wn-agent) writes this identity's profile.
+  # fields:                 # any extra kind-0 fields (about, picture, nip05, lud16, ...)
+  #   about: A placeholder bot.
+  # catalogue_file: ~/.local/state/hermes-nostr-gateway/commands.json
+  #                         # default: commands.json beside the socket. The Hermes plugin
+  #                         # writes it from the host's registry at startup.
+  # relays: []              # extra relays; relays.publish plus our own 10002 writes are
+  #                         # the default (a client reads the manifest over the room's
+  #                         # relays, so a room relay outside the publish set belongs here).
+
 relays:
   # Read set = our 10050 inbox relays PLUS the sender's app relays. Reading only the
   # first list misses DMs that exist nowhere else, silently (spec §3).
@@ -242,6 +263,9 @@ defaults:
 #   priority: 0                  # task priority for anything the bridge creates
 #   max_new: 20                  # new tasks per poll; the rest wait for the next one
 #   max_prs: 10                  # notices decided on, and handed to the daemon, per poll
+#   labels: true                 # publish each PR's review state (review-required, in-review,
+#                                # approved, changes-requested, stale) as a NIP-34 label on the
+#                                # PR; false publishes no extra events
 #   watch: true                  # the daemon wakes a pass when a mapped repo's issue/PR
 #                                # event arrives; default on once `assignee` is set, and
 #                                # `false` is exactly the cron-only behaviour (cron stays

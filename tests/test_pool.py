@@ -116,6 +116,23 @@ def test_a_worker_can_be_narrowed_to_repository_addresses():
     assert worker.live_state()["a_tags"] == 2
 
 
+def test_a_worker_can_be_narrowed_to_a_root_kind_for_comments():
+    """The comment filter: NIP-22 1111 under `#K`, the root's kind -- and no `#a` at all.
+
+    A published comment carries no `a` tag, so this is the only tag that can narrow it.
+    """
+    pool = RelayPool(SECRET, client=FakeClient())
+    worker = PoolWorker(pool, RELAY, ME, kinds=(1111,), root_kinds=("1621", "1618"),
+                        p_tag=None, purpose="ngit-comments")
+    spec = json.loads(worker.filter().as_json())
+
+    assert spec["kinds"] == [1111]
+    # The SDK sorts a tag array's values, which is fine: NIP-01 reads them as alternatives.
+    assert spec["#K"] == ["1618", "1621"]
+    assert "#a" not in spec
+    assert worker.live_state()["root_kinds"] == ["1621", "1618"]
+
+
 def test_a_filter_with_no_kinds_is_refused_rather_than_becoming_a_firehose():
     pool = RelayPool(SECRET, client=FakeClient())
     worker = make_worker(pool, kinds=(1059,))

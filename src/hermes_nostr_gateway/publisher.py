@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import enum
 import json
 import logging
 from typing import Any, Iterable, Protocol
@@ -40,11 +41,25 @@ log = logging.getLogger("hng.publish")
 #: costs this once -- not once per relay in the set, because the sends run concurrently.
 OK_TIMEOUT = 10.0
 
-#: Relay answers that are a decision, not a fault. Retrying one in-process only spends
-#: the relay's patience; everything else (a timeout, a dropped socket, an auth challenge
-#: we had not answered yet) is worth one more send of the same event.
-_DECISIONS = ("blocked", "invalid", "rate-limit", "pow:", "restricted",
-              "not allowed", "banned", "duplicate", "error:")
+#: Relay answers that are a *judgement* on the event or on this key. The same signed bytes
+#: meet the same answer however often they are sent, so there is nothing a retry can change
+#: and an advertisement records one instead of trying again. `auth-required` is a refusal
+#: here because this client answers AUTH in-process: an answer that survives that is about
+#: the key, not about the challenge. (`authentication failed` is *not* here -- it is the
+#: client saying the relay wants AUTH, which the next send answers.)
+_REFUSALS = ("blocked", "invalid", "restricted", "not allowed", "banned", "pow:",
+             "auth-required")
+
+#: Relay answers that are a *condition*: the relay is throttling, busy or shutting down and
+#: the same bytes are expected to land once it clears. A retry costs a backoff, never a new
+#: event -- and these must never be recorded as refusals, which is how a rate-limited relay
+#: used to stop being retried for good.
+_TRANSIENT = ("rate-limit", "rate limited", "error:", "unavailable", "busy",
+              "temporarily", "overloaded", "timeout", "try again")
+
+#: The relay already stores this exact event id (NIP-01 `duplicate:`): an idempotent
+#: success, not a failure -- the event is there, which is all the caller wanted.
+_HELD = ("duplicate", "already have", "already exists")
 
 
 def _norm(relay: str) -> str:
@@ -52,9 +67,52 @@ def _norm(relay: str) -> str:
     return str(relay).strip().rstrip("/").lower()
 
 
+class Outcome(enum.Enum):
+    """What one relay's answer to one event means for the next attempt."""
+
+    HELD = "held"            # already stored: nothing left to do at this relay
+    REFUSED = "refused"      # a judgement: this key or event will never be accepted
+    TRANSIENT = "transient"  # a condition: the same bytes are worth another send
+
+
+def classify(reason: str | None) -> Outcome:
+    """Classify a *failed* relay answer: a refusal, a transient condition, or already held.
+
+    Checked in that order deliberately -- `duplicate` first, because being already stored is
+    a success however the relay words it, and `rate-limit` never means "no". An answer that
+    matches nothing is transient: a dropped socket or a new relay phrase is likelier than a
+    judgement, and mis-reading one as a refusal cannot be undone (the event is never tried
+    again), while mis-reading a refusal as transient only costs a bounded retry.
+    """
+    text = (reason or "").strip().lower()
+    if any(word in text for word in _HELD):
+        return Outcome.HELD
+    if any(word in text for word in _TRANSIENT):
+        return Outcome.TRANSIENT
+    if any(word in text for word in _REFUSALS):
+        return Outcome.REFUSED
+    return Outcome.TRANSIENT
+
+
 def _retryable(reason: str | None) -> bool:
-    text = (reason or "").lower()
-    return not any(word in text for word in _DECISIONS)
+    return classify(reason) is Outcome.TRANSIENT
+
+
+def is_permanent_refusal(reason: str | None) -> bool:
+    """True when a relay's answer is a *judgement*, not a condition.
+
+    `blocked`, `invalid`, `restricted`, `not allowed`, a failed AUTH and friends will not
+    change on a retry. For an advertisement that means this relay will never carry this
+    kind, which the caller records instead of retrying on every start. A rate limit is not
+    one of these: it is a condition, and recording it as a refusal is what stopped those
+    relays from ever being retried (see `docs/decisions.md`).
+    """
+    return classify(reason) is Outcome.REFUSED
+
+
+def is_already_held(reason: str | None) -> bool:
+    """True when the relay answered that it already stores this event id."""
+    return classify(reason) is Outcome.HELD
 
 
 class Publisher(Protocol):

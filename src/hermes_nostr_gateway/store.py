@@ -104,6 +104,33 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+-- What this identity last advertised: its kind-0 profile and its kind-10304 command
+-- manifest. The content hash is the decision -- a restart republishes only when the
+-- stored copy differs -- and the event id is what a per-relay read-back compares against.
+CREATE TABLE IF NOT EXISTS advertised (
+    kind         INTEGER PRIMARY KEY,
+    event_id     TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    published_at INTEGER NOT NULL,
+    -- Relays that refused the kind outright, as JSON {relay: reason}. A refusal is a
+    -- decision, so it is recorded rather than retried on every start.
+    refused      TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Relays still owed an advertisement: the last attempt failed for a *condition* (a rate
+-- limit, an outage), not a judgement, so the copy is not a refusal and must be retried --
+-- but with a backoff, and only so many times. One row per kind and relay; `attempts` is
+-- the bound and `next_at` the earliest moment a retry is due. Recording this separately
+-- from `advertised.refused` is the whole point: a rate-limited relay is not a refusal.
+CREATE TABLE IF NOT EXISTS advertised_retry (
+    kind     INTEGER NOT NULL,
+    relay    TEXT NOT NULL,
+    reason   TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    next_at  INTEGER NOT NULL,
+    PRIMARY KEY (kind, relay)
+);
+
 -- Kind-0 claims we have read, so a restart does not refetch every peer and a peer that
 -- is a bot stays one. `bot` is 0/1, never NULL: a profile that said nothing about `bot`
 -- is a human by omission, which is different from a peer we have never looked up (no row).
@@ -493,6 +520,16 @@ class Store:
         for name, kind in _INVITE_COLUMNS.items():
             if name not in invite_cols:
                 self.db.execute(f"ALTER TABLE concord_invites ADD COLUMN {name} {kind}")
+
+        advert_cols = {
+            row["name"] for row in self.db.execute("PRAGMA table_info(advertised)")
+        }
+        if "refused" not in advert_cols:
+            # A store written before the column existed still holds the event id and hash;
+            # the refusals are the only part it could not have recorded.
+            self.db.execute(
+                "ALTER TABLE advertised ADD COLUMN refused TEXT NOT NULL DEFAULT '{}'"
+            )
 
         self.db.execute(
             "INSERT OR IGNORE INTO delivery_cursor (identity) VALUES (?)", (self.identity,)
@@ -1056,6 +1093,82 @@ class Store:
             (key, str(value)),
         )
 
+    # -- advertisement (kind 0 + kind 10304) ------------------------------
+    def advertised(self, kind: int) -> dict[str, Any] | None:
+        """The stored copy of one advertised kind, or None when it was never published."""
+        row = self.db.execute(
+            "SELECT * FROM advertised WHERE kind = ?", (int(kind),)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            parsed = json.loads(item.get("refused") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        item["refused"] = parsed if isinstance(parsed, dict) else {}
+        return item
+
+    def record_advertised(self, kind: int, event_id: str, content_hash: str,
+                          published_at: int, refused: dict[str, str] | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO advertised (kind, event_id, content_hash, published_at, refused)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(kind) DO UPDATE SET event_id = excluded.event_id,"
+            " content_hash = excluded.content_hash, published_at = excluded.published_at,"
+            " refused = excluded.refused",
+            (int(kind), str(event_id), str(content_hash), int(published_at),
+             json.dumps(dict(refused or {}), sort_keys=True)),
+        )
+
+    def advertised_retries(self, kind: int) -> dict[str, dict[str, Any]]:
+        """Relays still owed this kind, with the backoff state of each.
+
+        A row here means the last attempt failed for a *condition* -- a rate limit, an
+        outage -- so this is a debt, never a refusal: the copy is retried once `next_at`
+        has passed, and `attempts` bounds how often.
+        """
+        rows = self.db.execute(
+            "SELECT relay, reason, attempts, next_at FROM advertised_retry WHERE kind = ?"
+            " ORDER BY relay", (int(kind),)).fetchall()
+        return {str(row["relay"]): {"reason": str(row["reason"]),
+                                   "attempts": int(row["attempts"]),
+                                   "next_at": int(row["next_at"])}
+                for row in rows}
+
+    def record_advertised_retry(self, kind: int, relay: str, reason: str,
+                                attempts: int, next_at: int) -> None:
+        """Remember one relay's transient failure and when its next attempt is due."""
+        self.db.execute(
+            "INSERT INTO advertised_retry (kind, relay, reason, attempts, next_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(kind, relay) DO UPDATE SET reason = excluded.reason,"
+            " attempts = excluded.attempts, next_at = excluded.next_at",
+            (int(kind), str(relay), str(reason), max(1, int(attempts)), int(next_at)),
+        )
+
+    def clear_advertised_retry(self, kind: int, relay: str | None = None) -> None:
+        """Drop a relay's debt -- because it accepted the copy, or was refused outright."""
+        if relay is None:
+            self.db.execute("DELETE FROM advertised_retry WHERE kind = ?", (int(kind),))
+        else:
+            self.db.execute("DELETE FROM advertised_retry WHERE kind = ? AND relay = ?",
+                            (int(kind), str(relay)))
+
+    def advertised_all(self) -> list[dict[str, Any]]:
+        rows = []
+        for row in self.db.execute("SELECT * FROM advertised ORDER BY kind"):
+            item = dict(row)
+            try:
+                parsed = json.loads(item.get("refused") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                parsed = {}
+            item["refused"] = parsed if isinstance(parsed, dict) else {}
+            # Relays still owed this copy: a transient failure, not a refusal, so a reader
+            # that only looked at `refused` would call a rate-limited relay done for good.
+            item["retrying"] = self.advertised_retries(item["kind"])
+            rows.append(item)
+        return rows
+
     def replay_floor(self) -> int:
         """`received_at` below which nothing is ever replayed (0 = no floor)."""
         try:
@@ -1344,6 +1457,18 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def ngit_links(self, repo: str, kind: int) -> list[dict[str, Any]]:
+        """Every link this repo has for one kind, oldest first.
+
+        The label walk needs the PRs a poll did not carry: a review task can be dispatched,
+        and finish, between two passes, and the PR's own events may all predate both.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM ngit_links WHERE repo = ? AND kind = ? ORDER BY created_at, source_id",
+            (str(repo), int(kind)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def ngit_link_save(self, repo: str, kind: int, source_id: str, *, state: str,
                        task_id: str | None = None, board: str = "",
                        detail: dict[str, Any] | None = None) -> None:
@@ -1378,6 +1503,20 @@ class Store:
             (str(state), int(time.time()), str(repo), int(kind), str(source_id)),
         )
         return cur.rowcount > 0
+
+    def ngit_roots(self, repo: str) -> tuple[str, ...]:
+        """Every issue and PR event id the bridge has linked for this repository.
+
+        The watcher's comment subscription cannot name a repository -- a NIP-22 comment
+        carries no `a` tag, only the root event it replies to -- so these ids are how a
+        comment is attributed to a channel. Read-only, and deliberately so: the pass owns
+        the table, this only asks it what a comment could refer to.
+        """
+        rows = self.db.execute(
+            "SELECT source_id FROM ngit_links WHERE repo = ? AND kind IN (?, ?)",
+            (str(repo), 1621, 1618),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows if row and row[0])
 
     def ngit_comment_seen(self, repo: str, source_id: str, comment_id: str) -> bool:
         row = self.db.execute(

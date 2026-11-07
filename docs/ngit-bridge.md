@@ -30,6 +30,7 @@ ngit:
   priority: 0              # task priority for anything the bridge creates
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
+  labels: true             # publish each PR's review state as a NIP-34 label (see below)
   watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
                            # default on once `assignee` is set, `false` is the timer alone
   watch_debounce_s: 30     # coalesce a channel's events this long before the pass
@@ -140,15 +141,23 @@ is another event, an issue can be resolved or reopened later, and a merge is a k
 to be matched against the branch. Only the repository says what is true, and only
 `ngit issue list --json` and the checkout's refs say it. So the watcher subscribes, coalesces,
 and runs `hng ngit sync --channel <conversation>` as a child process: the same command the timer
-runs, with the same store, cursor and idempotency keys. It never opens the board or the outbox and never
-moves a cursor, so there is still exactly one writer to each.
+runs, with the same store, cursor and idempotency keys. It never writes the board, the outbox or
+the store and never moves a cursor, so there is still exactly one writer to each; the one thing
+it reads is the link table, for the issue and PR ids a comment can name.
 
 What it subscribes to:
 
-- kinds 1621 (issue), 1622 (comment), 1618 (PR), 1619 (PR revision) and 1631 (applied);
+- kinds 1621 (issue), 1618 (PR), 1619 (PR revision) and 1631 (applied), under
 - a `#a` filter naming only the mapped repositories — the `concord.projects` entries that declare
   a board, resolved through their checkout's own `ngit repo --json` address — never a kind on
-  its own and never the whole relay.
+  its own and never the whole relay;
+- and **separately**, kind 1111 comments under a `#K` filter — the root's kind, an issue or a
+  PR. A comment cannot ride in the first filter: `ngit issue comment` and `ngit pr comment`
+  publish NIP-22, whose event carries root `E`/`K`/`P`, parent `e`/`k`/`p` and **no `a` tag at
+  all**, so a `#a` subscription can never match one. Comments are attributed to a repository
+  locally, by that root id: the ids the pass has already linked (`ngit_links`) are read when
+  the plan is built, and an issue or PR event that arrives while listening teaches its own id.
+  A comment whose root is not known here wakes nothing and waits for the scheduled pass.
 
 1619 is in that list on purpose: a revised PR is a new 1619 event, and a watcher that ignored it
 would leave the review task's brief stale until the next scheduled pass.
@@ -203,8 +212,10 @@ Two operational notes:
   re-poll cannot create a second task for the same issue.
 - The issue id is a **dedupe key, not an identity**. A human may file a second task for the same
   issue; the bridge only refuses to duplicate its own.
-- A kind-1622 comment becomes a task comment, in `created_at` order, once (tracked per comment
-  id). A comment added later is appended; nothing is rewritten.
+- A NIP-22 kind-1111 comment becomes a task comment, in `created_at` order, once (tracked per
+  comment id). A comment added later is appended; nothing is rewritten. The kind is 1111
+  because that is what `ngit issue comment` and `ngit pr comment` publish on 3.0.5 — no ngit
+  release ever wrote 1622.
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming
@@ -274,6 +285,55 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
   not dump a month of merges into a channel; the remainder is counted as deferred and picked
   up on later polls.
 
+## The label on the PR
+
+`ngit pr list` has a LABELS column, and it is where a reader looks before opening anything. The
+bridge keeps it current, so "waiting on a review", "approved" and "changes asked for" are on
+the PR rather than only in a task comment. Five words, one namespace:
+
+| label | when |
+| --- | --- |
+| `review-required` | the PR has no verdict yet — what a new PR gets |
+| `in-review` | its review task is running, so a reviewer has it |
+| `approved` | the verdict is an approval; merging is still the operator's |
+| `changes-requested` | the verdict asked for changes |
+| `stale` | a revision (`kind 1619`) landed after an approval, so the approval no longer covers the tip |
+
+The state is **not** kept in the bridge: it is read from the review task that speaks for the
+PR — the **newest** one on the board: its status, and the verdict line in its comments
+(`Verdict: approved` or `Verdict: changes-requested`, which the task brief asks for) — plus
+the PR's tip. Newest matters because a revision is reviewed on a later card: the bridge makes
+one review task per PR, and a re-review is queued as a second card in the same shape (a title
+of `Review PR <first 8>: …` and the PR's event id in the body), so reading only the first
+card would leave the first verdict in force for ever. The card whose verdict is in force is
+the one the link names, which is the task a merge completes. The link row remembers only what
+was last published, so a poll publishes on change and a quiet poll publishes nothing. A merge
+leaves the last verdict in place: it is the verdict the merge was decided on, and a
+`stale`-free `approved` on a merged PR is the record of that. A revision after an approval
+gives `review-required` **and** `stale`; after a `changes-requested` it is `review-required`
+alone, because nothing was ever approved.
+
+Two things about the format were measured against ngit 3.0.5 and decide how it is published:
+
+- The namespace is `#t` (NIP-32), because that is the label a `ngit pr list` reader shows; a
+  namespace of the bridge's own does not appear in the column at all. One kind-1985 event
+  carries `L=#t`, `l=<label>,#t`, the repository's `a` and the PR's `e`.
+- A later label does **not** supersede an earlier one: ngit merges `#t` labels, so publishing
+  `approved` over `review-required` shows both. The bridge therefore retracts the label it is
+  replacing with a NIP-09 kind-5, sent to every relay it published the label to. Without that
+  the column accumulates a history and a superseded `approved` still reads as a green light.
+
+A reader with a cached checkout may still show the previous label until ngit refreshes its
+`.git/nostr-cache.lmdb`: the events on the relays are the state, and the cache is a copy of
+them. `ngit.labels: false` turns the whole thing off — a deployment that does not want the
+extra events on its repository's relays publishes none.
+
+Retrofitting is deliberately not done: the first poll after upgrading labels the PRs it
+carries, and an old PR still open is labelled when a revision puts it back in the window.
+Publishing a label onto every PR the bridge ever announced would be a burst of events nobody
+asked for, and a merge is left as it is — its link is closed, and the label a merged PR
+carries is whatever it was decided on.
+
 ## Bot identities and profiles
 
 A bot role is a job with its own voice: it gets its own key and, when it runs agent work, its
@@ -304,9 +364,12 @@ Rules that keep the pairing honest:
   ```
 
   The command reports a signed event, not a relay's acceptance: read the thread back **from a
-  relay** (a kind-1622 filter on the repository address) before calling the verdict published.
-  A comment that only exists in the local view is not on the PR, and a relay that does not
-  know the identity yet is the usual reason.
+  relay** before calling the verdict published. Read it by the kind the command actually
+  published: on ngit 3.0.5 that is a NIP-22 `kind: 1111` event whose `e` tag is the PR, not the
+  `kind: 1622` an older ngit wrote — a 1622 filter returns nothing and reads exactly like a
+  comment no relay kept. Query the author and the kind, then match the `e` tag to the PR
+  (`nak req -k 1111 -a <bot npub> <repository relay>`); a comment that only exists in the local
+  view is not on the PR, and a relay that does not know the identity yet is the usual reason.
 
 - **The profile must exist before the config names it.** `review_assignee: review` on a host
   with no `review` profile files a task that nothing will pick up. Create the profile first,

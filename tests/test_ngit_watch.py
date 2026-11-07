@@ -87,7 +87,7 @@ def a_project_cfg(path: Path, *, board: str = "example-board",
 
 def a_plan(tmp_path: Path, *, ngit: dict | None = None, streams=None,
            repo=None, read_relays: tuple[str, ...] = (RELAY,), board: str = "example-board",
-           channel: str = CHANNEL) -> watch.WatchPlan:
+           channel: str = CHANNEL, roots: tuple[str, ...] = ()) -> watch.WatchPlan:
     checkout = tmp_path / "checkout"
     checkout.mkdir(exist_ok=True)
     cfg = {**a_project_cfg(checkout, board=board, channel=channel),
@@ -96,7 +96,8 @@ def a_plan(tmp_path: Path, *, ngit: dict | None = None, streams=None,
     return watch.watch_plan(cfg, projects,
                             [a_stream()] if streams is None else streams,
                             read_relays=read_relays,
-                            repo_ref=lambda _path: repo or a_repo())
+                            repo_ref=lambda _path: repo or a_repo(),
+                            known_roots=lambda _address: roots)
 
 
 def a_watcher(plan: watch.WatchPlan, *, runner=None, clock: Clock | None = None):
@@ -109,6 +110,20 @@ def an_event(event_id: str = "e1" * 32, *, address: str = ADDRESS,
     return {"id": event_id, "pubkey": "11" * 32, "kind": kind, "created_at": 1000,
             "content": "body", "tags": [["a", address, "wss://relay.example"],
                                         ["subject", "Fix the thing"]]}
+
+
+def a_comment(event_id: str = "c1" * 32, *, root: str, kind: int = 1111,
+              root_kind: str = "1621") -> dict:
+    """A published NIP-22 comment: root `E`/`K`/`P`, parent `e`/`k`/`p`, and no `a`."""
+    return {"id": event_id, "pubkey": "22" * 32, "kind": kind, "created_at": 2000,
+            "content": "a verdict", "tags": [
+                ["E", root, "wss://relay.example"],
+                ["K", root_kind],
+                ["P", "33" * 32, "wss://relay.example"],
+                ["e", root, "wss://relay.example"],
+                ["k", root_kind],
+                ["p", "33" * 32, "wss://relay.example"],
+            ]}
 
 
 # -- the plan: what is watched, and where ------------------------------------
@@ -264,16 +279,100 @@ async def test_an_event_for_another_repository_is_ignored(tmp_path):
     assert runner.calls == []
 
 
-async def test_a_merge_and_a_comment_wake_the_channel(tmp_path):
-    """The kinds the pass acts on are the kinds that wake it."""
-    for kind in (1622, 1631, 1618, 1619, 1621):
+async def test_a_merge_and_an_issue_wake_the_channel(tmp_path):
+    """The kinds the pass acts on that name their repository are the kinds that wake it."""
+    for kind in (1631, 1618, 1619, 1621):
         assert kind in watch.WATCH_KINDS
     watcher, clock = a_watcher(a_plan(tmp_path))
-    for kind in (1622, 1631):
+    for kind in (1631, 1621):
         watcher.handle_event(RELAY, an_event(event_id=event_id(str(kind)), kind=kind))
     clock.advance(watcher.debounce_s)
 
     assert await watcher.tick() == 1
+
+
+@pytest.mark.parametrize("root_kind", ["1621", "1618"])
+async def test_a_comment_with_no_address_wakes_the_channel_by_its_root(tmp_path, root_kind):
+    """ngit 3.0.5 publishes comments as NIP-22 1111, which carries `E` and no `a`.
+
+    This is the acceptance case, for both an issue root (1621) and a PR root (1618): the
+    comment names only the thing it replies to, and that id is what the watcher matches on.
+    """
+    root = event_id("ab")
+    runner = Runner()
+    watcher, clock = a_watcher(a_plan(tmp_path, roots=(root,)), runner=runner)
+    assert watch.KIND_COMMENT == 1111
+    assert 1111 in watch.COMMENT_KINDS
+    assert root_kind in watch.COMMENT_ROOT_KINDS
+
+    # No `a` tag at all, exactly like event 43eef0cd on relay.ngit.dev.
+    watcher.handle_event(RELAY, a_comment(root=root, root_kind=root_kind))
+    clock.advance(watcher.debounce_s)
+    await watcher.tick()
+    await asyncio.sleep(0)
+
+    assert runner.calls == [CONVERSATION]
+
+
+async def test_a_reply_to_a_comment_wakes_by_its_root_not_its_parent(tmp_path):
+    """A reply's `e` is the comment it answers; its `E` is still the issue."""
+    root, parent = event_id("ab"), event_id("cd")
+    runner = Runner()
+    watcher, clock = a_watcher(a_plan(tmp_path, roots=(root,)), runner=runner)
+
+    reply = a_comment(event_id=event_id("ef"), root=root)
+    reply["tags"] = [["E", root], ["K", "1621"], ["P", "33" * 32],
+                     ["e", parent], ["k", "1111"], ["p", "44" * 32]]
+    watcher.handle_event(RELAY, reply)
+    clock.advance(watcher.debounce_s)
+    await watcher.tick()
+    await asyncio.sleep(0)
+
+    assert runner.calls == [CONVERSATION]
+
+
+async def test_a_comment_on_an_unknown_root_is_ignored(tmp_path):
+    """Comments for the rest of the relay must not wake a pass for this channel."""
+    runner = Runner()
+    watcher, clock = a_watcher(a_plan(tmp_path, roots=(event_id("ab"),)), runner=runner)
+
+    watcher.handle_event(RELAY, a_comment(root=event_id("99"), event_id=event_id("c2")))
+    clock.advance(watcher.debounce_s * 2)
+
+    assert await watcher.tick() == 0
+    assert runner.calls == []
+    assert watcher.status()["roots"] == 1
+
+
+async def test_an_issue_seen_live_teaches_its_root_so_its_comment_wakes(tmp_path):
+    """An issue filed after the plan was built is in no link yet: the event teaches it."""
+    root = event_id("ab")
+    runner = Runner()
+    watcher, clock = a_watcher(a_plan(tmp_path, roots=()), runner=runner)
+
+    watcher.handle_event(RELAY, an_event(event_id=root, kind=1621))
+    clock.advance(watcher.debounce_s)
+    await watcher.tick()
+    await asyncio.sleep(0)
+
+    # A second comment on that issue, and no second `a`-carrying event to say so.
+    watcher.handle_event(RELAY, a_comment(root=root, event_id=event_id("c3")))
+    clock.advance(watcher.debounce_s)
+    await watcher.tick()
+    await asyncio.sleep(0)
+
+    assert runner.calls == [CONVERSATION, CONVERSATION]
+    assert watcher.status()["roots"] == 1
+
+
+def test_a_revision_or_merge_never_teaches_a_root(tmp_path):
+    """Only an issue or a PR id can be a comment's `E`; a 1619/1631 id cannot."""
+    watcher, _clock = a_watcher(a_plan(tmp_path, roots=()))
+
+    for kind in (1619, 1631):
+        watcher.handle_event(RELAY, an_event(event_id=event_id(str(kind)), kind=kind))
+
+    assert watcher.status()["roots"] == 0
 
 
 async def test_a_trickle_cannot_starve_the_wake(tmp_path):
@@ -467,6 +566,7 @@ class RecordingWorker:
         self.relay = relay
         self.kinds = tuple(kwargs.get("kinds") or ())
         self.a_tags = tuple(kwargs.get("a_tags") or ())
+        self.root_kinds = tuple(kwargs.get("root_kinds") or ())
         self.purpose = kwargs.get("purpose", "dm")
         self.events, self.last_error = 0, None
         self.handler = None
@@ -507,7 +607,8 @@ async def test_watch_on_subscribes_only_to_the_mapped_repositories(tmp_path, qui
     quiet_gateway.setattr(gateway_mod, "PoolWorker", RecordingWorker)
     RecordingWorker.made.clear()
     plan = watch.WatchPlan(targets=(watch.WatchTarget(
-        address=ADDRESS, channel=CONVERSATION, repo=tmp_path, board="example-board"),),
+        address=ADDRESS, channel=CONVERSATION, repo=tmp_path, board="example-board",
+        roots=("ab" * 32,)),),
         relays=(RELAY,), debounce_s=5.0)
     quiet_gateway.setattr(gateway_mod, "watch_plan", lambda *a, **k: plan)
 
@@ -524,9 +625,19 @@ async def test_watch_on_subscribes_only_to_the_mapped_repositories(tmp_path, qui
         assert worker.a_tags == (ADDRESS,)
         assert worker.handler == watcher.handle_event, \
             "a repository event must not be routed through the message planes"
+
+        # Comments are a second subscription: a NIP-22 1111 has no `a`, so the `#a` filter
+        # above can never match one, and the root kind is what has to narrow it instead.
+        comments = next(w for w in RecordingWorker.made if w.purpose == "ngit-comments")
+        assert comments.kinds == watch.COMMENT_KINDS == (1111,)
+        assert comments.root_kinds == watch.COMMENT_ROOT_KINDS == ("1621", "1618")
+        assert comments.a_tags == ()
+        assert comments.handler == watcher.handle_event
+
         state = (await gateway.status())["ngit_watch"]
         assert state["enabled"] is True
         assert state["targets"][0]["channel"] == CONVERSATION
+        assert state["roots"] == 1
         assert state["relays"] == [RELAY]
     finally:
         await gateway.stop()

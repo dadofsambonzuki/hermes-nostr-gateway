@@ -30,17 +30,19 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | question | command | `--json` carries |
 | --- | --- | --- |
 | Is anything wrong right now? | `hng health --json` | `verdict`, `degraded`, `reasons`, per-plane `planes`, `counts`, `relays` (verdict per relay), `notes`. The command exits non-zero when degraded, so a cron can read the exit code alone. |
-| Is the daemon up, and are relays hearing anything? | `hng status --json` | `identity`, `daemon` (bool), `event_times`, `pending`, `blocked`, `drops`, `wraps`, `relays[].verdict`/`detail`, `ngit_watch`. |
+| Is the daemon up, and are relays hearing anything? | `hng status --json` | `identity`, `daemon` (bool), `event_times`, `pending`, `blocked`, `drops`, `wraps`, `menu` (the catalogue the Hermes plugin wrote, and whether its last write failed), `relays[].verdict`/`detail`, `ngit_watch`. |
 | What did policy refuse, and why? | `hng drops --json` | `drops[]` (plane, sender, kind, rule, why, reason, received_at, age_s, expired), `total`, `live`, `expired`, `ttl_s`. Add `--plane`, `--reason`, `--since-hours`. |
 | What actually arrived? | `hng recent [N]` | Text rows only (no `--json`): time, direction, sender, reach, first 90 characters. |
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `config`, `checkout`, `project`, `board`; exit 1 on any gap. Plain `hng projects --json` lists the map only. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
 | What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{d seen,created,ready,held,existing,comments,deleted,deferred,would_create}`, `prs{seen,signalled,merged,existing,pending,tasks,review_errors,deferred,would_post}`, `posted`, `failed`, `errors`, `notes`. |
+| What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
 | One preflight of all of the above | `hng doctor --json` | `ok` and `checks[]` of `{name, ok, detail, fix}`; exit 1 when any check fails. |
 
 Read-only questions are safe to run at any time: `status`, `health`, `drops`, `recent`,
-`projects`, `route`, `doctor` and `ngit sync --dry-run` write nothing. `ngit sync` without
-`--dry-run` writes tasks, comments, notices and cursors, and is what the scheduled pass runs.
+`projects`, `route`, `profile`, `doctor` and `ngit sync --dry-run` write nothing. `hng profile
+publish` publishes the advertisement, and `ngit sync` without `--dry-run` writes tasks,
+comments, notices and cursors — it is what the scheduled pass runs.
 
 ## Failure vocabulary
 
@@ -93,9 +95,10 @@ manual — run `ngit skill install` for the rest.
   PR already exists, not that the push failed.
 - **`ngit pr checkout <id-or-nevent>`** gets a PR whose branch is not on the remote: the
   patches ride on the PR event itself. `git fetch` will not find it.
-- **`ngit issue comment` takes issues only** and refuses a PR. Do not fake a kind-1622 by hand
-  and assume it lands: a hand-published `e`/`a`/`p` comment is accepted by the relay and still
-  does not appear in `ngit pr view --comments`.
+- **`ngit issue comment` takes issues only** and refuses a PR (`ngit pr comment` is the PR
+  form). Both publish NIP-22 **kind 1111** on 3.0.5 — never 1622, which no ngit release wrote.
+  Do not fake one by hand and assume it lands: a hand-published comment is accepted by the
+  relay and still does not appear in `ngit pr view --comments`.
 - **A proposal a rebase orphaned is closed with a status event, not a deletion.** Merging a
   rebased branch leaves the PR's original commits outside the target, so it reads `open` with its
   content already in `master`; a kind-5 deletion is refused (*authored by another pubkey*). Publish

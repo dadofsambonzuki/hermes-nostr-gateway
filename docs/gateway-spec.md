@@ -44,6 +44,12 @@ The gateway MUST NOT publish profile (0), contact list (3), relay list (10002) o
 kind. A startup check refuses to run if a configured `owned_kinds` entry collides with the
 wn-agent set. If that rule ever has to bend, introduce a signing broker and delete this table.
 
+**One opt-in exception: the advertisement.** `advertise.publish` may let the daemon publish kind 0
+(forced `bot: true`) and the kind-10304 command manifest, because a client discovers a bot's slash
+menu from exactly those two events. It is off by default; where another process (wn-agent) owns the
+identity's kind 0, `publish: [commands]` advertises the menu without writing the profile, so the
+two writers never share it. The reasoning and the command selection are in `docs/decisions.md`.
+
 The key is read from `~/.config/nostr-dm/identities/<npub>.json` (mode 0600, dir 0700,
 `{"npub":…,"secret_hex":…,"transports":["nip17","nip04"]}`). It is then held in memory and
 never passed through argv or the environment. `gateway identity import --from <path>` copies
@@ -322,6 +328,21 @@ Written as a contract the daemon enforces, not advice for callers:
    route the turn actually ran on. A route it cannot honour (`route_key_missing`,
    `route_unresolved`) is a turn that does not happen — never a fallback to another credential —
    and the frame is left unacknowledged so it is offered again once the route can be honoured.
+
+**A frame the daemon could not answer is retried without stalling the batch.** Hermes raises
+`RuntimeStoreError` both for a verdict about the message (`permission_denied`, `not_found`,
+`invalid_params`, `profile_mismatch`, `admission_conflict`) and for the daemon's own condition
+(`session_busy`, `storage_unavailable`, `runtime_draining`, `runtime_coordination_required`,
+`worker_not_live`, `worker_control_backpressure`, `launch_credentials_unavailable`,
+`model_resolution_failed`). Only a verdict is acked — the same frame would be answered the same
+way, so reconnecting on one is the reconnect storm. A condition is left unacked, and since
+`subscribe` is the only op that re-offers an unacked frame, the adapter closes the connection and
+reconnects so the replay retries it — on the same growing backoff, so a condition that lasts is
+not a retry loop either. Anything else — a plain exception, a code the adapter does not know — is
+a failure of that frame, and it is skipped instead: logged with its reason, left unacked (never
+acked, because nobody has read it), and the subscription reads on to the next frame. Reconnecting
+for one of those would be worse than useless, because `replay_pending` re-offers oldest-first: a
+frame that never succeeds would hold every frame behind it until it aged out of the replay window.
 
 A refusal is part of the contract, not an error to swallow: the adapter passes the code to
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
