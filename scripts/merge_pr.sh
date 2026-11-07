@@ -4,7 +4,8 @@
 #   scripts/merge_pr.sh <pr-id|nevent>            apply onto master, gate, push
 #   scripts/merge_pr.sh <pr-id|nevent> --check    apply and gate only, never push
 #
-# Exit: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage/state error.
+# Exit: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage/state error,
+#       4 a card workspace (not the operator's).
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -24,11 +25,16 @@ pr=""; check=0
 for arg in "$@"; do
   case "$arg" in
     --check|--dry) check=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) pr="$arg" ;;
   esac
 done
 [ -n "$pr" ] || { echo "usage: scripts/merge_pr.sh <pr-id|nevent> [--check]"; exit 3; }
+
+# A card workspace may not merge. This is the same guard that refuses a worker's push to
+# master (scripts/worker_push_guard.sh), checked here so the documented route is not a way
+# around it — and so it fails before the fetch rather than after the gate.
+"$REPO/scripts/worker_push_guard.sh" operator-only || exit 4
 
 cd "$REPO" || exit 3
 git fetch -q origin 2>/dev/null || { echo "FAIL fetch"; exit 3; }

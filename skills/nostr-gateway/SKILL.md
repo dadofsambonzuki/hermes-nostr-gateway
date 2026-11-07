@@ -87,6 +87,10 @@ Every refusal is a word, and the word decides what to do.
 
 ## Changing this repository
 
+- **A card workspace cannot merge, and that is enforced.** A `pre-push` hook installed by
+  `scripts/worker_push_guard.sh` refuses `master`/`main` from a card worktree, and
+  `scripts/merge_pr.sh` exits 4 there. If a push is refused, push the branch and say so on the
+  card — `--no-verify` is the deliberate act the guard exists to make visible.
 - **Merge a PR with `scripts/merge_pr.sh <pr-id>`**, not with `git merge`: an ngit fetch prunes
   `pr/*` refs to `master`, so the branch is not there to merge. The script applies the PR to a
   fresh worktree, runs the gates on the merged tree and pushes, in one command.

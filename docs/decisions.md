@@ -367,3 +367,21 @@ rate-limited relay through the publisher, the backoff and the retry, and a refus
 An unchanged copy is only re-sent to relays whose backoff has run out (or when `force` is asked
 for), and the retry re-signs with the stored `created_at`, so the event id a relay may already
 hold stays the one being sent. A relay dropped from the publish set loses its backoff row.
+
+## A card workspace cannot push master
+
+A kanban worker runs as the operator's user, so it holds push rights to `master`. That is
+refused in code, not asked for in prose: a `pre-push` hook installed once per clone refuses a
+push whose destination is `refs/heads/master` or `refs/heads/main` when it comes from a card
+workspace — a shell the dispatcher marked (`HERMES_KANBAN_TASK` / `HERMES_KANBAN_WORKSPACE`) or
+a checkout under `.worktrees/` — and `scripts/merge_pr.sh` refuses the same contexts with exit 4.
+Hooks live in the clone's shared git directory, so one install covers every worktree the
+dispatcher creates afterwards: nothing has to run inside the card for it to be guarded.
+
+Why a hook and not a key: the hook is a code change with a test that can land the night it was
+needed, while "the remote accepts `master` only from an operator key" is a server-side whitelist
+nobody can install from a card. The hook is also bypassable — `--no-verify`, deleting the file,
+or building a worktree from a shell the dispatcher never marked — and that is the point: it does
+not promise to stop a determined worker, it turns an accidental merge into a deliberate one. The
+durable answer is still identity; it is recorded here so the hook is never mistaken for a
+boundary.
