@@ -235,6 +235,13 @@ the reference to this entry in `status`. It is plane-scoped on purpose: NIP-17, 
 are this process's job, so a wrong Marmot key stops group traffic rather than taking the gateway
 down, and `status`/`health` are where it shows.
 
+`marmot.account_id_hex` is a fallback, not a source. wn-agent's `accounts/<label>/account.json`
+is read whenever the configured home holds one, and a configured id that disagrees with it is
+refused with both ids in the message: the key is a copy of an id, and a copy cannot be the thing
+the guard checks — comparing it is exactly how a re-bootstrapped daemon would attach while
+signing as a new npub. The one case where the configured id stands alone is a home with no
+account file at all, an install in progress.
+
 Why: the two copies exist because the daemon and the gateway are separately supervised and
 separately restored — wn-agent's home can be rebuilt, renamed or re-bootstrapped without this
 process losing the identity its own planes sign with. Retiring the copy is possible (see below)
@@ -254,10 +261,23 @@ usually under a fresh label) or a **restore** (the same key put back). Both are:
 3. start `wn-agent`, then the gateway.
 
 Miss the second write and the gateway refuses the Marmot plane at its next start, naming both
-short ids; miss the first and wn-agent's own account check fails. The one window left is a replace
-performed while both processes keep running: each holds its key in memory, so the disagreement is
-caught at the next gateway start rather than at the send — which is why the runbook above restarts
-both.
+short ids; miss the first and wn-agent's own account check fails. What "at its next start" can
+see is narrower than it sounds, and two windows stay open:
+
+- **A replace while both processes keep running.** Each holds its key in memory, so nothing
+  notices until something restarts; the check runs at gateway start and never at the send.
+- **The file replaced, `wn-agent` still running, the gateway restarted.** The gateway reads the
+  new account file and agrees with its own new key, while the daemon goes on signing with the key
+  it loaded at boot. The files agree and the processes do not. Only a `wn-agent` restart closes
+  this one, which is why the runbook restarts both and in that order.
+
+The check could read the daemon's *live* account instead: `{"type": "account_list"}` over the
+control socket returns the accounts the process actually serves, and that is the only source that
+closes the second window. It is deliberately not what this does — the guard refuses before it
+connects, so a process whose identity is in question never talks to the daemon at all
+(`tests/test_marmot_identity.py` asserts no request reaches the socket). Connecting first is a
+real option rather than an oversight: it would trade "never talk to a daemon we cannot trust" for
+a window a two-service restart already covers, and it belongs in a change that says so.
 
 ### Options considered and rejected
 

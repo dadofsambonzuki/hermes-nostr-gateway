@@ -88,6 +88,9 @@ marmot:
   # hermes_config: ~/.hermes/config.yaml   # default: $HERMES_HOME/config.yaml
   socket: ~/.marmot-agents/hermes/dev/wn-agent.sock
   home: ~/.marmot-agents/hermes     # account_id_hex is read from accounts/*/account.json
+  # account_id_hex: <hex>          # fallback only, for a home with no account file yet.
+  #                                # wn-agent's file is read first, and a configured id
+  #                                # that contradicts it refuses the plane.
   # label: hermes-agent             # only needed when that home holds more than one account
   # group: fcc995ef9affe55608ff3fe9f917de51   # narrow the inbound subscription to one group
 

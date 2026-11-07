@@ -240,6 +240,22 @@ class SocketServer:
                         )})
                     elif op == "peers":
                         await self._send(writer, {"type": "peers", **self.handler.peers()})
+                    elif op == "authorize":
+                        # A recovery re-ask, not a delivery path: Hermes re-checks a stored
+                        # turn's role grant against live policy rather than trusting the
+                        # flag it saved. A daemon too old to answer says so by code.
+                        handler = getattr(self.handler, "authorize", None)
+                        if handler is None:
+                            await self._send(writer, {"type": "error", "op": op,
+                                                      "code": "unsupported",
+                                                      "error": "authorize is not available "
+                                                               "on this daemon"})
+                        else:
+                            requested = req.get("kind")
+                            await self._send(writer, handler(
+                                pubkey=str(req.get("pubkey") or ""),
+                                conversation=str(req.get("conversation") or ""),
+                                kind=int(requested) if requested not in (None, "") else None))
                     elif op == "ack":
                         if "rule" in req or "frame" in req:
                             result = self.handler.ack(
