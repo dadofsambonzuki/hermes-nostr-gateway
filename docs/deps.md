@@ -38,7 +38,7 @@ Everything site-specific lives in the `deps:` block of `config.yaml` (see
 | `repositories` | `name`, `owner` (the npub or NIP-05 that published the repository) and `branch` a proposal is cut from |
 | `min_severity` | the CVSS floor; `7` is high and above |
 | `workspace` | where the bot's clones live (`/opt/deps-bot`); kept across runs, never inside a checkout |
-| `state_dir` | last proposal's lockfile hash per repository, so a pending bump is not repeated |
+| `state_dir` | last proposal's lockfile hash per repository, so a pending bump is not repeated; and the kept gate log of the last failure, `build-<name>.log` |
 | `log` | the run log, appended by the oneshot and readable by `journalctl` too |
 | `signer` | the Deps Bot npub that signs the proposal push and the scan trigger |
 | `coordinator` | whose name a manual CI run is requested from |
@@ -58,7 +58,8 @@ proposing is worse than one that fails.
 4. Let `osv-scanner fix --strategy in-place` propose the minimum upgrade. No diff, no
    proposal: the manifest is left untouched.
 5. Run the repository's own gates against the bump. A bump that fails a gate is discarded,
-   never proposed.
+   never proposed; the failing gate's output is kept at `state_dir/build-<name>.log`, so the
+   `(see …)` path the journal prints still opens after the run has returned.
 6. Compare the lockfile's hash with `state_dir/last-<name>`: the same proposal still waiting
    for review is not repeated.
 7. Commit as the Deps Bot and push `pr/deps-<date>` with a title and a description naming
@@ -91,6 +92,7 @@ workspace and its clones do not move.
 
 `tests/test_deps.py` covers the `deps:` block (the full shape, the defaults and each way it
 can be wrong), the report helpers, and the pipeline end to end against a miniature
-repository with stub tools: a dry run that writes nothing, the "same proposal" guard, and
-`open_prs: false`. `tests/test_deploy_units.py` pins the unit's shape: a oneshot that calls
+repository with stub tools: a dry run that writes nothing, the "same proposal" guard,
+`open_prs: false`, and a failing gate that leaves its output at the path the message names.
+`tests/test_deploy_units.py` pins the unit's shape: a oneshot that calls
 `hng deps run`, never the daemon.

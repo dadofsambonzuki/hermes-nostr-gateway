@@ -9,6 +9,7 @@ write. Placeholders only: no real npub, host or repository belongs in this file.
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 from pathlib import Path
 
@@ -291,6 +292,43 @@ def test_an_unknown_repository_is_refused_by_name(checkout, tmp_path):
     out = io.StringIO()
     assert run_deps(cfg, dry_run=True, only_repo="nope", out=out,
                     env=env_for(checkout)) == 2
+
+
+def test_a_failed_gate_keeps_its_log_where_the_message_points(checkout, tmp_path):
+    """The journal keeps only the pointer, so the pointer has to resolve after the run."""
+    tools, _workspace, _seed = checkout
+    (tools / "npm").write_text(
+        "#!/bin/sh\necho 'npm ERR! ERESOLVE could not resolve' >&2\nexit 1\n")
+
+    cfg = config(checkout, tmp_path)
+    repo = cfg.workspace / "example-repo"
+    before = head(repo)
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0
+    text = out.getvalue()
+    assert "gates FAILED at 'npm ci'" in text
+
+    shown = re.search(r"\(see (.+)\)\s*$", text, re.MULTILINE)
+    assert shown, text
+    kept = Path(shown.group(1))
+    assert kept == cfg.state_dir / "build-example-repo.log"
+    assert kept.exists(), f"{kept} was removed with the scratch directory"
+    body = kept.read_text()
+    assert "ERESOLVE could not resolve" in body
+    assert "example-repo" in body
+
+    # The bump is still discarded and the checkout is left where it was found.
+    assert head(repo) == before
+    assert not [name for name in branches(repo) if name.startswith("pr/deps-")]
+
+
+def test_a_passing_run_leaves_no_build_log_behind(checkout, tmp_path):
+    cfg = config(checkout, tmp_path)
+    out = io.StringIO()
+    assert run_deps(cfg, dry_run=True, out=out, env=env_for(checkout)) == 0
+    assert "gates passed" in out.getvalue()
+    assert not (cfg.state_dir / "build-example-repo.log").exists()
 
 
 # -- the CLI ------------------------------------------------------------------

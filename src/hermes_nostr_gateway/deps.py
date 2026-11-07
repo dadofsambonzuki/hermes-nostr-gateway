@@ -451,6 +451,30 @@ class Pipeline:
                 server.kill()
                 server.wait(timeout=5)
 
+    def _keep_build_log(self, repo: DepsRepo, scratch: Path) -> Path:
+        """Put a failed gate's output somewhere the message can still be read afterwards.
+
+        The gates write into the run's scratch directory, and that directory is removed as
+        soon as `one()` returns - while the journal keeps only the message naming the file.
+        A failure therefore copies the output to `state_dir/build-<name>.log` (the file the
+        retired shell script kept in /tmp) before the scratch directory goes.
+        """
+        kept = self.cfg.state_dir / f"build-{repo.name}.log"
+        try:
+            body = scratch.read_bytes()
+        except OSError:
+            body = b""
+        try:
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            kept.write_bytes(f"=== {repo.name} at {_timestamp()} ===\n".encode() + body)
+            return kept
+        except OSError as exc:
+            # Not fatal: the run still has to discard the bump. The run log always exists.
+            self.say(f"    cannot keep the gate log at {kept} ({exc.strerror}); "
+                     f"appending it to {self.cfg.log}")
+            self._append_log(body.decode("utf-8", "replace"))
+            return self.cfg.log
+
     def proposal_state(self, repo: DepsRepo, directory: Path) -> str:
         lockfile = directory / "package-lock.json"
         try:
@@ -537,8 +561,9 @@ class Pipeline:
             build_log = work / "build.log"
             failing = self.gates(directory, build_log)
             if failing:
+                kept = self._keep_build_log(repo, build_log)
                 self.say(f"    gates FAILED at {failing!r} - discarding the bump "
-                         f"(see {build_log})")
+                         f"(see {kept})")
                 self.restore(repo, directory)
                 return
             self.say("    gates passed (install, typecheck, lint, tests, build)")
