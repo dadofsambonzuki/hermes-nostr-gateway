@@ -1252,6 +1252,11 @@ class Gateway:
         the adapter turns `type: message` into an agent run, and a `drop` reach used
         to ride that path silently. `blocked` carries the reason and no content.
 
+        A policy refusal is the last word on its row: `blocked_reason` (or a `drop` reach) is
+        exactly what `Store.pending_immediate` excludes, so no later `subscribe` can offer it
+        again. That is what `final: true` says on the frame — the row's fate, so the adapter
+        settles the frame instead of holding it for a replay that cannot come.
+
         A channel's kind-7 reaction arrives here as a `ChannelReaction`, which brings its
         own `type: reaction` frame and has no row behind it: the plane never stores one, so
         there is nothing to look up and nothing to replay — the adapter either matches it to
@@ -1264,6 +1269,7 @@ class Gateway:
                 "from": msg.sender,
                 "reason": msg.blocked_reason or "not_allowlisted",
                 "rumor_id": msg.id,
+                "final": True,
             }
         return self._routed(msg.to_frame(), plane=getattr(msg, "plane", ""),
                             conversation=msg.conversation)
@@ -1335,6 +1341,12 @@ class Gateway:
         origin = sender or frame.get("sender") or frame.get("from") or ""
         rumor_id = message_id or frame.get("id")
         routed = dict(frame)
+        # Both refusals below are a condition, not a verdict about the message: the row has no
+        # `blocked_reason`, so `Store.pending_immediate` keeps it and the next `subscribe`
+        # offers it again — as this same refusal while the condition lasts. `final: false` says
+        # so on the frame, so the adapter holds it rather than settling a row that is still
+        # coming back. The flag is the row's fate and nothing else: a refusal reason added here
+        # later is replayable without anyone remembering to add it to a list.
         if self.routing:
             resolution = self.route_for(plane, conversation)
             if resolution.error:
@@ -1342,7 +1354,7 @@ class Gateway:
                           resolution.error, resolution.detail)
                 return {"type": "blocked", "plane": plane, "from": origin,
                         "reason": resolution.error, "why": resolution.detail,
-                        "rumor_id": rumor_id}
+                        "rumor_id": rumor_id, "final": False}
             routed["route"] = resolution.to_frame()
         if self.profiles:
             known = self.concord.channels() if plane == "concord" else None
@@ -1353,7 +1365,7 @@ class Gateway:
                           profile.error, profile.detail)
                 return {"type": "blocked", "plane": plane, "from": origin,
                         "reason": profile.error, "detail": profile.detail,
-                        "rumor_id": rumor_id}
+                        "rumor_id": rumor_id, "final": False}
             routed.update(profile.frame())
         return routed
 

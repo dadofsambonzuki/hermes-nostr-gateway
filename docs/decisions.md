@@ -135,6 +135,21 @@ only a log line), and a route change never migrates a session — the namespace 
 so the old session stays where it was. The control pane is not re-routed either: the route
 changes whose memory a turn runs in, not where a confirmation is asked or whose word it trusts.
 
+## A blocked frame carries its row's fate, never a reason to remember
+
+A `blocked` frame says `final`: `true` when the row is retired (a policy refusal, which the replay
+query excludes) and `false` while `Store.pending_immediate` still holds it (a route or a profile
+the gateway could not resolve). The adapter settles a `final` frame and holds the other, replacing
+its connection so the next `subscribe` offers the row again.
+
+Why: the adapter used to decide this from a list of blocked reasons, and a list only covers the
+reasons somebody wrote down. A refusal added later, or a shape another deployment emits, fell
+outside it and was settled — which parks a replayable row until something unrelated disconnects,
+because `subscribe` is the only op that offers one. The lifecycle is already on the row the gateway
+just wrote, so the frame carries the answer rather than every consumer re-deriving it. The adapter
+holds a frame that does not say: not knowing that a row is finished is not knowing it is over, and
+one reconnect is cheaper than a message parked until a disconnect.
+
 ## A replayed reply is stopped at the adapter, not by disabling recovery
 
 The Hermes adapter suppresses an identical send to the same chat, and keeps Hermes' recovery

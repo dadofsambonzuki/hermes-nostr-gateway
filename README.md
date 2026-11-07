@@ -80,7 +80,10 @@ Ops in: `subscribe`, `ack`, `mark_read`, `send`, `status`, `health`, `history`, 
 Frames out: `message`, `blocked`, `delivery`, `reaction`, `concord_invite`, `media`, plus a reply
 envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, `ok`, `pong`,
 `error`). A `blocked` frame carries a `reason` (`rate_limited`, `not_allowlisted`, `digest_quota`,
-`route_key_missing`, `route_unresolved`) and never looks like chat.
+`route_key_missing`, `route_unresolved`) and never looks like chat. It also carries `final`, the
+row's fate rather than the reason's: `true` when the row is retired (a policy refusal, never
+replayed) and `false` while the daemon is still offering it, so a consumer settles a finished
+refusal and holds a replayable one instead of guessing from the reason string.
 
 ### The slash menu a client can see (`advertise`)
 

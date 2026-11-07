@@ -177,7 +177,7 @@ Server frames:
  "attachments":[{"url":"https://…","mime":"image/jpeg","size":123456,"sha256":"…","status":"available"}],
  "route":{"provider":"…","model":"…","key":"MODEL_KEY","rule":"channel","why":"…"}}
 {"type":"reaction","cursor":42,"target_rumor_id":"…","from":"npub1…","emoji":"🔥","resolved":true}
-{"type":"blocked","from":"npub1…","reason":"not_allowlisted","rumor_id":"…"}
+{"type":"blocked","from":"npub1…","reason":"not_allowlisted","rumor_id":"…","final":true}
 {"type":"delivery","rumor_id":"…","ok":true,"relays_ok":["wss://…"]}
 {"type":"status","relays":{…},"queue_depth":0}
 ```
@@ -187,8 +187,8 @@ Server frames:
 `rule` says which rule won (`channel`, `plane`, `default`) and `why` says what it beat. The adapter
 reports the route it ran on with its `send`, and that reply (`{"route":{…}}` on the `delivery`
 frame, and on the stored row) is the audit trail. A route that cannot be honoured is a `blocked`
-frame with `reason: route_key_missing` or `route_unresolved`, never a message: see
-docs/decisions.md.
+frame with `reason: route_key_missing` or `route_unresolved`, never a message — and its row stays
+in the replay, so the frame says `final: false`: see docs/decisions.md.
 
 Text is capped at 8 KB inbound and outbound; larger is truncated with `"truncated":true`
 rather than dropped, so the agent can still see that something arrived.
@@ -347,13 +347,16 @@ frame that never succeeds would hold every frame behind it until it aged out of 
 
 **A frame that was handled but consumed nothing is held, never acked, and never at the head of
 the batch.** Not every frame left unacked got there by raising: a route the adapter cannot honour
-yet, a digest batch with no home channel, and a `blocked` frame the daemon refused for a route or
-profile it could not resolve (`route_key_missing`, `route_unresolved`, `route_invalid`,
-`profile_unknown`, `profile_invalid` — the refusals whose row it keeps replaying) are all answered
-as far as the adapter can go — logged, left pending, and deliberately not acked, because an ack
-claims Hermes took the message. A `blocked` frame with a policy reason (`not_allowlisted`,
-`rate_limited`, `echo`, `bot_reply_cap`) is settled instead: its row is never replayed, so a hold
-could never be answered and would only cost a reconnect per backoff.
+yet, a digest batch with no home channel, and a `blocked` frame for a row the daemon is still
+offering (a route or profile it could not resolve) are all answered as far as the adapter can go —
+logged, left pending, and deliberately not acked, because an ack claims Hermes took the message.
+Whether a `blocked` frame will come back is the daemon's answer and it is on the frame: `final:
+false` means the refusal is a condition and its row is still in the replay, so the adapter holds
+it; `final: true` means the row is retired — a policy refusal (`not_allowlisted`, `rate_limited`,
+`echo`, `bot_reply_cap`) — so the frame is settled, because a hold could never be answered and
+would only cost a reconnect per backoff. The adapter never decides this from the reason string: a
+list of reasons it knew is what let a refusal the daemon added later be settled, parking its row
+until something unrelated disconnected.
 Those return normally, so nothing fails and nothing is retried unless the adapter says so. It
 reports the hold to its reader, which reads on to the remaining frames of that `subscribe` — a
 hold must not take the batch down with it — and, once the batch is finished, replaces the

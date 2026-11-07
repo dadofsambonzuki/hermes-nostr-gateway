@@ -240,29 +240,18 @@ class FrameOutcome(str, Enum):
     RETRY = "retry"
     SKIP = "skip"
 
-# Why a frame was left unacknowledged on purpose. `_deliver` returns one of these — an empty
-# value means the frame is settled: delivered and acked, or dropped and acked as final. Both
-# frames below were handled as far as they can go and consumed nothing, so the only honest
-# answer is to leave them pending. Neither may be acked: an ack claims Hermes took the message,
+# Why a frame was left unacknowledged on purpose. `_deliver` and `_frame` return one of these —
+# an empty value means the frame is settled: delivered and acked, or dropped and acked as final.
+# Each frame below was handled as far as it can go and consumed nothing, so the only honest
+# answer is to leave it pending. None may be acked: an ack claims Hermes took the message,
 # and nothing did. A hold is read past exactly like a skipped frame — the frames behind it in
 # the same replay batch are still answered — and the connection is replaced once that batch is
 # finished, because `subscribe` is the only op that re-offers an unacked frame. Reading on and
 # reconnecting at the first held frame is what starves the batch: `replay_pending` is
 # oldest-first, so the held frame would be at the head of every replay.
 _HELD_ROUTE = "route_unresolved"
+_HELD_BLOCKED = "blocked_pending"
 _HELD_DIGEST = "no_home_channel"
-
-#: The `blocked` reasons whose row the daemon will offer again. A route or profile refusal is a
-#: condition, not a verdict about the sender: the key can be exported, the channel held again,
-#: the profile recreated, and `Store.pending_immediate` keeps the row replayable until it is
-#: delivered — a row carries a `blocked_reason` only when the *policy* refused it, and the replay
-#: query excludes exactly those. So the frame is held like a route this process cannot honour.
-#: Every other reason is that policy decision (and a `drop` reach): its row is never replayed, so
-#: a hold would cost a reconnect per backoff and could never be answered — those stay settled.
-_REPLAYABLE_BLOCK_REASONS = frozenset({
-    "route_key_missing", "route_unresolved", "route_invalid",
-    "profile_unknown", "profile_invalid",
-})
 
 #: How long a subscription may stay quiet after it held a frame before the batch the daemon
 #: wrote at `subscribe` is treated as finished and the connection is replaced. The whole replay
@@ -1042,7 +1031,8 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                         holds.append(held)
                         logger.warning("nostr gateway holding frame %s for the replay (%s); "
                                        "reading on to the frames behind it",
-                                       str(frame.get("id") or "")[:12] or "(no id)", held)
+                                       str(frame.get("id") or frame.get("rumor_id") or "")[:12]
+                                       or "(no id)", held)
                         continue
                     # The connection is carrying frames, so the next reconnect starts from
                     # the bottom of the backoff rather than from wherever a condition left it.
@@ -1092,12 +1082,16 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                            (frame.get("from") or "")[:12],
                            reason or "unknown",
                            f": {detail}" if detail else "")
-            if reason in _REPLAYABLE_BLOCK_REASONS:
-                # The daemon refused the turn, not the message: nothing here can decide it, and
-                # the row is still replayable, so it is held rather than settled. An ack would
-                # claim Hermes took a message it never saw, and settling it parks the row until
-                # something unrelated disconnects — `subscribe` is the only op that re-offers it.
-                return _HELD_ROUTE
+            if not frame.get("final"):
+                # Whether the daemon will offer this row again is the daemon's answer, and it
+                # is on the frame: `final` is true when the row is retired (a policy refusal,
+                # which `pending_immediate` excludes) and false while it is still pending (a
+                # route or profile it could not resolve). Holding only the reasons this
+                # adapter happened to remember is how a refusal nobody listed got settled and
+                # its row parked until an unrelated disconnect. A frame that does not say is
+                # held too: a daemon too old to know the row's fate is not evidence that the
+                # row is finished, and one extra reconnect is cheaper than a parked message.
+                return _HELD_BLOCKED
         return None
 
     async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> FrameOutcome:
@@ -1169,11 +1163,12 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         """Deliver one inbound message, and say whether it was consumed.
 
         None means settled: Hermes has it and acked, or it was dropped on purpose and acked
-        because the verdict is final. A hold reason (`_HELD_ROUTE`, `_HELD_DIGEST`) means the
-        frame was handled as far as it can go without consuming it, so it is left unacked and
-        the reader reads on past it — the batch behind it is still answered — and replaces the
-        connection once the batch is finished, so the daemon offers the hold again. Returning
-        quietly would park it until something unrelated disconnected.
+        because the verdict is final. A hold reason (`_HELD_ROUTE`, `_HELD_BLOCKED`,
+        `_HELD_DIGEST`) means the frame was handled as far as it can go without consuming it,
+        so it is left unacked and the reader reads on past it — the batch behind it is still
+        answered — and replaces the connection once the batch is finished, so the daemon
+        offers the hold again. Returning quietly would park it until something unrelated
+        disconnected.
         """
         message_id = frame.get("id") or ""
         if is_reaction_frame(frame):

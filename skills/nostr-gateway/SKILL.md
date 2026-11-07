@@ -51,11 +51,13 @@ Every refusal is a word, and the word decides what to do.
 - **blocked reasons on a message frame** (policy): `rate_limited` (a sender or rule bucket
   is exhausted), `echo` (a bot peer repeated our own recent text), `bot_reply_cap` (the
   bot-peer hourly cap), `not_allowlisted` (the rule or default is `drop`), and
-  `digest_quota` (a digest overflowed and the tail was cut). A blocked frame carries no
-  content and is never retried; the row stays as evidence.
+  `digest_quota` (a digest overflowed and the tail was cut). A policy refusal is `final` on
+  the frame — its row is never replayed — carries no content and is never retried; the row
+  stays as evidence.
 - **blocked reasons from routing** (the turn was not dispatched): `route_unresolved`,
-  `route_invalid`, `route_key_missing`, `profile_unknown`, `profile_invalid`. Fix the
-  `routing`/`profiles` config, replay, and the stored message is delivered.
+  `route_invalid`, `route_key_missing`, `profile_unknown`, `profile_invalid`. These are not
+  `final`: the row stays pending and the frame is re-offered, so fix the `routing`/`profiles`
+  config and the stored message is delivered without anyone re-sending it.
 - **refused vs dropped**: a *refused* message is `reach: drop` or carries a
   `blocked_reason`; it is what `hng drops` lists. *Dropped* with `digest_quota` means the
   digest quota cut it, not a rule. Both are final; a message never becomes deliverable by

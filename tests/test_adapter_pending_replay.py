@@ -39,6 +39,7 @@ import yaml
 
 from adapter_harness import load_adapter
 from hermes_nostr_gateway.gateway import Gateway
+from hermes_nostr_gateway.planes.concord.channels import ChannelStream
 from hermes_nostr_gateway.server import SocketServer
 from hermes_nostr_gateway.store import Inbound
 
@@ -608,6 +609,12 @@ async def test_a_held_frame_does_not_stall_the_frames_behind_it(
 # branch exists to prevent, so it is driven here through the real `Gateway` and `Store` rather
 # than a hand-written frame: the reason strings, the `rumor_id` field and the replay are the
 # daemon's own, and a test double could agree with itself about a shape it never sends.
+#
+# Which of the two a frame is, is not a question this adapter answers from the reason — a list
+# of strings it remembered settled every refusal the daemon added later. The daemon sets
+# `final` from the row it wrote: true when the row is retired, false while `pending_immediate`
+# still holds it. These tests pin the flag to the store for every refusal site, and pin the
+# adapter to the flag rather than to the reason.
 
 PEER_HEX = "ab" * 32
 ROUTE_KEY = "NOSTR_TEST_ROUTE_KEY"
@@ -707,6 +714,10 @@ async def test_a_blocked_route_refusal_is_held_and_the_message_behind_it_is_deli
         assert [item["type"] for item in offered] == ["blocked", "message"]
         assert offered[0]["reason"] == "route_key_missing"
         assert offered[0]["rumor_id"] == held_id, "a blocked frame names its row `rumor_id`"
+        assert offered[0]["final"] is False, (
+            "the row is still in `pending_immediate`, so the daemon must say the frame is "
+            "not the last word on it"
+        )
         assert held_id in [row["id"] for row in gateway.store.pending_immediate()], (
             "a route refusal is not a policy block: the daemon keeps offering the row"
         )
@@ -761,23 +772,90 @@ async def test_a_blocked_route_refusal_is_held_and_the_message_behind_it_is_deli
     )
 
 
+async def test_a_route_refusal_is_held_until_the_channel_is_held_then_delivered_once(
+        tmp_path, monkeypatch, caplog):
+    """A refusal that lasts, on the daemon's own `route_unresolved`: held, held, delivered.
+
+    Settled, the first offer parks the row until something unrelated disconnects. Held, every
+    `subscribe` offers it again — the reader replaces the connection each time the batch ends
+    with the hold — and once the channel is held the row arrives exactly once. Nothing may be
+    acked while the condition lasts: an ack would claim Hermes took a message it never saw.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
+    gateway, msg = _refused_channel_route(tmp_path)
+
+    offers = []
+
+    def hold_the_channel_on_third_offer(count):
+        offers.append(count)
+        if count == 3:
+            # The channel list the Control plane would have refreshed: the room is held now,
+            # so the same routing rule resolves and the row becomes a turn.
+            gateway.concord.channels = lambda: [ChannelStream(
+                community_id=COMMUNITY, channel_id=CHANNEL, name="room", private=False,
+                epoch=0, address="cd" * 32, chat_id=f"concord:{COMMUNITY}:{CHANNEL}")]
+
+    daemon = GatewayDaemon(gateway, on_replay=hold_the_channel_on_third_offer)
+    sock = tmp_path / "refusal.sock"
+    server = SocketServer(sock, daemon)
+    await server.start()
+
+    inst = _reader_adapter(sock)
+    handled = []
+
+    async def handle_message(event):
+        handled.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await _until(lambda: msg.id in daemon.acks,
+                     "the refused row was never delivered once the channel was held")
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert offers[:3] == [1, 2, 3], (
+        "an unacked refusal is re-offered by a new subscription and nowhere else: the reader "
+        "has to replace the connection for each hold instead of settling the frame"
+    )
+    assert handled == [msg.id], "the row is delivered exactly once, after the channel returns"
+    assert daemon.acks == [msg.id], "nothing may be acked while the refusal is a hold"
+    assert gateway.store.pending_immediate() == []
+    assert caplog.text.count("holding frame") >= 2, (
+        "every offer of the refusal is held and named in the log, not settled"
+    )
+
+
 async def test_a_policy_block_is_settled_because_its_row_is_never_replayed(tmp_path, monkeypatch):
-    """The other side of the boundary: a policy refusal has no replay behind it.
+    """The complement: a refusal with no replay behind it must settle, not wait for one.
 
     `not_allowlisted` is a `drop` and `rate_limited` writes `blocked_reason`; both are what
     `pending_immediate` excludes. A hold could never be answered — every reconnect would pay
-    the backoff for a frame the next `subscribe` cannot offer — so the adapter settles it.
+    the backoff for a frame the next `subscribe` cannot offer — so the daemon says `final` on
+    the frame and the adapter settles it.
     """
     monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
     gateway = _gateway(tmp_path)
     try:
-        dropped = gateway.frame_for(_inbound("c3" * 32, PEER_HEX, "nip17", "stranger",
-                                             reach="drop"))
-        limited = gateway.frame_for(_inbound("d4" * 32, PEER_HEX, "nip17", "flood",
-                                             reach="drop", blocked_reason="rate_limited"))
+        dropped_msg = _inbound("c3" * 32, PEER_HEX, "nip17", "stranger", reach="drop")
+        limited_msg = _inbound("d4" * 32, PEER_HEX, "nip17", "flood",
+                               reach="drop", blocked_reason="rate_limited")
+        for msg in (dropped_msg, limited_msg):
+            gateway.store.add(msg)
+        dropped = gateway.frame_for(dropped_msg)
+        limited = gateway.frame_for(limited_msg)
 
         assert (dropped["type"], dropped["reason"]) == ("blocked", "not_allowlisted")
         assert (limited["type"], limited["reason"]) == ("blocked", "rate_limited")
+        assert (dropped["final"], limited["final"]) == (True, True), (
+            "a policy refusal retires its row: no `subscribe` can offer it again, and the "
+            "frame has to say so or the adapter waits for a replay that cannot come"
+        )
         assert gateway.store.pending_immediate() == [], (
             "a policy refusal is not replayable: the hold branch must not apply to it"
         )
@@ -803,8 +881,9 @@ def _refused_channel_route(tmp_path):
     }
     gateway = _gateway(tmp_path, routing)
     gateway.concord.refreshed = True  # a refresh that found nothing: the room is gone
-    gateway.store.add(_inbound("e5" * 32, f"concord:{COMMUNITY}:{CHANNEL}", "concord", "hello"))
-    return gateway
+    msg = _inbound("e5" * 32, f"concord:{COMMUNITY}:{CHANNEL}", "concord", "hello")
+    gateway.store.add(msg)
+    return gateway, msg
 
 
 def _refused_profile(tmp_path):
@@ -815,9 +894,10 @@ def _refused_profile(tmp_path):
     (home / "config.yaml").write_text(yaml.safe_dump({"gateway": {"multiplex_profiles": True}}))
     gateway = _gateway(tmp_path, profiles={"default": "default", "planes": {"marmot": "ops"}},
                        hermes_config=str(home / "config.yaml"))
-    gateway.store.add(_inbound("e5" * 32, "marmot:group", "marmot", "hello"))
+    msg = _inbound("e5" * 32, "marmot:group", "marmot", "hello")
+    gateway.store.add(msg)
     (home / "profiles" / "ops" / ".env").unlink()
-    return gateway
+    return gateway, msg
 
 
 #: The refusals that are a condition on the daemon's side: the row stays replayable, so the
@@ -837,16 +917,141 @@ async def test_a_blocked_refusal_whose_row_is_replayable_is_held(tmp_path, monke
     """
     monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
     monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
-    gateway = _DAEMON_REFUSALS[reason](tmp_path)
+    gateway, _msg = _DAEMON_REFUSALS[reason](tmp_path)
     try:
         (refused,) = gateway.replay_pending()
         assert (refused["type"], refused["reason"]) == ("blocked", reason)
+        assert refused["final"] is False, "the daemon is still offering this row"
         assert gateway.store.pending_immediate(), "the row is kept for when the condition lifts"
 
         inst = _reader_adapter("/nonexistent")
-        assert await inst._frame(refused) == adapter._HELD_ROUTE, (
+        assert await inst._frame(refused) == adapter._HELD_BLOCKED, (
             "an ack would claim Hermes took a message it never saw"
         )
     finally:
         gateway.store.close()
+
+
+def test_the_final_flag_is_the_rows_lifecycle_at_every_refusal_site(tmp_path, monkeypatch):
+    """Every `blocked` shape the daemon can build, checked against the store that replays it.
+
+    `final` may only ever mean one thing — no later `subscribe` offers this row again — so at
+    each refusal site the flag has to agree with `Store.pending_immediate`, the query that *is*
+    the replay. That is what lets the adapter stop keeping a list of reasons: a refusal added
+    at either site is classified by where its row stands, not by a string someone remembered.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
+    monkeypatch.delenv(ROUTE_KEY, raising=False)
+
+    def under(name):
+        path = tmp_path / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # One gateway per branch: the policy branch of `frame_for`, and the routing and profile
+    # branches of `_routed` (which the replay path runs again).
+    policy = _gateway(under("policy"))
+    keyed = _gateway(under("keyed"), _MISSING_KEY_ROUTING)
+    keyed_msg = _inbound("a1" * 32, PEER_HEX, "nip17", "held route")
+    keyed.store.add(keyed_msg)
+    channel, channel_msg = _refused_channel_route(under("channel"))
+    profile, profile_msg = _refused_profile(under("profile"))
+    gateways = [policy, keyed, channel, profile]
+
+    shapes = {
+        "drop": (policy, _inbound("c3" * 32, PEER_HEX, "nip17", "stranger", reach="drop")),
+        "blocked_reason": (policy, _inbound("d4" * 32, PEER_HEX, "nip17", "flood",
+                                            reach="drop", blocked_reason="rate_limited")),
+        "route_key_missing": (keyed, keyed_msg),
+        "route_unresolved": (channel, channel_msg),
+        "profile_unknown": (profile, profile_msg),
+    }
+    try:
+        for name, (gateway, msg) in shapes.items():
+            gateway.store.add(msg)  # the two helpers stored theirs; a duplicate is a no-op
+            frame = gateway.frame_for(msg)
+            assert frame["type"] == "blocked", name
+            replayable = [row["id"] for row in gateway.store.pending_immediate()]
+            assert frame["final"] is (msg.id not in replayable), (
+                f"{name}: final={frame['final']} but the row is "
+                f"{'still' if msg.id in replayable else 'no longer'} in pending_immediate"
+            )
+            if msg.id in replayable:
+                # The replay builds the frame again, and it has to say the same thing.
+                replayed = [item for item in gateway.replay_pending()
+                            if item["type"] == "blocked"]
+                assert replayed and all(item["final"] is False for item in replayed), name
+    finally:
+        for gateway in gateways:
+            gateway.store.close()
+
+
+async def test_the_hold_follows_the_frame_not_the_reason_string():
+    """The reason says what was refused; `final` says whether it comes back. Only one decides.
+
+    Both directions are pinned, because the defect was a list of reasons: a policy-looking
+    reason on a row the daemon is still offering is held, and a reason this adapter used to
+    hold by name, on a row the daemon has retired, is settled. A frame that carries no `final`
+    at all is held too — a daemon too old to know the row's fate is not evidence that the row
+    is finished, and one reconnect is cheaper than a parked message.
+    """
+    inst = _reader_adapter("/nonexistent")
+
+    held = await inst._frame({"type": "blocked", "reason": "not_allowlisted",
+                              "rumor_id": "a1" * 32, "final": False})
+    assert held == adapter._HELD_BLOCKED, "the row is still coming back, whatever it is called"
+
+    retired = await inst._frame({"type": "blocked", "reason": "route_key_missing",
+                                 "rumor_id": "b2" * 32, "final": True})
+    assert retired is None, "a row the daemon has retired must not hold the subscription"
+
+    silent = await inst._frame({"type": "blocked", "reason": "not_allowlisted",
+                                "rumor_id": "c3" * 32})
+    assert silent == adapter._HELD_BLOCKED, (
+        "not knowing the row's fate is not knowing it is over"
+    )
+
+
+async def test_a_settled_blocked_frame_does_not_cost_a_resubscribe(tmp_path, monkeypatch):
+    """The complement at the socket: a refusal with no replay must not wait for one.
+
+    A policy-blocked row is never offered again, so holding it would replace a healthy
+    connection — and pay the backoff — for a frame the daemon cannot produce, while the
+    message behind it waits. The batch has to be read straight through instead.
+    """
+    monkeypatch.setattr(adapter, "_HELD_BATCH_SECONDS", 0.05)
+    settled = {"type": "blocked", "plane": "nip17", "from": "cd" * 32,
+               "reason": "not_allowlisted", "rumor_id": "ee" * 32, "final": True}
+    daemon = ConditionDaemon(_frame())
+    daemon.pending.insert(0, settled)  # offered ahead of the message, oldest-first
+    server = SocketServer(tmp_path / "settled.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "settled.sock")
+    delivered = []
+
+    async def handle_message(event):
+        delivered.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await daemon.wait_settled(MESSAGE_ID)
+        # Past the hold window: had the refusal been held, the connection would have been
+        # replaced by now and the resubscribe would show up in `subscriptions`.
+        await asyncio.sleep(0.3)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert delivered == [MESSAGE_ID], "a settled refusal must not stop the frames behind it"
+    assert daemon.acks == [MESSAGE_ID], "only the message Hermes took may be acked"
+    assert daemon.subscriptions == 1, (
+        "a refusal whose row is retired has no replay to wait for: replacing the connection "
+        "for it pays the backoff for a frame the daemon cannot offer again"
+    )
 
