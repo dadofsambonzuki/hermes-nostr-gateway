@@ -1439,16 +1439,30 @@ class Sync:
         if task_id:
             log.info("ngit: late review task %s for PR %s", task_id, pr.id[:8])
 
+    def _review_anchor(self, link: dict[str, Any]) -> str:
+        """The review task that speaks for this PR: the newest one the board holds.
+
+        The link names the first, and every later review is a card the bridge did not make
+        -- hand-queued in this deployment, under the title and the brief the bridge writes.
+        Reading the stored id alone would keep the first verdict in force for ever, so the
+        board is asked which review task is the current one.
+        """
+        found = self.board.review_task(str(link.get("source_id") or ""))
+        return str(found["id"]) if found is not None else str(link.get("task_id") or "")
+
     def _close_review(self, pr: PullRequest | None, merge: Merge, link: dict[str, Any],
                       report: Report, *, dry_run: bool) -> None:
         """Complete the PR's review task, naming the merge. Idempotent."""
-        task_id = str(link.get("task_id") or "")
-        if not task_id or dry_run:
+        if dry_run:
             return
         how = f"merged as {merge.commit}" if merge.commit else "merged"
         what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
         nevent = str(_detail(link).get("nevent") or "")
+        task_id = ""
         try:
+            task_id = self._review_anchor(link)
+            if not task_id:
+                return
             self.board.complete(
                 task_id, author="ngit",
                 comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
@@ -1457,17 +1471,19 @@ class Sync:
                 result=f"PR {merge.pr_id} {how}: the review is closed by the merge.")
         except (BoardError, sqlite3.Error) as exc:
             report.prs["review_errors"] += 1
-            report.errors.append(f"review task {task_id} for PR {merge.pr_id[:8]}: {exc}")
+            where = f"review task {task_id}" if task_id else f"review task for PR {merge.pr_id[:8]}"
+            report.errors.append(f"{where}: {exc}")
 
     # -- labels ----------------------------------------------------------
 
     def _labels(self, feed: PrFeed, report: Report) -> None:
         """Publish each PR's review state as a label, on change only.
 
-        The state is not kept here: it is read from the review task the bridge already made
-        (its status, and the verdict in its comments) plus the PR's tip. The link row only
-        remembers what was last published and the tip a verdict was given for, which is what
-        makes a poll with nothing new publish nothing.
+        The state is not kept here: it is read from the review task that speaks for the PR --
+        the newest one the board holds, whether the bridge made it or a reviewer queued a
+        re-review by hand -- from its status and the verdict in its comments, plus the PR's
+        tip. The link row only remembers what was last published and the tip a verdict was
+        given for, which is what makes a poll with nothing new publish nothing.
         """
         if self.labels is None or not self.config.labels or not self.target.address:
             return
@@ -1505,12 +1521,12 @@ class Sync:
         tip, tip_at = tips.get(pr_id, (str(detail.get("tip") or ""),
                                       int(detail.get("tip_at") or 0)))
         detail["tip"], detail["tip_at"] = tip, tip_at
-        status, verdict = self._review_state(link, detail)
+        status, verdict, task_id = self._review_state(link, detail)
         desired = review_labels(verdict=verdict, task_status=status, tip=tip,
                                 verdict_tip=str(detail.get("verdict_tip") or ""),
                                 merged=merged)
         if desired is None or tuple(desired) == tuple(detail.get("label") or ()):
-            self._save_detail(link, detail)
+            self._save_detail(link, detail, task_id=task_id)
             return
         retract = [str(event) for event in (detail.get("label_events") or ()) if event]
         try:
@@ -1527,7 +1543,7 @@ class Sync:
             report.errors.append(
                 f"label {pr_id[:8]} ({', '.join(desired)}): {result.error}"[:200])
             detail["label_pending"] = list(desired)
-            self._save_detail(link, detail)
+            self._save_detail(link, detail, task_id=task_id)
             return
         detail["label"] = list(desired)
         detail["label_events"] = list(result.events)
@@ -1538,16 +1554,25 @@ class Sync:
                 f"label {pr_id[:8]}: the superseded label could not be retracted"
                 f" ({result.error}); a reader may see both")
         log.info("ngit: PR %s labelled %s", pr_id[:8], ", ".join(desired))
-        self._save_detail(link, detail)
+        self._save_detail(link, detail, task_id=task_id)
 
-    def _review_state(self, link: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str]:
-        """The review task's status and verdict, and the tip the verdict was given for.
+    def _review_state(self, link: dict[str, Any],
+                      detail: dict[str, Any]) -> tuple[str, str, str]:
+        """The review task's status, its verdict, and its id.
 
         The verdict is the task's, not this module's: a reviewer writes it as a comment.
         `review_tip` is the tip the review started from, so a verdict recorded after a
         revision speaks for the revision the reviewer actually read.
+
+        A newer review task starts a new round: the anchors the previous round recorded --
+        its verdict, its comment, the tip it covered -- say nothing about the new card, and
+        keeping them would pin a fresh review to a verdict it never gave. They are dropped,
+        and this round's own verdict re-anchors the label when it lands.
         """
-        task_id = str(link.get("task_id") or "")
+        task_id = self._review_anchor(link)
+        if task_id and task_id != str(link.get("task_id") or ""):
+            for previous in ("verdict", "verdict_comment", "verdict_tip", "review_tip"):
+                detail.pop(previous, None)
         task = self.board.task(task_id) if task_id else None
         status = str(task.get("status") or "") if task else ""
         stated, comment_id = ("", 0)
@@ -1578,14 +1603,24 @@ class Sync:
             # The revision that superseded this verdict is the one the next review reads,
             # so the anchor that belongs to the old one must not outlive it.
             detail.pop("review_tip", None)
-        return status, verdict
+        return status, verdict, task_id
 
-    def _save_detail(self, link: dict[str, Any], detail: dict[str, Any]) -> None:
-        """Write the link's detail only when it changed: a poll with no news writes nothing."""
-        if json.dumps(detail, sort_keys=True) == json.dumps(_detail(link), sort_keys=True):
+    def _save_detail(self, link: dict[str, Any], detail: dict[str, Any], *,
+                     task_id: str = "") -> None:
+        """Write the link's note, and the task it anchors to, when either changed.
+
+        A poll with no news writes nothing. The task id is written when the anchor moved: a
+        review card the bridge did not make becomes the PR's review task as soon as a label
+        pass has read it, so the row names the task whose verdict is in force -- and the one
+        a merge completes.
+        """
+        repoint = bool(task_id) and task_id != str(link.get("task_id") or "")
+        if not repoint and (json.dumps(detail, sort_keys=True)
+                            == json.dumps(_detail(link), sort_keys=True)):
             return
         self.store.ngit_link_save(self.target.key, KIND_PR, str(link.get("source_id") or ""),
-                                  state=str(link.get("state") or "pending"), detail=detail)
+                                  state=str(link.get("state") or "pending"),
+                                  task_id=task_id or None, detail=detail)
 
     def _since(self, override: int | None) -> int:
         """Where this poll starts reading.

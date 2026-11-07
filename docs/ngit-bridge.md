@@ -287,14 +287,19 @@ the PR rather than only in a task comment. Five words, one namespace:
 | `changes-requested` | the verdict asked for changes |
 | `stale` | a revision (`kind 1619`) landed after an approval, so the approval no longer covers the tip |
 
-The state is **not** kept in the bridge: it is read from the review task the bridge already
-made — its status, and the verdict line in its comments (`Verdict: approved` or
-`Verdict: changes-requested`, which the task brief asks for) — plus the PR's tip. The link row
-remembers only what was last published, so a poll publishes on change and a quiet poll
-publishes nothing. A merge leaves the last verdict in place: it is the verdict the merge was
-decided on, and a `stale`-free `approved` on a merged PR is the record of that. A revision
-after an approval gives `review-required` **and** `stale`; after a `changes-requested` it is
-`review-required` alone, because nothing was ever approved.
+The state is **not** kept in the bridge: it is read from the review task that speaks for the
+PR — the **newest** one on the board: its status, and the verdict line in its comments
+(`Verdict: approved` or `Verdict: changes-requested`, which the task brief asks for) — plus
+the PR's tip. Newest matters because a revision is reviewed on a later card: the bridge makes
+one review task per PR, and a re-review is queued as a second card in the same shape (a title
+of `Review PR <first 8>: …` and the PR's event id in the body), so reading only the first
+card would leave the first verdict in force for ever. The card whose verdict is in force is
+the one the link names, which is the task a merge completes. The link row remembers only what
+was last published, so a poll publishes on change and a quiet poll publishes nothing. A merge
+leaves the last verdict in place: it is the verdict the merge was decided on, and a
+`stale`-free `approved` on a merged PR is the record of that. A revision after an approval
+gives `review-required` **and** `stale`; after a `changes-requested` it is `review-required`
+alone, because nothing was ever approved.
 
 Two things about the format were measured against ngit 3.0.5 and decide how it is published:
 

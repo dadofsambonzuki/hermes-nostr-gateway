@@ -1389,6 +1389,23 @@ def test_a_merge_leaves_the_last_verdict_in_place_and_closes_the_task(harness):
     assert label_detail(harness, pr.id)["label"] == ["approved"]
 
 
+def test_a_merge_closes_the_review_task_whose_verdict_is_in_force(harness):
+    """The merge closes the newest review card, not the first one the link was made with."""
+    pr, first = pr_with_review_task(harness)
+    harness.board.comment(first, "review", "Verdict: changes-requested")
+    set_review_status(harness, first, "done")
+    harness.sync()
+
+    second = hand_queued_review_task(harness, pr)
+    set_review_status(harness, second, "running")
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=3000)
+    harness.prs_data = ([pr], [merge])
+    harness.sync()
+
+    assert harness.task(second)["status"] == "done"
+    assert "merged as" in harness.comments(second)[-1]["body"]
+
+
 def test_a_label_that_could_not_be_published_is_retried_not_believed(home, store):
     failures = {"left": 1}
 
@@ -1523,7 +1540,9 @@ def test_a_late_review_task_does_not_drop_the_label_state(harness):
     harness.sync()
     assert label_detail(harness, pr.id)["label"] == ["review-required"]
     # Now the state a link from before review tasks existed is in: signalled, no task,
-    # and a recorded failure to make one.
+    # and a recorded failure to make one. `ngit_link_save` keeps a task id it is not given
+    # (`COALESCE`), so the row is cut back by hand -- otherwise `_late_review_task` returns
+    # on the id the previous poll wrote and the merge is never exercised.
     link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)
     detail = label_detail(harness, pr.id)
     detail["task_error"] = "database is locked"
@@ -1531,14 +1550,68 @@ def test_a_late_review_task_does_not_drop_the_label_state(harness):
                                  board=BOARD, detail=detail)
     harness.board.db.execute("UPDATE tasks SET idempotency_key = NULL WHERE id = ?",
                              (link["task_id"],))
+    harness.store.db.execute(
+        "UPDATE ngit_links SET task_id = NULL WHERE repo = ? AND kind = ? AND source_id = ?",
+        (ADDRESS, ngit.KIND_PR, pr.id))
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"] is None
 
     harness.prs_data = ([pr], [])
     harness.sync()
 
     after = label_detail(harness, pr.id)
+    late = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"]
+    assert late and late != link["task_id"]
     assert after["label"] == ["review-required"]
     assert after["label_events"] == detail["label_events"]
     assert harness.task(link["task_id"]) is not None
+
+
+def hand_queued_review_task(harness, pr, *, subject: str = "re-review") -> str:
+    """A review card the bridge did not make: what a reviewer queues for a revision."""
+    return harness.board.create(
+        title=f"Review PR {pr.id[:8]}: {subject}",
+        body=f"Re-review of PR `{pr.id}`: review the tip, then report a verdict.",
+        assignee="review", status="ready", created_by="holly")
+
+
+def test_a_re_review_task_moves_the_label_and_the_anchor(harness):
+    """The newest review's verdict is the one in force, not the first round's."""
+    pr, first = pr_with_review_task(harness)
+    harness.board.comment(first, "review", "Verdict: approved")
+    set_review_status(harness, first, "done")
+    harness.sync()
+    approved = tuple(label_detail(harness, pr.id)["label_events"])
+    assert label_detail(harness, pr.id)["label"] == ["approved"]
+
+    # The revision is re-reviewed on a card the bridge never made, and asks for changes.
+    second = hand_queued_review_task(harness, pr)
+    harness.board.comment(second, "review", "Verdict: changes-requested")
+    set_review_status(harness, second, "done")
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("changes-requested",), approved)
+    assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
+    # The link names the task whose verdict is in force, so a merge closes that one.
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["task_id"] == second
+    assert report.prs["labels"] == 1
+
+
+def test_a_running_re_review_reads_in_review_not_the_verdict_it_replaces(harness):
+    """A new review round has no verdict yet: the round before it must not speak for it."""
+    pr, first = pr_with_review_task(harness)
+    harness.board.comment(first, "review", "Verdict: changes-requested")
+    set_review_status(harness, first, "done")
+    harness.sync()
+    assert label_detail(harness, pr.id)["label"] == ["changes-requested"]
+
+    second = hand_queued_review_task(harness, pr)
+    set_review_status(harness, second, "running")
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    assert harness.label_calls[-1][2] == ("in-review",)
+    assert label_detail(harness, pr.id)["label"] == ["in-review"]
 
 
 def test_the_label_vocabulary_is_a_config_default():

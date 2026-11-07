@@ -120,6 +120,31 @@ class Board:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def review_task(self, pr_id: str) -> Optional[dict[str, Any]]:
+        """The newest task on this board that reviews this PR, or None.
+
+        Two things identify one. The bridge's own tasks carry `ngit:pr:<event id>` (and a
+        per-tip key would extend it), which is exact. A re-review card made by hand is not
+        the bridge's to key, so it is recognised by the shape the review brief gives it: a
+        title of `Review PR <first 8>: ...` and the PR's event id somewhere in the body,
+        which is the one line the brief cannot leave out.
+
+        Newest first, because a verdict covers the revision it was given for: a later card
+        is a later review of the same PR, and its verdict is the one in force.
+        """
+        pr_id = str(pr_id or "")
+        if not pr_id:
+            return None
+        row = self.db.execute(
+            "SELECT * FROM tasks WHERE status != 'archived'"
+            " AND (idempotency_key = ? OR idempotency_key LIKE ?"
+            "      OR (title LIKE ? AND body LIKE ?))"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%",
+             f"Review PR {pr_id[:8]}:%", f"%{pr_id}%"),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def comments(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
