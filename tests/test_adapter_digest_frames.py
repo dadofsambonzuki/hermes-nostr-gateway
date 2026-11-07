@@ -134,7 +134,10 @@ def test_without_a_home_channel_the_digest_is_left_unacked(monkeypatch):
     monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
     inst = _bare_adapter()
 
-    asyncio.run(inst._deliver(_digest_frame()))
+    held = asyncio.run(inst._deliver(_digest_frame()))
 
     assert inst.delivered == []
     assert inst.acked == [], "an undelivered batch must not be acked as if Hermes had it"
+    assert held == adapter._HELD_DIGEST, (
+        "an unacked batch has to be reported to the reader, or it is parked on a live socket"
+    )

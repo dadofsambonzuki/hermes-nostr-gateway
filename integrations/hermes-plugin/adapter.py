@@ -240,6 +240,38 @@ class FrameOutcome(str, Enum):
     RETRY = "retry"
     SKIP = "skip"
 
+# Why a frame was left unacknowledged on purpose. `_deliver` returns one of these — an empty
+# value means the frame is settled: delivered and acked, or dropped and acked as final. Both
+# frames below were handled as far as they can go and consumed nothing, so the only honest
+# answer is to leave them pending. Neither may be acked: an ack claims Hermes took the message,
+# and nothing did. A hold is read past exactly like a skipped frame — the frames behind it in
+# the same replay batch are still answered — and the connection is replaced once that batch is
+# finished, because `subscribe` is the only op that re-offers an unacked frame. Reading on and
+# reconnecting at the first held frame is what starves the batch: `replay_pending` is
+# oldest-first, so the held frame would be at the head of every replay.
+_HELD_ROUTE = "route_unresolved"
+_HELD_DIGEST = "no_home_channel"
+
+#: The `blocked` reasons whose row the daemon will offer again. A route or profile refusal is a
+#: condition, not a verdict about the sender: the key can be exported, the channel held again,
+#: the profile recreated, and `Store.pending_immediate` keeps the row replayable until it is
+#: delivered — a row carries a `blocked_reason` only when the *policy* refused it, and the replay
+#: query excludes exactly those. So the frame is held like a route this process cannot honour.
+#: Every other reason is that policy decision (and a `drop` reach): its row is never replayed, so
+#: a hold would cost a reconnect per backoff and could never be answered — those stay settled.
+_REPLAYABLE_BLOCK_REASONS = frozenset({
+    "route_key_missing", "route_unresolved", "route_invalid",
+    "profile_unknown", "profile_invalid",
+})
+
+#: How long a subscription may stay quiet after it held a frame before the batch the daemon
+#: wrote at `subscribe` is treated as finished and the connection is replaced. The whole replay
+#: is written by `SocketServer._handle` before the reader is handed any of it, so a quiet read
+#: means the batch is over. It is a heuristic, not a guarantee: a frame that turns up later than
+#: this wait only costs a reconnect, never a frame — the held frame is still pending and the next
+#: `subscribe` offers both. It is paid at most once per subscription, and only after a hold.
+_HELD_BATCH_SECONDS = 0.5
+
 
 # Hermes emits turn-control notices through the platform send path: an empty turn's
 # placeholder, interrupt notices, provider-retry notices, the home-channel prompt, the
@@ -960,13 +992,34 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                     backoff = 1.0
                 retrying = False
                 logger.info("nostr gateway subscribed at %s", self._socket)
-                async for raw in reader:
+                holds: list[str] = []
+                while True:
+                    try:
+                        # A held frame has to be re-offered, and `subscribe` is the only op
+                        # that re-offers one, so this connection has to be replaced — but not
+                        # before the frames the daemon already wrote to it are answered.
+                        # `SocketServer` writes the whole replay before the reader is handed
+                        # any of it, so everything behind a held frame is already buffered and
+                        # a read that has to wait is the end of the batch: the moment a
+                        # reconnect costs nothing. With nothing held, the read waits as before.
+                        raw = await asyncio.wait_for(
+                            reader.readline(), _HELD_BATCH_SECONDS if holds else None)
+                    except TimeoutError:
+                        # Nothing is left on this subscription: replace it, so `subscribe`
+                        # offers the held frames again on the same growing backoff.
+                        logger.info("nostr gateway resubscribing so %d held frame(s) are "
+                                    "replayed (%s)", len(holds), ", ".join(holds))
+                        pending = True
+                        break
+                    if not raw:
+                        break
                     try:
                         frame = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+                    held = ""
                     try:
-                        await self._frame(frame)
+                        held = await self._frame(frame) or ""
                     except Exception as exc:  # noqa: BLE001 - one frame must not kill the loop
                         outcome = await self._frame_failed(frame, exc)
                         if outcome is FrameOutcome.RETRY:
@@ -981,12 +1034,20 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                         # A skipped frame leaves the subscription healthy: reading on is what
                         # delivers the frames queued behind it instead of letting the one
                         # frame that cannot succeed hold them until the replay window ends.
-                    else:
-                        # The connection is carrying frames, so the next reconnect starts
-                        # from the bottom of the backoff rather than from wherever a
-                        # condition left it.
-                        backoff = 1.0
-                        retrying = False
+                        continue
+                    if held:
+                        # Nothing consumed it, so it is never acked — but it must not cost the
+                        # frames behind it either. Record it and read on; the end of the batch
+                        # is where the connection is replaced, so `subscribe` offers it again.
+                        holds.append(held)
+                        logger.warning("nostr gateway holding frame %s for the replay (%s); "
+                                       "reading on to the frames behind it",
+                                       str(frame.get("id") or "")[:12] or "(no id)", held)
+                        continue
+                    # The connection is carrying frames, so the next reconnect starts from
+                    # the bottom of the backoff rather than from wherever a condition left it.
+                    backoff = 1.0
+                    retrying = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect, never crash the platform
@@ -1008,22 +1069,36 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
-    async def _frame(self, frame: dict[str, Any]) -> None:
-        """Route one subscribed frame. Separate from the loop so a failure is catchable."""
+    async def _frame(self, frame: dict[str, Any]) -> Optional[str]:
+        """Route one subscribed frame. Separate from the loop so a failure is catchable.
+
+        Returns why the frame is being left for the replay, or None when it is settled. A
+        held frame was deliberately not acked: the reader reads on past it so the frames
+        behind it are still answered, and replaces the connection once the batch is finished,
+        which is what makes `subscribe` offer it again.
+        """
         if frame.get("type") == "reaction":
             # A reaction is a decision on a prompt, never chat (see §approval
             # reactions): handle it before anything can turn it into a run.
             await self._deliver_reaction(frame, frame.get("id") or "")
         elif frame.get("type") == "message":
-            await self._deliver(frame)
+            return await self._deliver(frame)
         elif frame.get("type") == "blocked":
             # Warnings, never user-visible chat (spec §11.6). A blocked
             # frame has no content and must never become an agent run.
+            reason = str(frame.get("reason") or "")
             detail = str(frame.get("detail") or "").strip()
             logger.warning("nostr blocked %s… (%s)%s",
                            (frame.get("from") or "")[:12],
-                           frame.get("reason") or "unknown",
+                           reason or "unknown",
                            f": {detail}" if detail else "")
+            if reason in _REPLAYABLE_BLOCK_REASONS:
+                # The daemon refused the turn, not the message: nothing here can decide it, and
+                # the row is still replayable, so it is held rather than settled. An ack would
+                # claim Hermes took a message it never saw, and settling it parks the row until
+                # something unrelated disconnects — `subscribe` is the only op that re-offers it.
+                return _HELD_ROUTE
+        return None
 
     async def _frame_failed(self, frame: dict[str, Any], exc: BaseException) -> FrameOutcome:
         """One frame's verdict, and what the subscription has to do next.
@@ -1090,16 +1165,24 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 delay *= 2
         return False
 
-    async def _deliver(self, frame: dict[str, Any]) -> None:
+    async def _deliver(self, frame: dict[str, Any]) -> Optional[str]:
+        """Deliver one inbound message, and say whether it was consumed.
+
+        None means settled: Hermes has it and acked, or it was dropped on purpose and acked
+        because the verdict is final. A hold reason (`_HELD_ROUTE`, `_HELD_DIGEST`) means the
+        frame was handled as far as it can go without consuming it, so it is left unacked and
+        the reader reads on past it — the batch behind it is still answered — and replaces the
+        connection once the batch is finished, so the daemon offers the hold again. Returning
+        quietly would park it until something unrelated disconnected.
+        """
         message_id = frame.get("id") or ""
         if is_reaction_frame(frame):
             # A kind-7 rumor rides the NIP-17 plane's ordinary message frame, but it is an
             # answer to a prompt, not something a person said: it must never start a turn.
             await self._deliver_reaction(frame, message_id)
-            return
+            return None
         if is_digest_frame(frame):
-            await self._deliver_digest(frame, message_id)
-            return
+            return await self._deliver_digest(frame, message_id)
         sender = frame.get("sender") or ""
         conversation = frame.get("conversation") or sender
         if sender:
@@ -1141,11 +1224,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             return
         # Where this turn is meant to run, before anything is downloaded for it: a route that
         # cannot be honoured is not a turn, and an unacknowledged frame is offered again once
-        # the key is there (`hng route` says which rule and which variable).
+        # the key is there (`hng route` says which rule and which variable). Held, not parked:
+        # the reader reads on past it and replaces the connection once the batch is finished,
+        # so the daemon offers it again without waiting for an unrelated disconnect, and
+        # nothing is acked — an ack claims Hermes took the message.
         route, refusal = route_for_turn(frame)
         if refusal:
             logger.error("nostr turn not run for %s: %s", _short(sender), refusal)
-            return
+            return _HELD_ROUTE
         if route:
             self._remember_route(conversation, route)
             logger.info("nostr turn for %s on %s", _short(sender), route_note(route))
@@ -1208,7 +1294,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # Ack only once Hermes has taken the message; a crash before this replays it.
         await self._ack(message_id)
 
-    async def _deliver_digest(self, frame: dict[str, Any], message_id: str) -> None:
+    async def _deliver_digest(self, frame: dict[str, Any], message_id: str) -> Optional[str]:
         """Deliver one digest batch into the owner's session, as data.
 
         A digest has no sender Hermes could authorise, so it is presented in the home
@@ -1216,6 +1302,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         may be sent to "digest". `role_authorized` is False unconditionally: batching
         drops per-item provenance, so no batch may carry instructions, whatever the frame
         claims. The gateway still owns the ack contract, so ack only after Hermes took it.
+
+        Returns `_HELD_DIGEST` when there is nowhere to put the batch: it is left unacked,
+        the reader reads on past it, and the connection is replaced once the batch is
+        finished — so a home channel configured later picks it up instead of the batch
+        waiting for an unrelated disconnect.
         """
         owner = self._home_chat()
         if not owner:
@@ -1224,7 +1315,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             logger.warning(
                 "nostr digest %s not delivered: no home channel is configured",
                 message_id or "(no id)")
-            return
+            return _HELD_DIGEST
         event = MessageEvent(
             text=frame.get("content") or "",
             message_type=MessageType.TEXT,

@@ -16,18 +16,31 @@ reconnect re-offers it ahead of everything else: one poisoned frame holds the wh
 it ages out of the replay window. So it is skipped — left pending, never acked, named in the log
 — and the reader carries on to the next frame.
 
+The fourth case is the other side of the third. A frame the adapter handled but consumed nothing
+(a route it cannot honour, a digest with no home channel) is held: never acked, but read past
+exactly like a skip — the frames behind it are still answered — and only once the batch the
+daemon wrote is finished is the connection replaced, so `subscribe` offers the hold again.
+Reconnecting at the held frame instead would put it at the head of every replay; that is the
+same starvation, and it is the shape the first review of this branch measured.
+
 All of it is driven through the real `_reader_loop` against the real `SocketServer`, because the
 defect is in the loop's control flow: a test that calls `_frame_failed` directly cannot see
 whether the subscription was reset or the next frame delivered.
 """
 
 import asyncio
+import json
+import time
 from collections import OrderedDict, deque
 
+import nostr_sdk as sdk
 import pytest
+import yaml
 
 from adapter_harness import load_adapter
+from hermes_nostr_gateway.gateway import Gateway
 from hermes_nostr_gateway.server import SocketServer
+from hermes_nostr_gateway.store import Inbound
 
 adapter = load_adapter("nostr_adapter_pending_replay")
 
@@ -90,6 +103,34 @@ class ConditionDaemon:
 def _frame(ident=MESSAGE_ID):
     return {"type": "message", "id": ident, "sender": "ab" * 32,
             "conversation": "ab" * 32, "content": "hello", "authority": "instructions"}
+
+
+ROUTE_KEY = "NOSTR_TEST_ROUTE_KEY"
+DIGEST_ID = "dd" * 32
+HOME_CHAT = "cd" * 32
+
+
+class ReplayDaemon(ConditionDaemon):
+    """`ConditionDaemon` whose re-offers can seed the world between two attempts.
+
+    The two frames below are held for something that can appear later (a route's key, a home
+    channel), so it has to be seeded *between* one offer and the next. Only the daemon can say
+    when a re-offer happened without the test sleeping on a guess: `replay_pending` runs
+    synchronously in the server's `subscribe` handler, so the frames it returns are the first
+    ones that can be honoured.
+    """
+
+    def __init__(self, *frames, on_replay=None):
+        super().__init__(*frames)
+        self.on_replay = on_replay
+        self.replays: list[int] = []
+
+    def replay_pending(self, limit=20):
+        replay = super().replay_pending(limit)
+        self.replays.append(self.subscriptions)
+        if self.on_replay is not None:
+            self.on_replay(self.subscriptions)
+        return replay
 
 
 def _reader_adapter(path):
@@ -302,3 +343,510 @@ async def test_a_verdict_acks_without_resetting_the_subscription(tmp_path):
     assert attempts == [MESSAGE_ID, SECOND_ID]
     assert daemon.acks == [MESSAGE_ID, SECOND_ID]
     assert daemon.subscriptions == 1, "a verdict must not cost a resubscribe"
+
+
+# ── frames held without an exception ────────────────────────────────────────
+# The branches below never raise, so `_frame_failed` is not in the picture: `_deliver` handles
+# the frame as far as it can go, consumes nothing and acks nothing. Left unacknowledged on a
+# live subscription the frame is offered again only by `subscribe`, so the adapter has to
+# reset the connection here too — the same signal, one path further along.
+
+
+def _routed_frame():
+    """A frame whose route names a key: the turn runs on it or not at all."""
+    return {**_frame(), "route": {"provider": "p3", "model": "model-b",
+                                  "key": ROUTE_KEY, "rule": "channel"}}
+
+
+def _digest_frame():
+    return {"type": "message", "plane": "digest", "id": DIGEST_ID, "sender": "digest",
+            "conversation": "digest", "content": "3 item(s) in the ops digest",
+            "rule": "ops", "frame": 7}
+
+
+async def test_a_frame_held_for_its_route_is_reoffered_and_delivered_once(tmp_path, monkeypatch):
+    """`route_key_missing` consumes nothing, so it has to cost a resubscribe — and only one ack."""
+    monkeypatch.delenv(ROUTE_KEY, raising=False)
+    acks_before_the_key = []
+
+    def export_key_on_reoffer(count):
+        if count == 2:
+            # What the daemon held when it re-offered the frame: nothing acked it, because
+            # nothing consumed it.
+            acks_before_the_key.append(list(daemon.acks))
+            monkeypatch.setenv(ROUTE_KEY, "route-value")
+
+    daemon = ReplayDaemon(_routed_frame(), on_replay=export_key_on_reoffer)
+    server = SocketServer(tmp_path / "r.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "r.sock")
+    delivered = []
+
+    async def handle_message(event):
+        delivered.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        # The ack is the observable end of the retry: it only exists if the held frame was
+        # offered again, taken this time, and retired.
+        await daemon.wait_settled(MESSAGE_ID)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert acks_before_the_key == [[]], "a route it cannot honour is a turn that does not happen"
+    assert delivered == [MESSAGE_ID], "the replayed turn had to run exactly once"
+    assert daemon.acks == [MESSAGE_ID], "the replayed frame must be acked once it is taken"
+    assert daemon.subscriptions == 2, (
+        "a held frame is only retried by a new subscription: the reader has to reset the "
+        "socket rather than read on"
+    )
+
+
+async def test_a_digest_with_no_home_channel_resubscribes_and_is_not_acked(tmp_path, monkeypatch):
+    """A batch with nowhere to go is held, not parked — and never acked as if Hermes had it."""
+    monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
+    acks_before_the_home = []
+
+    def set_home_on_reoffer(count):
+        if count == 2:
+            acks_before_the_home.append(list(daemon.acks))
+            monkeypatch.setenv("NOSTR_HOME_CHANNEL", HOME_CHAT)
+
+    daemon = ReplayDaemon(_digest_frame(), on_replay=set_home_on_reoffer)
+    server = SocketServer(tmp_path / "d.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "d.sock")
+    delivered = []
+
+    async def handle_message(event):
+        delivered.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await daemon.wait_settled(DIGEST_ID)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert acks_before_the_home == [[]], (
+        "an ack claims Hermes took the batch, and with no home channel nothing did"
+    )
+    assert delivered == [DIGEST_ID], "the batch had to reach its home channel exactly once"
+    assert daemon.acks == [DIGEST_ID]
+    assert daemon.subscriptions == 2, (
+        "the batch was held for a home channel, so the reader has to resubscribe to be "
+        "offered it again"
+    )
+
+
+async def test_a_digest_with_no_home_channel_keeps_being_offered(tmp_path, monkeypatch):
+    """Holding is not a one-shot: until a home channel exists the batch stays pending and unacked."""
+    monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
+    daemon = ReplayDaemon(_digest_frame())
+    server = SocketServer(tmp_path / "d2.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "d2.sock")
+    delivered = []
+
+    async def handle_message(event):
+        delivered.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while len(daemon.replays) < 3:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(
+                    f"the batch was offered {len(daemon.replays)} time(s) and then parked"
+                )
+            await asyncio.sleep(0.05)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert delivered == [], "no home channel means no destination, however many offers"
+    assert daemon.acks == [], "an unacked batch stays pending until it has somewhere to go"
+    assert [frame["id"] for frame in daemon.pending] == [DIGEST_ID]
+
+
+async def test_a_held_frame_backs_off_instead_of_being_retried_every_second(tmp_path, monkeypatch):
+    """A hold that lasts is a condition like any other: the wait between offers has to grow."""
+    monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
+    waits = []
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(adapter.asyncio, "sleep", no_wait)
+
+    inst = _reader_adapter(tmp_path / "b.sock")
+
+    def stop_after_four(count):
+        # Stop on the fourth offer, so the loop leaves by its own route instead of the test
+        # cancelling it mid-cycle: the delays recorded are then exactly the ones it slept.
+        if count == 4:
+            inst._closing = True
+
+    daemon = ReplayDaemon(_digest_frame(), on_replay=stop_after_four)
+    server = SocketServer(tmp_path / "b.sock", daemon)
+    await server.start()
+
+    async def handle_message(event):
+        raise AssertionError("a batch with no home channel must never be delivered")
+
+    inst.handle_message = handle_message
+    try:
+        await asyncio.wait_for(asyncio.create_task(inst._reader_loop()), 10)
+    finally:
+        await server.stop()
+
+    assert waits == [1.0, 2.0, 4.0], "a lasting hold must back off, not retry in a loop"
+    assert daemon.acks == []
+
+
+# ── a hold must not take the batch with it ──────────────────────────────────
+# The measured repro from the first review: two pending frames, the held one first and a plain
+# deliverable message behind it, `replay_pending` oldest-first. Replacing the connection at the
+# held frame re-offers that frame ahead of the message on every attempt, so the message is never
+# delivered. Both hold shapes this branch adds have to be read past, and both have to leave the
+# frame pending for the next offer.
+
+async def _until(condition, what, timeout=10):
+    """Wait for *condition*, failing at the deadline instead of hanging on the loop."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"{what} (waited {timeout}s)")
+        await asyncio.sleep(0.05)
+
+
+#: The two ways this adapter holds a frame without raising: a route whose key it cannot read (the
+#: gateway resolved the route, this process is the one that has to hold the credential), and a
+#: digest batch with no home channel to put it in.
+_HOLD_SHAPES = {
+    "route": (_routed_frame, MESSAGE_ID, adapter._HELD_ROUTE),
+    "digest": (_digest_frame, DIGEST_ID, adapter._HELD_DIGEST),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HOLD_SHAPES))
+async def test_a_held_frame_does_not_stall_the_frames_behind_it(
+        tmp_path, monkeypatch, caplog, shape):
+    """Held first, deliverable second: the second is delivered, the first stays unacked.
+
+    The blocked path was the loop leaving at the first held frame, which closed a socket the
+    daemon had already written the whole replay to. So the batch behind it was discarded, and
+    the next subscription re-offered the same held frame first. A hold is read past like a
+    skipped frame; the connection is replaced when the batch is finished, where the hold is
+    offered again and is still pending.
+    """
+    held_frame, held_id, reason = _HOLD_SHAPES[shape]
+    # Neither shape has what it needs: no credential for the route, no home for the digest.
+    monkeypatch.delenv(ROUTE_KEY, raising=False)
+    monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
+
+    daemon = ReplayDaemon(held_frame(), _frame(SECOND_ID))
+    sock = tmp_path / f"held-batch-{shape}.sock"
+    server = SocketServer(sock, daemon)
+    await server.start()
+
+    inst = _reader_adapter(sock)
+    handled, at_subscription = [], []
+
+    async def handle_message(event):
+        handled.append(event.message_id)
+        # Which subscription this frame was answered on: the held frame's own, or a replay?
+        at_subscription.append(daemon.subscriptions)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await daemon.wait_settled(SECOND_ID)
+        await _until(lambda: len(daemon.replays) >= 2,
+                     f"the {shape} hold was never offered again on a later subscription")
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    assert handled == [SECOND_ID], "the frame behind the held one was never delivered"
+    assert at_subscription == [1], (
+        "the frame behind a hold has to be answered on the subscription that held it: a "
+        "reconnect first re-offers the held frame, ahead of everything behind it"
+    )
+    assert daemon.acks == [SECOND_ID], "only the frame Hermes took may be acked"
+    assert [frame["id"] for frame in daemon.pending] == [held_id], (
+        "a held frame is never acked and never lost: it stays pending for the next offer"
+    )
+    assert "holding frame" in caplog.text and held_id[:12] in caplog.text \
+        and reason in caplog.text, "the hold has to be named in the log with its reason"
+
+
+# ── the daemon's own `blocked` frame ────────────────────────────────────────
+# The hold shapes above are frames the adapter decides on. The daemon has a third one: a route
+# or profile it could not resolve arrives as `{"type": "blocked", "reason": …}`, whose row it
+# keeps offering on every `subscribe` (only a *policy* block writes `blocked_reason`, and
+# `pending_immediate` excludes exactly those). Settling that frame is the same park the hold
+# branch exists to prevent, so it is driven here through the real `Gateway` and `Store` rather
+# than a hand-written frame: the reason strings, the `rumor_id` field and the replay are the
+# daemon's own, and a test double could agree with itself about a shape it never sends.
+
+PEER_HEX = "ab" * 32
+ROUTE_KEY = "NOSTR_TEST_ROUTE_KEY"
+
+
+def _gateway(tmp_path, routing=None, *, profiles=None, hermes_config=None) -> Gateway:
+    """A real `Gateway` with an empty policy, for its frames and its store's replay."""
+    secret = tmp_path / "identity.json"
+    secret.write_text(json.dumps(
+        {"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()}))
+    config = {
+        "identity": {"secret_file": str(secret)},
+        "relays": {"read": [], "publish": []},
+        "store": str(tmp_path / "gateway.db"),
+        "socket": str(tmp_path / "gateway.sock"),
+        "groups": {}, "policies": [], "defaults": {},
+        "marmot": {"enabled": False, "hermes_platform": False},
+    }
+    if routing is not None:
+        config["routing"] = routing
+    if profiles is not None:
+        config["profiles"] = profiles
+        config["hermes_config"] = hermes_config
+    return Gateway(config, socket_path=tmp_path / "gateway.sock")
+
+
+def _inbound(ident, conversation, plane, content, *, reach="immediate",
+             blocked_reason=None) -> Inbound:
+    return Inbound(id=ident, wrapper_id="w" * 64, sender=PEER_HEX, kind=14,
+                   created_at=int(time.time()), content=content,
+                   conversation=conversation, reply_to=None, plane=plane,
+                   reach=reach, authority="instructions", rule="r", why="w",
+                   blocked_reason=blocked_reason)
+
+
+class GatewayDaemon:
+    """The socket's `subscribe`/`ack` contract, answered by the real `Gateway`.
+
+    Nothing here restates the daemon's rules: a subscription gets `Gateway.replay_pending`'s
+    own frames and an ack is `Gateway.ack`, so the test cannot pass on a shape the daemon does
+    not send.
+    """
+
+    def __init__(self, gateway, *, on_replay=None):
+        self.gateway = gateway
+        self.on_replay = on_replay
+        self.subscriptions = 0
+        self.replays: list[int] = []
+        self.acks: list[str] = []
+
+    def replay_pending(self, limit=20):
+        self.subscriptions += 1
+        self.replays.append(self.subscriptions)
+        if self.on_replay is not None:
+            self.on_replay(self.subscriptions)
+        return self.gateway.replay_pending()
+
+    def ack(self, ids=None, *, rule=None, frame=None):
+        ids = list(ids or [])
+        self.acks.extend(ids)
+        return self.gateway.ack(ids)
+
+    async def status(self):
+        return {}
+
+
+#: One plane rule whose credential this process cannot read: a DM on `nip17` is refused by the
+#: daemon, while everything on another plane still takes the default route.
+_MISSING_KEY_ROUTING = {
+    "models": ["model-a"],
+    "default": {"provider": "p1", "model": "model-a", "key": "GATEWAY_KEY"},
+    "planes": {"nip17": {"provider": "p2", "model": "model-a", "key": ROUTE_KEY}},
+}
+
+
+async def test_a_blocked_route_refusal_is_held_and_the_message_behind_it_is_delivered(
+        tmp_path, monkeypatch, caplog):
+    """Held first, deliverable second, with the daemon's own refusal frames.
+
+    `Gateway.frame_for`/`replay_pending` answer a route they cannot honour with
+    `{"type": "blocked", "reason": "route_key_missing"}`, and the row stays in
+    `pending_immediate`. Settled, that frame parks the row until something unrelated
+    disconnects; held, the message behind it is still delivered on the same subscription and
+    the refused row comes back as a `message` frame once the key exists.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
+    monkeypatch.delenv(ROUTE_KEY, raising=False)
+
+    gateway = _gateway(tmp_path, _MISSING_KEY_ROUTING)
+    held_id, behind_id = "a1" * 32, "b2" * 32
+    gateway.store.add(_inbound(held_id, PEER_HEX, "nip17", "held route"))
+    gateway.store.add(_inbound(behind_id, "marmot:group", "marmot", "deliverable"))
+    try:
+        # The daemon's half first: this is its refusal shape, and its row is replayable.
+        offered = gateway.replay_pending()
+        assert [item["type"] for item in offered] == ["blocked", "message"]
+        assert offered[0]["reason"] == "route_key_missing"
+        assert offered[0]["rumor_id"] == held_id, "a blocked frame names its row `rumor_id`"
+        assert held_id in [row["id"] for row in gateway.store.pending_immediate()], (
+            "a route refusal is not a policy block: the daemon keeps offering the row"
+        )
+
+        acks_at_the_second_offer = []
+
+        def export_key_on_reoffer(count):
+            if count == 2:
+                acks_at_the_second_offer.append(list(daemon.acks))
+                monkeypatch.setenv(ROUTE_KEY, "route-value")
+
+        daemon = GatewayDaemon(gateway, on_replay=export_key_on_reoffer)
+        sock = tmp_path / "blocked.sock"
+        server = SocketServer(sock, daemon)
+        await server.start()
+
+        inst = _reader_adapter(sock)
+        handled, at_subscription = [], []
+
+        async def handle_message(event):
+            handled.append(event.message_id)
+            at_subscription.append(daemon.subscriptions)
+
+        inst.handle_message = handle_message
+        task = asyncio.create_task(inst._reader_loop())
+        try:
+            await _until(lambda: held_id in daemon.acks,
+                         "the refused frame was never delivered once the key existed")
+        finally:
+            inst._closing = True
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await server.stop()
+    finally:
+        gateway.store.close()
+
+    assert acks_at_the_second_offer == [[behind_id]], (
+        "the refusal is not a delivery: while it was blocked nothing may be acked for it"
+    )
+    assert handled == [behind_id, held_id], (
+        "the message behind the refusal has to be delivered, and the refusal exactly once"
+    )
+    assert at_subscription == [1, 2], (
+        "the message behind the hold is answered on the subscription that held it; the held "
+        "frame only comes back on the next one"
+    )
+    assert daemon.acks == [behind_id, held_id]
+    assert gateway.store.pending_immediate() == [], "nothing is left pending once both land"
+    assert "route_key_missing" in caplog.text and "holding frame" in caplog.text, (
+        "the refusal and the hold have to be named in the log"
+    )
+
+
+async def test_a_policy_block_is_settled_because_its_row_is_never_replayed(tmp_path, monkeypatch):
+    """The other side of the boundary: a policy refusal has no replay behind it.
+
+    `not_allowlisted` is a `drop` and `rate_limited` writes `blocked_reason`; both are what
+    `pending_immediate` excludes. A hold could never be answered — every reconnect would pay
+    the backoff for a frame the next `subscribe` cannot offer — so the adapter settles it.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    gateway = _gateway(tmp_path)
+    try:
+        dropped = gateway.frame_for(_inbound("c3" * 32, PEER_HEX, "nip17", "stranger",
+                                             reach="drop"))
+        limited = gateway.frame_for(_inbound("d4" * 32, PEER_HEX, "nip17", "flood",
+                                             reach="drop", blocked_reason="rate_limited"))
+
+        assert (dropped["type"], dropped["reason"]) == ("blocked", "not_allowlisted")
+        assert (limited["type"], limited["reason"]) == ("blocked", "rate_limited")
+        assert gateway.store.pending_immediate() == [], (
+            "a policy refusal is not replayable: the hold branch must not apply to it"
+        )
+
+        inst = _reader_adapter("/nonexistent")
+        assert await inst._frame(dropped) is None, "a dropped sender is settled, not held"
+        assert await inst._frame(limited) is None, "a rate-limited sender is settled, not held"
+    finally:
+        gateway.store.close()
+
+
+COMMUNITY = "c0" * 32
+CHANNEL = "11" * 32
+
+
+def _refused_channel_route(tmp_path):
+    """A channel rule for a room this gateway does not hold: the daemon's `route_unresolved`."""
+    routing = {
+        "models": ["model-a"],
+        "default": {"provider": "p1", "model": "model-a", "key": "GATEWAY_KEY"},
+        "channels": [{"community": COMMUNITY, "channel": CHANNEL, "provider": "p3",
+                      "model": "model-a", "key": "GATEWAY_KEY"}],
+    }
+    gateway = _gateway(tmp_path, routing)
+    gateway.concord.refreshed = True  # a refresh that found nothing: the room is gone
+    gateway.store.add(_inbound("e5" * 32, f"concord:{COMMUNITY}:{CHANNEL}", "concord", "hello"))
+    return gateway
+
+
+def _refused_profile(tmp_path):
+    """A profile deleted after the daemon loaded it: the daemon's `profile_unknown`."""
+    home = tmp_path / "hermes"
+    (home / "profiles" / "ops").mkdir(parents=True)
+    (home / "profiles" / "ops" / ".env").write_text("A=1\n")
+    (home / "config.yaml").write_text(yaml.safe_dump({"gateway": {"multiplex_profiles": True}}))
+    gateway = _gateway(tmp_path, profiles={"default": "default", "planes": {"marmot": "ops"}},
+                       hermes_config=str(home / "config.yaml"))
+    gateway.store.add(_inbound("e5" * 32, "marmot:group", "marmot", "hello"))
+    (home / "profiles" / "ops" / ".env").unlink()
+    return gateway
+
+
+#: The refusals that are a condition on the daemon's side: the row stays replayable, so the
+#: adapter has to ask again rather than settle the frame.
+_DAEMON_REFUSALS = {"route_unresolved": _refused_channel_route,
+                    "profile_unknown": _refused_profile}
+
+
+@pytest.mark.parametrize("reason", sorted(_DAEMON_REFUSALS))
+async def test_a_blocked_refusal_whose_row_is_replayable_is_held(tmp_path, monkeypatch, reason):
+    """`route_unresolved` and `profile_unknown` are conditions, not verdicts about the message.
+
+    The daemon refuses the turn rather than running it somewhere nobody chose, and keeps the
+    row pending so it runs once the room or the profile is back. The adapter has to hold the
+    frame: settling it parks the row until something unrelated disconnects, because `subscribe`
+    is the only op that offers a pending row again.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
+    gateway = _DAEMON_REFUSALS[reason](tmp_path)
+    try:
+        (refused,) = gateway.replay_pending()
+        assert (refused["type"], refused["reason"]) == ("blocked", reason)
+        assert gateway.store.pending_immediate(), "the row is kept for when the condition lifts"
+
+        inst = _reader_adapter("/nonexistent")
+        assert await inst._frame(refused) == adapter._HELD_ROUTE, (
+            "an ack would claim Hermes took a message it never saw"
+        )
+    finally:
+        gateway.store.close()
+
