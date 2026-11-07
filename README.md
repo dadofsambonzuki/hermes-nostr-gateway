@@ -119,7 +119,7 @@ supplies the checkout and the board:
 | event | becomes |
 |---|---|
 | kind-1621 issue | a task on the channel's board |
-| kind-1622 comment | a comment on that task, in `created_at` order, once |
+| kind-1111 comment | a comment on that task, in `created_at` order, once |
 | kind-1618 PR | one notice in the channel, and one review task on the board |
 | kind-1631 applied | a `merged as <commit>` follow-up; it completes the review task |
 
@@ -143,7 +143,9 @@ deferred, so a backlog is carried, not stepped over.
 recovery path.
 
 The ten-minute pass is the floor, not the whole story: `hng serve` also **watches** the mapped
-repositories — a `#a` subscription for kinds 1621/1622/1618/1619/1631, nothing else — and wakes
+repositories — a `#a` subscription for kinds 1621/1618/1619/1631, plus a `#K` one for the NIP-22
+kind-1111 comments (`ngit` publishes comments without an `a` tag, so they can never match the
+first filter), nothing else — and wakes
 `hng ngit sync` when something changes, coalescing a channel's events for 30 seconds and running
 one pass per channel at a time. It is an accelerator, never a second decision-maker: the watcher
 writes no cursor, no task and no notice, and the pass still reads the repository and decides. The

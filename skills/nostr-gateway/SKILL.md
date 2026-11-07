@@ -93,9 +93,10 @@ manual — run `ngit skill install` for the rest.
   PR already exists, not that the push failed.
 - **`ngit pr checkout <id-or-nevent>`** gets a PR whose branch is not on the remote: the
   patches ride on the PR event itself. `git fetch` will not find it.
-- **`ngit issue comment` takes issues only** and refuses a PR. Do not fake a kind-1622 by hand
-  and assume it lands: a hand-published `e`/`a`/`p` comment is accepted by the relay and still
-  does not appear in `ngit pr view --comments`.
+- **`ngit issue comment` takes issues only** and refuses a PR (`ngit pr comment` is the PR
+  form). Both publish NIP-22 **kind 1111** on 3.0.5 — never 1622, which no ngit release wrote.
+  Do not fake one by hand and assume it lands: a hand-published comment is accepted by the
+  relay and still does not appear in `ngit pr view --comments`.
 - **A proposal a rebase orphaned is closed with a status event, not a deletion.** Merging a
   rebased branch leaves the PR's original commits outside the target, so it reads `open` with its
   content already in `master`; a kind-5 deletion is refused (*authored by another pubkey*). Publish

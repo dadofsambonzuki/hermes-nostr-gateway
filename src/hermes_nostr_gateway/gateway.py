@@ -24,6 +24,8 @@ from .health import (
 )
 from .media import MediaConfig, MediaError, media_config, resolve_attachment
 from .ngit_watch import (
+    COMMENT_KINDS,
+    COMMENT_ROOT_KINDS,
     WATCH_KINDS,
     WATCH_SINCE_DAYS,
     NgitWatchConfig,
@@ -510,8 +512,8 @@ class Gateway:
 
     def _new_worker(self, relay: str, *, kinds: tuple[int, ...],
                     p_tag: str | None = None, authors: tuple[str, ...] = (),
-                    a_tags: tuple[str, ...] = (), purpose: str = "dm",
-                    since_days: int = 3) -> PoolWorker:
+                    a_tags: tuple[str, ...] = (), root_kinds: tuple[str, ...] = (),
+                    purpose: str = "dm", since_days: int = 3) -> PoolWorker:
         """Build a read worker: one relay's subscription set on the shared client.
 
         `PoolWorker` is the only read transport now. Its counters and `live_state()` are
@@ -519,8 +521,9 @@ class Gateway:
         not branch on how the events arrive.
         """
         return PoolWorker(self.pool, relay, self.me, kinds=kinds, p_tag=p_tag,
-                          authors=authors, a_tags=a_tags, purpose=purpose,
-                          since_days=since_days, on_refusal=self._note_refusal)
+                          authors=authors, a_tags=a_tags, root_kinds=root_kinds,
+                          purpose=purpose, since_days=since_days,
+                          on_refusal=self._note_refusal)
 
     def _setup_marmot(self, cfg: dict[str, Any]) -> None:
         """Attach the Marmot proxy only when the operator opted in *and* wn-agent is there.
@@ -662,7 +665,8 @@ class Gateway:
         try:
             plan = await asyncio.wait_for(asyncio.to_thread(
                 watch_plan, self.cfg, self.projects, self.concord.channels(),
-                read_relays=tuple(self.relays_read)), timeout=120)
+                read_relays=tuple(self.relays_read),
+                known_roots=self.store.ngit_roots), timeout=120)
         except Exception as exc:  # noqa: BLE001 - the scheduled pass is still the floor
             log.warning("ngit watch: no watch plan (%s); the scheduled pass keeps the bridge "
                         "moving", exc)
@@ -687,12 +691,17 @@ class Gateway:
 
     def _attach_ngit_watch(self, addresses: tuple[str, ...],
                            handler: Any) -> list[PoolWorker]:
-        """One narrowed read worker per relay, for the mapped repositories' `#a` addresses.
+        """Narrowed read workers per relay: the repositories, and their comments.
 
         The watcher is an accelerator, so its workers are ordinary pool workers: same
         NIP-42, same reconnects, same counters in `status`/`health` -- only the filter and
         the handler differ. The handler is the watcher's own, so a repository event never
         falls through to the message planes.
+
+        Comments are a second subscription, not another kind in the first: ngit publishes
+        them as NIP-22 kind 1111, which carries no `a` tag, so a `#a` filter can never
+        match one. `#K` (the root's kind) is what narrows this one to comments on issues
+        and PRs; which repository that is, the watcher decides by the root event id.
         """
         watcher = self.ngit_watch
         relays = watcher.plan.relays if watcher is not None else ()
@@ -703,6 +712,13 @@ class Gateway:
             self.workers.append(worker)
             self._tasks.append(asyncio.create_task(self._guarded(worker, handler)))
             workers.append(worker)
+            comments = self._new_worker(relay, kinds=COMMENT_KINDS,
+                                        root_kinds=COMMENT_ROOT_KINDS,
+                                        purpose="ngit-comments",
+                                        since_days=WATCH_SINCE_DAYS)
+            self.workers.append(comments)
+            self._tasks.append(asyncio.create_task(self._guarded(comments, handler)))
+            workers.append(comments)
         return workers
 
     # -- invites: join on a trusted word, hold for a human ----------------

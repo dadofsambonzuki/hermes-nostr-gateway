@@ -140,15 +140,23 @@ is another event, an issue can be resolved or reopened later, and a merge is a k
 to be matched against the branch. Only the repository says what is true, and only
 `ngit issue list --json` and the checkout's refs say it. So the watcher subscribes, coalesces,
 and runs `hng ngit sync --channel <conversation>` as a child process: the same command the timer
-runs, with the same store, cursor and idempotency keys. It never opens the board or the outbox and never
-moves a cursor, so there is still exactly one writer to each.
+runs, with the same store, cursor and idempotency keys. It never writes the board, the outbox or
+the store and never moves a cursor, so there is still exactly one writer to each; the one thing
+it reads is the link table, for the issue and PR ids a comment can name.
 
 What it subscribes to:
 
-- kinds 1621 (issue), 1622 (comment), 1618 (PR), 1619 (PR revision) and 1631 (applied);
+- kinds 1621 (issue), 1618 (PR), 1619 (PR revision) and 1631 (applied), under
 - a `#a` filter naming only the mapped repositories — the `concord.projects` entries that declare
   a board, resolved through their checkout's own `ngit repo --json` address — never a kind on
-  its own and never the whole relay.
+  its own and never the whole relay;
+- and **separately**, kind 1111 comments under a `#K` filter — the root's kind, an issue or a
+  PR. A comment cannot ride in the first filter: `ngit issue comment` and `ngit pr comment`
+  publish NIP-22, whose event carries root `E`/`K`/`P`, parent `e`/`k`/`p` and **no `a` tag at
+  all**, so a `#a` subscription can never match one. Comments are attributed to a repository
+  locally, by that root id: the ids the pass has already linked (`ngit_links`) are read when
+  the plan is built, and an issue or PR event that arrives while listening teaches its own id.
+  A comment whose root is not known here wakes nothing and waits for the scheduled pass.
 
 1619 is in that list on purpose: a revised PR is a new 1619 event, and a watcher that ignored it
 would leave the review task's brief stale until the next scheduled pass.
@@ -203,8 +211,10 @@ Two operational notes:
   re-poll cannot create a second task for the same issue.
 - The issue id is a **dedupe key, not an identity**. A human may file a second task for the same
   issue; the bridge only refuses to duplicate its own.
-- A kind-1622 comment becomes a task comment, in `created_at` order, once (tracked per comment
-  id). A comment added later is appended; nothing is rewritten.
+- A NIP-22 kind-1111 comment becomes a task comment, in `created_at` order, once (tracked per
+  comment id). A comment added later is appended; nothing is rewritten. The kind is 1111
+  because that is what `ngit issue comment` and `ngit pr comment` publish on 3.0.5 — no ngit
+  release ever wrote 1622.
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming

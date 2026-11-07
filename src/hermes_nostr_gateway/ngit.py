@@ -5,7 +5,7 @@ work belongs to; it now also says which board that work queues on (see `projects
 the same lookup serves the inbound and the outbound half of this module:
 
     inbound   kind-1621 issue    -> a task on the channel's board
-              kind-1622 comment  -> a task comment, in the order the issue carries them
+              kind-1111 comment  -> a task comment, in the order the issue carries them
     outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
                                    review task on that board (a verdict, never a merge:
                                    merging is the operator's)
@@ -67,9 +67,15 @@ log = logging.getLogger("hng.ngit")
 
 #: NIP-34 kinds this bridge reads. 1630-1633 are the status kinds; only `applied` is news.
 KIND_ISSUE = 1621
-KIND_ISSUE_COMMENT = 1622
 KIND_PR = 1618
 KIND_APPLIED = 1631
+
+#: A comment is NIP-22, not NIP-34: ngit 3.0.5 publishes `ngit issue comment` and
+#: `ngit pr comment` as kind 1111 (`src/lib/git_events.rs`, `KIND_COMMENT`), and no ngit
+#: release ever wrote 1622 -- the 1622s this bridge used to look for were hand-published.
+#: Reading is kind-agnostic (`ngit issue view --comments` returns them either way); this
+#: constant is for the watcher's subscription, which has to name a kind.
+KIND_COMMENT = 1111
 
 #: How a kind-1631 names the commit(s) it landed, most specific first. NIP-34 spells a merge
 #: `merge-commit`; ngit 3.0.4 writes `merge-commit-id` instead -- one oid for a merge commit,
@@ -254,7 +260,8 @@ class NotifyBusy(NotifyError):
 
 @dataclass(frozen=True)
 class Comment:
-    """One kind-1622 reply on an issue, as `ngit issue view --comments --json` reports it."""
+    """One NIP-22 kind-1111 reply on an issue, as `ngit issue view --comments --json`
+    reports it."""
 
     id: str            # nevent, or the hex id when it could not be encoded
     hex: str
