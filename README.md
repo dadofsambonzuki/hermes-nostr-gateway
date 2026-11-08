@@ -170,11 +170,13 @@ the bridge applied verdicts to cards — is read again by `hng ngit reconcile --
 `changes-requested` returns it to its implementer. `--dry-run` names every card and the
 transition first, and a second run moves nothing.
 
-A PR's review task ends in a verdict and a comment on the task; it never merges, and the merge
-event closes it. The bridge chooses no model for it: the board's default, then the assignee
-profile's own model, decides, and one task can be moved with `hermes kanban set-model`. A bot
-host points `review_assignee` at the review role's own profile, whose identity signs the
-verdict it publishes on the PR — see "Bot identities and profiles" in `docs/ngit-bridge.md`.
+A PR's review task ends in a verdict — the reviewer writes it once, on the task, and the bridge
+publishes it on the PR itself as a kind-1111 comment signed by the review identity, with one line
+in the channel; it never merges, and the merge event closes the task. The bridge chooses no model
+for it: the board's default, then the assignee profile's own model, decides, and one task can be
+moved with `hermes kanban set-model`. A bot host points `review_assignee` at the review role's own
+profile and `ngit.review_secret_file` at its key — see "Bot identities and profiles" in
+`docs/ngit-bridge.md`.
 
 Notices are queued in `ngit_outbox` before they are sent, each with an idempotency key the daemon
 records, so a busy daemon delays a notice instead of losing it and a lost acknowledgement cannot

@@ -762,8 +762,9 @@ Recovery:
 - Publishing status events from the board back to Nostr (a task completing does not close or
   apply the issue). The mapping is one-way for status on purpose: the board's lifecycle is the
   board's, and a status event is a public statement someone should choose.
-- Merging. A review task ends with a verdict; the merge is the operator's (`ngit pr merge`), and
-  the bridge only watches for the status event it produces.
+- Merging. A review card ends with a verdict — published on the PR and on the card — and the
+  merge is the operator's (`scripts/merge_pr.sh`, which refuses it without a verdict from a
+  different npub); the bridge only watches for the status event a merge produces.
 - Retrofitting review tasks for PRs announced before this bridge made them. A PR already
   `signalled` with no task stays that way: the channel was told what happened at the time, and
   a change of behaviour is not a reason to rewrite it.
