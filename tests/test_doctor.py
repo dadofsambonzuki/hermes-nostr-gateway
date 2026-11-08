@@ -6,12 +6,14 @@ Placeholders only: no real community id, repository, board or host name belongs 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 import yaml
 
+from git_sandbox import commit, git, make_clone
 from hermes_nostr_gateway import cli, doctor
 from hermes_nostr_gateway.ngit import NGIT_FLOOR, NgitError, resolve_target
 
@@ -111,7 +113,9 @@ def fake_ngit(tmp_path: Path, monkeypatch, *, version: str = NGIT_FLOOR) -> Path
     script.write_text(NGIT_STUB.format(version=version, maintainer=MAINTAINER,
                                        identifier=IDENTIFIER))
     script.chmod(0o755)
-    monkeypatch.setenv("PATH", str(bindir))
+    # Prepend, do not replace: the stub must win `which ngit`, but `git` and the rest of the
+    # host still have to be reachable — the checkout checks shell out to git.
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
     monkeypatch.delenv("HNG_NGIT", raising=False)
     return script
 
@@ -172,6 +176,18 @@ def checks_by_name(capsys) -> dict[str, dict]:
     return {check["name"]: check for check in data["checks"]}
 
 
+def live_clone(tmp_path: Path, name: str = "live-clone") -> Path:
+    """The checkout doctor reads: a real clone on master, never this host's tree."""
+    root = tmp_path / name
+    root.mkdir()
+    return make_clone(root).repo
+
+
+def use_live_checkout(monkeypatch, repo: Path | None) -> None:
+    """Point the check at `repo`; `run` must not measure the machine it is running on."""
+    monkeypatch.setattr(doctor, "live_checkout_path", lambda: repo)
+
+
 @pytest.fixture()
 def good(tmp_path, monkeypatch):
     """Every check can pass: real key, real checkout, registry, stub daemon, stub cron, ngit."""
@@ -181,6 +197,7 @@ def good(tmp_path, monkeypatch):
     fake_ngit(tmp_path, monkeypatch)
     stub_daemon(monkeypatch, live_daemon())
     stub_cron(monkeypatch)
+    use_live_checkout(monkeypatch, live_clone(tmp_path))
     return tmp_path, home, checkout, config
 
 
@@ -190,6 +207,35 @@ def test_a_correct_config_exits_zero(good, monkeypatch, capsys):
     checks = checks_by_name(capsys)
     assert all(check["ok"] for check in checks.values()), checks
     assert checks["ngit"]["detail"].startswith(NGIT_FLOOR)
+    assert "behind master" in checks["checkout"]["detail"]
+
+
+def test_a_checkout_parked_on_a_proposal_branch_is_a_failed_check(good, monkeypatch, capsys,
+                                                                  tmp_path):
+    """The failure that went unnoticed: a clean PR branch served as if it were merged."""
+    tmp_path, home, checkout, config = good
+    live = live_clone(tmp_path, "proposal-clone")
+    git(live, "switch", "-q", "-c", "pr/blackhole-unauthorised")
+    commit(live, "proposal.txt")
+    use_live_checkout(monkeypatch, live)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    check = checks_by_name(capsys)["checkout"]
+    assert not check["ok"]
+    assert "pr/blackhole-unauthorised" in check["detail"]
+    assert "git checkout master && git pull" in check["fix"]
+
+
+def test_a_checkout_that_is_not_a_repo_is_not_the_live_checkout(good, monkeypatch, capsys,
+                                                                tmp_path):
+    """A wheel install has nothing to keep on master; that is not a failed preflight."""
+    tmp_path, home, checkout, config = good
+    use_live_checkout(monkeypatch, None)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    check = checks_by_name(capsys)["checkout"]
+    assert check["ok"]
+    assert "not running from a git checkout" in check["detail"]
 
 
 def test_bad_identity_is_named_with_a_fix(good, monkeypatch, capsys, tmp_path):

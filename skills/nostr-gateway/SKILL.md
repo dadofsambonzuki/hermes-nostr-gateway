@@ -30,7 +30,7 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | question | command | `--json` carries |
 | --- | --- | --- |
 | Is anything wrong right now? | `hng health --json` | `verdict`, `degraded`, `reasons`, per-plane `planes`, `counts`, `relays` (verdict per relay), `notes`. The command exits non-zero when degraded, so a cron can read the exit code alone. |
-| Is the daemon up, and are relays hearing anything? | `hng status --json` | `identity`, `daemon` (bool), `event_times`, `pending`, `blocked`, `drops`, `wraps`, `menu` (the catalogue the Hermes plugin wrote, and whether its last write failed), `relays[].verdict`/`detail`, `ngit_watch`. |
+| Is the daemon up, and are relays hearing anything? | `hng status --json` | `identity`, `checkout` (`branch`, `commit`, `behind`, `ahead`, `ok`), `daemon` (bool), `event_times`, `pending`, `blocked`, `drops`, `wraps`, `menu` (the catalogue the Hermes plugin wrote, and whether its last write failed), `relays[].verdict`/`detail`, `ngit_watch`. |
 | What did policy refuse, and why? | `hng drops --json` | `drops[]` (plane, sender, kind, rule, why, reason, received_at, age_s, expired), `total`, `live`, `expired`, `ttl_s`. Add `--plane`, `--reason`, `--since-hours`. |
 | What actually arrived? | `hng recent [N]` | Text rows only (no `--json`): time, direction, sender, reach, first 90 characters. |
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `config`, `checkout`, `project`, `board`; exit 1 on any gap. Plain `hng projects --json` lists the map only. |
@@ -89,6 +89,12 @@ Every refusal is a word, and the word decides what to do.
 
 ## Changing this repository
 
+- **The live checkout stays on `master`.** The daemon serves this clone (editable install), so a
+  clone left on a proposal branch is a box running code nobody merged, and `health` stays green
+  through it. `hng doctor`'s `checkout` check fails on a proposal or detached HEAD and prints the
+  fix; `hng status` prints `checkout: <branch> @ <sha> (<n> behind master)` as one line. A script
+  that needs a branch takes a worktree — `scripts/live_checkout_guard.sh worktree <path> [ref]` —
+  never `git checkout` in the clone.
 - **A card workspace cannot merge, and that is enforced.** A `pre-push` hook installed by
   `scripts/worker_push_guard.sh` refuses `master`/`main` from a card worktree, and
   `scripts/merge_pr.sh` exits 4 there. If a push is refused, push the branch and say so on the
