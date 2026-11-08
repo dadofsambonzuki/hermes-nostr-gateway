@@ -1391,6 +1391,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         issues=checkout.issues, detail=checkout.detail,
         prs=prs.events if prs is not None else None,
         statuses=prs.statuses if prs is not None else None,
+        sweep=prs.sweep if prs is not None else None,
         notify=notifier, anchor=anchor, labels=labeler, state=state)
     return board, sync, note
 

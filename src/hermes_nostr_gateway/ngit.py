@@ -170,6 +170,19 @@ MAX_STATUS_PRS = 50
 #: twenty is deep enough for a relay that also replays retried publishes.
 STATUS_READ_AHEAD = 20
 
+#: How far back every pass re-reads the two PR status kinds (`Sync._sweep`). The cursor is a
+#: watermark on what a poll *reached*, not proof of what it delivered: a kind-1631/1632 that
+#: lands at a relay after the poll whose window covered its timestamp sits behind the cursor for
+#: good, and the link stays `signalled` while the board keeps obeying it. Re-reading the status
+#: kinds over a trailing window is cheap -- a repository publishes a handful a week -- and every
+#: transition they drive is idempotent. `0` turns the sweep off.
+DEFAULT_SWEEP_HOURS = 24
+
+#: The cursor row the sweep keeps: when it last read through. Separate from `prs` on purpose --
+#: the sweep must never move the cursor proposals are read with, because an event it reported is
+#: not an event the incremental poll delivered.
+SWEEP_CURSOR = "prs_reconcile"
+
 #: How long one notice waits for the daemon. A turn can hold the daemon for longer than a
 #: socket round trip takes, so the timeout is generous -- but it still has to end: the notice
 #: is queued, and giving up on it is what lets the poll finish and the next one retry.
@@ -513,6 +526,27 @@ def merge_feeds(*feeds: PrFeed) -> PrFeed:
     return PrFeed(prs=list(prs.values()), merges=list(merges.values()),
                   revisions=list(revisions.values()), closed=list(closed.values()))
 
+def with_statuses(feed: PrFeed, statuses: PrFeed) -> PrFeed:
+    """The poll's feed with the trailing sweep's statuses folded in.
+
+    One entry per PR and the newer event wins, so an event the incremental poll happened to
+    carry is not replaced by an older copy of it. Only `merges` and `closed` come from the
+    sweep: `prs` and `revisions` stay exactly what the poll delivered, which is what keeps the
+    sweep out of the review-task and notice windows.
+    """
+    merges = {merge.pr_id: merge for merge in feed.merges}
+    for merge in statuses.merges:
+        seen = merges.get(merge.pr_id)
+        if seen is None or merge.created_at > seen.created_at:
+            merges[merge.pr_id] = merge
+    closed = {stopped.pr_id: stopped for stopped in feed.closed}
+    for stopped in statuses.closed:
+        seen = closed.get(stopped.pr_id)
+        if seen is None or stopped.created_at > seen.created_at:
+            closed[stopped.pr_id] = stopped
+    return PrFeed(prs=feed.prs, merges=list(merges.values()),
+                  revisions=feed.revisions, closed=list(closed.values()))
+
 
 @dataclass(frozen=True)
 class Target:
@@ -543,6 +577,9 @@ class BridgeConfig:
     review_assignee: str = "default"
     relays: tuple[str, ...] = ()
     lookback_hours: int = 168
+    #: The trailing window the status sweep re-reads on every pass (`Sync._sweep`). Cheap
+    #: because it names two kinds, and it is what heals a status event that landed late.
+    sweep_hours: int = DEFAULT_SWEEP_HOURS
     issues: bool = True
     prs: bool = True
     priority: int = 0
@@ -590,12 +627,20 @@ class BridgeConfig:
             log.warning("ngit: watch_debounce_s must be positive; using %gs",
                         DEFAULT_WATCH_DEBOUNCE_S)
             debounce = DEFAULT_WATCH_DEBOUNCE_S
+        # 0 is a legitimate value here -- it is how a deployment turns the sweep off -- so the
+        # absent key falls back to the default and a bad one falls back with a line.
+        try:
+            sweep_hours = max(0, int(block.get("sweep_hours", DEFAULT_SWEEP_HOURS)))
+        except (TypeError, ValueError):
+            log.warning("ngit: sweep_hours is not a number; using %dh", DEFAULT_SWEEP_HOURS)
+            sweep_hours = DEFAULT_SWEEP_HOURS
         return cls(
             assignee=str(block.get("assignee") or "").strip(),
             reviews=bool(block.get("reviews", True)),
             review_assignee=str(block.get("review_assignee") or "default").strip(),
             relays=cleaned,
             lookback_hours=int(block.get("lookback_hours", 168) or 0),
+            sweep_hours=sweep_hours,
             issues=bool(block.get("issues", True)),
             prs=bool(block.get("prs", True)),
             priority=int(block.get("priority", 0) or 0),
@@ -617,6 +662,10 @@ class Report:
     assignee: str
     address: str = ""
     dry_run: bool = False
+    #: The trailing window the status sweep re-read this pass, or 0 when there is no sweep. It
+    #: is here, not only in the counts, so an operator can see the sweep *ran* even when it
+    #: found nothing -- the whole point is that a quiet pass is not the same as a blind one.
+    sweep_hours: int = 0
     issues: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "ready": 0, "held": 0, "existing": 0,
         "comments": 0, "deleted": 0, "deferred": 0, "would_create": 0,
@@ -626,7 +675,9 @@ class Report:
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
         "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
         "approved": 0, "changes": 0, "applied": 0,
-        "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0})
+        "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0,
+        #: Status events the trailing sweep re-read: applied/closed only, never a proposal.
+        "swept": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
     #: poll can fail twenty times for the same reason, and a cron log needs one line.
@@ -650,6 +701,7 @@ class Report:
         return {"channel": self.channel, "repo": self.repo, "board": self.board,
                 "assignee": self.assignee, "repo_address": self.address,
                 "dry_run": self.dry_run, "issues": dict(self.issues), "prs": dict(self.prs),
+                "sweep_hours": self.sweep_hours,
                 "posted": self.posted, "failed": self.failed,
                 "errors": list(self.errors), "notes": list(self.notes)}
 
@@ -686,6 +738,9 @@ class Report:
                    + (f", {p['label_errors']} label failure(s)" if p["label_errors"] else "")
                    + (f", {p['deferred']} waiting for the next poll" if p["deferred"] else "")
                    + (f", {p['would_post']} would be posted" if self.dry_run else ""))
+        if self.sweep_hours:
+            out.append(f"sweep:   {p['swept']} applied/closed event(s) re-read over"
+                       f" {self.sweep_hours}h (status kinds only)")
         out.append(f"posted:  {self.posted} channel message(s)"
                    + (f", {self.failed} not delivered" if self.failed else "")
                    + (" (dry run: nothing written)" if self.dry_run else ""))
@@ -1078,15 +1133,17 @@ class RelayPrs:
 
     def events(self, since: int) -> PrFeed:
         """Every PR, revision, applied and closed-status event newer than `since`."""
+        return self._feed(since, kinds=(KIND_PR, KIND_PR_REVISION, KIND_APPLIED, KIND_CLOSED))
+
+    def _feed(self, since: int, *, kinds: Sequence[int]) -> PrFeed:
         if not self.relays:
             raise NgitError("ngit.relays (or relays.read) is empty: nowhere to read PR events")
         if not self.address:
             raise NgitError("this checkout has no NIP-34 address: no PRs to read")
-        raw = self._fetch(relays=self.relays,
-                          kinds=[KIND_PR, KIND_PR_REVISION, KIND_APPLIED, KIND_CLOSED],
+        raw = self._fetch(relays=self.relays, kinds=list(kinds),
                           a_tag=self.address, since=int(since), limit=500,
                           secret=self.secret)
-        return self._fold(raw)
+        return self._fold(raw, wanted={int(kind) for kind in kinds})
 
     def statuses(self, pr_ids: Sequence[str]) -> PrFeed:
         """Kinds 1631/1632 that name these PRs by `e`, whether or not they carry an `a`.
@@ -1108,9 +1165,19 @@ class RelayPrs:
         # `fetch_tagged` names the relay that answered each event; a reader that just
         # returns events is fine too, since a status is attributed by its own root id.
         events = [item[1] if isinstance(item, tuple) else item for item in raw or ()]
-        return self._fold(events)
+        return self._fold(events, wanted={KIND_APPLIED, KIND_CLOSED})
 
-    def _fold(self, raw: Sequence[Any]) -> PrFeed:
+    def sweep(self, since: int) -> PrFeed:
+        """The applied/closed statuses newer than `since`: what the trailing sweep reads.
+
+        Proposals and revisions are deliberately not asked for. The sweep exists to heal a
+        link whose status event landed behind the cursor, and a proposal it re-read would be a
+        second chance to announce a PR the channel may never have heard about -- a second card
+        and a second message for something that is old news or was never news at all.
+        """
+        return self._feed(since, kinds=(KIND_APPLIED, KIND_CLOSED))
+
+    def _fold(self, raw: Sequence[Any], *, wanted: set[int] | None = None) -> PrFeed:
         """One relay answer, split into proposals, revisions, merges and closes."""
         prs: dict[str, PullRequest] = {}
         merges: dict[str, Merge] = {}
@@ -1120,6 +1187,11 @@ class RelayPrs:
             if not isinstance(event, dict) or not event.get("id"):
                 continue
             kind = int(event.get("kind") or 0)
+            if wanted is not None and kind not in wanted:
+                # A relay may answer with more than it was asked for. The sweep's promise is
+                # that it reads status kinds only, so the filter is here as well as in the
+                # request: a proposal arriving anyway must not become a second announcement.
+                continue
             if kind in (KIND_PR, KIND_PR_REVISION):
                 # A `c` tag with an `E` that names another event is an update, whatever
                 # kind the client published it as: NIP-34 spells it 1619, and a
@@ -1688,7 +1760,7 @@ class Sync:
     def __init__(self, *, store: Store, board: Board, control: ControlConfig,
                  config: BridgeConfig, target: Target, issues: IssueSource,
                  detail: DetailSource, prs: PrSource | None = None,
-                 statuses: StatusSource | None = None,
+                 statuses: StatusSource | None = None, sweep: PrSource | None = None,
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
                  applied: Optional[AppliedSource] = None,
@@ -1701,7 +1773,11 @@ class Sync:
         self.issues = issues
         self.detail = detail
         self.prs = prs
+        #: The second read: statuses for the PR ids the store already links, by `#e`.
         self.statuses = statuses
+        #: The trailing status sweep's source (`RelayPrs.sweep`): the same relays, two
+        #: kinds. Injected and optional so a pass with no PR source, or a test, has no sweep.
+        self.sweep_source = sweep
         self.notify = notify
         self.anchor = anchor or Anchor()
         self.labels = labels
@@ -2030,6 +2106,14 @@ class Sync:
         # PRs' statuses by id and fold them in: attribution is by id already, so a status
         # for a PR this board does not link changes nothing.
         feed = self._with_statuses(feed, report)
+        # What the incremental poll itself carried. Only these events may move the `prs`
+        # cursor: the sweep's are older by construction, and stepping the cursor over an
+        # event the poll never read is the very defect the sweep exists to heal.
+        polled_merges = {merge.pr_id for merge in feed.merges}
+        polled_closed = {stopped.pr_id for stopped in feed.closed}
+        swept = self._sweep(report, dry_run=dry_run)
+        if swept is not None:
+            feed = with_statuses(feed, swept)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
@@ -2114,12 +2198,15 @@ class Sync:
             link = self.store.ngit_link(self.target.key, KIND_PR, merge.pr_id)
             if link is None:
                 # A merge for a PR this bridge never announced is not replayed into the
-                # channel; it narrates what it watched, not the repository's history.
-                settled.append(merge.created_at)
+                # channel: it narrates what it watched, not the repository's history. The
+                # sweep re-reads the same status every pass, so it never moves the cursor.
+                if merge.pr_id in polled_merges:
+                    settled.append(merge.created_at)
                 continue
             if budget <= 0:
                 report.prs["deferred"] += 1
-                deferred.append(merge.created_at)
+                if merge.pr_id in polled_merges:
+                    deferred.append(merge.created_at)
                 continue
             known = next((pr for pr in feed.prs if pr.id == merge.pr_id), None)
             note = _detail(link)
@@ -2131,7 +2218,8 @@ class Sync:
                                     commit=str(note.get("commit") or ""))
             text = merged_message(known, merge, nevent)
             budget -= 1
-            settled.append(merge.created_at)
+            if merge.pr_id in polled_merges:
+                settled.append(merge.created_at)
             if dry_run:
                 report.prs["would_post"] += 1
                 continue
@@ -2154,19 +2242,23 @@ class Sync:
         for stopped in sorted(feed.closed, key=lambda c: (c.created_at, c.pr_id)):
             link = self.store.ngit_link(self.target.key, KIND_PR, stopped.pr_id)
             if link is None:
-                settled.append(stopped.created_at)
+                if stopped.pr_id in polled_closed:
+                    settled.append(stopped.created_at)
                 continue
             note = _detail(link)
             if str(link.get("state") or "") == "merged" or note.get("merge"):
                 # Applied is final: a late or stale close cannot undo a merge that landed.
-                settled.append(stopped.created_at)
+                if stopped.pr_id in polled_closed:
+                    settled.append(stopped.created_at)
                 continue
             if budget <= 0:
                 report.prs["deferred"] += 1
-                deferred.append(stopped.created_at)
+                if stopped.pr_id in polled_closed:
+                    deferred.append(stopped.created_at)
                 continue
             budget -= 1
-            settled.append(stopped.created_at)
+            if stopped.pr_id in polled_closed:
+                settled.append(stopped.created_at)
             if dry_run:
                 report.prs["would_close"] += 1
                 continue
@@ -2245,6 +2337,50 @@ class Sync:
             if event_hex(source):
                 ids.append(event_hex(source))
         return ids[-MAX_STATUS_PRS:]
+
+    def _sweep(self, report: Report, *, dry_run: bool) -> PrFeed | None:
+        """Re-read the two PR status kinds over a trailing window. Best effort, every pass.
+
+        The cursor is a watermark on what a poll *reached*, not proof that every event before
+        it was delivered. A kind-1631/1632 that reaches a relay after the poll whose window
+        covered its timestamp sits behind the cursor for good: no later pass reads it, the link
+        stays `signalled`, and the card waits for a merge or a close the bridge can never again
+        observe. Reading the status kinds again over a trailing window is cheap -- a repository
+        publishes a handful a week -- and every transition they drive is idempotent: a close on
+        a `merged` link is skipped, a second close writes the same state, and a card already
+        blocked is not blocked again.
+
+        Status kinds only, and `prs`/`revisions` are never taken from here: the sweep must not
+        become a second chance to announce a PR, because an old proposal would then produce a
+        second card and a second channel message.
+
+        A slow or refusing relay costs the pass a report line, not its news, so this never
+        raises. Its own cursor (`SWEEP_CURSOR`) records when it last read through -- that is
+        what covers a pass that was down for longer than the window -- and it is deliberately
+        not the `prs` cursor: an event the sweep reported is not an event the poll delivered.
+        """
+        if self.sweep_source is None:
+            return None
+        hours = max(0, int(self.config.sweep_hours or 0))
+        if hours <= 0:
+            return None
+        now = int(self._now())
+        report.sweep_hours = hours
+        floor = now - hours * 3600
+        stored = self.store.ngit_cursor(self.target.key, SWEEP_CURSOR)
+        if stored and str(stored).isdigit():
+            floor = min(floor, int(stored))
+        try:
+            feed = self.sweep_source(max(0, floor))
+        except Exception as exc:  # noqa: BLE001 - best effort: a report line, not an exception
+            message = str(exc) if isinstance(exc, NgitError) else f"{type(exc).__name__}: {exc}"
+            report.notes.append(f"sweep: {message}"[:200])
+            log.warning("ngit: status sweep failed: %s", message)
+            return None
+        report.prs["swept"] += len(feed.merges) + len(feed.closed)
+        if not dry_run:
+            self.store.ngit_set_cursor(self.target.key, SWEEP_CURSOR, now)
+        return PrFeed(merges=feed.merges, closed=feed.closed)
 
     def _fold_repeats(self, prs: Sequence[PullRequest],
                       applied: dict[str, Merge],

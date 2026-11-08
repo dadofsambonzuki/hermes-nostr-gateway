@@ -283,6 +283,9 @@ defaults:
 #   relays:                      # where 1618/1631 events are read; default: relays.read
 #     - wss://relay.example
 #   lookback_hours: 168          # the first poll's floor (0 = everything the relay gives)
+#   sweep_hours: 24              # every pass re-reads applied/closed this far back, so a
+#                                # status event that landed behind the cursor still heals
+#                                # (0 turns the sweep off)
 #   issues: true                 # import kind-1621 issues
 #   prs: true                    # announce kind-1618 PRs and kind-1631 merges
 #   priority: 0                  # task priority for anything the bridge creates

@@ -171,7 +171,7 @@ class Harness:
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
                  notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
-                 applied: FakeApplied | None = None):
+                 applied: FakeApplied | None = None, sweep=None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -183,6 +183,10 @@ class Harness:
         #: The second read: statuses for the PR ids the store already links, by `#e`.
         self.statuses = statuses
         self.since_seen: list[int] = []
+        #: The trailing status sweep's source. Empty unless a test says otherwise; an
+        #: exception instance makes it raise, which is how the best-effort half is pinned.
+        self.sweep_data = sweep if sweep is not None else ngit.PrFeed()
+        self.sweep_since: list[int] = []
         self.label_calls: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
         self.labeler = labeler or self._label
         #: The checkout's answer about a proposal whose status record says nothing.
@@ -215,6 +219,13 @@ class Harness:
         if isinstance(self.prs_data, ngit.PrFeed):
             return self.prs_data
         return ngit.PrFeed(*self.prs_data)
+
+    def sweep(self, since: int):
+        """The trailing sweep's source: whatever `sweep_data` holds, or the exception to raise."""
+        self.sweep_since.append(since)
+        if isinstance(self.sweep_data, BaseException):
+            raise self.sweep_data
+        return self.sweep_data
 
     def _state(self, pr_ids):
         """The relay read: whatever the test put in `verdicts`, `carried` and `readings`."""
@@ -257,7 +268,8 @@ class Harness:
             store=self.store, board=self.board, control=self.control,
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
-            prs=self.prs, statuses=self.statuses, notify=self.notifier, anchor=self.anchor,
+            prs=self.prs, statuses=self.statuses, sweep=self.sweep,
+            notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state, applied=self.applied)
 
     def task(self, task_id: str):
@@ -1805,6 +1817,177 @@ def test_a_status_returned_by_both_reads_is_counted_once():
     assert ngit.merge_feeds(
         ngit.PrFeed(merges=[merge]),
         ngit.PrFeed(merges=[ngit.Merge(pr_id=pr_id, created_at=3000)])).merges == [merge]
+
+# -- the trailing status sweep ------------------------------------------------
+#
+# The live shape (2026-11-08): the PR feed's cursor had reached 21:46:50 and the close had
+# been published at 15:42:03, so every incremental read started *after* the close. Nothing
+# re-read it, the link stayed `signalled`, and the board kept obeying an open PR. The sweep
+# re-reads the two status kinds over a trailing window, every pass, and is the only reader
+# that can still see that close.
+
+def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
+    """Acceptance (1): the sweep sees a close the incremental poll has moved past."""
+    pr, task_id = pr_with_review_task(harness)
+    reached = 1794174410                                     # 2026-11-08 21:46:50Z
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1794152523)
+    harness.store.ngit_set_cursor(ADDRESS, "prs", reached)
+    # The poll carries nothing: its window starts long after the close was published.
+    harness.prs_data = ngit.PrFeed()
+    harness.sweep_data = ngit.PrFeed(closed=[stopped])
+
+    report = harness.sync()
+
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "closed"
+    row = harness.task(task_id)
+    assert row["status"] == "blocked" and row["block_kind"] == "dependency"
+    assert any("9" * 64 in comment["body"] for comment in harness.comments(task_id))
+    assert report.prs["blocked"] == 1 and report.prs["swept"] == 1
+    # The sweep read a window that reaches back past the close ...
+    assert harness.sweep_since[-1] <= stopped.created_at
+    # ... and left the cursor the proposals are read with exactly where it was.
+    assert harness.store.ngit_cursor(ADDRESS, "prs") == str(reached)
+    # The guard refuses the completion, naming the close: the card cannot be finished by it.
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    assert "closed without a merge" in str(refused.value)
+
+
+def test_a_close_behind_the_cursor_is_invisible_without_the_sweep(harness):
+    """The same pass without the sweep: this is the state the bridge was stuck in for hours."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.store.ngit_set_cursor(ADDRESS, "prs", 1794174410)
+    harness.prs_data = ngit.PrFeed()
+
+    report = harness.sync()
+
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "signalled"
+    assert harness.task(task_id)["status"] == "ready"
+    assert report.prs["blocked"] == 0
+
+
+def test_the_sweep_never_re_announces_a_pr(harness):
+    """Acceptance (2): status kinds only -- no second card, no second channel message."""
+    pr, task_id = pr_with_review_task(harness)
+    assert len(harness.tasks()) == 1 and len(harness.messages) == 1
+
+    merge = ngit.Merge(pr_id=pr.id, commit="d" * 40, created_at=1100)
+    harness.prs_data = ngit.PrFeed()
+    harness.sweep_data = ngit.PrFeed(merges=[merge])
+    harness.sync()
+
+    assert harness.task(task_id)["status"] == "done"
+    assert len(harness.tasks()) == 1          # one card, still
+    assert len(harness.messages) == 2         # the PR's announcement, then its merge
+    assert harness.messages[-1][1].count("merged") == 1
+
+    # The same window, read again on the next pass: the merge is decided once, not twice.
+    report = harness.sync()
+    assert len(harness.tasks()) == 1
+    assert len(harness.messages) == 2
+    assert report.posted == 0
+
+
+def test_the_sweep_does_not_narrate_a_pr_the_bridge_never_announced(harness):
+    """A status for an unknown PR root is not news: the bridge narrates what it watched."""
+    harness.sweep_data = ngit.PrFeed(
+        merges=[ngit.Merge(pr_id="7" * 64, commit="e" * 40, created_at=1100)],
+        closed=[ngit.Closed(pr_id="8" * 64, event_id="9" * 64, created_at=1200)])
+
+    report = harness.sync()
+
+    assert harness.tasks() == [] and harness.messages == []
+    assert report.prs["swept"] == 2 and report.posted == 0
+
+
+def test_the_report_carries_the_sweeps_own_count(harness):
+    """Acceptance (3): `--dry-run --json` shows the sweep ran, and it writes nothing."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.sweep_data = ngit.PrFeed(
+        closed=[ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1200)])
+    before = harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR)
+
+    report = harness.sync(dry_run=True)
+    payload = report.as_dict()
+
+    assert payload["sweep_hours"] == ngit.DEFAULT_SWEEP_HOURS == 24
+    assert payload["prs"]["swept"] == 1 and payload["prs"]["would_close"] == 1
+    assert any(line.startswith("sweep:   1 applied/closed") for line in report.lines())
+    # A dry run writes nothing, the sweep's cursor included, and the card is untouched.
+    assert harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR) == before
+    assert harness.task(task_id)["status"] == "ready"
+
+
+def test_a_failing_sweep_is_a_report_line_not_a_lost_pass(harness):
+    """A relay that will not answer for the status kinds must not cost the pass its news."""
+    harness.prs_data = ([make_pr("c9")], [])
+    harness.sweep_data = ngit.NgitError("relay timed out")
+
+    report = harness.sync()
+
+    assert report.posted == 1 and report.prs["signalled"] == 1
+    assert report.errors == []                       # best effort: not a failed pass
+    assert any("sweep: relay timed out" in note for note in report.notes)
+    # Nothing was read, so nothing claims the window was covered.
+    assert harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR) is None
+
+
+def test_the_sweep_window_extends_over_the_gap_since_the_last_sweep(harness):
+    """A pass that was down for longer than the window still covers what it missed."""
+    harness.store.ngit_set_cursor(ADDRESS, ngit.SWEEP_CURSOR, 1794000000)
+    before = int(time.time())
+
+    harness.sync()
+
+    assert harness.sweep_since[0] == 1794000000
+    assert int(harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR)) >= before
+
+
+def test_sweep_hours_zero_turns_the_sweep_off(harness):
+    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, sweep_hours=0)
+
+    report = harness.sync()
+
+    assert harness.sweep_since == []
+    assert report.sweep_hours == 0 and report.prs["swept"] == 0
+    assert harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR) is None
+
+
+def test_the_sweep_source_asks_for_the_two_status_kinds_only():
+    """The relay read names applied and closed, with the repository address, and nothing else."""
+    seen: dict = {}
+    events = [
+        {"id": "a" * 64, "kind": ngit.KIND_APPLIED, "pubkey": REPO_OWNER, "created_at": 1000,
+         "tags": [["a", ADDRESS], ["e", "b" * 64], ["merge-commit", "c" * 40]]},
+        {"id": "d" * 64, "kind": ngit.KIND_CLOSED, "pubkey": REPO_OWNER, "created_at": 1100,
+         "tags": [["a", ADDRESS], ["e", "b" * 64]]},
+        # A proposal in the same answer is ignored: the sweep's source never reads one.
+        {"id": "e" * 64, "kind": ngit.KIND_PR, "pubkey": REPO_OWNER, "created_at": 1200,
+         "tags": [["a", ADDRESS], ["subject", "Old news"], ["branch-name", "pr/old"],
+                  ["c", "f" * 40]]},
+    ]
+
+    def fetcher(**kwargs):
+        seen.update(kwargs)
+        return list(events)
+
+    feed = ngit.RelayPrs(["wss://relay.example"], ADDRESS, fetcher=fetcher).sweep(500)
+
+    assert seen["kinds"] == [ngit.KIND_APPLIED, ngit.KIND_CLOSED]
+    assert seen["a_tag"] == ADDRESS and seen["since"] == 500
+    assert [(merge.pr_id, merge.commit) for merge in feed.merges] == [("b" * 64, "c" * 40)]
+    assert [stopped.pr_id for stopped in feed.closed] == ["b" * 64]
+    assert feed.prs == [] and feed.revisions == []
+
+
+def test_a_swept_status_never_replaces_a_newer_one_the_poll_carried():
+    """Overlap is normal; the newer event wins, so a replayed older copy cannot undo it."""
+    newer = ngit.Merge(pr_id="a" * 64, commit="b" * 40, created_at=2000)
+    older = ngit.Merge(pr_id="a" * 64, commit="c" * 40, created_at=1000)
+
+    merged = ngit.with_statuses(ngit.PrFeed(merges=[newer]), ngit.PrFeed(merges=[older]))
+
+    assert [(merge.commit, merge.created_at) for merge in merged.merges] == [("b" * 40, 2000)]
 
 
 def test_the_cli_refuses_an_open_pr_card(harness):

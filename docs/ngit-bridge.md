@@ -25,6 +25,7 @@ ngit:
   # relays:                # where 1618/1631 events are read; default: the repository
   #   - wss://relay.example # announcement's own relay hints, then relays.read
   lookback_hours: 168      # the first poll's floor; 0 reads everything the relay will give
+  sweep_hours: 24          # every pass re-reads applied/closed this far back (0 turns it off)
   issues: true             # import kind-1621 issues
   prs: true                # announce kind-1618 PRs and kind-1631 merges
   priority: 0              # task priority for anything the bridge creates
@@ -390,6 +391,19 @@ same branch and a revision all land on that one card; none of them makes a secon
   queued ones it hands to the daemon. The first run, or a catch-up after a long outage, must
   not dump a month of merges into a channel; the remainder is counted as deferred and picked
   up on later polls.
+- **Every pass re-reads the status kinds over a trailing window.** The cursor is a watermark on
+  what a poll *reached*, not proof that it delivered everything before it: a kind-1631/1632
+  that reaches a relay after the poll whose window covered its timestamp would otherwise sit
+  behind the cursor for good, the link staying `signalled` while the board keeps obeying it. So
+  each pass also asks the same relays for `kinds=[1631, 1632]` with the repository's `a` tag,
+  from `now - ngit.sweep_hours` (default 24), and folds what it finds into the same merge and
+  close walk. **Status kinds only** — never a proposal or a revision — so the sweep cannot make
+  a card or post a "ready for review" line, and every transition it drives is idempotent: a
+  close on a `merged` link is skipped, a second close writes the same state, a card already
+  blocked is not blocked again, and a notice already sent cannot be queued twice. It keeps its
+  own cursor (`ngit_cursors`, stream `prs_reconcile`) so a gap longer than the window is still
+  covered, and it never moves `prs`. A relay that is slow or refuses the read costs the pass a
+  report line (`sweep: …`), not its news.
 
 ## The label on the PR
 
@@ -608,6 +622,14 @@ In the gateway store (`store.py`):
 - `ngit_comments` — which comment has been copied onto which task.
 - `ngit_cursors` — the last event time each repo's PR poll reached, with a 5-minute overlap so
   clock skew cannot skip an event; the link table, not the cursor, prevents a duplicate.
+- **A missed status event heals on the next pass.** The cursor is a watermark on what a poll
+  *reached*, not proof that every event before it was delivered: a kind-1631/1632 that reaches
+  a relay after the poll whose window covered its timestamp sits behind the cursor. The
+  trailing sweep (above) re-reads the two status kinds over `ngit.sweep_hours` every pass, so
+  the next one closes the link and completes or blocks the card. The manual repair —
+  `hng ngit sync --channel <id> --since <epoch just before the event>` (with `--dry-run` first:
+  it reports `would close`/`would merge` and writes nothing) — is only for an event **older
+  than the window**, or for when the sweep is turned off.
 - `ngit_outbox` — one row per notice (`issue`, `question`, `ready`, `merged`), `queued` until the
   daemon took it and `sent` after, with an attempt count and the last error.
 - `send_keys` — the daemon's receipts: which idempotency key produced which message.

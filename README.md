@@ -315,7 +315,8 @@ the board and appears on the PR, so a reader of either one sees the same thing.
   (`project`) and the kanban board (`board`). Three names with three jobs, none inferred from
   another; a board without a project is a config error, because nothing anchors the worktree.
 - **`ngit`** — the bridge, a sibling block rather than a corner of Concord: `assignee`, `reviews`,
-  `review_assignee`, `relays`, `lookback_hours`, `issues`, `prs`, `priority`, `max_new`, `max_prs`.
+  `review_assignee`, `relays`, `lookback_hours`, `sweep_hours`, `issues`, `prs`, `priority`,
+  `max_new`, `max_prs`.
 
 ## Operations
 
