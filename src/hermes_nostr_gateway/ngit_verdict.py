@@ -195,14 +195,12 @@ class VerdictPublisher:
     def __init__(self, relays: Sequence[str], *, secret: str,
                  publish: Callable[..., dict[str, tuple[bool, Optional[str]]]] = publish_events,
                  sign: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
-                 read: Optional[Reader] = None,
-                 now: Callable[[], float] = time.time):
+                 read: Optional[Reader] = None):
         self.relays = tuple(str(relay) for relay in relays if str(relay or "").strip())
         self._secret = secret
         self._publish = publish
         self._sign = sign
         self._read = read or relay_reader(self.relays, secret=secret)
-        self._now = now
         self.pubkey = pubkey_from_secret(parse_secret(secret or "")) if secret else ""
 
     # -- signing and sending -------------------------------------------
