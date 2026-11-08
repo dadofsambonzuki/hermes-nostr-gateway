@@ -177,17 +177,20 @@ async def test_a_500_event_burst_keeps_the_loop_responsive(tmp_path):
 
     * during the 500 accepts the event-loop thread's own SQLite connection changes no
       rows: the inserts happen on the writer's connection, on its thread;
-    * the loop thread spends well under a millisecond of CPU per event accepting them
-      (``time.thread_time()`` stops while the process is descheduled, so a throttled
-      runner cannot turn into a failure);
+    * the loop thread spends bounded wall time accepting them, measured around each
+      ``store.add`` and asserted as a **sum** (35-46 ms here against a 500 ms bound; the
+      pre-P6 shape spent 500+ ms). A sum, not a p99 or a max: a *wait* is the shape of
+      the original defect — the per-message fsync was I/O wait, which costs wall time and
+      almost no CPU — so the sum catches a wait, while a runner descheduling the process
+      inflates only the call it interrupts instead of failing the gate;
     * the heartbeat sampled, so the loop was never held for the whole burst;
     * all 500 rows are committed — the work happened, off the loop.
 
     Wall-clock p99 loop lag is deliberately not asserted here: it measures the host. The
     same commit that measures a p99 of 0.2-4 ms on a quiet machine measured 64.0 ms and
-    317.3 ms on the shared CI runner, which is the runner descheduling the whole process,
-    not the store blocking the loop. The plan's 50 ms claim is reproduced by
-    ``benchmarks/store_burst.py``, which prints the machine it ran on.
+    317.3 ms on the shared CI runner — a burst yields only a handful of heartbeat samples,
+    so the "p99" was really a max, and one deschedule failed it. The plan's 50 ms claim is
+    reproduced by ``benchmarks/store_burst.py``, which prints the machine it ran on.
     """
     store = Store(tmp_path / "lag.db")
     # One cursor block covers the whole burst: the reservation is a transaction, and the
@@ -198,6 +201,7 @@ async def test_a_500_event_burst_keeps_the_loop_responsive(tmp_path):
     await writer.start()
     store.attach_writer(writer)
     lags: list[float] = []
+    wall: list[float] = []
     cpu: list[float] = []
     done = asyncio.Event()
 
@@ -213,9 +217,10 @@ async def test_a_500_event_burst_keeps_the_loop_responsive(tmp_path):
     loop_rows = store.db.total_changes
     try:
         for i in range(500):
-            started = time.thread_time()
+            started, cpu_started = time.perf_counter(), time.thread_time()
             assert store.add(inbound(i)) is True
-            cpu.append(time.thread_time() - started)
+            cpu.append(time.thread_time() - cpu_started)
+            wall.append(time.perf_counter() - started)
             # The relay reader yields to the loop between events; this is that yield.
             await asyncio.sleep(0)
         await store.flush()
@@ -231,16 +236,18 @@ async def test_a_500_event_burst_keeps_the_loop_responsive(tmp_path):
         assert written == 0, (
             f"the event-loop thread's connection changed {written} row(s) while the burst "
             "was accepted: the writes belong on the writer's thread")
-        # ~15-35 ms of loop CPU here for 500 events (0.03-0.07 ms each); the pre-P6 shape,
-        # one transaction and one fsync per message, spent 60-140 ms of CPU and 500+ ms of
-        # the loop's wall time on the same accepts. 200 ms is a guard against real work
-        # creeping back onto the loop -- a host five times slower than this one still
-        # passes -- not a benchmark of the host.
-        total = sum(cpu)
-        assert total < 0.200, (
-            f"the loop thread spent {total * 1000:.0f} ms of CPU accepting 500 events "
-            f"({total / 500 * 1000:.3f} ms each): the accept path is doing work that "
-            "belongs off the loop")
+        # 35-46 ms of loop wall time for 500 events here; the pre-P6 shape, one transaction
+        # and one fsync per message, spent 500+ ms. 500 ms leaves a runner room to
+        # deschedule one call by hundreds of milliseconds and still pass, and cannot pass a
+        # per-message wait being put back on the loop.
+        waited = sum(wall)
+        assert waited < 0.500, (
+            f"the event-loop thread spent {waited * 1000:.0f} ms accepting 500 events "
+            f"({waited / 500 * 1000:.3f} ms each; {sum(cpu) * 1000:.0f} ms of it CPU, "
+            f"worst single call {max(wall) * 1000:.0f} ms): the accept path is waiting on "
+            "work that belongs off the loop. If the CPU figure is near the total the loop "
+            "is doing the work itself; if it is tens of milliseconds the host descheduled "
+            "the loop, and the wall-clock claim belongs to benchmarks/store_burst.py")
     finally:
         store.close()
 

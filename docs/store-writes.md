@@ -39,8 +39,9 @@ to a named machine, not to CI: the same commit measures a p99 of 0.2-4 ms on thi
 and measured **64.0 ms and 317.3 ms on the shared CI runner**, where the runner
 deschedules the whole process while the heartbeat sleeps. So the gate in
 `tests/test_store_writes.py` asserts the mechanism instead — during a 500-event burst the
-event-loop thread writes no row, and spends well under a millisecond of CPU per event —
-and the wall-clock number is this benchmark's, printed with its host.
+event-loop thread writes no row, and the 500 accepts cost it 35-46 ms of wall time against
+a 500 ms bound (a sum, so one deschedule fails the call it interrupts rather than the
+gate) — and the wall-clock number is this benchmark's, printed with its host.
 
 ## What changed
 

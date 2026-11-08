@@ -13,7 +13,7 @@ rather than asserted.
 
 The plan's acceptance (plan-v2 §P6) is a p99 loop lag under 50 ms while a 500-event burst
 is accepted. That number is a property of the host as much as of the code, so it belongs
-here and not in the CI gate: the same commit measured a p99 of 0.2-1 ms on the quiet host
+here and not in the CI gate: the same commit measured a p99 of 0.2-4 ms on the quiet host
 `docs/store-writes.md` quotes, and 64.0 ms and 317.3 ms on the shared CI runner, where
 the runner deschedules the whole process while the heartbeat sleeps. Pass
 `--max-p99-ms 50` on a machine you have named to hold the claim to it; the CI gate
@@ -150,9 +150,12 @@ def main() -> int:
              "plan's number is 50, and it is a statement about one named machine")
     args = parser.parse_args()
 
-    print(banner())
     arrivals = {"paced": [False], "burst": [True], "both": [False, True]}[args.arrival]
     paths = {"legacy": [False], "writer": [True], "both": [False, True]}[args.path]
+    if args.max_p99_ms is not None and not any(paths):
+        parser.error("--max-p99-ms needs a writer-path run to measure: "
+                     "use --path writer or --path both")
+    print(banner())
     writer_p99: list[tuple[str, float | None]] = []
     for run in range(args.repeat):
         for burst in arrivals:
