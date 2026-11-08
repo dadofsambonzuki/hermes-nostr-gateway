@@ -298,9 +298,14 @@ same branch and a revision all land on that one card; none of them makes a secon
   merge commit and a comment saying what landed. A merge that arrives for a card already
   completed is a no-op: nothing is written twice. A 1631 that names **no commit** is not
   evidence and completes nothing: the card stays open and the pass says why.
-- **`done` requires `applied`.** A PR card whose PR is still open cannot be completed by a
-  worker — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not
-  `--force`. The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
+  The bridge never publishes this one itself — it cannot know what a merge left on master — so
+  the merge helper does: `scripts/merge_pr.sh` publishes the 1631 after its push
+  (`hng ngit applied <pr> --commit <sha>` by hand). It must carry the repository `a`
+  coordinate, because that is the filter this feed is read with: a status without it is stored
+  by the relay and seen by nobody here.
+- **`done` requires `applied`.** A card whose PR is still open cannot be completed by anyone
+  — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not `--force`.
+  The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
   `ngit_pr_guards` and one `BEFORE UPDATE OF status` trigger whose message is the refusal a
   person reads (`PR <short> is open at <tip> -- a merge completes a PR card, and a reviewer's
   approving verdict finishes a review card`). A merge releases the guard (the commit is the

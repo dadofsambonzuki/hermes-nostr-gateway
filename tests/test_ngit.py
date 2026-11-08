@@ -18,7 +18,7 @@ from pathlib import Path
 import nostr_sdk as sdk
 import pytest
 
-from hermes_nostr_gateway import cli, ngit, ngit_labels
+from hermes_nostr_gateway import cli, ngit, ngit_labels, pr_status
 from hermes_nostr_gateway.control import ControlConfig
 from hermes_nostr_gateway.kanban import Anchor, Board
 from hermes_nostr_gateway.store import Store
@@ -1246,6 +1246,64 @@ def test_a_merge_releases_the_guard_and_names_the_commit(harness):
     # Nothing is left to refuse: the guard and its trigger are gone.
     assert guard_triggers(harness) == []
     assert report.prs["completed"] == 1
+
+
+def test_the_applied_record_the_merge_script_publishes_releases_the_guard(harness):
+    """The real event shape, not a hand-built Merge: `scripts/merge_pr.sh` publishes it.
+
+    `ngit pr apply` replays a proposal as new commits, so nothing else can tell the bridge
+    what landed. The feed is built the way the bridge reads it -- `RelayPrs.events`, whose
+    filter is the repository's `a` coordinate -- and then handed to the pass, whose guard
+    release is the thing that was missing in production.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    commit = "f" * 40
+    event = pr_status.signed(
+        pr_status.applied_event(
+            pr_id=pr.id, address=ADDRESS, merge_commit=commit, authors=(TRUSTED_HEX,),
+            relay_hint="wss://relay.example", created_at=1100),
+        sdk.Keys.generate().secret_key().to_hex())
+
+    def fetch(**kwargs):
+        assert kwargs["a_tag"] == ADDRESS
+        return [event]
+
+    feed = ngit.RelayPrs(("wss://relay.example",), ADDRESS, fetcher=fetch).events(0)
+    assert [merge.commit for merge in feed.merges] == [commit]
+
+    harness.prs_data = feed
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done"
+    assert commit in str(row["result"])
+    assert guard_triggers(harness) == []
+    assert report.prs["completed"] == 1
+
+
+def test_a_close_the_tooling_publishes_is_seen_and_blocks_the_card(harness):
+    """The same filter, for the other status: without the `a` tag the close never arrives."""
+    pr, task_id = pr_with_review_task(harness)
+    event = pr_status.signed(
+        pr_status.closed_event(
+            pr_id=pr.id, address=ADDRESS, reason="Superseded by PR 1234abcd.",
+            authors=(TRUSTED_HEX,), relay_hint="wss://relay.example", created_at=1100),
+        sdk.Keys.generate().secret_key().to_hex())
+
+    def fetch(**kwargs):
+        assert kwargs["a_tag"] == ADDRESS
+        return [event]
+
+    feed = ngit.RelayPrs(("wss://relay.example",), ADDRESS, fetcher=fetch).events(0)
+    assert [stopped.pr_id for stopped in feed.closed] == [pr.id]
+
+    harness.prs_data = feed
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "blocked" and row["block_kind"] == "dependency"
+    assert any(str(event["id"]) in comment["body"] for comment in harness.comments(task_id))
+    assert report.prs["blocked"] == 1
 
 
 def test_a_merge_completes_every_card_for_the_pr_root(harness):

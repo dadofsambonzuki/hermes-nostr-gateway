@@ -541,6 +541,26 @@ place both completion paths meet, and the guard is installed next to the rows th
 already writes. A kernel schema rebuild can drop the trigger; the next pass re-installs it from
 the link, so the rule heals rather than silently lapsing.
 
+## The merge publishes its own record
+
+`ngit pr apply` replays a proposal's patches as **new** commits. The proposal's own commits
+never become ancestors of the target, so ngit's inference ("the proposal is in master") never
+fires, and the PR reads `open` with its content already in. Nothing infers `applied` here; a
+maintainer kind-1631 has to say it, naming the commit the push left. So `scripts/merge_pr.sh`
+publishes one after the push (`hng ngit applied`), and the bridge never does: only the merge
+knows the commit.
+
+**Both readers decide the tags.** `merge_from_event` takes the root `e` and the commit from
+`merge-commit-id` or `merge-commit`; the repository feed (`RelayPrs.events`) is filtered by the
+repository's `a` coordinate. A status with one and not the other parses in a test and is
+invisible in production — which is how a hand-published close (`e`/`p`/`alt`) vanished, and why
+`hng ngit closed` exists rather than `ngit pr close` (which writes no `a` tag).
+
+**A merge that publishes no record is not a success.** The content is in and the card still
+refuses completion, so the helper exits 8 and prints the retry rather than reporting the merge
+as done. The alternative — treating the push as the end of the job — is the failure this record
+exists to remove.
+
 ## Three labels, one writer
 
 A PR's review state is one of three words — `review-required`, `changes-requested`, `approved`

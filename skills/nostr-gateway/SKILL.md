@@ -154,9 +154,14 @@ manual — run `ngit skill install` for the rest.
   relay and still does not appear in `ngit pr view --comments`.
 - **A proposal a rebase orphaned is closed with a status event, not a deletion.** Merging a
   rebased branch leaves the PR's original commits outside the target, so it reads `open` with its
-  content already in `master`; a kind-5 deletion is refused (*authored by another pubkey*). Publish
-  **kind 1632** instead — `e` = the PR id, one `a` per maintainer coordinate, `alt` = `PR closed` —
-  and read it back with `ngit pr view`. Never leave a dead proposal for a reviewer to re-read.
+  content already in `master`; a kind-5 deletion is refused (*authored by another pubkey*). Close
+  it with **`hng ngit closed <id> --reason "<why>"`**, which publishes a kind 1632 carrying the
+  repository `a` coordinate — `ngit pr close` writes the same kind without that tag, so a
+  repository reader never sees the close. Read it back with `ngit pr view`. Never leave a dead
+  proposal for a reviewer to re-read.
+- A **merged** proposal needs its own kind-1631: `ngit pr apply` re-signs the commits, so the
+  proposal can never infer `applied`. `scripts/merge_pr.sh` publishes it after the push, and
+  `hng ngit applied <id> --commit <full sha>` does it by hand (`--dry-run` shows the event).
 - Read **`ngit pr view <id> --json`** for state, and judge a push by it — a self-hosted GRASP
   can fail its ref update while the ngit relay took the change.
 

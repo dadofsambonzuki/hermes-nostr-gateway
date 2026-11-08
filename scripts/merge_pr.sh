@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Apply a PR and gate it, in one command.
 #
-#   scripts/merge_pr.sh <pr-id|nevent>            apply onto master, gate, push
+#   scripts/merge_pr.sh <pr-id|nevent>            apply onto master, gate, push, publish the record
 #   scripts/merge_pr.sh <pr-id|nevent> --check    apply and gate only, never push
 #
 # Exit: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage/state error,
 #       4 a card workspace (not the operator's), 5 the live checkout moved,
-#       6 a commit does not say which card wrote it, 7 the card is not in review or done.
+#       6 a commit does not say which card wrote it, 7 the card is not in review or done,
+#       8 merged, but the applied record (kind-1631) did not publish.
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -16,6 +17,14 @@
 # Why a script at all: doing this by hand is a dozen tool round-trips per PR — a
 # status lookup, a worktree, a merge, two gate runs, a push — each one re-sending the
 # agent's whole context. One command, a few lines of output, same result.
+#
+# Why it publishes a kind-1631 after the push: `ngit pr apply` replays the proposal's
+# patches as NEW commits, so the proposal's commits never become ancestors of master and
+# ngit never infers `applied`. Without the status the content is in and the PR still reads
+# `open`, and a board card guarded by `done` requires `applied` refuses to finish. The
+# commit in the record is the one the push left (`git rev-parse HEAD` in the worktree), and
+# the event carries the repository `a` coordinate because that is what a repository feed
+# filters on — see `hng ngit applied`.
 #
 # Why it cannot move the clone: the daemon serves this checkout, so a script that leaves it
 # on a proposal branch makes that proposal live. Everything below runs in a throwaway
@@ -182,4 +191,27 @@ fi
 
 git -C "$wt" push -q origin HEAD:master || { echo "FAIL push"; exit 2; }
 git -C "$REPO" fetch -q origin 2>/dev/null
+
+# The push landed; the record is what makes the PR read `applied` and releases a card's
+# guard. The commit is the worktree's HEAD — the one master now points at — and it has to
+# be published from the live checkout, whose `ngit repo --json` names the address and the
+# relays this repository's readers use. `HNG_CONFIG` and `HNG_NSEC_FILE` are for an operator
+# whose config or signer is not this box's default; the record is signed by the key that
+# publishes it, so a merge made with another maintainer key publishes with that key too.
+commit=$(git -C "$wt" rev-parse HEAD)
+hng=("$VENV/bin/hng")
+[ -n "${HNG_CONFIG:-}" ] && hng+=(--config "$HNG_CONFIG")
+nsec=()
+[ -n "${HNG_NSEC_FILE:-}" ] && nsec+=(--nsec-file "$HNG_NSEC_FILE")
+record_cmd=("${hng[@]}" ngit applied "$pr" --commit "$commit" --repo "$REPO" "${nsec[@]}")
+
+if ! record=$("${record_cmd[@]}" 2>&1); then
+  echo "FAIL applied $pr: content is in master ($commit), the applied record is not published"
+  printf '%s\n' "$record" | sed 's/^/     /' | head -3
+  echo "     until it is, the PR reads open and a guarded card refuses completion. Retry:"
+  printf '     '; printf '%q ' "${record_cmd[@]}"; echo
+  exit 8
+fi
 echo "OK   applied $pr | $tests | master $(git -C "$REPO" rev-parse --short origin/master)"
+echo "     $record"
+

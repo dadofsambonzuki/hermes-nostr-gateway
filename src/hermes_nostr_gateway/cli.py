@@ -16,7 +16,7 @@ import yaml
 
 from .bots import BotRegistry
 from .checkout import inspect as inspect_checkout
-from .control import ControlConfig
+from .control import ControlConfig, as_hex
 from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret
 from .fetch import fetch_many_blocking, stream_events
 from .health import (
@@ -1267,6 +1267,10 @@ def cmd_ngit(args) -> int:
         return cmd_ngit_merge(cfg, args)
     if args.ngit_cmd == "reconcile":
         return cmd_ngit_reconcile(cfg, args)
+    if args.ngit_cmd == "applied":
+        return cmd_ngit_applied(cfg, args)
+    if args.ngit_cmd == "closed":
+        return cmd_ngit_closed(cfg, args)
     return cmd_ngit_sync(cfg, args)
 
 
@@ -1456,6 +1460,96 @@ def cmd_ngit_answer(cfg: dict[str, Any], args) -> int:
     else:
         print(f"{result['task']}: unchanged ({result.get('note') or result['status']})")
     return 0
+
+
+def _status_secret(cfg: dict[str, Any], args) -> str:
+    """The key the status is signed with: `--nsec-file`, else the gateway's own identity.
+
+    A merge is a maintainer's act, and the record has to be attributable to whoever did it.
+    The default is the identity every other write on this host uses, so `merge_pr.sh` needs
+    no key of its own -- and a maintainer whose key is not the gateway's names their file.
+    """
+    path = str(getattr(args, "nsec_file", "") or "").strip()
+    if path:
+        location = os.path.expanduser(path)
+        return _checked_secret(read_secret_file(location), f"nsec file {location}")
+    return secret_from(cfg)
+
+
+def _publish_pr_status(cfg: dict[str, Any], args, *, kind: str) -> int:
+    """Publish the status record for one proposal: `applied` or `closed`.
+
+    Both commands exist because the two readers of a NIP-34 repository disagree about what
+    a hand-published status looks like. `merge_from_event` needs the root `e` and a commit
+    tag; `RelayPrs.events` filters by the repository's `a` coordinate. One builder emits
+    both (`pr_status`), and this is where the checkout, the key and the relay set are
+    resolved for it -- the same set the bridge reads, so a status that lands is a status
+    the bridge sees.
+    """
+    from . import ngit as bridge
+    from . import pr_status
+
+    repo = Path(os.path.expanduser(str(args.repo or os.getcwd())))
+    label = "applied-record" if kind == "applied" else "close-record"
+    try:
+        secret = _status_secret(cfg, args)
+        signer = pr_status.signer_pubkey(secret)
+        repository = bridge.Ngit(repo).repository()
+        if not repository.address:
+            raise bridge.NgitError(
+                f"{repo} has no NIP-34 address (ngit repo --json named no coordinate):"
+                " there is no repository to publish a status against")
+        detail = pr_status.pr_detail(repo, args.pr)
+        pr_id = bridge.event_hex(str(detail.get("id") or ""))
+        if not pr_id:
+            raise bridge.NgitError(f"ngit pr view {args.pr} named no event id")
+        authors = [key for key in (as_hex(str(detail.get("author") or "")), signer) if key]
+        # The same read set `ngit sync` publishes labels to: `ngit.relays` when the operator
+        # named one, otherwise the announcement's hints and the gateway's read relays --
+        # where a repository that predates the hints still publishes.
+        ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
+        relays = tuple(ngit_cfg.relays or ())
+        if not relays:
+            relays = tuple(dict.fromkeys((*repository.relays, *_read_relays(cfg))))[:8]
+        hint = repository.relays[0] if repository.relays else ""
+        if kind == "applied":
+            commit = pr_status.full_commit(args.commit)
+            event = pr_status.applied_event(
+                pr_id=pr_id, address=repository.address, merge_commit=commit,
+                root_commit=pr_status.root_commit(repo), authors=authors, relay_hint=hint)
+        else:
+            commit = ""
+            event = pr_status.closed_event(
+                pr_id=pr_id, address=repository.address, reason=args.reason or "",
+                authors=authors, relay_hint=hint)
+    except bridge.NgitError as exc:
+        print(f"ngit {kind}: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "dry_run", False):
+        # The operator's look before the send: the event exactly as it would be published.
+        print(json.dumps(event, indent=2))
+        return 0
+    try:
+        published = pr_status.publish_status(event, relays, secret)
+    except bridge.NgitError as exc:
+        print(f"ngit {kind}: {exc}", file=sys.stderr)
+        return 1
+    if not published.ok:
+        print(f"{label} FAILED {pr_id[:8]}: {published.line()}", file=sys.stderr)
+        return 1
+    how = f" -> {commit}" if commit else ""
+    print(f"{label} {pr_id[:8]}{how} | {published.line()}")
+    return 0
+
+
+def cmd_ngit_applied(cfg: dict[str, Any], args) -> int:
+    """The kind-1631 that makes an applied PR read `applied` (and releases a board guard)."""
+    return _publish_pr_status(cfg, args, kind="applied")
+
+
+def cmd_ngit_closed(cfg: dict[str, Any], args) -> int:
+    """The kind-1632 that closes a proposal -- with the `a` tag a repository reader filters on."""
+    return _publish_pr_status(cfg, args, kind="closed")
 
 
 def cmd_deps(args) -> int:
@@ -2041,6 +2135,40 @@ def main(argv: list[str] | None = None) -> int:
     p_ngit_merge.add_argument("--board", default=None, help="board slug override")
     p_ngit_merge.add_argument("--json", action="store_true")
     p_ngit_merge.set_defaults(func=cmd_ngit)
+
+    p_ngit_applied = ngit_sub.add_parser(
+        "applied", help="publish the kind-1631 that makes a merged PR read applied")
+    p_ngit_applied.add_argument(
+        "pr", help="the proposal: event id (hex, full or a prefix ngit resolves) or nevent")
+    p_ngit_applied.add_argument(
+        "--commit", required=True,
+        help="the full 40-character commit on the target branch that the push left")
+    p_ngit_applied.add_argument(
+        "--repo", default=None, help="checkout override (default: the current directory)")
+    p_ngit_applied.add_argument(
+        "--nsec-file", default=None,
+        help="sign with this key file instead of the gateway identity")
+    p_ngit_applied.add_argument(
+        "--dry-run", action="store_true",
+        help="print the event it would publish; publish nothing")
+    p_ngit_applied.set_defaults(func=cmd_ngit)
+
+    p_ngit_closed = ngit_sub.add_parser(
+        "closed", help="close a proposal (kind-1632) with the repository `a` tag")
+    p_ngit_closed.add_argument(
+        "pr", help="the proposal: event id (hex, full or a prefix ngit resolves) or nevent")
+    p_ngit_closed.add_argument(
+        "--reason", default="",
+        help="one line saying why: `closed` alone reads as rejected")
+    p_ngit_closed.add_argument(
+        "--repo", default=None, help="checkout override (default: the current directory)")
+    p_ngit_closed.add_argument(
+        "--nsec-file", default=None,
+        help="sign with this key file instead of the gateway identity")
+    p_ngit_closed.add_argument(
+        "--dry-run", action="store_true",
+        help="print the event it would publish; publish nothing")
+    p_ngit_closed.set_defaults(func=cmd_ngit)
 
     p_deps = sub.add_parser(
         "deps", help="dependency proposals: scan, gate and push a pr/deps-* branch")

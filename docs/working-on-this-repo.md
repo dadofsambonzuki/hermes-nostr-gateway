@@ -13,7 +13,8 @@ scripts/merge_pr.sh <pr-id|nevent> --check    # apply and gate only
 Exit codes: 0 applied (or would), 1 conflict, 2 gate failure or a refused push, 3 usage or state
 error, 4 a card workspace (not the operator's), 5 the live checkout moved mid-run, 6 a commit
 carries no card trailer (none at all, or one that names something that is not a card), 7 the card
-is not in `review` or `done`. The last two are the authorship route:
+is not in `review` or `done`, 8 merged but the applied record (kind-1631) did not publish. 6 and
+7 are the authorship route:
 [every commit says which card wrote it](#every-commit-says-which-card-wrote-it) and
 [a merge needs the card finished](#a-merge-needs-the-card-in-review-or-done).
 
@@ -32,6 +33,28 @@ Verified on ngit 3.0.5 here: the delta update is not appliable, the full-set upd
 
 The script exists because the hand-rolled loop — status lookup, worktree, merge, ruff, pytest,
 push — is a dozen tool round-trips, and each one re-sends the caller's entire context.
+
+**A merge ends with a kind-1631, not just a push.** `ngit pr apply` replays the proposal's
+patches as *new* commits, so the proposal's commits never become ancestors of `master` and ngit
+never infers `applied`: the content is in and the PR still reads `open`. So the script publishes
+a maintainer status after the push naming the commit master now points at. The same record by
+hand:
+
+```sh
+hng ngit applied <id|nevent> --commit <full 40-char sha> [--dry-run]
+```
+
+`--dry-run` prints the exact event instead of publishing it. The record is what releases a board
+card's guard (`done` requires `applied`), so a merge without one leaves the card refusing
+completion with its content already merged — exit 8 from the script says precisely that, and
+prints the retry. The commit must be the full 40 characters: a short id names nothing a reader
+can resolve, and the failure looks like a PR that never applied.
+
+**Closing a proposal** is `hng ngit closed <id|nevent> --reason "<why>"`, not `ngit pr close`.
+`ngit pr close` writes a 1632 with `e`/`alt`/`p` and no `a` tag; a repository's feed is filtered
+by that coordinate, so the bridge and every other repository reader never see the close. And say
+why: `closed` on its own reads as "rejected", which is a lie about a proposal whose content is
+already in master.
 
 ## Every commit says which card wrote it
 
