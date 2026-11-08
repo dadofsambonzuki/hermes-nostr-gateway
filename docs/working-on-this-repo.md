@@ -23,6 +23,12 @@ route. A proposal whose branch was rebased reads `open` with its content already
 it with a maintainer kind-1632 status event, not a kind-5 deletion (the relay refuses a deletion
 of someone else's event).
 
+**A revision is published with the full patch set, not a delta.**
+`ngit pr send origin/master..HEAD --base $(git rev-parse origin/master) --in-reply-to <root id>`
+updates an open PR; `--in-reply-to` with a range starting at the previous tip publishes only the
+new commits, and `ngit pr apply` then fails on them because their parent is not in `master`.
+Verified on ngit 3.0.5 here: the delta update is not appliable, the full-set update is.
+
 The script exists because the hand-rolled loop — status lookup, worktree, merge, ruff, pytest,
 push — is a dozen tool round-trips, and each one re-sends the caller's entire context.
 
