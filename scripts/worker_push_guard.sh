@@ -168,7 +168,11 @@ status_guard() {
   dest=$hooks/pre-push
   state=1
   if [ -f "$dest" ] && grep -q "$MARKER" "$dest" 2>/dev/null; then
-    printf 'guard: installed at %s\n' "$dest"
+    if [ "$SELF" -ef "$dest" ] || cmp -s "$SELF" "$dest"; then
+      printf 'guard: installed at %s (current)\n' "$dest"
+    else
+      printf 'guard: installed at %s (STALE: %s differs; re-run install)\n' "$dest" "$SELF"
+    fi
     state=0
   elif [ -e "$dest" ]; then
     printf 'guard: NOT installed -- %s holds a different hook\n' "$dest"

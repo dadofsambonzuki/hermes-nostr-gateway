@@ -43,6 +43,9 @@ scripts/worker_push_guard.sh install     # once per clone
 scripts/worker_push_guard.sh status      # installed? is this shell a card workspace?
 ```
 
+The hook is a copy, so a clone that pulls a newer guard keeps the old one until `install` runs
+again — `status` reports that as `STALE` rather than `current`.
+
 A shell is a **card workspace** when the dispatcher marked it (`HERMES_KANBAN_TASK` or
 `HERMES_KANBAN_WORKSPACE`), or when the checkout is under `.worktrees/`. Those two are also
 where the guard ends: a worktree made by hand from an unmarked shell is an operator's, and

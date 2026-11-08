@@ -245,6 +245,28 @@ def test_status_names_the_hook_and_the_shell(sandbox: SimpleNamespace) -> None:
     assert "operator" in as_operator.stdout
 
 
+def test_status_calls_a_stale_install_stale(sandbox: SimpleNamespace) -> None:
+    """An installed copy that has drifted from the script must not read as current."""
+    sandbox.hook.write_text(
+        sandbox.hook.read_text(encoding="utf-8") + "\n# an older install\n", encoding="utf-8"
+    )
+
+    status = guard(sandbox.repo, "status")
+
+    assert status.returncode == 0
+    assert "STALE" in status.stdout
+
+
+def test_merge_pr_help_does_not_print_the_shell_line(tmp_path: Path) -> None:
+    help_text = subprocess.run(
+        ["bash", str(MERGE), "--help"], capture_output=True, text=True, timeout=60
+    )
+
+    assert help_text.returncode == 0
+    assert "Apply a PR and gate it" in help_text.stdout
+    assert "set -uo pipefail" not in help_text.stdout
+
+
 def test_install_from_another_directory_writes_the_shared_hook(tmp_path: Path) -> None:
     """`install <repo>` from elsewhere must not create `<cwd>/.git/hooks` or miss the real one."""
     made = make_repo(tmp_path, card=False)
