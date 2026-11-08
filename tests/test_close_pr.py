@@ -264,3 +264,19 @@ def test_successors_says_so_when_no_other_proposal_shares_the_branch(tmp_path: P
     assert found.returncode == 0, found.stdout + found.stderr
     assert "no other open proposal shares" in found.stdout
     assert "--reason 'Superseded by <id> (tip <sha>)" in found.stdout
+
+
+def test_successors_with_no_tip_asks_for_one_instead_of_crashing(tmp_path: Path) -> None:
+    made = make_close(tmp_path)
+    duplicate_and_successor(made)
+    proposal(made, SUCCESSOR, branch="pr/duplicate(bbbbbbbb)", status="open")
+    (made.state / "list.json").write_text(json.dumps([
+        {"id": DUP, "branch": "pr/duplicate(aaaaaaaa)", "status": "open"},
+        {"id": SUCCESSOR, "branch": "pr/duplicate(bbbbbbbb)", "status": "open"},
+    ]), encoding="utf-8")
+
+    found = close(made, "successors", DUP)
+
+    assert found.returncode == 0, found.stdout + found.stderr
+    assert "bbbbbbbb (ngit names no tip)" in found.stdout
+    assert "pass --tip" in found.stdout

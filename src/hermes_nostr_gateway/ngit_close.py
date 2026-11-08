@@ -222,10 +222,17 @@ def _repo(value: str) -> Path:
 def _print_successors(ref: str, found: Sequence[Successor]) -> None:
     """The lines the merge route prints: the successor, its tip, and the close command."""
     for successor in found:
-        tip = successor.tip or "<tip: pass --tip>"
         subject = f' -- "{successor.subject}"' if successor.subject else ""
-        print(f"other open proposal on this branch: {successor.label} at tip {tip}{subject}")
-        print(f"  ngit pr close {ref} --reason '{close_reason(successor)}'")
+        if successor.tip:
+            print(f"other open proposal on this branch: {successor.label}"
+                  f" at tip {successor.tip}{subject}")
+            print(f"  ngit pr close {ref} --reason '{close_reason(successor)}'")
+        else:
+            # The close still has to name a tip; ngit has none, so say which one to pass.
+            print(f"other open proposal on this branch: {successor.label}"
+                  f" (ngit names no tip){subject}")
+            print(f"  ngit pr close {ref} --reason 'Superseded by {successor.label}"
+                  f" (tip <sha>): {DEFAULT_WHY}.'  # pass --tip <sha>")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
