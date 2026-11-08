@@ -1917,6 +1917,101 @@ def test_one_poll_carrying_a_proposal_and_its_republish_makes_one_card(harness):
     assert "b" * 40 in harness.comments(task["id"])[-1]["body"]
 
 
+#: The two kind-1618 roots ngit 3.0.5 published for **one** branch, 108 seconds apart, when a
+#: second commit was pushed and `grasp.day.ag` answered the ref update with 404, so the client
+#: could not see the branch it had already proposed: `5e1f9dbe` and `08baeaaf`.
+#:
+#: Everything the bridge reads is the published value. Both roots carry the same `branch-name`
+#: -- the branch as typed, cut to 60 characters -- and each names its own tip; the second one's
+#: `merge-base` is the first one's tip, which is what a re-push (rather than a rebase) looks
+#: like. `ngit pr view --json` prints `pr/<branch>-(5e1f9dbe)` and `...-(08baeaaf)`: that
+#: suffix is the client's decoration to tell two roots apart on screen, and it is not on the
+#: wire, so the fold's key matches. Do not make a fold or a test depend on it.
+#:
+#: Only `a` is this test's repository (the pass asks relays for one address, so an event naming
+#: another could never reach it); `r`, `clone`, `p` and `alt` are dropped as unread here.
+_NGIT_REPUSH_BRANCH = "hermes-nostr-gateway/t_fc8bf1c9-merge-route-the-rest-of-the-"
+_NGIT_REPUSH_TIPS = ("1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7",
+                     "0ad9f8dad061e7505f9acad6d7f2bf9b6c6a6c6a")
+_NGIT_REPUSH = (
+    {"id": "5e1f9dbe4280cb804d5d0197472e5c5d6914d68e3df2127b07d5d48aaad63051",
+     "kind": ngit.KIND_PR,
+     "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+     "created_at": 1794152305,
+     "content": "The authorship half of the merge route had one part: a verdict signed by a "
+                "different npub.",
+     "tags": [["a", ADDRESS],
+              ["subject", "Merge route: a commit names its card, and a merge needs the card "
+                          "finished"],
+              ["branch-name", _NGIT_REPUSH_BRANCH],
+              ["c", _NGIT_REPUSH_TIPS[0]],
+              ["merge-base", "9b52622679dccf34e7fe646da8ac9fe70beaf112"]]},
+    {"id": "08baeaaf6792bd3d1361ceed725d03271f3a2ad77d284963a41dbb93a5451b63",
+     "kind": ngit.KIND_PR,
+     "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+     "created_at": 1794152413,
+     "content": "The rules are in `working-on-this-repo.md` and `queue-and-prs.md`; this is the "
+                "record of what was chosen.",
+     "tags": [["a", ADDRESS],
+              ["subject", "Docs: the two authorship decisions, and why the trailer is not "
+                          "written at merge"],
+              ["branch-name", _NGIT_REPUSH_BRANCH],
+              ["c", _NGIT_REPUSH_TIPS[1]],
+              ["merge-base", _NGIT_REPUSH_TIPS[0]]]},
+)
+
+
+def test_the_two_roots_ngit_publishes_for_one_repush_name_the_same_branch():
+    """The published `branch-name` has no `(<pr-id>)`: it is the branch, cut to 60 characters."""
+    feed = ngit.RelayPrs(["wss://relay.example"], ADDRESS,
+                         fetcher=lambda **kwargs: list(_NGIT_REPUSH)).events(0)
+    first, second = sorted(feed.prs, key=lambda pr: pr.created_at)
+
+    assert (first.id, second.id) == (_NGIT_REPUSH[0]["id"], _NGIT_REPUSH[1]["id"])
+    assert first.branch == second.branch == _NGIT_REPUSH_BRANCH
+    assert len(first.branch) == 60 and "(" not in first.branch
+    assert (first.commit, second.commit) == _NGIT_REPUSH_TIPS
+
+
+def test_one_poll_carrying_both_roots_of_a_repush_makes_one_card(harness):
+    """The incident: one branch, two roots, two review cards. It is one card and one link."""
+    harness.prs_data = ngit.RelayPrs(
+        ["wss://relay.example"], ADDRESS,
+        fetcher=lambda **kwargs: list(_NGIT_REPUSH)).events(0)
+
+    report = harness.sync()
+
+    tasks = review_tasks(harness)
+    assert len(tasks) == 1 and len(pr_links(harness)) == 1
+    assert tasks[0]["idempotency_key"] == f"ngit:pr:{_NGIT_REPUSH[0]['id']}"
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 1
+    # The second root is folded as a revision: its tip is on the one card, and the channel
+    # hears one announcement, not two.
+    assert _NGIT_REPUSH_TIPS[1] in harness.comments(tasks[0]["id"])[-1]["body"]
+    assert len(harness.messages) == 1
+
+
+def test_a_repush_published_as_a_second_root_reopens_the_one_card(harness):
+    """A pass that already has the root folds the re-push onto its card instead of a new one."""
+    harness.prs_data = ngit.RelayPrs(
+        ["wss://relay.example"], ADDRESS,
+        fetcher=lambda **kwargs: [_NGIT_REPUSH[0]]).events(0)
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+
+    harness.prs_data = ngit.RelayPrs(
+        ["wss://relay.example"], ADDRESS,
+        fetcher=lambda **kwargs: [_NGIT_REPUSH[1]]).events(0)
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 1 and len(pr_links(harness)) == 1
+    assert harness.task(task_id)["status"] == "ready"
+    assert report.prs["reopened"] == 1 and report.prs["tasks"] == 0
+    assert _NGIT_REPUSH_TIPS[1] in harness.comments(task_id)[-1]["body"]
+    assert len(harness.messages) == 1
+
+
 def test_a_republished_proposal_reopens_the_one_card(harness):
     """A rebased branch read as a fresh proposal is the same work, not a second PR."""
     pr = make_pr("f3", commit="a" * 40, branch="pr/widget")

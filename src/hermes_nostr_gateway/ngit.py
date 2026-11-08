@@ -1731,6 +1731,12 @@ class Sync:
         whose (author, branch) an existing, unapplied link already names is folded onto
         that root as a revision; the oldest link wins, because the 1618 that opened the PR
         is the record. A proposal with no tip names no revision and is left as a PR.
+
+        The key is the branch **as published**: the 1618's `branch-name`, which ngit cuts to
+        60 characters and never decorates. `ngit pr view --json` prints
+        `pr/<branch>-(<8 hex>)` to tell two roots apart on screen, and that suffix is the
+        client's display string -- it is not on the wire, so it is not stripped here: a
+        duplicate card is never a suffix mismatch (see `docs/queue-and-prs.md`).
         """
         closed = closed or set()
         known: dict[tuple[str, str], str] = {}

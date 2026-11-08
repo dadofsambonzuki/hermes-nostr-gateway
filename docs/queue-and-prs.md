@@ -65,7 +65,23 @@ published as a second proposal, and a revision all land on that card.
 **Enforced in** `_fold_repeats` and `_revisions` in `src/hermes_nostr_gateway/ngit.py`, the
 `ngit:pr:<root>` idempotency key on the card, and `Board.reopen` in
 `src/hermes_nostr_gateway/kanban.py`. `tests/test_ngit.py` pins one card across two passes, a
-republished proposal and a revision of a `done` card.
+republished proposal and a revision of a `done` card — and, since the queue grew a duplicate
+review card for a re-push, the two real kind-1618 roots it published (same `branch-name`, two
+tips, the second one based on the first).
+
+**The branch it compares is the one on the wire.** `branch-name` is the author's branch as
+typed, cut by ngit to 60 characters. `ngit pr view --json` prints
+`pr/<branch>-(<8 hex>)`, adding the short PR id so two roots of one branch stay apart on
+screen; that suffix is the client's display string and never reaches the bridge, so it is not
+stripped. Two roots of one re-push carry the **same** `branch-name` and fold; a `(<pr-id>)`
+mismatch is not a failure mode, and a normalisation for it would guard a string this code
+never sees.
+
+**So a second card for one branch means the pass that made it had no fold.** Check the
+checkout before the comparison: `hng status` prints `checkout: <branch> @ <sha> (<n> behind
+master)`, and a bridge serving a stale tree makes one card per root while every gate stays
+green (`hng doctor` passes a checkout that is behind by design). Pull, restart the daemon,
+then read the board again — the code is right, the deployment was not.
 
 **In this tree:** yes — all three are on `master`.
 
