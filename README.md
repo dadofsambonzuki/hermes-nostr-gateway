@@ -241,6 +241,30 @@ picks the release up by name fails only at runtime.
 The Hermes plugin finds the socket through `NOSTR_GATEWAY_SOCKET` or its `socket_path` setting;
 the daemon's default is `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`.
 
+The work half queues onto a **kanban board**, so the install is not finished until Hermes has the
+plugin that renders it. `plugins.enabled` in `~/.hermes/config.yaml` must include `kanban`; a
+`hermes` install without it queues work nobody can see — the cards exist, the bridge behaves, and
+the dashboard has no tab to show them. The board is then at `/kanban` on the dashboard, which is
+the operator's view: which profile is running what, and which cards are waiting on a decision.
+
+Give reviews their own capacity, because a review and an implementation card are different pools
+and a queue of reviews otherwise starves the work it exists to gate:
+
+```yaml
+kanban:
+  review_dispatch: true
+  max_in_progress: 10
+  max_in_progress_per_profile:
+    default: 5    # implementation
+    review: 5     # review runs
+```
+
+A card that cannot proceed is **blocked, and a blocked card is announced in its channel** — the
+card, the reason, and the question it is waiting on, once, when the state changes. A silent block
+is indistinguishable from work that has not started, which is how a queue stalls overnight while
+every health check stays green. The same goes for a verdict: approve or changes-requested leaves
+the board and appears on the PR, so a reader of either one sees the same thing.
+
 ## Configuration
 
 `config.example.yaml` carries the comments; this is the map.

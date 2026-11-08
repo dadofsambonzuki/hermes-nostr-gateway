@@ -87,6 +87,17 @@ Every refusal is a word, and the word decides what to do.
 - **Review tasks are keyed `ngit:pr:<event id>`.** The key is what makes a re-poll or a
   wake idempotent: the board refuses a second task with the same key. Do not rename it.
 
+## When a card blocks, say so
+
+- **A block is an event, not a state.** When a card enters `blocked`, post one message in its
+  channel: the card id, the reason, and the question it waits on. Once, on the transition — a
+  repeated poll must not repeat the notice, and a silent block reads exactly like work that never
+  started, which is how a board stalls with every health check green.
+- **A verdict leaves the board.** Approve or changes-requested is published on the PR (kind-1111
+  comment plus a label) as well as the card, so the operator sees the same fact from either side.
+- **Blocked is not a failure.** It is the board asking a question; answer it with the card, not by
+  re-dispatching the work and hoping.
+
 ## Changing this repository
 
 - **The live checkout stays on `master`.** The daemon serves this clone (editable install), so a
