@@ -93,7 +93,9 @@ def close_env(made: SimpleNamespace, **extra: str) -> dict[str, str]:
 
 
 def close(made: SimpleNamespace, *args: str, **extra: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["/bin/sh", str(made.repo / "scripts" / "close_pr.sh"), *args],
+    # The script's shebang is bash and it uses `set -o pipefail`, which dash does not have;
+    # run it through the interpreter its shebang names, as merge_pr's tests do.
+    return subprocess.run(["bash", str(made.repo / "scripts" / "close_pr.sh"), *args],
                           cwd=made.repo, env=close_env(made, **extra),
                           capture_output=True, text=True, timeout=120)
 
