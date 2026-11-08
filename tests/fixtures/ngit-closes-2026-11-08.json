@@ -1,0 +1,102 @@
+{
+  "source": "nak req -k 1632 -t a=30617:c4f5e7a7...:hermes-nostr-gateway wss://relay.ngit.dev",
+  "note": "two real kind-1632 closes, verbatim: one with a reason, one with empty content",
+  "events": [
+    {
+      "kind": 1632,
+      "id": "638825a6c27aae756d824e2d174c93e059b99e82b5d76b111c79cd338a94fd13",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794164989,
+      "tags": [
+        [
+          "alt",
+          "PR closed"
+        ],
+        [
+          "e",
+          "a37838913fca220db17068e18a6261c8be6c29fbac825cb1dcede7abfbf26047",
+          "wss://relay.ngit.dev",
+          "root"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway"
+        ],
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ]
+      ],
+      "content": "superseded by 63f6a63b7bb6a823be7818b04edecf2c79e5bfccd8ed35ae8a8f65304398dd1e",
+      "sig": "3c4fe19c9262315ae1e0b1b844796d7935950814853cb535a5913cb28bdbac291ad5b5d5e796b6f5ac1af697174ad595a5a6dee608b3889c5578e4a278fbe995"
+    },
+    {
+      "kind": 1632,
+      "id": "f9aa833aeaa883bdd3c68f499c26ca98517285cad6c11d3b431686600206504a",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794152523,
+      "tags": [
+        [
+          "alt",
+          "PR closed"
+        ],
+        [
+          "e",
+          "5e1f9dbe4280cb804d5d0197472e5c5d6914d68e3df2127b07d5d48aaad63051",
+          "wss://relay.ngit.dev",
+          "root"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway"
+        ],
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ]
+      ],
+      "content": "",
+      "sig": "bb72c0122b83ec01e6f375a2e152ebf5c2620a02786f58e5888fa02fb739a89473e467a62d0724fb73c40a6c00a86db62abd09234857009e131abd0016412d87"
+    }
+  ]
+}

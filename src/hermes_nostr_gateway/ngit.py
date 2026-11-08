@@ -86,6 +86,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import nostr_sdk as sdk
 
+from . import ngit_guard
 from .applied import Checkout as AppliedCheckout
 from .applied import Evidence
 from .control import ControlConfig, as_hex
@@ -159,6 +160,16 @@ TRUSTED_PLANE = "concord"
 ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted",
                           "waiting"})
 PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
+
+#: Guard states the pass must never walk back. A PR does not un-merge, a closed proposal does
+#: not reopen (a re-push is a second root, not a revival), and an approving verdict stays an
+#: approval -- so `applied`, `closed` and `approved` are final on the board. This matters
+#: because the PR feed is **incremental**: a pass whose window held no news about a PR has not
+#: learned that it is open, only that nothing arrived, and relay delivery can put a status
+#: event behind the cursor for good. Rewriting `open` on that silence is what pinned a closed
+#: PR's card in place; on an `approved` guard it would re-make the refusal trigger on a card
+#: the verdict already finished (see docs/queue-and-prs.md, "The guard is monotonic").
+TERMINAL_GUARD_STATES = frozenset({ngit_guard.APPLIED, ngit_guard.APPROVED, ngit_guard.CLOSED})
 
 #: Seconds of overlap on a relay cursor. Relays apply `since` inclusively and clocks drift;
 #: the link table, not the cursor, is what stops a replayed event being reported twice.
@@ -3271,6 +3282,12 @@ class Sync:
                     for card in cards:
                         if str(card.get("status") or "") in (DONE, "archived"):
                             continue  # finished by a merge or by an approval; prune drops it
+                        held = self.board.guard_state(str(card["id"])) or {}
+                        if str(held.get("state") or "") in TERMINAL_GUARD_STATES:
+                            # No news in this window is not evidence the PR is open: the
+                            # feed is incremental and a status event can sit behind the
+                            # cursor for good. A terminal guard stays terminal.
+                            continue
                         self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip,
                                             evidence=evidence)
             except (BoardError, sqlite3.Error) as exc:

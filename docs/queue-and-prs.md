@@ -134,6 +134,34 @@ lists `ngit_pr_done_*` for the open PRs' cards,
 `sqlite3 <board>/kanban.db "select pr_id, state, evidence from ngit_pr_guards"` shows what each
 refusal is based on, and `test -f src/hermes_nostr_gateway/ngit_guard.py` answers true.
 
+#### The guard is monotonic
+
+`applied`, `closed` and `approved` are final: the pass never walks any of them back to `open`.
+Only the absence of a *newer* event could suggest a PR reopened, and the PR feed is incremental
+— each pass fetches from a stored cursor, so silence about a PR means "nothing arrived in this
+window", not "this PR is open". A status event that reaches the relays after the pass whose
+window covered its timestamp sits behind the cursor for good, and re-asserting `open` on that
+silence rewrites a truthful row into a refusal no later pass can undo. The guard reads each
+card's existing state before refreshing it and leaves a terminal one alone
+(`TERMINAL_GUARD_STATES` in `ngit.py`, used by `Sync._guards`); the **link** is another half,
+because a link whose state is `merged` or that carries `note["merge"]` is skipped outright,
+and so is a card already `done` or `archived` — a finished card has nothing left to guard.
+
+`approved` is in the set because an approving verdict releases the guard: the card is finished
+by the verdict, the merge stays a person's. A no-news pass that rewrote that row to `open`
+would re-make the trigger and refuse the completion the verdict earned — the one thing the
+review loop exists to prevent.
+
+This does not hide a missed event: a card whose close was never read stays open and still
+refuses completion. Curing that needs a lookback wider than the cursor — see
+`docs/ngit-bridge.md`, "A missed status event does not heal".
+
+**Enforced in** `Sync._guards` (`src/hermes_nostr_gateway/ngit.py`).
+**Tested by** `test_a_pass_with_no_news_does_not_reopen_a_released_guard`,
+`test_a_pass_with_no_news_does_not_reopen_a_closed_guard`,
+`test_a_pass_with_no_news_does_not_reopen_an_approved_guard`, and the control
+`test_a_pass_with_no_news_still_holds_an_open_guard` in `tests/test_ngit.py`.
+
 ### A merge requires the card finished
 
 The other direction of the same rule. `done` requires applied, and an applied PR requires a card

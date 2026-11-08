@@ -1936,6 +1936,80 @@ def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
     assert "closed without a merge" in str(refused.value)
 
 
+# -- a close is a close, whatever it says ------------------------------------
+
+#: Two real kind-1632 closes from 2026-11-08, copied verbatim off relay.ngit.dev. Same
+#: author, same relay set, same tags -- one names its reason, the other carries nothing.
+#: The empty one was mistaken for an event the bridge drops, so it is pinned here: the
+#: reader decides on kind and root tag, and `content` never enters into it.
+CLOSES_FIXTURE = Path(__file__).parent / "fixtures" / "ngit-closes-2026-11-08.json"
+
+
+def real_closes() -> list[dict]:
+    return json.loads(CLOSES_FIXTURE.read_text(encoding="utf-8"))["events"]
+
+
+def root_tag(event: dict) -> str:
+    return next(tag[1] for tag in event["tags"] if tag[0] == "e" and tag[3] == "root")
+
+
+def test_a_close_with_no_content_closes_its_pr_just_the_same():
+    """`content` is the reason, not the signal: an empty close is still a close."""
+    reasoned, silent = real_closes()
+    assert reasoned["content"] and not silent["content"]  # the fixture's whole point
+    for event in (reasoned, silent):
+        stopped = ngit.closed_from_event(event)
+        assert stopped is not None
+        assert stopped.event_id == event["id"]
+        assert stopped.pr_id == root_tag(event)
+
+
+def test_the_relay_reader_keeps_a_close_with_empty_content():
+    """The feed the pass actually reads: the empty close survives the fetch and the fold."""
+    _reasoned, silent = real_closes()
+    feed = ngit.RelayPrs(["wss://relay.example"], ADDRESS,
+                         fetcher=lambda **_: [silent]).events(0)
+
+    assert [stopped.event_id for stopped in feed.closed] == [silent["id"]]
+    assert [stopped.pr_id for stopped in feed.closed] == [root_tag(silent)]
+
+
+def test_a_pass_with_no_news_does_not_reopen_a_released_guard(harness):
+    """Silence is not evidence: an incremental window must not undo a terminal state.
+
+    A status event can reach the relays after the pass whose window covered its timestamp,
+    which puts it behind the cursor for good. The pass then sees nothing at all about the
+    PR -- and rewriting `open` on that silence is what pinned a card whose content had
+    already landed on master.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    harness.board.guard_pr(task_id, pr_id=pr.id, state="applied", tip="c0ffee",
+                           merge_commit="a" * 40, detail="content landed as a" + "a" * 39)
+
+    harness.prs_data = ([], [])  # this poll carried no news about the PR
+    report = harness.sync()
+
+    assert harness.board.guard_state(task_id)["state"] == "applied"
+    assert guard_triggers(harness) == []
+    assert report.prs["review_errors"] == 0
+    # And the card is still completable: the guard has nothing left to refuse.
+    assert harness.board.db.execute(
+        "UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,)).rowcount == 1
+
+
+def test_a_pass_with_no_news_does_not_reopen_a_closed_guard(harness):
+    pr, task_id = pr_with_review_task(harness)
+    harness.board.close_guard(task_id, event_id="9" * 64)
+
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    assert harness.board.guard_state(task_id)["state"] == "closed"
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    assert "closed without a merge" in str(refused.value)
+
+
 def test_a_close_behind_the_cursor_is_invisible_without_the_sweep(harness):
     """The same pass without the sweep: this is the state the bridge was stuck in for hours."""
     pr, task_id = pr_with_review_task(harness)
@@ -2071,6 +2145,41 @@ def test_a_swept_status_never_replaces_a_newer_one_the_poll_carried():
     merged = ngit.with_statuses(ngit.PrFeed(merges=[newer]), ngit.PrFeed(merges=[older]))
 
     assert [(merge.commit, merge.created_at) for merge in merged.merges] == [("b" * 40, 2000)]
+
+
+def test_a_pass_with_no_news_does_not_reopen_an_approved_guard(harness):
+    """An approval is terminal too: no-news silence must not re-make the refusal.
+
+    A reviewer's approving verdict releases the guard so the card can be finished. The row
+    stays `approved` -- and a pass that learned nothing about the PR must leave it alone.
+    Rewriting `open` would re-make the trigger and refuse a completion the verdict earned,
+    which is the exact loop cdc7550 exists to close.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    harness.board.approve_guard(task_id, verdict="a" * 64)
+
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    assert harness.board.guard_state(task_id)["state"] == "approved"
+    assert guard_triggers(harness) == []
+    # The card is still completable: an approval has nothing left to refuse.
+    assert harness.board.db.execute(
+        "UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,)).rowcount == 1
+
+
+def test_a_pass_with_no_news_still_holds_an_open_guard(harness):
+    """The control: monotonic does not mean toothless -- an open guard keeps refusing."""
+    pr, task_id = pr_with_review_task(harness)
+
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    assert harness.board.guard_state(task_id)["state"] == "open"
+    assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    assert "open at c0ffee" in str(refused.value)
 
 
 def test_the_cli_refuses_an_open_pr_card(harness):
