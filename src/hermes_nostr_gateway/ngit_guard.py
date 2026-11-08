@@ -9,11 +9,14 @@ distribution, so the guard is a **trigger on the board's own `tasks` table** -- 
 next to the rows this bridge already writes. It is deliberately narrow:
 
 - one row per guarded card in `ngit_pr_guards`, carrying the PR, its state, the tip it is
-  open at, and the merge commit once one is seen;
+  open at, the merge commit once one is seen, and the evidence the pass used to decide
+  (`no applied status names it, and no commit on master carries its patch (...)`) -- so a
+  refusal can never say "open" about a PR whose content is already on master without also
+  saying what it compared;
 - one `BEFORE UPDATE OF status` trigger per guarded card, whose message is the refusal a
-  person reads (`PR <short> is open at <tip> -- a merge is the only thing ...`). SQLite's
+  person reads (`PR <short> is open at <tip> -- <evidence> -- a merge completes ...`). SQLite's
   `RAISE(ABORT, ...)` takes a literal only, which is why the message is baked into the
-  trigger and the trigger is re-made whenever the state or the tip moves;
+  trigger and the trigger is re-made whenever the state, the tip or the evidence moves;
 - no trigger at all once the PR is `applied` (a merge) or `approved` (a reviewer's verdict):
   those are the two ways a PR card is finished, and each completes normally.
 
@@ -58,6 +61,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     tip          TEXT,
     merge_commit TEXT,
     detail       TEXT,
+    evidence     TEXT,
     updated_at   INTEGER NOT NULL
 )
 """
@@ -78,35 +82,54 @@ def _trigger(task_id: str) -> str:
     return f"{TRIGGER_PREFIX}{re.sub(r'[^A-Za-z0-9_]', '_', str(task_id or ''))}"
 
 
-def refusal(pr_id: str, state: str, tip: str = "", detail: str = "") -> str:
+def refusal(pr_id: str, state: str, tip: str = "", detail: str = "",
+            evidence: str = "") -> str:
     """The sentence a refused completion carries: what the state actually is.
 
     It names the PR and the tip, because "completion refused" without either is the generic
-    error this rule exists to replace. `closed` names the event that closed it: the card is
-    waiting for a person, not for a merge. The last clause tells a reviewer where its end
-    is: the review lane's own `kanban_complete` is exactly the one this guard refuses while
-    the PR is open, and the verdict -- not the card -- is what it writes.
+    error this rule exists to replace. `evidence` is what the pass compared before saying
+    the PR is open -- a status record that names no applied event, and the checkout's own
+    answer about the patch -- so this sentence is never printed about a PR whose content is
+    already on master without saying what was checked. `closed` names the event that closed
+    it: the card is waiting for a person, not for a merge. The last clause tells a reviewer
+    where its end is: the review lane's own `kanban_complete` is exactly the one this guard
+    refuses while the PR is open, and the verdict -- not the card -- is what it writes.
     """
     short = str(pr_id or "")[:8] or "unknown"
+    seen = str(evidence or "").strip().rstrip(".")
     if state == CLOSED:
         by = f" by event {str(detail)[:16]}" if detail else ""
+        if seen:
+            return (f"PR {short} was closed without a merge{by} -- {seen}; a human must decide."
+                    " A closed PR does not finish a card")
         return (f"PR {short} was closed without a merge{by} -- a human must decide; "
                 "a closed PR does not finish a card")
     at = f" at {str(tip)[:12]}" if tip else ""
-    return (f"PR {short} is open{at} -- a merge completes a PR card, and a reviewer's"
+    proof = f" -- {seen}. A" if seen else " -- a"
+    return (f"PR {short} is open{at}{proof} merge completes a PR card, and a reviewer's"
             " approving verdict finishes a review card. A worker's word does neither.")
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create the guard table, and add `evidence` to one made before it existed.
+
+    The live board already holds guard rows written by the previous shape; a missing column
+    must not turn every guard call into an error on the deployment.
+    """
     conn.execute(_SCHEMA)
+    columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({TABLE})")}
+    if "evidence" not in columns:
+        conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN evidence TEXT")
 
 
 def guard(conn: sqlite3.Connection, task_id: str, *, pr_id: str, state: str,
-          tip: str = "", merge_commit: str = "", detail: str = "") -> None:
+          tip: str = "", merge_commit: str = "", detail: str = "",
+          evidence: str = "") -> None:
     """Record the card's PR state and (re)make the trigger that enforces it.
 
-    Called on every pass for an open PR, so a moved tip updates the refusal line. Applied
-    removes the trigger instead: a merged PR has nothing left to refuse.
+    Called on every pass for an open PR, so a moved tip or a new piece of evidence updates
+    the refusal line. Applied removes the trigger instead: a merged PR has nothing left to
+    refuse.
     """
     task_id, pr_id = str(task_id or ""), str(pr_id or "")
     if not task_id or not pr_id:
@@ -114,15 +137,15 @@ def guard(conn: sqlite3.Connection, task_id: str, *, pr_id: str, state: str,
     ensure_schema(conn)
     conn.execute(
         f"INSERT OR REPLACE INTO {TABLE}"
-        " (task_id, pr_id, state, tip, merge_commit, detail, updated_at)"
-        " VALUES (?,?,?,?,?,?,?)",
+        " (task_id, pr_id, state, tip, merge_commit, detail, evidence, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
         (task_id, pr_id, str(state), str(tip or ""), str(merge_commit or ""),
-         str(detail or ""), int(time.time())),
+         str(detail or ""), str(evidence or ""), int(time.time())),
     )
     conn.execute(f"DROP TRIGGER IF EXISTS {_trigger(task_id)}")
     if state in (APPLIED, APPROVED):
         return
-    message = _q(refusal(pr_id, state, tip, detail))
+    message = _q(refusal(pr_id, state, tip, detail, evidence))
     conn.execute(
         f"CREATE TRIGGER {_trigger(task_id)} BEFORE UPDATE OF status ON tasks"
         " WHEN NEW.status = 'done' AND OLD.status != 'done'"
@@ -131,23 +154,30 @@ def guard(conn: sqlite3.Connection, task_id: str, *, pr_id: str, state: str,
     )
 
 
-def release(conn: sqlite3.Connection, task_id: str, *, merge_commit: str = "") -> None:
+def release(conn: sqlite3.Connection, task_id: str, *, merge_commit: str = "",
+            evidence: str = "") -> None:
     """The PR is applied: drop the refusal so the merge path can finish the card."""
     row = _row(conn, task_id)
     if row is None:
         return
     guard(conn, task_id, pr_id=str(row["pr_id"]), state=APPLIED,
           tip=str(row["tip"] or ""), merge_commit=str(merge_commit or ""),
-          detail=str(row["detail"] or ""))
+          detail=str(row["detail"] or ""), evidence=str(evidence or ""))
 
 
-def close(conn: sqlite3.Connection, task_id: str, *, event_id: str = "") -> None:
-    """The PR was closed without a merge: refuse completion and name the closing event."""
+def close(conn: sqlite3.Connection, task_id: str, *, event_id: str = "",
+          evidence: str = "") -> None:
+    """The PR was closed without a merge: refuse completion and name the closing event.
+
+    `evidence` is what the pass compared before leaving the card to a person -- normally
+    "no commit on master carries its patch" -- so the refusal does not read as a shrug.
+    """
     row = _row(conn, task_id)
     if row is None:
         return
     guard(conn, task_id, pr_id=str(row["pr_id"]), state=CLOSED,
-          tip=str(row["tip"] or ""), detail=str(event_id or ""))
+          tip=str(row["tip"] or ""), detail=str(event_id or ""),
+          evidence=str(evidence or row.get("evidence") or ""))
 
 
 def approve(conn: sqlite3.Connection, task_id: str, *, verdict: str = "") -> None:

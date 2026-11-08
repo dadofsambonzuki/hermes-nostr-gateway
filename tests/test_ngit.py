@@ -19,6 +19,7 @@ import nostr_sdk as sdk
 import pytest
 
 from hermes_nostr_gateway import cli, ngit, ngit_labels, pr_status
+from hermes_nostr_gateway.applied import Evidence
 from hermes_nostr_gateway.control import ControlConfig
 from hermes_nostr_gateway.kanban import Anchor, Board
 from hermes_nostr_gateway.store import Store
@@ -133,12 +134,44 @@ def store(tmp_path: Path):
     handle.close()
 
 
+class FakeApplied:
+    """A checkout stand-in for `applied.Checkout`: an answer per tip, and what was asked.
+
+    `head` is the base tip the pass stamps its answers with; a test that wants a second
+    question answered moves it (which is what a merge does) rather than reaching into the
+    link row.
+    """
+
+    def __init__(self, answers: dict | None = None, *, base: str = "base0001",
+                 error: Exception | None = None):
+        self.answers = dict(answers or {})
+        self.base = base
+        self.error = error
+        self.probes: list[str] = []
+        self.heads = 0
+
+    def head(self) -> str:
+        self.heads += 1
+        if self.error is not None:
+            raise self.error
+        return self.base
+
+    def probe(self, tip: str):
+        self.probes.append(tip)
+        if self.error is not None:
+            raise self.error
+        return self.answers.get(
+            tip, Evidence(False, "no commit on master carries its patch"
+                                 " (1 compared against 2 since 9b52622)"))
+
+
 class Harness:
     """A sync with every external collaborator replaced by something a test can see."""
 
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
-                 notifier=None, prs=((), ()), statuses=None, labeler=None, state=None):
+                 notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
+                 applied: FakeApplied | None = None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -152,6 +185,8 @@ class Harness:
         self.since_seen: list[int] = []
         self.label_calls: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
         self.labeler = labeler or self._label
+        #: The checkout's answer about a proposal whose status record says nothing.
+        self.applied = applied or FakeApplied()
         #: What the relays say about a PR: the verdict comment and the labels it carries.
         self.verdicts: dict[str, ngit_labels.Verdict] = {}
         self.carried: dict[str, tuple[ngit_labels.Label, ...]] = {}
@@ -223,7 +258,7 @@ class Harness:
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
             prs=self.prs, statuses=self.statuses, notify=self.notifier, anchor=self.anchor,
-            labels=self.labeler, state=self.state)
+            labels=self.labeler, state=self.state, applied=self.applied)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -1244,6 +1279,177 @@ def test_a_card_with_no_pr_link_is_completed_as_before(harness):
 
     assert harness.board.complete(plain, author="worker", result="written") is True
     assert harness.task(plain)["status"] == "done"
+
+
+# -- `applied` has two witnesses: the record, and the content ------------------
+
+#: What a pass says when the status record is silent and the patch is on the branch: the
+#: shape `applied.Checkout` returns for an `ngit pr apply` merge.
+APPLIED_BY_PATCH = Evidence(
+    True, "its patch is already on origin/master as decdff5 (patch-id 25b99bf6)", commit="d" * 40)
+
+
+def test_a_pr_applied_as_patches_completes_its_card_without_a_status_event(harness):
+    """`ngit pr apply` re-signs the commits: no status names them, and the content is in.
+
+    The card is finished by the same path a recorded merge takes, with the evidence on it --
+    this is the case that used to refuse for ever (`PR <short> is open at <tip>`).
+    """
+    pr, task_id = pr_with_review_task(harness)
+    # The merge moved master; that is what makes the question worth asking again.
+    harness.applied.base = "base-after-merge"
+    harness.applied.answers["c0ffee"] = APPLIED_BY_PATCH
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done"
+    assert "applied as " + "d" * 40 in str(row["result"])
+    assert guard_triggers(harness) == []
+    assert report.prs["applied"] == 1
+    assert any("applied without a status event" in note for note in report.notes)
+    comment = next(c["body"] for c in harness.comments(task_id) if "applied as" in c["body"])
+    assert "No applied status names it" in comment and "patch-id 25b99bf6" in comment
+    # One line to the channel, naming what landed -- not a second "ready for review".
+    assert len([text for _, text in harness.messages if "applied as" in text]) == 1
+
+    # The evidence is recorded, so the next pass neither probes nor posts again.
+    harness.prs_data = ([], [])
+    before = len(harness.applied.probes)
+    harness.sync()
+    assert len(harness.applied.probes) == before
+    assert len([text for _, text in harness.messages if "applied as" in text]) == 1
+
+
+def test_an_open_pr_card_names_the_evidence_it_checked(harness):
+    """The refusal says what was compared, so "open" is never a bare assertion."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.applied.base = "base-after-nothing"
+    harness.applied.answers["c0ffee"] = Evidence(
+        False, "no commit on master carries its patch (1 compared against 4 since 9b52622)")
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+
+    message = str(refused.value)
+    assert pr.id[:8] in message and "open at c0ffee" in message
+    assert "no applied status names it" in message
+    assert "no commit on master carries its patch" in message
+    guard = harness.board.guard_state(task_id)
+    assert guard["state"] == "open"
+    assert "no commit on master carries its patch" in str(guard["evidence"])
+
+
+def test_an_applied_check_is_not_repeated_while_the_tip_and_base_stand_still(harness):
+    """A pass with no news costs one `rev-parse`, not a probe per open PR."""
+    pr, _task = pr_with_review_task(harness)
+    # The first pass asks before it has a link to stamp the answer on.
+    assert harness.applied.probes == ["c0ffee"]
+
+    harness.prs_data = ([], [])
+    harness.sync()  # this answer is stamped on the link
+    assert harness.applied.probes == ["c0ffee", "c0ffee"]
+
+    harness.sync()  # nothing moved: nothing to ask
+    assert harness.applied.probes == ["c0ffee", "c0ffee"]
+
+    # A new tip is a new question -- asked on the pass after the one that recorded it,
+    # because the revision is written to the link after this check has run.
+    harness.prs_data = ngit.PrFeed(
+        revisions=[ngit.Revision(pr_id=pr.id, commit="c0ffe1", created_at=2000)])
+    harness.sync()
+    harness.sync()
+    assert harness.applied.probes == ["c0ffee", "c0ffee", "c0ffe1"]
+
+
+def test_a_dry_run_asks_the_checkout_and_writes_nothing(harness):
+    """`--dry-run` may read the object graph; it may not stamp the answer on the link."""
+    pr, _task = pr_with_review_task(harness)
+    before = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["detail"]
+    harness.prs_data = ([], [])
+
+    harness.sync(dry_run=True)
+
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["detail"] == before
+    assert harness.applied.probes == ["c0ffee", "c0ffee"]  # asked, not remembered
+
+
+def test_a_close_does_not_overrule_content_that_is_on_the_branch(harness):
+    """A 1632 that arrives after the landing cannot un-apply it; the content is the proof."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.applied.base = "base-after-merge"
+    harness.applied.answers["c0ffee"] = APPLIED_BY_PATCH
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1200)
+    harness.prs_data = ngit.PrFeed(closed=[stopped])
+
+    harness.sync()
+
+    assert harness.task(task_id)["status"] == "done"
+    assert "closed without a merge" not in str(harness.task(task_id)["result"])
+
+
+def test_a_closed_pr_with_nothing_on_master_still_needs_a_person(harness):
+    """The close guard survives: a proposal that did not land is a decision, not a completion."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.applied.base = "base-after-nothing"
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1200)
+    harness.prs_data = ngit.PrFeed(closed=[stopped])
+
+    harness.sync()
+
+    assert harness.task(task_id)["status"] == "blocked"
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    message = str(refused.value)
+    assert "closed without a merge" in message and "a human must decide" in message
+    assert "9" * 16 in message  # the closing event, shortened as every id in a refusal is
+    assert "no commit on master carries its patch" in message
+
+
+def test_a_checkout_that_cannot_answer_does_not_stop_the_pass(harness):
+    """An unreadable checkout is a sentence in the refusal, not a pass that dies."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.applied = FakeApplied(error=OSError("the checkout is gone"))
+    harness.prs_data = ([], [])
+
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "ready"
+    assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]
+    assert any("the checkout could not be read" in error for error in report.errors)
+
+
+def test_a_guard_table_from_before_the_evidence_column_is_migrated(tmp_path: Path):
+    """The live board holds rows written by the previous shape: a guard call must still work."""
+    path = tmp_path / "board.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(BOARD_SCHEMA)
+        conn.execute(
+            "CREATE TABLE ngit_pr_guards (task_id TEXT PRIMARY KEY, pr_id TEXT NOT NULL,"
+            " state TEXT NOT NULL, tip TEXT, merge_commit TEXT, detail TEXT,"
+            " updated_at INTEGER NOT NULL)")
+        conn.execute("INSERT INTO ngit_pr_guards VALUES ('t_old', ?, 'open', 'c0ffee', '', '', 1)",
+                     ("f" * 64,))
+        conn.execute("INSERT INTO tasks (id, title, status, created_at)"
+                     " VALUES ('t_old', 'an old card', 'ready', 1)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = Board(path)
+    try:
+        board.guard_pr("t_old", pr_id="f" * 64, state="open", tip="c0ffee",
+                       evidence="no applied status names it")
+        row = board.guard_state("t_old")
+        assert row is not None and row["evidence"] == "no applied status names it"
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            board.db.execute("UPDATE tasks SET status = 'done' WHERE id = 't_old'")
+        assert "no applied status names it" in str(refused.value)
+    finally:
+        board.close()
 
 
 def test_a_merge_releases_the_guard_and_names_the_commit(harness):

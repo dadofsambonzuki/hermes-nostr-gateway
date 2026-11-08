@@ -202,7 +202,10 @@ two from becoming three state machines for one fact.
   revision all land on the same card; only a new PR makes a new one.
 - **`done` requires applied, or an approval.** A card that reviews a PR is finished by the merge,
   or by the reviewer's approving verdict on the PR — never by a worker's word. An approved PR is
-  a finished card and an unmerged PR: the merge is still the operator's.
+  a finished card and an unmerged PR: the merge is still the operator's. *Applied* is the status
+  record or the content: `ngit pr apply` re-signs the commits, so the bridge compares patch ids
+  with `master` (`applied.py`) and a PR whose patches are already in finishes its card even when
+  no status event names it.
 - **A merge requires the card finished.** The route reads the card before it applies anything and
   refuses a PR whose card is still being worked on; `review` and `done` pass, and `blocked` passes
   only on the PR's own card.

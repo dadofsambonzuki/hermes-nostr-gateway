@@ -515,9 +515,11 @@ an open PR made the board report work as finished that a human still had to land
 
 **The rule.** Completion of a PR-backed card requires the link to be `applied` with a merge
 commit id, or a reviewer's approving verdict (`approved` — see "A verdict finishes its card"
-below). The bridge enforces it on the board itself (`ngit_guard`): one row per PR card and
-one `BEFORE UPDATE OF status` trigger whose refusal names the state it saw — `PR <short> is
-open at <tip>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
+below). `applied` is the status record *or* the content on the branch (see "Applied has two
+witnesses" below) — the distinction is what this rule needed most. The bridge enforces it on
+the board itself (`ngit_guard`): one row per PR card and one `BEFORE UPDATE OF status` trigger
+whose refusal names the state it saw and what was compared — `PR <short> is open at <tip> --
+<evidence>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
 covers the agent's tool and the CLI without either knowing the bridge exists. A merge releases
 the guard, an approval releases it, and a close keeps it refusing.
 
@@ -560,6 +562,49 @@ invisible in production — which is how a hand-published close (`e`/`p`/`alt`) 
 refuses completion, so the helper exits 8 and prints the retry rather than reporting the merge
 as done. The alternative — treating the push as the end of the job — is the failure this record
 exists to remove.
+## Applied has two witnesses
+
+`done` requires `applied`, and for a while the only answer to "is this PR applied" was the
+kind-1631 status record. That is the right answer on a forge that fast-forwards — `git merge`,
+`gh pr merge` — because the proposal's tip becomes an ancestor of the target. It is the wrong
+answer on this repository's only route: `ngit pr apply` replays the patch series as **new**
+commits, so the tip a status would name is never an ancestor, and the status itself is only
+published by a merge route that may not have run. Every merged PR then read `open` for ever
+and its card refused for ever with `PR <short> is open at <tip>` — a sentence literally true
+of the object graph and false about the work. Three merged PRs (`30500fef`, `6699c28f`,
+`63f6a63b`) sat behind that refusal while their changes were on `master`.
+
+**Decided: the record first, the checkout second** (`applied.py`).
+
+* A kind-1631 that names the PR is the record. Nothing else is asked.
+* Otherwise, every patch the proposal adds is compared with the base branch by `git patch-id`
+  — a hash of the diff with line numbers stripped, so a replayed, rebased or cherry-picked
+  commit keeps its id while its commit id changes. The proposal is applied when every patch it
+  adds is on the branch, or when the proposal taken as one patch is (a squash).
+* Ancestry is still checked, first and cheaply: exact when a forge fast-forwards, and now one
+  signal among three rather than the signal.
+
+**The refusal names the evidence it used.** The guard row and its trigger carry the sentence
+the pass compared — `no applied status names it, and no commit on master carries its patch
+(1 compared against 12 since 9b52622)` — so "open at <tip>" is never printed about a PR whose
+content is in without also saying what was checked. A card completed by content says
+`applied as <commit> (its patch is already on master …)` and that no status event claims it,
+so a reader checks the commit instead of taking the board's word. The answer is stamped on the
+link with the tip and base it was read at; a pass with no news costs one `rev-parse`.
+
+**A close with nothing on the branch still needs a person.** The kind-1632 rule survives
+unchanged: no merge, no card completion, and the closing event is named. What a close cannot do
+is undo a landing: a proposal whose content is on the branch is applied, and a 1632 that
+arrived afterwards is recorded rather than obeyed. Completion means the work is in; a close
+means someone decided it should stop — when both are true, the work is still in.
+
+**Rejected: trusting `ngit pr view`'s status.** It reports the same record the feed does, so
+it inherits the same silence.
+
+**Rejected: a merge route that publishes the status itself.** `scripts/merge_pr.sh` should
+publish the kind-1631 for a merge it applies (a separate change), but the bridge cannot depend
+on it: PRs land through the route as it is deployed today, and a card that refuses until an
+operator publishes an event is a card that was never actually gated by a merge.
 
 ## Three labels, one writer
 

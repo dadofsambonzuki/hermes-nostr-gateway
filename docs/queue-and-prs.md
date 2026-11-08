@@ -97,10 +97,20 @@ has one row per PR root.
 
 ### `done` requires applied
 
-A card that reviews a PR is finished by the merge — not by the worker, and not by the
-reviewer's approval. A worker's word is not a merge. While the PR is open the board refuses
-`done` and names what it saw (`PR <short> is open at <tip>`); a PR closed without a merge keeps
-refusing and names the closing event.
+A card that reviews a PR is finished by the merge — or by the reviewer's approving verdict, which
+is the review's end and not the work's landing. A worker's word is neither. While the PR is open
+the board refuses `done` and names what it saw *and what it compared* (`PR <short> is open at
+<tip> -- no applied status names it, and no commit on master carries its patch (…)`); a PR closed
+without a merge keeps refusing and names the closing event.
+
+**`applied` is decided from the record, then from the checkout** (`applied.py`). `ngit pr apply`
+replays a proposal's patches as new commits, so the tip the PR event names is never an ancestor
+of `master` however cleanly the change landed — and a kind-1631 exists only when a merge route
+published one. So the pass asks the checkout whether every patch the PR adds is already on the
+base branch (`git patch-id`), or the PR as one patch (a squash). A PR found that way is applied:
+its cards are completed with `applied as <commit> (its patch is already on master …)` as the
+result, and the comment says no status event claims it. A close with nothing on the branch is
+still a person's decision.
 
 The agent's `kanban_complete` tool and `hermes kanban complete` both write
 `tasks.status = 'done'`, so one guard covers both without either knowing the bridge exists. A
@@ -108,16 +118,21 @@ merge releases the guard, and the bridge completes the card with the merge commi
 result.
 
 **Enforced in** `src/hermes_nostr_gateway/ngit_guard.py` — one row per guarded card in
-`ngit_pr_guards`, and one `BEFORE UPDATE OF status` trigger on the board's `tasks` table whose
-refusal is the sentence a person reads. `tests/test_ngit.py` drives both completion paths
+`ngit_pr_guards`, carrying the evidence the pass used, and one `BEFORE UPDATE OF status` trigger
+on the board's `tasks` table whose refusal is the sentence a person reads. The evidence check is
+`src/hermes_nostr_gateway/applied.py`; `tests/test_ngit.py` drives both completion paths
 (`test_the_cli_refuses_an_open_pr_card`,
-`test_an_open_pr_card_refuses_completion_at_the_board`).
+`test_an_open_pr_card_refuses_completion_at_the_board`,
+`test_a_pr_applied_as_patches_completes_its_card_without_a_status_event`) and
+`tests/test_applied.py` drives the checkout's answers.
 
-**In this tree:** yes — `ngit_guard.py` and its trigger are on `master` (PR `14bd6ea3`).
+**In this tree:** yes — `ngit_guard.py` and its trigger are on `master` (PR `14bd6ea3`), and the
+checkout half is on `master` with this change.
 
 **Check:** `sqlite3 <board>/kanban.db "select name from sqlite_master where type='trigger'"`
-lists `ngit_pr_done_*` for the open PRs' cards, and
-`test -f src/hermes_nostr_gateway/ngit_guard.py` answers true.
+lists `ngit_pr_done_*` for the open PRs' cards,
+`sqlite3 <board>/kanban.db "select pr_id, state, evidence from ngit_pr_guards"` shows what each
+refusal is based on, and `test -f src/hermes_nostr_gateway/ngit_guard.py` answers true.
 
 ### A merge requires the card finished
 

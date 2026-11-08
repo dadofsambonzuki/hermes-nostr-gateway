@@ -303,15 +303,30 @@ same branch and a revision all land on that one card; none of them makes a secon
   (`hng ngit applied <pr> --commit <sha>` by hand). It must carry the repository `a`
   coordinate, because that is the filter this feed is read with: a status without it is stored
   by the relay and seen by nobody here.
-- **`done` requires `applied`.** A card whose PR is still open cannot be completed by anyone
+- **`applied` has two witnesses: the record and the content.** The record is the kind-1631
+  above. The other is the checkout, because `ngit pr apply` replays a proposal's patches as
+  **new** commits — the tip the PR event names never becomes an ancestor of the branch it
+  landed on — and a merge route is not obliged to publish a status. So for every PR the
+  record leaves open, the pass asks the checkout (`applied.py`): is every patch the proposal
+  adds already on the base branch (`git patch-id`), or the proposal as one patch (a squash)?
+  If it is, the PR is applied without a status event: the channel gets one
+  `applied as <commit> (its patch is already on <base> …)` line instead of a second "ready
+  for review", every card it owns is completed by the same path a recorded merge takes, and
+  the comment says no status names it so a reader checks the commit. Ancestry is checked
+  first, and is the whole answer on a forge that fast-forwards. The answer is stamped on the
+  link with the tip and base it was read at, so a pass with no news costs one `rev-parse`.
+- **`done` requires `applied`.** A PR card whose PR is still open cannot be completed by anyone
   — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not `--force`.
   The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
   `ngit_pr_guards` and one `BEFORE UPDATE OF status` trigger whose message is the refusal a
-  person reads (`PR <short> is open at <tip> -- a merge completes a PR card, and a reviewer's
-  approving verdict finishes a review card`). A merge releases the guard (the commit is the
-  proof) and the completion succeeds; an approving verdict releases it too (the verdict is
-  the review's proof); a close keeps it refusing and names the closing event. A card with no
-  PR link — ops, docs, a fix card — is untouched.
+  person reads (`PR <short> is open at <tip> -- <what was compared> -- a merge completes a PR
+  card, and a reviewer's approving verdict finishes a review card`). A merge releases the
+  guard (the commit is the proof) and the completion succeeds; an approving verdict releases
+  it too (the verdict is the review's proof); a close keeps it refusing and names the closing
+  event. The refusal carries the evidence the pass used — `no applied status names it, and no
+  commit on master carries its patch (1 compared against 12 since 9b52622)` — so "open" is
+  never printed about a PR whose content is on the branch without saying what was checked. A
+  card with no PR link — ops, docs, a fix card — is untouched.
 - **A verdict finishes its card.** The reviewer records the verdict as a comment and **parks
   the card** with `kanban_block`, the first line of the reason being `Verdict: approved` or
   `Verdict: changes-requested` and the tip it covers. That park is a hand-off, not a

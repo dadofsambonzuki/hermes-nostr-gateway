@@ -35,7 +35,7 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | What actually arrived? | `hng recent [N]` | Text rows only (no `--json`): time, direction, sender, reach, first 90 characters. |
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `config`, `checkout`, `project`, `board`; exit 1 on any gap. Plain `hng projects --json` lists the map only. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
-| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{d seen,created,ready,held,existing,comments,deleted,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
+| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{d seen,created,ready,held,existing,comments,deleted,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
 | Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
 | What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
 | Does the live Nostr plugin match this checkout's adapter? | `hng adapter status --json`; `hng adapter install` writes it | `repo`/`live` (both paths), `repo_hash`/`live_hash`, both mtimes, `equal`, `unit`, `unit_started`, `stale_import`, `problems`, `detail`; exit 1 when the copies differ or one cannot be read. |
@@ -103,6 +103,11 @@ Every refusal is a word, and the word decides what to do.
   `approved` completes the card with the verdict as its result (the merge is still the
   operator's), and `changes-requested` returns it to the implementer as `ready` with the
   findings. Neither leaves the card parked, so the board and the PR say the same thing.
+- **A merged PR's card finishes itself, and the refusal says why.** `ngit pr apply` replays the
+  patches as new commits, so the bridge does not trust ancestry or a status event alone: it
+  compares patch ids against the base branch too. A refusal that names what it compared (`no
+  applied status names it, and no commit on master carries its patch`) means the checkout has
+  not fetched the proposal — run `git fetch origin` in it — not that the merge is missing.
 - **Blocked is not a failure.** It is the board asking a question; answer it with the card, not by
   re-dispatching the work and hoping.
 

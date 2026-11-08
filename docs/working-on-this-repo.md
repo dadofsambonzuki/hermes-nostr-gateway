@@ -21,9 +21,12 @@ is not in `review` or `done`, 8 merged but the applied record (kind-1631) did no
 **PRs are not branches here.** The remote is an ngit remote: a fetch prunes `pr/*` refs back to
 `master`, so `git merge origin/pr/<something>` answers *"not something we can merge"* however
 cleanly the PR would apply. The patches ride on the PR event itself, so `ngit pr apply` is the
-route. A proposal whose branch was rebased reads `open` with its content already in master; close
-it with a maintainer kind-1632 status event, not a kind-5 deletion (the relay refuses a deletion
-of someone else's event).
+route. It is also why a merged PR keeps reading `open`: `ngit pr apply` replays the patch series
+as **new** commits, so the tip the PR event names never becomes an ancestor of `master`. The
+bridge settles that itself — it compares patch ids against the branch (`applied.py`) and finishes
+the card, saying so — so nothing has to be closed to record a landing. A proposal that will not
+land is closed with a maintainer kind-1632 status event, not a kind-5 deletion (the relay refuses
+a deletion of someone else's event).
 
 **A revision is published with the full patch set, not a delta.**
 `ngit pr send origin/master..HEAD --base $(git rev-parse origin/master) --in-reply-to <root id>`

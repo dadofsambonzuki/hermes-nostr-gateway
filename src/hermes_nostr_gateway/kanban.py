@@ -606,23 +606,25 @@ class Board:
     # -- the `done` requires `applied` guard -------------------------------
 
     def guard_pr(self, task_id: str, *, pr_id: str, state: str, tip: str = "",
-                 merge_commit: str = "", detail: str = "") -> None:
+                 merge_commit: str = "", detail: str = "", evidence: str = "") -> None:
         """Record a card's PR state on the board, and make completion refuse while it holds.
 
         The guard is a trigger on `tasks`, so both completion paths -- the agent's
         `kanban_complete` tool and the CLI's `hermes kanban complete` -- are refused without
-        either of them knowing this bridge exists. See `ngit_guard`.
+        either of them knowing this bridge exists. See `ngit_guard`. `evidence` is what the
+        pass compared before deciding, and it is part of the sentence a person reads.
         """
         try:
             ngit_guard.guard(self.db, task_id, pr_id=pr_id, state=state, tip=tip,
-                             merge_commit=merge_commit, detail=detail)
+                             merge_commit=merge_commit, detail=detail, evidence=evidence)
         except sqlite3.Error as exc:
             raise BoardError(f"could not guard {task_id} on {self.path}: {exc}") from exc
 
-    def release_guard(self, task_id: str, *, merge_commit: str = "") -> None:
+    def release_guard(self, task_id: str, *, merge_commit: str = "",
+                      evidence: str = "") -> None:
         """The PR is applied: the card may now be completed."""
         try:
-            ngit_guard.release(self.db, task_id, merge_commit=merge_commit)
+            ngit_guard.release(self.db, task_id, merge_commit=merge_commit, evidence=evidence)
         except sqlite3.Error as exc:
             raise BoardError(f"could not release {task_id} on {self.path}: {exc}") from exc
 
@@ -639,10 +641,10 @@ class Board:
         except sqlite3.Error as exc:
             raise BoardError(f"could not approve {task_id} on {self.path}: {exc}") from exc
 
-    def close_guard(self, task_id: str, *, event_id: str = "") -> None:
+    def close_guard(self, task_id: str, *, event_id: str = "", evidence: str = "") -> None:
         """The PR was closed without a merge: completion stays refused, naming the event."""
         try:
-            ngit_guard.close(self.db, task_id, event_id=event_id)
+            ngit_guard.close(self.db, task_id, event_id=event_id, evidence=evidence)
         except sqlite3.Error as exc:
             raise BoardError(f"could not close {task_id} on {self.path}: {exc}") from exc
 

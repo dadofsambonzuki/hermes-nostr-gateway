@@ -22,6 +22,16 @@ the same lookup serves the inbound and the outbound half of this module:
               kind-1632 closed   -> blocks the PR's cards for a person, naming the event:
                                    a close is not a merge and cannot finish a card
 
+**`applied` has two witnesses.** The status record is one: a kind-1631 names the commit.
+The other is the checkout itself, because `ngit pr apply` replays a proposal's patches as
+**new** commits -- the tip the PR event names never becomes an ancestor of the branch it
+landed on -- and the kind-1631 is published by a merge route that may not have run. So a
+PR the record leaves open is asked about directly: is every patch it adds already on the
+base branch (`git patch-id`, `applied.py`)? If it is, the PR is applied, its cards are
+finished by the same path a recorded merge takes, and the comment says the content is the
+proof. If it is not, the refusal says what was compared, so "open at <tip>" is never said
+about a proposal whose content is already in.
+
 **`done` requires `applied`, or an approval.** A PR card whose PR is still open cannot be
 completed by a worker -- the agent's tool, `hermes kanban complete`, or `--force` -- because
 the bridge installs a guard on the board itself (`ngit_guard`). A merge releases it, a
@@ -70,10 +80,12 @@ import subprocess
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import nostr_sdk as sdk
 
+from .applied import Checkout as AppliedCheckout
+from .applied import Evidence
 from .control import ControlConfig, as_hex
 from .fetch import fetch_many_blocking, fetch_tagged_blocking
 from .kanban import (
@@ -361,13 +373,21 @@ class PullRequest:
 
 @dataclass(frozen=True)
 class Merge:
-    """A kind-1631 applied/resolved status for a PR, with whatever commit it names."""
+    """A kind-1631 applied/resolved status for a PR, with whatever commit it names.
+
+    `evidence` is set only for a merge the pass established from the checkout rather than
+    from a status event: the PR is applied, no record says so, and this is the sentence that
+    says why (`its patch is already on master as decdff5`). An event-driven merge leaves it
+    empty, because the event *is* the evidence.
+    """
 
     pr_id: str         # hex of the root PR event
     commit: str = ""
     created_at: int = 0
     #: The status event itself, so two reads of one relay count it once.
     event_id: str = ""
+    #: Why the pass believes it is applied, for a merge read from the checkout.
+    evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -605,7 +625,7 @@ class Report:
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
         "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
-        "approved": 0, "changes": 0,
+        "approved": 0, "changes": 0, "applied": 0,
         "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
@@ -654,6 +674,8 @@ class Report:
                    + (f", {p['approved']} card(s) finished by an approval"
                       if p["approved"] else "")
                    + (f", {p['changes']} card(s) returned for changes" if p["changes"] else "")
+                   + (f", {p['applied']} PR(s) applied without a status event"
+                      if p["applied"] else "")
                    + (f", {p['completed']} card(s) completed by a merge" if p["completed"] else "")
                    + (f", {p['unblocked']} card(s) released by a merge" if p["unblocked"] else "")
                    + (f", {p['blocked']} card(s) blocked by a close" if p["blocked"] else "")
@@ -1481,8 +1503,25 @@ def revision_note(note: dict[str, Any], revision: Revision) -> str:
     return "\n".join(lines)
 
 
+def applied_how(merge: Merge) -> str:
+    """How the PR landed, in the words the channel and the card both use.
+
+    A status event says `merged as <commit>`. A merge the pass established from the checkout
+    says `applied as <commit>` and gives the evidence, because no record claims a merge: the
+    patch itself is what landed, and a reader who checks the commit can see it.
+    """
+    if merge.commit:
+        how = f"merged as {merge.commit}"
+    else:
+        how = "merged"
+    if merge.evidence:
+        how = f"applied as {merge.commit}" if merge.commit else "applied"
+        how += f" ({merge.evidence})"
+    return how
+
+
 def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> str:
-    how = f"merged as {merge.commit}" if merge.commit else "merged"
+    how = applied_how(merge)
     if pr is None:
         return f"PR {nevent or merge.pr_id} {how}"
     return f'PR "{pr.subject}" by {pr.author} {how}\n{pr.nevent or nevent}'
@@ -1608,6 +1647,24 @@ StatusSource = Callable[[Sequence[str]], PrFeed]
 Notifier = Callable[[str, str, str], None]
 
 
+class AppliedSource(Protocol):
+    """What the sync asks the checkout: is this proposal's content already on the base?
+
+    `applied.Checkout` is the real one -- git, and `git patch-id` -- and the tests use a
+    stand-in. Two methods rather than one function because `head()` is what lets a pass
+    stamp an answer: an unmoved tip on an unmoved base is not probed again. See
+    `applied.py` for why the status record alone is not enough on this repository.
+    """
+
+    def head(self) -> str:
+        """The base branch's tip, or "" when the checkout cannot say."""
+        ...
+
+    def probe(self, tip: str) -> Evidence:
+        """Whether the proposal at `tip` is already on the base branch, and why."""
+        ...
+
+
 def notice_state(kind: int, notice: str) -> str:
     """The link state a notice earns once the daemon has taken it."""
     if int(kind) == KIND_PR:
@@ -1634,6 +1691,7 @@ class Sync:
                  statuses: StatusSource | None = None,
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
+                 applied: Optional[AppliedSource] = None,
                  now: Callable[[], float] = time.time):
         self.store = store
         self.board = board
@@ -1648,6 +1706,11 @@ class Sync:
         self.anchor = anchor or Anchor()
         self.labels = labels
         self.state = state
+        # The checkout is asked only when the record is silent about a PR, and only about a
+        # PR the bridge links: `applied.py` has the reason the record can be silent (an
+        # `ngit pr apply` merge publishes no status of its own) and what it compares instead.
+        self.applied: Optional[AppliedSource] = applied or AppliedCheckout(
+            target.repo, target.default_branch or "master")
         self._now = now
 
     # -- entry point -----------------------------------------------------
@@ -1970,6 +2033,16 @@ class Sync:
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
+        # The record first: a PR a kind-1631 names is applied and nothing else is asked. For
+        # the rest the checkout is asked whether the proposal's content is already on the
+        # base branch, because `ngit pr apply` replays its patches as new commits: the tip a
+        # status would have named is never an ancestor, and on this repository the status is
+        # often never published at all. A PR found this way joins `merges`, so the notice,
+        # the card completion and the guard release take the same path a recorded merge does.
+        found, open_why = self._applied_by_content(applied, feed.prs, report, dry_run=dry_run)
+        if found:
+            merges = [*merges, *found]
+            applied.update({merge.pr_id: merge for merge in found})
         # A re-push that a client published as a second proposal is the same work, not a
         # second PR: fold it onto the root the bridge already has, as a revision. The feed
         # the rest of the pass sees then has one entry per PR root, which is what makes
@@ -2116,8 +2189,8 @@ class Sync:
 
         # The guard follows the link: open PRs refuse completion, applied ones allow it,
         # closed ones refuse it and name the closing event. Last, so it sees the state this
-        # pass actually left the cards in.
-        self._guards(feed, report, dry_run=dry_run)
+        # pass actually left the cards in -- and `open_why` so its refusal names the evidence.
+        self._guards(feed, report, dry_run=dry_run, why=open_why)
 
         # Labels last: every task the poll just made or closed is state the label walk has
         # to see, and a label that cannot be published must not hold the cursor -- the next
@@ -2449,6 +2522,10 @@ class Sync:
         enough -- a card that says "merged" without saying *what* landed cannot be audited
         -- so the card stays open and the pass says why.
 
+        An applied-without-a-status merge (`Merge.evidence`) says so: the comment names the
+        commit, the evidence, and the fact that no status event claims the merge, so a reader
+        can check the commit rather than take the board's word for it.
+
         The set is `_pr_cards`, not the newest review task: one PR root can still have more
         than one card on a board with history (a re-review filed by hand under the brief's
         title, a duplicate from before one-card-per-root), and a merge finishes all of them.
@@ -2460,7 +2537,10 @@ class Sync:
             report.notes.append(
                 f"PR {merge.pr_id[:8]} is applied without a commit id: its card stays open")
             return
-        how = f"merged as {merge.commit}"
+        how = applied_how(merge)
+        proof = ("The merge was published as status " + merge.pr_id
+                 if not merge.evidence else
+                 "No applied status names it: " + merge.evidence)
         what = f'"{pr.subject}"' if pr is not None and pr.subject else f"PR {merge.pr_id}"
         cards = self._pr_cards(link, merge.pr_id, nevent)
         for card in cards:
@@ -2469,12 +2549,12 @@ class Sync:
             if not task_id or status in (DONE, "archived"):
                 continue
             try:
-                self.board.release_guard(task_id, merge_commit=merge.commit)
+                self.board.release_guard(task_id, merge_commit=merge.commit,
+                                         evidence=merge.evidence)
                 if self.board.complete(
                     task_id, author="ngit",
                     comment=f"{what} {how}" + (f" ({nevent})" if nevent else "")
-                            + f"\nThe merge was published as status {merge.pr_id}; this card"
-                            " is closed by it.",
+                            + f"\n{proof}; this card is closed by it.",
                     result=f"PR {merge.pr_id} {how}: the card is closed by the merge.",
                 ):
                     report.prs["completed"] += 1
@@ -2493,7 +2573,7 @@ class Sync:
         PR <short>`), never a bare mention of the PR: a card that merely talks about it is
         not waiting for it.
         """
-        how = f"merged as {merge.commit}"
+        how = applied_how(merge)
         for card in self._premise_cards(merge.pr_id, nevent):
             task_id = str(card.get("id") or "")
             try:
@@ -2573,14 +2653,99 @@ class Sync:
                 report.prs["review_errors"] += 1
                 report.errors.append(f"PR card {task_id} for closed PR {stopped.pr_id[:8]}: {exc}")
 
-    def _guards(self, feed: PrFeed, report: Report, *, dry_run: bool) -> None:
+    def _applied_by_content(self, record: Mapping[str, Merge],
+                            prs: Sequence[PullRequest], report: Report,
+                            *, dry_run: bool = False) -> tuple[list[Merge], dict[str, str]]:
+        """PRs the record is silent about, whose content the checkout says is already in.
+
+        `ngit pr apply` replays a proposal's patches as **new** commits, so the tip its
+        status would name is never an ancestor of the branch it landed on -- and the status
+        itself is only published when someone publishes it. Asking the status record alone
+        therefore leaves a landed PR reading `open` for ever, and its card refusing for ever.
+        So for every PR the record does not finish -- a linked one, or one this poll is
+        seeing for the first time -- the checkout is asked (`applied.py`): an applied answer
+        becomes a `Merge` with `evidence` set, and a no becomes the sentence the guard's
+        refusal prints. The record still wins: nothing here second-guesses a kind-1631.
+
+        The answer is stamped on the link (`applied_check`) with the tip and base it was read
+        at, so a pass with no news costs one `rev-parse`, not a probe per PR. A close is not
+        an applied record and does not stop the question: a proposal whose content is on the
+        branch was applied, and a close that arrived afterwards does not undo it. What a close
+        *does* finish is a PR with nothing on the branch -- that stays a person's decision.
+        """
+        source = self.applied
+        if source is None:
+            return [], {}
+        try:
+            head = str(source.head() or "")
+        except Exception as exc:  # noqa: BLE001 - a probe may raise; the pass may not die
+            report.errors.append(f"applied check: the checkout could not be read: {exc}")
+            return [], {}
+        found: list[Merge] = []
+        why: dict[str, str] = {}
+        links = {str(link.get("source_id") or ""): link
+                 for link in self.store.ngit_links(self.target.key, KIND_PR)}
+        # A PR this poll is seeing for the first time has no link yet; its tip is on the
+        # event. Both are asked about, so a proposal that landed before the bridge ever
+        # announced it gets the merged line on the first pass instead of a review card.
+        candidates: list[tuple[str, str, dict[str, Any] | None]] = []
+        for pr_id, link in links.items():
+            note = _detail(link)
+            if pr_id and pr_id not in record and not note.get("merge"):
+                candidates.append((pr_id, str(note.get("tip") or note.get("commit") or ""), link))
+        for pr in prs:
+            if pr.id and pr.id not in record and pr.id not in links:
+                candidates.append((pr.id, str(pr.commit or ""), None))
+        for pr_id, tip, link in candidates:
+            if not tip:
+                why[pr_id] = "no applied status names it, and the PR names no tip to check"
+                continue
+            stamp = _detail(link).get("applied_check") if link is not None else None
+            if (isinstance(stamp, dict) and head
+                    and str(stamp.get("tip") or "") == tip
+                    and str(stamp.get("base") or "") == head
+                    and not stamp.get("applied")):
+                why[pr_id] = str(stamp.get("why") or "")
+                continue
+            try:
+                evidence = source.probe(tip)
+            except Exception as exc:  # noqa: BLE001 - a probe may raise; the pass may not die
+                why[pr_id] = (f"no applied status names it, and its patch could not be"
+                              f" checked ({exc})")
+                continue
+            if evidence.applied and evidence.commit:
+                found.append(Merge(pr_id=pr_id, commit=evidence.commit, created_at=0,
+                                   evidence=evidence.why))
+                report.prs["applied"] += 1
+                report.notes.append(
+                    f"PR {pr_id[:8]} is applied without a status event: {evidence.why}")
+                continue
+            why[pr_id] = ("no applied status names it, and " + evidence.why.rstrip(".")
+                          if evidence.why else "no applied status names it")
+            if link is None or dry_run:
+                continue  # nothing to stamp, or a dry run: this pass writes nothing
+            note = _detail(link)
+            note["applied_check"] = {"tip": tip, "base": head, "applied": False,
+                                     "why": why[pr_id]}
+            try:
+                self._save_detail(link, note, task_id=str(link.get("task_id") or ""))
+            except (BoardError, sqlite3.Error) as exc:
+                report.errors.append(f"applied check for PR {pr_id[:8]}: {exc}")
+        return found, why
+
+    def _guards(self, feed: PrFeed, report: Report, *, dry_run: bool,
+                why: Optional[Mapping[str, str]] = None) -> None:
         """Keep the board's `done requires applied` guard in step with the link table.
 
         One row and one trigger per open PR card; released on a merge, closed on a 1632,
-        pruned when the card is gone or finished. A dry run writes nothing.
+        pruned when the card is gone or finished. `why` is what `_applied_by_content` compared
+        before leaving a PR open (or a close with nothing on the branch), and it goes into the
+        refusal so the board says *what it checked*, not just that it is refusing. A dry run
+        writes nothing.
         """
         if dry_run:
             return
+        why = why or {}
         applied = {merge.pr_id: merge for merge in feed.merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
         for link in self.store.ngit_links(self.target.key, KIND_PR):
@@ -2590,22 +2755,26 @@ class Sync:
             state = str(link.get("state") or "")
             merge = applied.get(pr_id)
             stopped = closed.get(pr_id)
+            evidence = str(why.get(pr_id) or "")
             try:
                 cards = self._pr_cards(link, pr_id, nevent)
                 if merge is not None and merge.commit:
                     for card in cards:
-                        self.board.release_guard(str(card["id"]), merge_commit=merge.commit)
+                        self.board.release_guard(str(card["id"]), merge_commit=merge.commit,
+                                                 evidence=merge.evidence)
                 elif stopped is not None or state == "closed":
                     event_id = (stopped.event_id if stopped is not None
                                 else str(note.get("closed") or ""))
                     for card in cards:
-                        self.board.close_guard(str(card["id"]), event_id=event_id)
+                        self.board.close_guard(str(card["id"]), event_id=event_id,
+                                               evidence=evidence)
                 elif state != "merged" and not note.get("merge"):
                     tip = str(note.get("tip") or note.get("commit") or "")
                     for card in cards:
                         if str(card.get("status") or "") in (DONE, "archived"):
                             continue  # finished by a merge or by an approval; prune drops it
-                        self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip)
+                        self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip,
+                                            evidence=evidence)
             except (BoardError, sqlite3.Error) as exc:
                 report.prs["review_errors"] += 1
                 report.errors.append(f"guard for PR {pr_id[:8]}: {exc}")
