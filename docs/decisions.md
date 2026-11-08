@@ -753,6 +753,21 @@ wording — decides what is a candidate: a card blocked on a person's question m
 so it is not listed by `--dry-run` and not moved by the real run. `--dry-run` prints the blast
 radius first, because a repair an operator cannot preview is a repair an operator cannot trust.
 
+## A close names the successor
+
+`ngit pr close` publishes a kind-1632 whose `content` is the reason, and the reason is optional.
+That default is wrong for the case closes exist for here: a branch amended and re-pushed
+publishes a second proposal, the older one is closed, and a reader of the closed record needs
+to know which proposal survived. An empty close reads as a withdrawal and gives them nothing
+to follow — and the bridge's own comment quotes the closing event, so the pointer has to be in
+the event itself.
+
+So the close route (`scripts/close_pr.sh`) requires a successor, reads its tip from
+`ngit pr view --json`, and publishes `Superseded by <id> (tip <sha>): <why>`. The merge route
+uses the same lookup when a proposal applies no commits: it names the other open proposal on
+the branch and prints the exact close command. A branch with no sibling still has to name the
+successor in the reason — the rule is about the record, not about what the lookup found.
+
 ## A PR status is read by `e` as well as by `a`
 
 NIP-34 addresses a status to a PR, and `ngit pr close` publishes exactly that: a kind-1631 or

@@ -114,6 +114,17 @@ commits=$(git -C "$wt" rev-list origin/master..HEAD)
 if [ -z "$commits" ]; then
   echo "FAIL $pr applies no commits onto origin/master"
   echo "     it is already in master (a rebased proposal): close it with a kind-1632 status event"
+  # A re-push can publish a second proposal for the same branch while this one is being
+  # merged; the close then has to name the one that survived. Ask the checkout what else is
+  # open on this branch and print the exact command, so the reason is never empty.
+  successor=$(PYTHONPATH="${PYTHONPATH:-$REPO/src}" "$PYTHON" -m hermes_nostr_gateway.ngit_close \
+    successors "$pr" --repo "$REPO" 2>/dev/null) || successor=""
+  if [ -n "$successor" ]; then
+    printf '%s\n' "$successor" | sed 's/^/     /'
+  else
+    echo "     no other open proposal shares this branch; name the successor in the reason anyway:"
+    echo "     ngit pr close $pr --reason 'Superseded by <id> (tip <sha>): <why>'"
+  fi
   exit 3
 fi
 missing=()

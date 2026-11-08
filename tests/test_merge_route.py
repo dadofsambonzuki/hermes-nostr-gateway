@@ -12,6 +12,7 @@ the trailer walk, the board read, the gate, the exit code — is the code under 
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -207,7 +208,17 @@ FAKE_NGIT = """#!/bin/sh
 # in $FAKE_PR_DIR the way `git am` does -- verbatim messages, and no commit-msg hook.
 case "${1:-} ${2:-}" in
   "pr view")
-    printf 'Status:   %s\\n' "${FAKE_PR_STATUS:-open}"
+    if [ "${4:-}" = "--json" ]; then
+      file="${FAKE_PR_JSON_DIR:-}/${3:-}.json"
+      [ -f "$file" ] || exit 1
+      cat "$file"
+    else
+      printf 'Status:   %s\\n' "${FAKE_PR_STATUS:-open}"
+    fi
+    ;;
+  "pr list")
+    [ -n "${FAKE_PR_LIST_JSON:-}" ] && [ -f "$FAKE_PR_LIST_JSON" ] || exit 1
+    cat "$FAKE_PR_LIST_JSON"
     ;;
   "pr apply")
     dir=${FAKE_PR_DIR:-}
@@ -498,6 +509,66 @@ def test_a_pr_the_bridge_has_not_seen_still_checks_its_trailer_card(tmp_path: Pa
     assert refused.returncode == 7, refused.stdout + refused.stderr
     assert "t_e1b2c3d4" in refused.stderr
     assert "ready" in refused.stderr
+
+
+def test_a_rebased_proposal_names_the_successor_that_replaced_it(tmp_path: Path) -> None:
+    """A proposal that applies no commits is a duplicate: its close names the survivor.
+
+    The merge route refuses the stale proposal, but an operator who closes it by hand needs
+    the successor's id and tip in the reason -- an empty kind-1632 leaves a reviewer no
+    pointer to the proposal that actually landed.
+    """
+    made = make_repo(tmp_path)
+    successor = "b" * 64
+    tip = "3bbb86b5" + "0" * 32
+    jsondir = tmp_path / "pr-json"
+    jsondir.mkdir()
+    (jsondir / f"{PR}.json").write_text(json.dumps({
+        "id": PR, "branch": "pr/duplicate(2207969b)", "status": "open",
+        "subject": "the stale proposal"}), encoding="utf-8")
+    (jsondir / f"{successor}.json").write_text(json.dumps({
+        "id": successor, "branch": "pr/duplicate(bbbbbbbb)", "status": "open",
+        "subject": "the proposal that survived",
+        "ci": {"runs": [{"commit": tip}]}}), encoding="utf-8")
+    prlist = tmp_path / "pr-list.json"
+    prlist.write_text(json.dumps([
+        {"id": PR, "branch": "pr/duplicate(2207969b)", "status": "open"},
+        {"id": successor, "branch": "pr/duplicate(bbbbbbbb)", "status": "open"},
+    ]), encoding="utf-8")
+    bridge = make_bridge(tmp_path, made.repo, cards={})
+
+    refused = merge(made, PR, "--check", env=merge_env(
+        made, bridge, FAKE_PR_JSON_DIR=str(jsondir), FAKE_PR_LIST_JSON=str(prlist)))
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "applies no commits onto origin/master" in refused.stdout
+    assert "bbbbbbbb" in refused.stdout
+    assert tip in refused.stdout
+    assert "--reason 'Superseded by bbbbbbbb (tip " in refused.stdout
+    assert master(made) == made.base
+
+
+def test_a_rebased_proposal_with_no_sibling_still_asks_for_a_named_successor(
+        tmp_path: Path) -> None:
+    """No other proposal on the branch is not licence for an empty close."""
+    made = make_repo(tmp_path)
+    jsondir = tmp_path / "pr-json"
+    jsondir.mkdir()
+    (jsondir / f"{PR}.json").write_text(json.dumps({
+        "id": PR, "branch": "pr/only(2207969b)", "status": "open"}), encoding="utf-8")
+    prlist = tmp_path / "pr-list.json"
+    prlist.write_text(json.dumps([
+        {"id": PR, "branch": "pr/only(2207969b)", "status": "open"},
+    ]), encoding="utf-8")
+    bridge = make_bridge(tmp_path, made.repo, cards={})
+
+    refused = merge(made, PR, "--check", env=merge_env(
+        made, bridge, FAKE_PR_JSON_DIR=str(jsondir), FAKE_PR_LIST_JSON=str(prlist)))
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "no other open proposal shares" in refused.stdout
+    assert "ngit pr close" in refused.stdout
+    assert "--reason 'Superseded by <id> (tip <sha>)" in refused.stdout
 
 
 # -- the module the script calls -----------------------------------------------

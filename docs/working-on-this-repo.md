@@ -27,6 +27,9 @@ bridge settles that itself — it compares patch ids against the branch (`applie
 the card, saying so — so nothing has to be closed to record a landing. A proposal that will not
 land is closed with a maintainer kind-1632 status event, not a kind-5 deletion (the relay refuses
 a deletion of someone else's event).
+A proposal that will not land — a duplicate, or a rebase that applies no commits — is closed the same way,
+and that close must name the successor:
+
 
 **A revision is published with the full patch set, not a delta.**
 `ngit pr send origin/master..HEAD --base $(git rev-parse origin/master) --in-reply-to <root id>`

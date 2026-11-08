@@ -157,13 +157,19 @@ manual — run `ngit skill install` for the rest.
   form). Both publish NIP-22 **kind 1111** on 3.0.5 — never 1622, which no ngit release wrote.
   Do not fake one by hand and assume it lands: a hand-published comment is accepted by the
   relay and still does not appear in `ngit pr view --comments`.
-- **A proposal a rebase orphaned is closed with a status event, not a deletion.** Merging a
-  rebased branch leaves the PR's original commits outside the target, so it reads `open` with its
-  content already in `master`; a kind-5 deletion is refused (*authored by another pubkey*). Close
-  it with **`hng ngit closed <id> --reason "<why>"`**, which publishes a kind 1632 carrying the
-  repository `a` coordinate — `ngit pr close` writes the same kind without that tag, so a
-  repository reader never sees the close. Read it back with `ngit pr view`. Never leave a dead
-  proposal for a reviewer to re-read.
+- **A proposal a rebase orphaned is closed with a status event, not a deletion, and the event
+  names what replaced it.** Merging a rebased branch leaves the PR's original commits outside
+  the target, so it reads `open` with its content already in `master`; a kind-5 deletion is
+  refused (*authored by another pubkey*). Close it with **`hng ngit closed <id> --reason
+  "<why>"`**, which publishes a kind 1632 carrying the repository `a` coordinate — `ngit pr
+  close` writes the same kind without that tag, so a repository reader never sees the close —
+  and read it back with `ngit pr view`. The `--reason` names the successor PR id and tip:
+  `Superseded by 08baeaaf (tip 3bbb86b): a re-push published a second proposal`. **Never
+  publish an empty close**: `closed` with no content reads as a withdrawal and gives a reviewer
+  no proposal to follow. `scripts/close_pr.sh <duplicate> --successor <id>` builds that reason
+  from ngit's record and refuses to publish without one (`ngit pr close --reason`; pass the
+  same reason to `hng ngit closed` when the `a` tag matters). A hand-published close passes
+  `--reason` itself. Never leave a dead proposal for a reviewer to re-read.
 - A **merged** proposal needs its own kind-1631: `ngit pr apply` re-signs the commits, so the
   proposal can never infer `applied`. `scripts/merge_pr.sh` publishes it after the push, and
   `hng ngit applied <id> --commit <full sha>` does it by hand (`--dry-run` shows the event).

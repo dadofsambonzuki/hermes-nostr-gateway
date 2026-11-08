@@ -354,7 +354,10 @@ same branch and a revision all land on that one card; none of them makes a secon
 - A kind-1632 **closed** status is not a merge and never completes a card. The PR's cards are
   blocked with `block_kind=dependency`, a comment naming the closing event, and a guard that
   refuses completion — a person decides whether the work is re-filed, re-proposed or dropped.
-  A queued "ready for review" line for a closed PR is dropped rather than posted.
+  A queued "ready for review" line for a closed PR is dropped rather than posted. A close of a
+  duplicate names the successor in its `--reason` (`scripts/close_pr.sh` builds it); the
+  bridge's comment quotes the closing event, so an empty close leaves a reader nothing to
+  follow.
 - **A status is read twice: by the repository's `#a`, and by the PR's own `#e`.** NIP-34
   addresses a status to a PR, and `ngit pr close` publishes `e`/`alt`/`p` with **no `a` tag at
   all**, so a read filtered by the repository address never sees it — which is how a merged or
