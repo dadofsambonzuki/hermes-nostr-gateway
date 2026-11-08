@@ -11,14 +11,23 @@ optional_env:
   - name: NOSTR_GATEWAY_SOCKET
     description: "Unix socket exposed by hermes-nostr-gateway (defaults to ~/.local/state/hermes-nostr-gateway/gateway.sock)"
     password: false
+  - name: NOSTR_GATEWAY_COMMANDS
+    description: "Path of the command catalogue the adapter writes for the gateway on load (defaults to a file beside NOSTR_GATEWAY_SOCKET)"
+    password: false
   - name: NOSTR_HOME_CHANNEL
     description: "Default Nostr peer pubkey (hex) for Hermes home and cron delivery"
+    password: false
+  - name: NOSTR_CONTROL_CHANNEL
+    description: "Comma-separated npubs that may receive control-plane notices; naming one is the only exception to dropping control text"
     password: false
   - name: NOSTR_ALLOWED_USERS
     description: "Comma-separated pubkeys allowed to message Hermes (advisory; the gateway policy is authoritative)"
     password: false
   - name: NOSTR_ALLOW_ALL_USERS
     description: "When true, accept Nostr messages from any sender; the gateway still applies its own policy"
+    password: false
+  - name: NOSTR_MEDIA
+    description: "Set to 0/false/no/off to stop delivery fetching attachments; a refusal is named in the message text (default: fetch)"
     password: false
   - name: NOSTR_DEDUPE_WINDOW_S
     description: "Seconds inside which an identical send to the same chat is treated as a replay and dropped (default 60; 0 disables the windowed rule)"

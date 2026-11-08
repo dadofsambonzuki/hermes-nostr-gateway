@@ -99,6 +99,16 @@ def validate_inbound_media_size(size: int, *, media_type: str = "media",
             f"Inbound {media_type} payload is too large ({size} bytes > {limit} bytes)")
 
 
+def get_scoped_secret(name: str, default=None, *, external_fallback: bool = False):
+    """Hermes' profile-scoped secret reader, in the form a harness can honour.
+
+    The real one reads the active profile's secret scope (``agent.secret_scope``); outside
+    Hermes there is no profile, so the process environment *is* that profile's scope. A test
+    that needs another answer monkeypatches the loaded adapter's ``_get_scoped_secret``.
+    """
+    return os.environ.get(name, default)
+
+
 def load_adapter(name: str = "nostr_adapter"):
     """Import the plugin module against the stubs and return it.
 
@@ -112,6 +122,9 @@ def load_adapter(name: str = "nostr_adapter"):
           cache_media_bytes_async=cache_media_bytes_async,
           validate_inbound_media_size=validate_inbound_media_size)
     _stub("gateway.platforms.event", MessageEvent=Kw, MessageType=MessageType)
+    # Credentials and settings are read through the host's secret route (catalog rule 11), so
+    # the harness has to answer that route rather than let the adapter fall back to `os.environ`.
+    _stub("gateway.platforms._shared", get_scoped_secret=get_scoped_secret)
     # The adapter asks Hermes whether a routed profile exists; without the stub that question
     # is unanswerable outside Hermes and every profile would be "not missing".
     stub_profiles()

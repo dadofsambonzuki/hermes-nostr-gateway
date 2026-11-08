@@ -57,6 +57,14 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 
+try:  # Hermes' profile-scoped secret route (catalog rule 11)
+    from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+except Exception:  # noqa: BLE001 - loaded outside Hermes (tests, tools)
+    def _get_scoped_secret(name: str, default: Any = None,
+                           *, external_fallback: bool = False) -> Any:
+        """No host to ask, so nothing resolves: fail closed rather than read ``os.environ``."""
+        return default
+
 PLATFORM_NAME = "nostr"
 DEFAULT_SOCKET = "~/.local/state/hermes-nostr-gateway/gateway.sock"
 SEND_TIMEOUT_S = 180.0
@@ -128,8 +136,23 @@ def _extra(config: Any) -> dict[str, Any]:
     return extra if isinstance(extra, dict) else {}
 
 
+def env_setting(name: str, default: str = "") -> str:
+    """A settings variable from *this* profile's environment, never another profile's.
+
+    Read through Hermes' secret scope rather than ``os.environ``: under
+    ``gateway.multiplex_profiles`` the process environment holds the *default* profile's
+    values, so a bare read would configure a secondary profile's adapter with a sibling's
+    socket, home channel or control destination. This is the reader the gateway's own
+    adapters use, and it keeps the default profile's startup fallback.
+    """
+    try:
+        return str(_get_scoped_secret(name, default) or "").strip()
+    except Exception:  # noqa: BLE001 - an unanswerable scope read is an unset setting
+        return default
+
+
 def socket_path(config: Any) -> Path:
-    configured = os.environ.get("NOSTR_GATEWAY_SOCKET") or _extra(config).get("socket_path")
+    configured = env_setting("NOSTR_GATEWAY_SOCKET") or _extra(config).get("socket_path")
     return Path(os.path.expanduser(configured or DEFAULT_SOCKET))
 
 
@@ -329,38 +352,32 @@ def is_digest_frame(frame: dict[str, Any]) -> bool:
 
 # -- routing --------------------------------------------------------------------
 # The gateway decides which provider, model and credential a conversation's turn asks for, and
-# says so on the frame: `route` carries names only, and `key` is the *name* of a variable. The
-# value is read here, at the moment the turn is about to run, and is never logged, never kept on
-# the event and never echoed back. A route that cannot be honoured refuses the turn rather than
+# says so on the frame: `route` carries names only, and `key` is the *name* of a variable. Even
+# the presence of that variable is Hermes' question, asked through its secret route (catalog
+# rule 11): the adapter never opens the `.env` the route's `env_file` names, and never holds,
+# logs or echoes a value. A route whose key the host cannot resolve refuses the turn rather than
 # running it on some other model or another channel's key — the gateway keeps the message
 # unacknowledged and replays it once the route can be honoured.
 #
 # Hermes' own provider resolution is not touched here (applying a provider per turn is the
 # host's change, not the transport's): the adapter hands the route to the host on the event so
 # it can be applied and audited, and reports back what it ran on.
-def env_value(name: str, env_file: str = "") -> str:
-    """The value of *name* from the environment, else from *env_file*; "" when absent."""
+def secret_present(name: str) -> bool:
+    """Whether this profile's secret route holds a value for *name* — no file is read.
+
+    The credential itself is not needed here, only the answer "is there one", and Hermes owns
+    that answer: ``agent.secret_scope.get_secret`` honours the active profile, so a routed turn
+    cannot borrow a sibling profile's key. The frame's ``env_file`` names where the *daemon*
+    looked when it resolved the rule; a plugin that parsed it again would be reading a file it
+    does not own, which catalog rule 11 forbids outright. A route the host cannot answer for is
+    refused, never run on whatever credential the process happens to hold.
+    """
     if not name:
-        return ""
-    value = os.environ.get(name, "")
-    if value:
-        return value
-    if not env_file:
-        return ""
+        return False
     try:
-        with open(env_file, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, raw = line.partition("=")
-                if key.strip().removeprefix("export ").strip() == name:
-                    raw = raw.strip()
-                    quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\""
-                    return raw[1:-1] if quoted else raw
-    except OSError:
-        return ""
-    return ""
+        return bool(str(_get_scoped_secret(name, "") or "").strip())
+    except Exception:  # noqa: BLE001 - an unanswerable scope read is a missing credential
+        return False
 
 
 def route_for_turn(frame: dict[str, Any]) -> tuple[Optional[dict[str, str]], str]:
@@ -378,7 +395,7 @@ def route_for_turn(frame: dict[str, Any]) -> tuple[Optional[dict[str, str]], str
     route = {name: str(raw.get(name) or "") for name in
              ("provider", "model", "key", "rule", "why")}
     key = route["key"]
-    if key and not env_value(key, str(raw.get("env_file") or "")):
+    if key and not secret_present(key):
         return None, f"${key} is not set, and the turn will not borrow another key"
     return route, ""
 
@@ -409,8 +426,8 @@ _MEDIA_KIND_TO_MESSAGE_TYPE = (
 
 def media_enabled(config: Any) -> bool:
     """Whether delivery fetches attachments: `NOSTR_MEDIA=0` or config `media: false` opts out."""
-    raw = os.environ.get("NOSTR_MEDIA")
-    if raw is None or not str(raw).strip():
+    raw = env_setting("NOSTR_MEDIA")
+    if not raw:
         raw = _extra(config).get("media")
     if raw is None:
         return True
@@ -470,8 +487,8 @@ def reply_body(content: str) -> str:
 
 def dedupe_window_seconds(config: Any) -> float:
     """The configured replay window, in seconds. 0 means the windowed rule is off."""
-    raw = os.environ.get("NOSTR_DEDUPE_WINDOW_S")
-    if raw is None or not str(raw).strip():
+    raw = env_setting("NOSTR_DEDUPE_WINDOW_S")
+    if not raw:
         raw = _extra(config).get("dedupe_window_s")
     if raw is None or not str(raw).strip():
         return DEFAULT_DEDUPE_WINDOW_S
@@ -634,7 +651,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     # -- destinations ---------------------------------------------------
     def _home_chat(self) -> str:
         """The one destination a notice may always use, as hex when it is configured."""
-        raw = (os.environ.get("NOSTR_HOME_CHANNEL")
+        raw = (env_setting("NOSTR_HOME_CHANNEL")
                or _extra(getattr(self, "_config", None)).get("home_channel") or "").strip()
         if not raw:
             return ""
@@ -675,7 +692,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         agents echoing their status lines at each other. Naming a destination here is
         the deliberate exception — a control plane you asked for, not an accident.
         """
-        raw = (os.environ.get("NOSTR_CONTROL_CHANNEL")
+        raw = (env_setting("NOSTR_CONTROL_CHANNEL")
                or _extra(getattr(self, "_config", None)).get("control_channel") or "").strip()
         if not raw:
             return ""
@@ -697,7 +714,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
     def _control_allowed(self, chat_id: str) -> bool:
         target = (chat_id or "").strip().lower()
         allowed = {p.strip().lower() for p in
-                   (os.environ.get("NOSTR_CONTROL_CHANNEL")
+                   (env_setting("NOSTR_CONTROL_CHANNEL")
                     or _extra(getattr(self, "_config", None)).get("control_channel") or "").split(",")
                    if p.strip()}
         return bool(target) and target in allowed | {self._control_chat()}
@@ -1515,10 +1532,10 @@ class CatalogueEmpty(RuntimeError):
 
 def catalogue_path() -> Path:
     """Where the daemon reads the catalogue: beside the socket it also reads."""
-    configured = os.environ.get("NOSTR_GATEWAY_COMMANDS")
+    configured = env_setting("NOSTR_GATEWAY_COMMANDS")
     if configured:
         return Path(os.path.expanduser(configured))
-    socket = os.environ.get("NOSTR_GATEWAY_SOCKET") or DEFAULT_SOCKET
+    socket = env_setting("NOSTR_GATEWAY_SOCKET") or DEFAULT_SOCKET
     return Path(os.path.expanduser(socket)).with_name(COMMANDS_FILE)
 
 

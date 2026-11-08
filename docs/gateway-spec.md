@@ -323,9 +323,11 @@ Written as a contract the daemon enforces, not advice for callers:
    `handle_message`, so the turn starts with the file on disk — and never for a `blocked`
    frame or a digest batch;
 6. surface `blocked`/`delivery` frames as warnings, never as user-visible chat.
-7. when a `message` frame carries a `route`, honour it: read the credential it names at the moment
-   the turn runs, hand the route to the host on the event, and report back with the `send` which
-   route the turn actually ran on. A route it cannot honour (`route_key_missing`,
+7. when a `message` frame carries a `route`, honour it: ask the host whether the credential it
+   names is available at the moment the turn runs — through the host's secret route
+   (`agent.secret_scope`), never by opening the `env_file` the route names or any other
+   credential store — hand the route to the host on the event, and report back with the `send`
+   which route the turn actually ran on. A route it cannot honour (`route_key_missing`,
    `route_unresolved`) is a turn that does not happen — never a fallback to another credential —
    and the frame is left unacknowledged so it is offered again once the route can be honoured
    (which takes a resubscribe: see below).

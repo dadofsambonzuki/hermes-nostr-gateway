@@ -237,9 +237,11 @@ defaults:
 # noisy feed, a stronger one for a work channel, a dedicated key so one channel's usage is
 # accountable. Precedence is channel > plane > default, and `hng route` prints which rule won.
 #
-# `key` is the NAME of an environment variable (or of an entry in `routing.env_file`), never a
-# value: it is read at the moment the turn runs, and a name that cannot be read fails the turn
-# rather than falling back to another rule's credential. `routing.models` is the catalogue, so a
+# `key` is the NAME of an environment variable, never a value. The adapter asks Hermes's secret
+# scope for it at the moment the turn runs, so the name has to be visible to the Hermes profile
+# running the turn (its `$HERMES_HOME/.env` or process environment); `routing.env_file` is where
+# the daemon itself checks it for `hng route`. A name that cannot be read fails the turn rather
+# than falling back to another rule's credential. `routing.models` is the catalogue, so a
 # typo is a load error instead of a turn on the wrong model. A block that cannot be loaded stops
 # `hng serve` (like a Marmot ownership clash); `hng route --check` reports the same problems
 # without starting anything.
