@@ -80,7 +80,12 @@ Enable WAL, batch inserts per tick, and move writes off the loop. Measure with a
 burst.
 
 - Acceptance: p99 loop lag under 50 ms during a burst; no rows lost on kill -9 (WAL);
-  a benchmark is committed so the claim is testable.
+  a benchmark is committed so the claim is testable. The 50 ms number is a benchmark
+  measurement on a named machine (`benchmarks/store_burst.py`, which prints its host),
+  not a CI assertion: a shared runner's scheduling is not the writer's work, and asserting
+  it as one made docs-only PRs red. The CI gate asserts the mechanism instead — no row
+  written by the event-loop thread during a 500-event burst — in
+  `tests/test_store_writes.py`.
 
 ## P7 — Concord is a supported plane (corrected)
 
