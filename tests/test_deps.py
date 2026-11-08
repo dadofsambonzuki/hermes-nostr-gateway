@@ -516,6 +516,15 @@ def test_a_proposal_files_one_review_task_on_the_board(checkout, board, tmp_path
     assert record["task_id"] == task_id
 
 
+def test_a_dry_run_files_no_card_and_records_no_proposal(checkout, board, tmp_path):
+    cfg, _prs, _branch = publishing(checkout, tmp_path, board=BOARD)
+    out = io.StringIO()
+    assert run_deps(cfg, dry_run=True, out=out, env=env_for(checkout)) == 0
+    assert "dry run: would push" in out.getvalue()
+    assert card_count(board) == 0
+    assert not (cfg.state_dir / "proposal-example-repo.json").exists()
+
+
 def test_a_second_run_of_the_scan_files_no_second_task(checkout, board, tmp_path):
     cfg, _prs, _branch = publishing(checkout, tmp_path, board=BOARD)
     assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
