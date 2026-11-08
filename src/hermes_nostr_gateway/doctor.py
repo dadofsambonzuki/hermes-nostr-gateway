@@ -2,9 +2,10 @@
 
 The knowledge used to live in six commands run in a remembered order: is the config there,
 does the key read, can the store be written, does the daemon answer, is `ngit` new enough,
-does every mapped checkout carry a NIP-34 address, are the project and board really there,
-is a pass scheduled for each channel, and what is the watcher doing? Each check here is one of
-those questions, reports the answer, and names what to change when it fails.
+is the checkout the daemon serves on `master`, does every mapped checkout carry a NIP-34
+address, are the project and board really there, is a pass scheduled for each channel, and
+what is the watcher doing? Each check here is one of those questions, reports the answer,
+and names what to change when it fails.
 
 `run` never raises for a bad host: a broken config, a missing key or a missing `ngit` is a
 failing check with a fix, which is what `--json` carries and what makes the exit code
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .checkout import NOT_A_CHECKOUT, CheckoutState, is_card_workspace, repo_root
+from .checkout import inspect as inspect_checkout
 from .ngit import (
     NGIT_FLOOR,
     NGIT_INSTALL_HINT,
@@ -248,6 +251,35 @@ def _ngit_check(status: NgitStatus) -> Check:
             detail = f"{status.path} did not answer `--version`; need >= {NGIT_FLOOR}"
         return Check("ngit", False, detail, NGIT_INSTALL_HINT)
     return Check("ngit", True, f"{status.version} at {status.path} (floor {NGIT_FLOOR})")
+
+
+def live_checkout_path() -> Path | None:
+    """The checkout this build runs from -- one seam, so a test never reads the host's tree.
+
+    Same rule as the ngit probe: the question a check asks about the host goes through one
+    module-level function that tests can replace, or every unit test measures the machine it
+    runs on. In CI the checkout is a PR branch, so a doctor test would go red for a reason
+    that is not the code under test.
+    """
+    return repo_root()
+
+
+def _checkout_check() -> Check:
+    """The live checkout serves merged code: HEAD is a commit that exists on origin/master.
+
+    Not "the tree is clean": a proposal branch that passes its own gates is clean, and serving
+    it is exactly the failure this check exists for. A card worktree is expected to be on a
+    proposal branch and is not the tree the daemon runs from, so it is named and passed.
+    """
+    path = live_checkout_path()
+    if path is None:
+        return Check("checkout", True, NOT_A_CHECKOUT)
+    if is_card_workspace(path):
+        return Check("checkout", True,
+                     f"{path} is a card workspace, not the live checkout (on a proposal "
+                     f"branch by design)")
+    state: CheckoutState = inspect_checkout(path)
+    return Check("checkout", state.ok, state.describe(), "" if state.ok else state.fix())
 
 
 def _checkouts_check(mapping: ProjectMap, status: NgitStatus) -> Check:
@@ -571,6 +603,7 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
         _store_check(cfg),
         _socket_check(path, reply, problem),
         _ngit_check(status),
+        _checkout_check(),
         _checkouts_check(mapping, status),
         projects_check,
         boards_check,

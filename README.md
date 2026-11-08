@@ -219,10 +219,11 @@ $EDITOR config.yaml                     # identity.secret_file, relays, policies
 
 `hng doctor` is the one preflight, and it replaces six commands run in a remembered order: the
 config parses, the identity key reads, the store is writable, the configured socket path expands
-and the daemon answers, `ngit` is on `PATH` at or above its floor, every `concord.projects`
-checkout is a repository carrying a NIP-34 address, each declared project and board exists and is
-bound, a timer instance or crontab line carries a pass for every channel that queues work, and the
-watcher reports its state.
+and the daemon answers, `ngit` is on `PATH` at or above its floor, the checkout the daemon runs
+from has `master`'s code (HEAD is a commit that exists on `origin/master`, so a clone left on a
+proposal branch fails), every `concord.projects` checkout is a repository carrying a NIP-34
+address, each declared project and board exists and is bound, a timer instance or crontab line
+carries a pass for every channel that queues work, and the watcher reports its state.
 Every failing check names its fix; `--json` is the same shape for a script, and the exit code is 1
 when anything failed.
 

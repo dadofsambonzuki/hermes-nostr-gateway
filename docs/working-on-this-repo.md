@@ -20,6 +20,38 @@ of someone else's event).
 The script exists because the hand-rolled loop — status lookup, worktree, merge, ruff, pytest,
 push — is a dozen tool round-trips, and each one re-sends the caller's entire context.
 
+## The live checkout stays on master
+
+The daemon runs from this checkout — `.venv/bin/hng serve`, an editable install, whatever branch
+the clone was last left on. So a clone parked on a proposal branch is a box quietly serving code
+nobody merged: `master` moves on, `health` stays green, because a PR branch that passes its own
+gates is a working gateway. That happened here (hours on `pr/blackhole-unauthorised` at `762f859`
+while `master` moved six merges ahead), so the rule is checked in three places:
+
+- **`hng doctor`** has a `checkout` check: HEAD must be a commit that exists on `origin/master`.
+  It is not "the tree is clean" — a proposal branch is clean. A detached HEAD or a proposal
+  branch fails the check and prints `cd <repo> && git checkout master && git pull`. A checkout
+  that is simply behind `master` passes and says how far, because stale merged code is still
+  merged code. A build with no clone (a wheel, a container) has nothing to check and says so.
+- **`hng status`** prints one line without a daemon, for the day nobody runs doctor:
+  `checkout: master @ 8025ca9 (3 behind master)`. A card worktree prints its own proposal branch
+  — that is the truth about the tree you are in, not a verdict about the daemon's.
+- **A script that needs a branch takes a worktree.** `scripts/merge_pr.sh` does its whole merge in
+  a throwaway worktree, snapshots the clone's HEAD before the first git command and exits 5 if it
+  moved. `scripts/live_checkout_guard.sh` is the helper for anything else:
+
+  ```sh
+  scripts/live_checkout_guard.sh status [repo]            # branch @ sha (n behind master)
+  scripts/live_checkout_guard.sh check [repo]             # exit 1 unless HEAD is master
+  scripts/live_checkout_guard.sh snapshot [repo]          # a token naming HEAD
+  scripts/live_checkout_guard.sh unchanged <token> [repo] # exit 1 when HEAD moved
+  scripts/live_checkout_guard.sh worktree <path> [ref]    # try a ref without touching the clone
+  ```
+
+To try a proposal, use a worktree: `scripts/live_checkout_guard.sh worktree /tmp/try-pr
+origin/master`, then apply the PR there. Never `git checkout` in the clone itself — the next
+`systemctl restart` then runs the proposal.
+
 ## A card workspace cannot merge
 
 A kanban worker runs as the same user as the operator, so it holds push rights to `master`.

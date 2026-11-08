@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from .bots import BotRegistry
+from .checkout import inspect as inspect_checkout
 from .control import ControlConfig
 from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret
 from .fetch import fetch_many_blocking, stream_events
@@ -387,6 +388,10 @@ def cmd_status(args) -> int:
     cfg = load_config(args.config)
     crypto, store, policy, plane = build(cfg)
     stats = store.stats()
+    # What the box is actually running, asked without the daemon: the line is for the case
+    # where nobody runs `hng doctor`, and `hng health` cannot see it (a proposal branch that
+    # passes its own gates is a working gateway).
+    served = inspect_checkout()
     drops_ttl = drops_ttl_seconds(cfg.get("drops"))
     drops = {**store.drop_counts(drops_ttl), "ttl_hours": drops_ttl / 3600}
     now = time.time()
@@ -429,6 +434,7 @@ def cmd_status(args) -> int:
         print(json.dumps({
             "identity": plane.me,
             "store": str(store.path),
+            "checkout": served.as_dict(),
             "socket": str(socket_path),
             "daemon": frame is not None,
             "event_times": reports_event_times(frame),
@@ -451,6 +457,7 @@ def cmd_status(args) -> int:
 
     print(f"identity: {plane.me}")
     print(f"store:    {store.path}")
+    print(served.status_line())
     print(f"rumors:   {stats['total']} ({stats['pending']} pending delivery, "
           f"{stats['blocked']} blocked)")
     print(f"drops:    {drops['total']} refused ({drops['live']} live, "
@@ -1758,7 +1765,8 @@ def main(argv: list[str] | None = None) -> int:
     p_projects.set_defaults(func=cmd_projects)
 
     p_doctor = sub.add_parser(
-        "doctor", help="one preflight: config, identity, store, socket, ngit, mappings, schedules")
+        "doctor", help="one preflight: config, identity, store, socket, ngit, checkout, "
+                       "mappings, schedules")
     p_doctor.add_argument("--socket", default=None, help="daemon socket override")
     p_doctor.add_argument("--json", action="store_true",
                           help="machine-readable checks; exit 1 when any fails")
