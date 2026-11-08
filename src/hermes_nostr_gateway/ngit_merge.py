@@ -22,8 +22,18 @@ A PR names its card in three places, and each is read for what it is:
 `review` and `done` are both allowed, because both mean "nobody is still working on it".
 `review` is a reviewer's turn; `done` is what the bridge writes when it sees the merge, but a
 card can also be finished before its PR lands and refusing that would make the rule about the
-board rather than about the work. Everything else -- `running`, `ready`, `blocked`, `todo`,
-`scheduled`, `triage`, `archived` -- is a refusal that names the card and the status it has.
+board rather than about the work.
+
+`blocked` is the one status that means two different things, and the two are told apart by which
+card it is. **The PR's own card** may be blocked: the review brief's last instruction is *park
+the card with `kanban_block`*, because `done` requires applied and the reviewer may not complete
+it. Refusing that would refuse every PR that went through the review lane -- the card cannot be
+`done` before the merge and could never be merged at all. The person a blocked card waits for is
+exactly the person who merges. **A work card** named by a trailer may not be blocked: a block
+there is the work saying it is not finished, and a merge does not overrule it.
+
+Everything else -- `running`, `ready`, `todo`, `scheduled`, `triage`, `archived` -- is a refusal
+that names the card and the status it has.
 
 Exit codes are the merge script's: 0 allowed, 3 could not read (no config, no board, an
 unreadable store), 7 refused, so a caller can tell "wait for the card" from "the box is wrong".
@@ -48,6 +58,11 @@ KIND_PR = 1618
 
 #: Statuses a merge may land: the reviewer's turn, or finished. See the module docstring.
 FINISHED = ("review", "done")
+
+#: A card parked for a person. Allowed for the PR's own card only -- that is where the review
+#: brief puts a reviewed PR, and the person it waits for is the one merging. A *work* card in
+#: this state is work that stopped, and a merge does not overrule it.
+PARKED = "blocked"
 
 #: The trailer value that says "this is the operator's work, not a card's".
 OPERATOR = "operator"
@@ -264,7 +279,8 @@ def check(pr: str, cards: Sequence[str] = (), *, config: Mapping[str, Any],
             continue
         states.append(Card(task_id=card.task_id, source=source, status=card.status,
                            title=card.title))
-        if card.status not in FINISHED:
+        allowed = FINISHED if source == "trailer" else FINISHED + (PARKED,)
+        if card.status not in allowed:
             refusals.append(f"{task_id} ({_source(source)}) is {card.status or 'unknown'}")
     if refusals:
         return Verdict(False, pr=str(pr), board=slug, cards=tuple(states),

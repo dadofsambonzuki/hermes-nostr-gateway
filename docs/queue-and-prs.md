@@ -119,11 +119,17 @@ lists `ngit_pr_done_*` for the open PRs' cards, and
 
 The other direction of the same rule. `done` requires applied, and an applied PR requires a card
 that is not still being worked on: the merge route reads the PR's card and refuses when its
-status is anything but `review` or `done`. `review` is a reviewer's turn and `done` is finished,
-so both mean nobody is still working on it; `running`, `ready` and `blocked` do not, and a
-`triage`, `todo`, `scheduled` or `archived` card is no better. The refusal names the card and the
-status the board actually holds, because a merge that says only "refused" is the generic error
-this rule exists to replace.
+status says the work is unfinished. `review` is a reviewer's turn and `done` is finished, so both
+mean nobody is still working on it; `running`, `ready`, `todo`, `scheduled`, `triage` and
+`archived` do not. The refusal names the card and the status the board actually holds, because a
+merge that says only "refused" is the generic error this rule exists to replace.
+
+`blocked` means two things and the two are told apart by which card it is. The PR's **own** card
+may be blocked: the review brief's last instruction is to park a reviewed PR's card with
+`kanban_block` (a reviewer cannot complete it, because `done` requires applied), and the person
+such a card waits for is the person who merges — refusing it would refuse every PR that went
+through the review lane. A **work** card named by a trailer may not be blocked: there a block
+says the work is not finished, and a merge does not overrule it.
 
 Which card is read is the bridge's answer, not the merge's: the `ngit_links` row for the PR root
 names the PR's card, and every `Card:` trailer in the commits names the card the work was done

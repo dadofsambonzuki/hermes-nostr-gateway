@@ -443,18 +443,49 @@ def test_the_gate_does_not_run_for_a_refused_pr(tmp_path: Path) -> None:
     assert "ruff" not in (log.read_text(encoding="utf-8") if log.exists() else "")
 
 
-def test_a_blocked_card_is_refused(tmp_path: Path) -> None:
-    """The board is the authority: a PR linked to a card that is `blocked` does not land."""
+def test_a_blocked_work_card_is_refused(tmp_path: Path) -> None:
+    """A work card that stopped is not finished work, whatever a merge would like."""
     made = make_repo(tmp_path)
     pr_commits(made, "add a thing\n\nCard: t_d1b2c3d4")
-    bridge = make_bridge(tmp_path, made.repo, cards={"t_d1b2c3d4": "blocked"},
-                         links=[(PR, "t_d1b2c3d4")])
+    bridge = make_bridge(tmp_path, made.repo, cards={"t_d1b2c3d4": "blocked"})
+
+    refused = merge(made, OTHER_PR, "--check", env=merge_env(made, bridge))
+
+    assert refused.returncode == 7, refused.stdout + refused.stderr
+    assert "t_d1b2c3d4" in refused.stderr
+    assert "blocked" in refused.stderr
+
+
+def test_a_blocked_review_card_is_allowed(tmp_path: Path) -> None:
+    """The review brief parks a reviewed PR's card with `kanban_block`; that is not in progress.
+
+    `done` requires applied, so a reviewer cannot complete the card while the PR is open --
+    refusing its own parked card would refuse every PR that went through the review lane.
+    """
+    made = make_repo(tmp_path)
+    pr_commits(made, "add a thing\n\nCard: t_a1b2c3d4")
+    bridge = make_bridge(tmp_path, made.repo, cards={"t_a1b2c3d4": "blocked"},
+                         links=[(PR, "t_a1b2c3d4")])
+
+    allowed = merge(made, PR, "--check", env=merge_env(made, bridge))
+
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    assert "would apply" in allowed.stdout
+
+
+def test_a_blocked_work_card_still_refuses_while_the_review_card_is_parked(
+        tmp_path: Path) -> None:
+    made = make_repo(tmp_path)
+    pr_commits(made, "add a thing\n\nCard: t_d1b2c3d4")
+    bridge = make_bridge(tmp_path, made.repo,
+                         cards={"t_d1b2c3d4": "blocked", "t_a1b2c3d4": "blocked"},
+                         links=[(PR, "t_a1b2c3d4")])
 
     refused = merge(made, PR, "--check", env=merge_env(made, bridge))
 
-    assert refused.returncode == 7
+    assert refused.returncode == 7, refused.stdout + refused.stderr
     assert "t_d1b2c3d4" in refused.stderr
-    assert "blocked" in refused.stderr
+    assert "t_a1b2c3d4" not in refused.stderr
 
 
 def test_a_pr_the_bridge_has_not_seen_still_checks_its_trailer_card(tmp_path: Path) -> None:

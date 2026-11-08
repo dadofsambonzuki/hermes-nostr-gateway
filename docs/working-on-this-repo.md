@@ -66,9 +66,15 @@ rather than an accident, and the merge route then refuses it.
 
 The board is the intent record, so the merge route reads it before it gates anything. The PR's
 own card comes from the bridge's `ngit_links` row for the PR root; every card a `Card:` trailer
-names is read as well. A card in `running`, `ready`, `blocked`, `todo`, `scheduled`, `triage` or
-`archived` refuses the merge (exit 7) and names the card and the status it has. `review` and
-`done` are both allowed: both mean nobody is still working on it.
+names is read as well. A card in `running`, `ready`, `todo`, `scheduled`, `triage` or `archived`
+refuses the merge (exit 7) and names the card and the status it has.
+
+`review` and `done` allow it, because both mean nobody is still working on it. So does `blocked`
+for the PR's **own** card, and that exception is the review lane's shape: the brief tells a
+reviewer to park a reviewed PR's card with `kanban_block` (a reviewer cannot complete it —
+`done` requires applied), and the person a blocked card waits for is the person who merges. A
+blocked **work** card named by a trailer is still refused: a block there says the work is not
+finished, and a merge does not overrule it.
 
 `Card: operator` names operator work, and is not a bypass — a PR the bridge has linked still has
 to satisfy its linked card, so operator work cannot land a worker's PR early. When the bridge

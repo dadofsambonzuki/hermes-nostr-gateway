@@ -493,8 +493,16 @@ a copy of it.
 bridge writes once it sees the merge, but the board also holds cards finished before their PR
 landed. Refusing `done` would make the rule about a status the merge itself sets, which is
 circular; refusing `review` would make the route wait for a decision nobody asked for.
-Everything else — `running`, `ready`, `blocked`, `todo`, `scheduled`, `triage`, `archived` — is
-work that has not reached a reviewer, and the refusal names the card and the status it has.
+Everything else — `running`, `ready`, `todo`, `scheduled`, `triage`, `archived` — is work that
+has not reached a reviewer, and the refusal names the card and the status it has.
+
+**`blocked` is allowed on the PR's own card, and nowhere else.** The review brief's last
+instruction is to park a reviewed PR's card with `kanban_block`, because `done` requires applied
+and a reviewer may not complete it; the person such a card waits for is the person who merges.
+Refusing it would mean no PR that went through the review lane could ever land — the card cannot
+be `done` before the merge, so the merge would be refused for waiting on itself. A *work* card
+named by a trailer is the other case: a block there is the work saying it is not finished, and a
+merge does not overrule it.
 
 **Which card is the bridge's answer.** The `ngit_links` row for the PR root is the PR's card,
 and every `Card:` trailer names a card the work was done under; the merge route checks both, so
