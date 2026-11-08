@@ -94,6 +94,37 @@ Every refusal is a word, and the word decides what to do.
 - **the heal**: a pass also re-queues a card whose PR link records a tip newer than the card's
   completion — a revision that was recorded without a re-open — reported as `healed`.
 
+## An old epoch is not an error, it is silence
+
+A Concord channel key is derived **per epoch** (community root, channel id, epoch → key *and*
+stream address), so a new epoch is a new key at a new address. Nothing warns when two members
+are on different ones:
+
+- A member holding an older invite or rekey keeps publishing under the old address with the old
+  key. The relay accepts the wrap — the signature is valid — the sender sees `posted=True`, and
+  no one on the current epoch can decrypt it. The mirror is just as quiet: they cannot read
+  current traffic either.
+- The daemon subscribes only to the epochs it holds keys for, so old-epoch traffic is not a
+  `drop`, not `blocked`, not an `undecryptable` count. It simply is not there. `health` reads ok
+  while half a room talks past itself.
+- A reported "I posted and nobody replied" is an epoch question until proven otherwise, and so
+  is "the bot ignores me in one channel only".
+- Root and per-channel epochs move independently: a community at root epoch 1 can hold a room at
+  epoch 2 while its other rooms sit at 0. Compare per channel, never per community.
+
+What moves a member onto the current epoch: an **invite bundle** whose `channels[]` carries that
+room at that epoch, or a **CORD-06 rekey blob**. A role grant carries roles and `control_wrap`,
+never a channel key, so re-granting access changes nothing.
+
+- **Never build the channel wrap yourself.** A helper that derives its own key from whichever
+  invite it happens to discover drifts on the first rotation: it reports success while writing
+  messages only it can read. Post through the daemon's `send` op
+  (`to: concord:<community-id>:<channel-id>`), which uses the invite the daemon actually holds —
+  one signer, one key, the same code path as a reply.
+- To check a room, read `epoch` from the loaded invite for that channel and compare it with the
+  epoch its members' clients show. If they differ, the fix is to re-invite those members to that
+  room (or deliver a rekey), not to resend the message.
+
 ## The bridge's rules
 
 - **One pass owns store, board and cursor.** Never run two passes for one channel at once
