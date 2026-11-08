@@ -138,6 +138,24 @@ To try a proposal, use a worktree: `scripts/live_checkout_guard.sh worktree /tmp
 origin/master`, then apply the PR there. Never `git checkout` in the clone itself — the next
 `systemctl restart` then runs the proposal.
 
+## The plugin adapter is a copy
+
+The checkout being on `master` is only half of a deployment. Hermes does not import
+`integrations/hermes-plugin/adapter.py`; it loads a **copy** from its plugins directory —
+`$HERMES_HOME/plugins/nostr/adapter.py`, or wherever `--live`, `NOSTR_PLUGIN_PATH` or `adapter.path`
+points. So an adapter change is live only when that copy is refreshed *and* the gateway restarts:
+
+```sh
+.venv/bin/hng adapter status              # both hashes, both mtimes, the gateway's start time
+.venv/bin/hng adapter install             # backs the copy up, writes this build's file
+sudo systemctl restart hermes-gateway     # yours to run: the verb never restarts a unit
+```
+
+`hng doctor`'s `adapter` check fails when the two hashes differ, so a box whose copy was never
+refreshed is red instead of quietly running the previous adapter. A passing check still warns when
+`ActiveEnterTimestamp` predates the live copy: the files are right and the process is old, which
+the next restart fixes.
+
 ## A card workspace cannot merge
 
 A kanban worker runs as the same user as the operator, so it holds push rights to `master`.

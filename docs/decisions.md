@@ -339,6 +339,49 @@ a window a two-service restart already covers, and it belongs in a change that s
   directory. Rejected for that coupling, not for feasibility; if the duplicate is ever retired,
   this is the one-line change, and the check should stay.
 
+## The adapter copy is compared, not removed
+
+`integrations/hermes-plugin/adapter.py` is canonical and Hermes loads a **copy** of it from its
+plugins directory (`<HERMES_HOME>/plugins/nostr/adapter.py` by default). The copy stays: packaging
+the plugin for `hermes plugins install` is a different decision, and until it is made the copy is
+how a checkout's adapter becomes a running gateway's adapter. What was missing is not the file but
+the comparison — a merged adapter change read as deployed while the running process still held the
+module it imported at its last restart, which is the "a merge is not a deployment" failure one
+level up.
+
+**Three surfaces, one comparison.** `hng doctor` gained an `adapter` check that fails the run when
+the two `adapter.py` files differ, naming both SHA-256 hashes; `hng adapter status` is the same
+comparison on its own, printing both hashes, both mtimes, and whether `hermes-gateway`'s
+`ActiveEnterTimestamp` predates the live copy; `hng adapter install` backs the live copy up beside
+itself (`adapter.py.bak-<UTC stamp>`), writes this build's file and hashes what landed. Only the
+`.py` is compared — `__pycache__` holds bytecode from whichever interpreter last imported it, and
+no restart reconciles that.
+
+**Exit codes follow the vocabulary already there.** `doctor` is binary (0, or 1 when any check
+fails), so a mismatch is a failed check named `adapter` and gets no code of its own. `adapter
+status` answers 0 when the copies match, 1 when they differ or one cannot be read, and 2 — the
+CLI's existing "refused before touching anything" — when the config it was pointed at will not
+parse.
+
+**A stale import is a warning, not a failure.** The files matching is the invariant; the process
+age is evidence. The two are different repairs: a mismatch is `hng adapter install` and a restart,
+while an older process start only means the next restart will load a copy that is already correct.
+Failing the preflight for it would make `doctor` red on every host that had just installed and not
+yet restarted, which is the state `install` deliberately leaves behind. So the passing check says
+it, and `install` prints the restart as the operator's step.
+
+**`install` never restarts a unit.** A copy is not a deployment. Restarting `hermes-gateway` cuts
+in-flight turns, and a command whose advertised job is "make the file match" must not also decide
+when that happens. `--live`, `NOSTR_PLUGIN_PATH` and `adapter.path` exist so a copy installed
+somewhere else can be compared and refreshed, and `$HERMES_HOME` wins over `$HOME` because the
+caller's home is not necessarily the gateway's.
+
+Why compare at all instead of restoring the copy from the checkout at every start: the gateway is
+not the thing that loads the plugin, so a startup hook there would still be a copy — one that
+rewrites a file Hermes may be mid-import on, with no backup and nothing for `doctor` to report.
+The comparison has no such window, and it answers the question an operator actually asks — which
+file is the running process holding?
+
 ## The slash menu is the host's catalogue, and this plane's subset of it
 
 Armada renders a bot's commands only from a replaceable **kind 10304** manifest, discovered per

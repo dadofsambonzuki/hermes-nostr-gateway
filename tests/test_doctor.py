@@ -188,6 +188,25 @@ def use_live_checkout(monkeypatch, repo: Path | None) -> None:
     monkeypatch.setattr(doctor, "live_checkout_path", lambda: repo)
 
 
+def stub_adapter(monkeypatch, tmp_path: Path, *, equal: bool = True,
+                 started: tuple[float | None, str] = (None, "")) -> Path:
+    """The live plugin copy a test points the check at, never this host's plugins directory.
+
+    The repository half is the real file this build carries (there is one in every checkout),
+    copied to the live path; `equal=False` appends a line so the hashes differ.
+    """
+    from hermes_nostr_gateway import adapter_copy
+
+    source = adapter_copy.source_path()
+    data = source.read_bytes() if source is not None else b'"""stand-in adapter."""\n'
+    live = tmp_path / "hermes-home" / "plugins" / "nostr" / "adapter.py"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_bytes(data if equal else data + b"\n# an edit only this host has\n")
+    monkeypatch.setenv("NOSTR_PLUGIN_PATH", str(live))
+    monkeypatch.setattr(adapter_copy, "unit_started", lambda *args, **kwargs: started)
+    return live
+
+
 @pytest.fixture()
 def good(tmp_path, monkeypatch):
     """Every check can pass: real key, real checkout, registry, stub daemon, stub cron, ngit."""
@@ -198,6 +217,7 @@ def good(tmp_path, monkeypatch):
     stub_daemon(monkeypatch, live_daemon())
     stub_cron(monkeypatch)
     use_live_checkout(monkeypatch, live_clone(tmp_path))
+    stub_adapter(monkeypatch, tmp_path)
     return tmp_path, home, checkout, config
 
 
@@ -236,6 +256,75 @@ def test_a_checkout_that_is_not_a_repo_is_not_the_live_checkout(good, monkeypatc
     check = checks_by_name(capsys)["checkout"]
     assert check["ok"]
     assert "not running from a git checkout" in check["detail"]
+
+
+def test_the_adapter_check_is_named_and_passes(good, monkeypatch, capsys):
+    """The half `checkout` cannot see: Hermes loads a copy, so the copy is compared by name."""
+    from hermes_nostr_gateway import adapter_copy
+
+    tmp_path, home, checkout, config = good
+    live = tmp_path / "hermes-home" / "plugins" / "nostr" / "adapter.py"
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    adapter = checks_by_name(capsys)["adapter"]
+    assert adapter["ok"]
+    assert str(live) in adapter["detail"]
+    assert adapter_copy.digest(live) in adapter["detail"]
+
+
+def test_a_live_adapter_that_differs_fails_the_run_with_both_hashes(good, monkeypatch, capsys):
+    from hermes_nostr_gateway import adapter_copy
+
+    tmp_path, home, checkout, config = good
+    live = stub_adapter(monkeypatch, tmp_path, equal=False)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    adapter = checks_by_name(capsys)["adapter"]
+    assert not adapter["ok"]
+    assert adapter["fix"], "a failing check must name its fix"
+    assert "hng adapter install" in adapter["fix"]
+    assert "differs from" in adapter["detail"]
+    assert adapter_copy.digest(live) in adapter["detail"]
+    repo = adapter_copy.source_path()
+    if repo is not None:  # a wheel build has no repository half to hash
+        assert adapter_copy.digest(repo) in adapter["detail"]
+
+
+def test_a_stale_import_is_a_warning_on_a_passing_check(good, monkeypatch, capsys):
+    """The files matching is the invariant; an older process start is evidence, not a failure."""
+    tmp_path, home, checkout, config = good
+    live = stub_adapter(monkeypatch, tmp_path, started=(1_700_000_000.0, ""))
+    os.utime(live, (1_700_000_100, 1_700_000_100))
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    adapter = checks_by_name(capsys)["adapter"]
+    assert adapter["ok"]
+    assert "restart" in adapter["detail"]
+
+
+def test_a_missing_live_adapter_fails_the_run(good, monkeypatch, capsys):
+    tmp_path, home, checkout, config = good
+    live = stub_adapter(monkeypatch, tmp_path)
+    live.unlink()
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    adapter = checks_by_name(capsys)["adapter"]
+    assert not adapter["ok"]
+    assert "no live copy" in adapter["detail"]
+    assert "hng adapter install" in adapter["fix"]
+
+
+def test_the_adapter_check_is_not_a_failure_without_a_checkout(good, monkeypatch, capsys):
+    """A wheel build carries no repository copy: named as not applicable, not failed."""
+    from hermes_nostr_gateway import adapter_copy
+
+    tmp_path, home, checkout, config = good
+    monkeypatch.setattr(adapter_copy, "source_path", lambda: None)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    adapter = checks_by_name(capsys)["adapter"]
+    assert adapter["ok"]
+    assert "no repository copy" in adapter["detail"]
 
 
 def test_bad_identity_is_named_with_a_fix(good, monkeypatch, capsys, tmp_path):

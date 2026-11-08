@@ -38,11 +38,13 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{d seen,created,ready,held,existing,comments,deleted,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
 | Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
 | What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
+| Does the live Nostr plugin match this checkout's adapter? | `hng adapter status --json`; `hng adapter install` writes it | `repo`/`live` (both paths), `repo_hash`/`live_hash`, both mtimes, `equal`, `unit`, `unit_started`, `stale_import`, `problems`, `detail`; exit 1 when the copies differ or one cannot be read. |
 | One preflight of all of the above | `hng doctor --json` | `ok` and `checks[]` of `{name, ok, detail, fix}`; exit 1 when any check fails. |
 
 Read-only questions are safe to run at any time: `status`, `health`, `drops`, `recent`,
-`projects`, `route`, `profile`, `doctor`, `ngit sync --dry-run` and `ngit reconcile --dry-run`
-write nothing. `hng profile publish` publishes the advertisement, `ngit sync` without
+`projects`, `route`, `profile`, `doctor`, `adapter status`, `ngit sync --dry-run` and
+`ngit reconcile --dry-run` write nothing. `hng profile publish` publishes the advertisement,
+`hng adapter install` replaces the live plugin copy (after backing it up), `ngit sync` without
 `--dry-run` writes tasks, comments, notices and cursors — it is what the scheduled pass runs —
 and `ngit reconcile` without `--dry-run` moves the cards parked on a verdict (never a card
 blocked on a person's question).
@@ -160,6 +162,14 @@ manual — run `ngit skill install` for the rest.
 
 ## Traps, as rules
 
+- **A merged adapter is not a deployed adapter.** Hermes does not import this repository's
+  `integrations/hermes-plugin/adapter.py`; it loads a copy from
+  `<HERMES_HOME>/plugins/nostr/adapter.py`. So `master` can carry the fix while the running
+  gateway still holds the module it imported at its last restart, and every health check stays
+  green. `hng adapter status` prints both SHA-256 hashes and warns when the process started
+  before the copy was written (a stale import); `hng doctor`'s `adapter` check fails when they
+  differ. The repair is `hng adapter install` — which backs the live copy up and never restarts a
+  unit — followed by the restart **you** perform (`sudo systemctl restart hermes-gateway`).
 - Key every `concord.projects` entry by the channel **id** (hex), or by the whole
   `concord:<community-id>:<channel-id>` string. A friendly name resolves inbound messages
   fine and looks correct, but a scheduled pass that names the channel by id cannot match it,

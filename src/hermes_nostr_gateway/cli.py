@@ -1671,8 +1671,58 @@ def cmd_skill(args) -> int:
     return 0
 
 
+def cmd_adapter(args) -> int:
+    """The live Hermes plugin copy: compare it with this build's adapter, or write it.
+
+    `status` exits 1 when the copies differ or one cannot be read -- an unproven copy is the
+    fact the operator asked about -- and 2 when the config it was pointed at will not parse,
+    like every other verb that refuses before touching anything. `install` backs the live copy
+    up, writes this build's file and verifies it, and leaves the restart to the operator: it
+    never restarts a unit, because a deployment is a decision and a copy is not one.
+    """
+    from . import adapter_copy
+
+    cfg: dict[str, Any] = {}
+    found = resolve_config_path(args.config)
+    if found is None:
+        if args.config:
+            print(f"adapter: no config at {args.config}", file=sys.stderr)
+            return 2
+    else:
+        try:
+            loaded = load_config(str(found))
+        except (SystemExit, yaml.YAMLError, OSError) as exc:
+            print(f"adapter: {exc}", file=sys.stderr)
+            return 2
+        if isinstance(loaded, dict):
+            cfg = loaded
+    live = getattr(args, "live", None)
+    if args.adapter_cmd == "status":
+        state = adapter_copy.status(cfg, live=live)
+        if getattr(args, "json", False):
+            print(json.dumps(state.as_dict(), indent=2))
+        else:
+            print("\n".join(state.lines()))
+        return 0 if state.ok else 1
+    try:
+        result = adapter_copy.install(cfg, live=live)
+    except adapter_copy.AdapterError as exc:
+        print(f"adapter: {exc}", file=sys.stderr)
+        return 2
+    if result.action == "current":
+        print(f"adapter: {result.target} is already this build's adapter "
+              f"(sha256 {result.after}); nothing written")
+    else:
+        print(f"adapter: wrote {result.source} to {result.target} (sha256 {result.after})")
+        if result.backup is not None:
+            print(f"adapter: the copy it replaced is {result.backup}")
+    print(f"adapter: Hermes imports the plugin at start, so restart it yourself: "
+          f"sudo systemctl restart {adapter_copy.UNIT} (this command never restarts a unit)")
+    return 0
+
+
 def cmd_doctor(args) -> int:
-    """One preflight over the config, identity, store, socket, ngit, mappings and schedules.
+    """One preflight over the config, identity, store, socket, ngit, adapter, mappings, schedules.
 
     Every failing check names its fix, `--json` carries the same shape, and the exit code is
     1 when anything failed — so a fresh host can be driven to green by the output alone.
@@ -1854,7 +1904,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_doctor = sub.add_parser(
         "doctor", help="one preflight: config, identity, store, socket, ngit, checkout, "
-                       "mappings, schedules")
+                       "adapter, mappings, schedules")
     p_doctor.add_argument("--socket", default=None, help="daemon socket override")
     p_doctor.add_argument("--json", action="store_true",
                           help="machine-readable checks; exit 1 when any fails")
@@ -1872,6 +1922,24 @@ def main(argv: list[str] | None = None) -> int:
     p_skill_install.add_argument("--force", action="store_true",
                                  help="replace an existing, different copy")
     p_skill_install.set_defaults(func=cmd_skill)
+
+    p_adapter = sub.add_parser(
+        "adapter", help="the live Hermes plugin copy: does it match this build's adapter?")
+    adapter_sub = p_adapter.add_subparsers(dest="adapter_cmd", required=True)
+    p_adapter_status = adapter_sub.add_parser(
+        "status", help="compare the live copy with this build's adapter (exit 1 when they differ)")
+    p_adapter_status.add_argument("--live", default=None,
+                                  help="the live copy (default: $NOSTR_PLUGIN_PATH, then the "
+                                       "config's adapter.path, then "
+                                       "$HERMES_HOME/plugins/nostr/adapter.py)")
+    p_adapter_status.add_argument("--json", action="store_true",
+                                  help="both hashes and mtimes, machine-readable")
+    p_adapter_status.set_defaults(func=cmd_adapter)
+    p_adapter_install = adapter_sub.add_parser(
+        "install", help="back the live copy up and write this build's adapter (never restarts)")
+    p_adapter_install.add_argument("--live", default=None,
+                                   help="the live copy (same default as `adapter status`)")
+    p_adapter_install.set_defaults(func=cmd_adapter)
 
     p_profiles = sub.add_parser(
         "profiles", help="which Hermes profile each plane and channel runs as")

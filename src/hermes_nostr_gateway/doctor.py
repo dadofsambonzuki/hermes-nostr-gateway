@@ -2,10 +2,10 @@
 
 The knowledge used to live in six commands run in a remembered order: is the config there,
 does the key read, can the store be written, does the daemon answer, is `ngit` new enough,
-is the checkout the daemon serves on `master`, does every mapped checkout carry a NIP-34
-address, are the project and board really there, is a pass scheduled for each channel, and
-what is the watcher doing? Each check here is one of those questions, reports the answer,
-and names what to change when it fails.
+is the checkout the daemon serves on `master`, is the live Hermes plugin copy the `adapter.py`
+this build ships, does every mapped checkout carry a NIP-34 address, are the project and board
+really there, is a pass scheduled for each channel, and what is the watcher doing? Each check
+here is one of those questions, reports the answer, and names what to change when it fails.
 
 `run` never raises for a bad host: a broken config, a missing key or a missing `ngit` is a
 failing check with a fix, which is what `--json` carries and what makes the exit code
@@ -280,6 +280,23 @@ def _checkout_check() -> Check:
                      f"branch by design)")
     state: CheckoutState = inspect_checkout(path)
     return Check("checkout", state.ok, state.describe(), "" if state.ok else state.fix())
+
+
+def _adapter_check(cfg: dict[str, Any]) -> Check:
+    """The live plugin copy is this build's adapter -- the deployment `checkout` cannot see.
+
+    `checkout` proves the daemon's tree is merged code; Hermes does not import that tree. It
+    loads a copy of `adapter.py` from its plugins directory, so an adapter merge reaches a
+    running gateway only when the copy is refreshed (and the process restarted). The invariant
+    is therefore the two hashes; an older process start is reported on the passing check as a
+    warning, because the files matching is what the check is for and the process age is
+    evidence for the operator, not a second failure.
+    """
+    from .adapter_copy import INSTALL_FIX
+    from .adapter_copy import status as adapter_status
+
+    state = adapter_status(cfg)
+    return Check("adapter", state.ok, state.detail(), "" if state.ok else INSTALL_FIX)
 
 
 def _checkouts_check(mapping: ProjectMap, status: NgitStatus) -> Check:
@@ -604,6 +621,7 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
         _socket_check(path, reply, problem),
         _ngit_check(status),
         _checkout_check(),
+        _adapter_check(cfg),
         _checkouts_check(mapping, status),
         projects_check,
         boards_check,

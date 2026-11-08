@@ -229,14 +229,17 @@ cp config.example.yaml config.yaml
 $EDITOR config.yaml                     # identity.secret_file, relays, policies
 .venv/bin/hng --config config.yaml status
 .venv/bin/hng --config config.yaml serve
+```
 
 `hng doctor` is the one preflight, and it replaces six commands run in a remembered order: the
 config parses, the identity key reads, the store is writable, the configured socket path expands
 and the daemon answers, `ngit` is on `PATH` at or above its floor, the checkout the daemon runs
 from has `master`'s code (HEAD is a commit that exists on `origin/master`, so a clone left on a
-proposal branch fails), every `concord.projects` checkout is a repository carrying a NIP-34
-address, each declared project and board exists and is bound, a timer instance or crontab line
-carries a pass for every channel that queues work, and the watcher reports its state.
+proposal branch fails), the live Hermes plugin copy is this build's `adapter.py` by SHA-256 (with a
+warning naming the restart when the gateway process started before that copy was written), every
+`concord.projects` checkout is a repository carrying a NIP-34 address, each declared project and
+board exists and is bound, a timer instance or crontab line carries a pass for every channel that
+queues work, and the watcher reports its state.
 Every failing check names its fix; `--json` is the same shape for a script, and the exit code is 1
 when anything failed.
 
@@ -244,7 +247,15 @@ when anything failed.
 the verbs, the failure vocabulary and the traps — into `$HERMES_HOME/skills/nostr-gateway/`, so an
 agent on a fresh host does not have to rediscover them. `--print` writes the same text to stdout
 and `--profile <name>` installs into that profile's tree instead of the shared one.
-```
+
+The Hermes plugin is a **hand copy**: `integrations/hermes-plugin/adapter.py` is canonical, and
+Hermes loads a copy of it from its plugins directory, so a merged adapter change reaches a running
+gateway only when that copy is refreshed and the process restarted. `hng adapter status` prints
+both SHA-256 hashes and both mtimes and says whether `hermes-gateway` started before the live copy
+was written (a stale import); it exits 1 when they differ. `hng adapter install` backs the live
+copy up to `adapter.py.bak-<UTC stamp>` beside it, writes this build's file, verifies the written
+bytes, and prints the restart as the operator's step — it never restarts anything. `--live` /
+`NOSTR_PLUGIN_PATH` / `adapter.path` point it at a copy installed elsewhere.
 
 Install `requirements.txt` before the editable install: it is the only path that carries the
 `nostr-sdk` wheel's URL and hash. The release of the same version does not expose

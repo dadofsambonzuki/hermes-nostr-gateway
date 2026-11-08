@@ -297,6 +297,19 @@ defaults:
 #                                # as the floor either way -- see docs/ngit-bridge.md)
 #   watch_debounce_s: 30         # coalesce a channel's events this long before the pass
 
+# The Hermes plugin and this checkout: `integrations/hermes-plugin/adapter.py` is canonical, and
+# Hermes loads a *copy* of it from its plugins directory -- so a merged adapter change reaches a
+# running gateway only when that copy is refreshed and the process restarted. `hng doctor`
+# compares the two by SHA-256 (the `adapter` check), `hng adapter status` prints both hashes and
+# mtimes and warns when `hermes-gateway` started before the live copy was written, and
+# `hng adapter install` backs the live copy up (`adapter.py.bak-<UTC stamp>`) and writes this
+# build's file, leaving the restart to the operator. Default:
+# `$HERMES_HOME/plugins/nostr/adapter.py`. `NOSTR_PLUGIN_PATH` in the environment wins over this
+# setting, and `--live` wins over both; a value naming a directory gets `adapter.py` appended.
+#
+# adapter:
+#   path: ~/.hermes/plugins/nostr/adapter.py
+
 # The control pane: where a confirmation is asked, and whose word needs none. One
 # destination per plane; a plane with no entry is reported as unconfigured rather than
 # guessed. `hng control` prints the resolved pane.
