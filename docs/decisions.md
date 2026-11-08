@@ -456,3 +456,49 @@ and records the event and relay; so does a relay read that failed, and a PR the 
 labelled but cannot read a verdict for. Falling back to an older approval is the one direction
 that can publish permission nobody gave. Relays that disagree are read per relay: the newest
 verdict wins, and the pass says which relay it read and which relays saw something else.
+
+## The commit names its card; the merge only checks it
+
+The authorship half of the merge route answers two questions: did anyone else sign this, and is
+it finished? The second needs `git log` to answer *which card wrote this line* without the
+board, because the tree outlives the board — a card can be archived, a board can be rebuilt, and
+the merge commit stays.
+
+**Written by the worker, never synthesised at merge time.** The alternatives were a trailer the
+merge route adds when it lands the PR, or one the worker's commit already carries. Synthesising
+at merge time loses on three counts: it can only guess for a PR whose commits never said (the
+link names the PR's card, not which card each commit was done under); rewriting the commits to
+insert it changes the history the verdict covered; and an ngit PR lands as `git am`, so the
+commits themselves are what reach `master`. The worker's `commit-msg` hook writes the trailer
+once, on the commit that is pushed, and the merge route only refuses when it is absent (exit 6).
+`git log` then answers on `master`, and because an ngit PR's description is built from its
+commits' messages, so does `ngit pr view`.
+
+**Operator work says so.** The hook writes `Card: operator` from a shell that is not a card
+workspace. That is an explicit statement in the record, not a silent absence, and it is the only
+way a PR with no card lands. It is also not a bypass: a PR the bridge has linked to a card is
+still refused when that card is unfinished. `--no-verify` and deleting the hook remain
+possible, as they do for the push guard; the merge route refusing an untrailered commit is what
+makes them deliberate rather than invisible.
+
+## A merge needs the card finished
+
+`done` requires applied (`ngit_guard.py`): a card cannot be completed while its PR is open. The
+merge route is the same rule read the other way: a PR cannot land while its card is still being
+worked on. The merge is the only thing that finishes a PR card, so the two checks are the two
+halves of one transition, and both read the card's `status` from the board rather than keeping
+a copy of it.
+
+**`review` and `done` both allow the merge.** `review` is a reviewer's turn; `done` is what the
+bridge writes once it sees the merge, but the board also holds cards finished before their PR
+landed. Refusing `done` would make the rule about a status the merge itself sets, which is
+circular; refusing `review` would make the route wait for a decision nobody asked for.
+Everything else — `running`, `ready`, `blocked`, `todo`, `scheduled`, `triage`, `archived` — is
+work that has not reached a reviewer, and the refusal names the card and the status it has.
+
+**Which card is the bridge's answer.** The `ngit_links` row for the PR root is the PR's card,
+and every `Card:` trailer names a card the work was done under; the merge route checks both, so
+a block of operator work cannot carry a worker's PR past its review. When the bridge has not
+linked a PR yet, the board comes from the checkout's `concord.projects` entry — the mapping the
+rest of the bridge already trusts — so "not linked yet" reads as a card that must be finished
+rather than as a reason to skip the check.
