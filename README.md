@@ -186,6 +186,24 @@ was down, so a missed event costs latency rather than correctness. `ngit.watch: 
 the scheduled-pass-only behaviour, and `hng status` shows what the watcher is doing and what it has
 woken.
 
+## Working the queue
+
+Work arrives on the host's kanban board, and a change that lands as a PR is tracked by one card
+for the life of that PR: **the card is the queue, the PR is the record**. Four rules keep the
+two from becoming three state machines for one fact.
+
+- **One card per PR root.** A re-poll, a retry, a re-push read as a second proposal and a
+  revision all land on the same card; only a new PR makes a new one.
+- **`done` requires applied.** A card that reviews a PR is finished by the merge, not by the
+  worker's or the reviewer's word.
+- **Three labels, one writer.** `review-required`, `changes-requested` and `approved` are
+  derived from the newest verdict on the PR and written by one pass.
+- **A worker cannot merge.** A card workspace pushes its branch; `master` is the operator's.
+
+[`docs/queue-and-prs.md`](docs/queue-and-prs.md) has what each card status means, the
+transitions between them, and — rule by rule — the script, hook or CLI check that enforces it,
+plus the part that is still convention.
+
 ## Quick start
 
 Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). One process serves one identity.
@@ -348,6 +366,7 @@ when the host user that owns those files is not 1000. The entrypoint is `hng`, s
 |---|---|
 | [`docs/gateway-spec.md`](docs/gateway-spec.md) | planes, relay policy, socket API and trust model — the design |
 | [`docs/decisions.md`](docs/decisions.md) | calls already made, and why |
+| [`docs/queue-and-prs.md`](docs/queue-and-prs.md) | the card is the queue, the PR is the record: statuses, transitions, and what enforces each rule |
 | [`docs/ngit-bridge.md`](docs/ngit-bridge.md) | the bridge: issues as work, PRs signalled in a channel |
 | [`docs/marmot-ownership.md`](docs/marmot-ownership.md) | the one-owner rule and the flip |
 | [`docs/publish.md`](docs/publish.md) | the write path and its retry guarantees |
