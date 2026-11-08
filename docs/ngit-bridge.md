@@ -297,7 +297,10 @@ same branch and a revision all land on that one card; none of them makes a secon
   under the brief's title, and any duplicate history left behind — with a result naming the
   merge commit and a comment saying what landed. A merge that arrives for a card already
   completed is a no-op: nothing is written twice. A 1631 that names **no commit** is not
-  evidence and completes nothing: the card stays open and the pass says why.
+  evidence and completes nothing: the card stays open and the pass says why. The merge is
+  also written on the link, and the guard pass reads it back: a card that could not be
+  finished when the merge was seen (a locked board) is finished later, even though the event
+  is by then behind the cursor.
   The bridge never publishes this one itself — it cannot know what a merge left on master — so
   the merge helper does: `scripts/merge_pr.sh` publishes the 1631 after its push
   (`hng ngit applied <pr> --commit <sha>` by hand). It must carry the repository `a`

@@ -1452,6 +1452,27 @@ def test_a_guard_table_from_before_the_evidence_column_is_migrated(tmp_path: Pat
         board.close()
 
 
+def test_a_link_whose_note_records_the_merge_repairs_its_stuck_guard(harness):
+    """A merge seen once, then behind the cursor: the link's own note is the record."""
+    pr, task_id = pr_with_review_task(harness)
+    # A pass that saw the merge wrote it on the row, then could not finish the card (a
+    # locked board); the event is now behind the cursor, so only the row knows.
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)
+    detail = json.loads(link["detail"])
+    detail["merge"] = "a" * 40
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr.id, board=BOARD,
+                                 state="signalled", task_id=task_id, detail=detail)
+    assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]
+
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done" and "a" * 40 in str(row["result"])
+    assert guard_triggers(harness) == []
+    assert report.prs["completed"] == 1
+
+
 def test_a_merge_releases_the_guard_and_names_the_commit(harness):
     pr, task_id = pr_with_review_task(harness)
     assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]

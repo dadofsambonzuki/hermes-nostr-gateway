@@ -2754,14 +2754,26 @@ class Sync:
             nevent = str(note.get("nevent") or "")
             state = str(link.get("state") or "")
             merge = applied.get(pr_id)
+            from_note = False
+            if merge is None and note.get("merge"):
+                # The merge is on the link's own note, not in this poll's feed: the pass that
+                # saw it may have failed to release the guard or finish a card (a locked
+                # board), and the event is now behind the cursor. The note is the same record,
+                # so repair from it rather than leave a card refusing with no event in sight.
+                merge = Merge(pr_id=pr_id, commit=str(note.get("merge") or ""))
+                from_note = True
             stopped = closed.get(pr_id)
             evidence = str(why.get(pr_id) or "")
             try:
                 cards = self._pr_cards(link, pr_id, nevent)
                 if merge is not None and merge.commit:
-                    for card in cards:
-                        self.board.release_guard(str(card["id"]), merge_commit=merge.commit,
-                                                 evidence=merge.evidence)
+                    if from_note:
+                        self._close_pr_cards(None, merge, link, report, dry_run=False)
+                    else:
+                        for card in cards:
+                            self.board.release_guard(str(card["id"]),
+                                                     merge_commit=merge.commit,
+                                                     evidence=merge.evidence)
                 elif stopped is not None or state == "closed":
                     event_id = (stopped.event_id if stopped is not None
                                 else str(note.get("closed") or ""))
