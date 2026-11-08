@@ -160,9 +160,10 @@ A shell is a **card workspace** when the dispatcher marked it (`HERMES_KANBAN_TA
 where the guard ends: a worktree made by hand from an unmarked shell is an operator's, and
 `git push --no-verify` or deleting `.git/hooks/pre-push` skips the hook. Each of those turns
 an accidental merge into a deliberate one, which is all a hook can honestly promise — it is
-not a security boundary. The durable answer is identity: a merge signs with a key no worker
-profile holds, and the remote accepts `master` only from that key (branch protection is not
-available on a GRASP).
+not a security boundary. There is no identity-based backstop behind it: a GRASP authorises a
+push against the repository's maintainer set, not against a ref, so any confirmed maintainer
+can move `master` and the remote cannot be asked to accept it from one key only. The check
+and the alternatives that were weighed are in `docs/decisions.md`.
 
 `scripts/merge_pr.sh` refuses in a card workspace too (exit 4), so the documented merge route
 is not a way around the guard.

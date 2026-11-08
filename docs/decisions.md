@@ -424,9 +424,45 @@ Why a hook and not a key: the hook is a code change with a test that can land th
 needed, while "the remote accepts `master` only from an operator key" is a server-side whitelist
 nobody can install from a card. The hook is also bypassable — `--no-verify`, deleting the file,
 or building a worktree from a shell the dispatcher never marked — and that is the point: it does
-not promise to stop a determined worker, it turns an accidental merge into a deliberate one. The
-durable answer is still identity; it is recorded here so the hook is never mistaken for a
-boundary.
+not promise to stop a determined worker, it turns an accidental merge into a deliberate one. It
+is recorded here so the hook is never mistaken for a boundary; the identity-based gate that
+would sit behind it does not exist on this remote (see *A GRASP cannot gate a branch by ref*).
+
+## A GRASP cannot gate a branch by ref
+
+This repository's remote cannot be configured to accept `refs/heads/master` only from an
+operator key. GRASP push authorisation is the repository's confirmed maintainer set, applied to
+every branch ref alike: a push is accepted when its signer resolves to a confirmed maintainer
+and the pushed commit matches the latest state event (kind 30618) authored by a confirmed
+maintainer. Any confirmed maintainer can author that state event, so any of them can move
+`master`. The published GRASP-01 requirement says the same in one line — a server must accept
+pushes "that match the latest repo state announcement on the relay, respecting the recursive
+maintainer set" — and it has no per-ref clause.
+
+Checked, not assumed: the origin's server runs stock `ngit-grasp` 3.1.1, the three other
+servers the repository's announcement lists run the same software, and its authorization module
+is unchanged from 3.0.9 through 3.1.1. `authorize_push` partitions the pushed refs into
+`refs/nostr/<event-id>` (PR submission) and everything else, and applies the maintainer set to
+the branch refs without looking at which branch they are. ngit-grasp's configuration surface has
+no ref, branch or push-allowlist knob. Only `refs/nostr/<event-id>` has a different rule, and
+that is the PR path: the contributor endpoint accepts that namespace and must reject every
+other, so it cannot host a `pr/*` branch either.
+
+**The fallbacks, and why neither was taken.** Making the operator's key the only confirmed
+maintainer would refuse a worker's `master` push — and its `pr/*` push for the same reason,
+because the maintainer set is not per-ref. Workers would then have to submit commits through
+the contributor endpoint as `refs/nostr/<event-id>`; that is a workflow change (and the
+endpoint is enabled on two of the four servers), not a gate. Forking our own instance to add a
+per-ref check is the other option, and it gates nothing: the server the `nostr://` origin names
+is not ours and would accept the same push under the stock rule. A branch-protection feature
+would have to land upstream in `ngit-grasp` and be deployed by every server the announcement
+lists before it gated anything.
+
+**So the pre-push hook is the only gate.** `scripts/worker_push_guard.sh` refuses a card
+workspace's push to `refs/heads/master`/`main`, and `scripts/merge_pr.sh` refuses the same
+contexts with exit 4. Its limits are the honest ones already written down: `--no-verify`,
+deleting the hook, or building a worktree from a shell the dispatcher never marked. Each turns
+an accidental merge into a deliberate one. There is no remote that catches what the hook misses.
 
 ## `done` requires `applied`
 
