@@ -189,13 +189,19 @@ woken.
 ## Working the queue
 
 Work arrives on the host's kanban board, and a change that lands as a PR is tracked by one card
-for the life of that PR: **the card is the queue, the PR is the record**. Four rules keep the
+for the life of that PR: **the card is the queue, the PR is the record**. Six rules keep the
 two from becoming three state machines for one fact.
 
 - **One card per PR root.** A re-poll, a retry, a re-push read as a second proposal and a
   revision all land on the same card; only a new PR makes a new one.
 - **`done` requires applied.** A card that reviews a PR is finished by the merge, not by the
   worker's or the reviewer's word.
+- **A merge requires the card finished.** The route reads the card before it applies anything and
+  refuses a PR whose card is still being worked on; `review` and `done` pass, and `blocked` passes
+  only on the PR's own card.
+- **Every commit carries its card.** A `commit-msg` hook writes `Card: t_xxxxxxxx` (or
+  `Card: operator`), so `git log` answers which card wrote a line without the board, and the merge
+  route refuses a commit that carries none.
 - **Three labels, one writer.** `review-required`, `changes-requested` and `approved` are
   derived from the newest verdict on the PR and written by one pass.
 - **A worker cannot merge.** A card workspace pushes its branch; `master` is the operator's.

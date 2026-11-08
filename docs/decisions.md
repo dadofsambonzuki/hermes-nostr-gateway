@@ -533,7 +533,8 @@ at merge time loses on three counts: it can only guess for a PR whose commits ne
 link names the PR's card, not which card each commit was done under); rewriting the commits to
 insert it changes the history the verdict covered; and an ngit PR lands as `git am`, so the
 commits themselves are what reach `master`. The worker's `commit-msg` hook writes the trailer
-once, on the commit that is pushed, and the merge route only refuses when it is absent (exit 6).
+once, on the commit that is pushed, and the merge route refuses a commit that carries no card
+trailer — none at all, or one that names something that is not a card (exit 6).
 `git log` then answers on `master`, and because an ngit PR's description is built from its
 commits' messages, so does `ngit pr view`.
 
@@ -573,3 +574,8 @@ a block of operator work cannot carry a worker's PR past its review. When the br
 linked a PR yet, the board comes from the checkout's `concord.projects` entry — the mapping the
 rest of the bridge already trusts — so "not linked yet" reads as a card that must be finished
 rather than as a reason to skip the check.
+
+**Erratum.** The commit that wrote this section (`8a7f0de`, published as PR 08baeaaf, `0ad9f8d`
+before `git am`) lists `blocked` among the statuses the merge refuses. On the PR's own card it
+does not, for the reason above. The message stays as written — it is the history the verdict
+covered — and this line is the correction.

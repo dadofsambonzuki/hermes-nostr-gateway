@@ -10,9 +10,10 @@ scripts/merge_pr.sh <pr-id|nevent>            # apply onto master, gate, push
 scripts/merge_pr.sh <pr-id|nevent> --check    # apply and gate only
 ```
 
-Exit codes: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage or state error, 4 a card
-workspace (not the operator's), 5 the live checkout moved, 6 a commit does not say which card
-wrote it, 7 the card is not in `review` or `done`. The last two are the authorship route:
+Exit codes: 0 applied (or would), 1 conflict, 2 gate failure or a refused push, 3 usage or state
+error, 4 a card workspace (not the operator's), 5 the live checkout moved mid-run, 6 a commit
+carries no card trailer (none at all, or one that names something that is not a card), 7 the card
+is not in `review` or `done`. The last two are the authorship route:
 [every commit says which card wrote it](#every-commit-says-which-card-wrote-it) and
 [a merge needs the card finished](#a-merge-needs-the-card-in-review-or-done).
 
@@ -61,19 +62,22 @@ dispatcher's marker (`HERMES_KANBAN_TASK`, or the `t_xxxxxxxx` at the front of a
 that already has a `Card:` trailer is left exactly as it is, so an operator working for a card
 writes the id themselves and the hook never overwrites it.
 
-`scripts/merge_pr.sh` refuses a PR (exit 6) when any commit it adds carries no trailer, and
-names the commits: a PR with no card is either operator work, which should say so, or a worker
-going around the board. It is checked there and never written there — an attribution the commits
-did not make is a guess, and rewriting them would change the history the review covered. As with
-the push guard, `--no-verify` or deleting the hook makes an untrailered commit a deliberate act
-rather than an accident, and the merge route then refuses it.
+`scripts/merge_pr.sh` refuses a PR (exit 6) when any commit it adds carries no trailer, or a
+`Card:` value that is neither `t_xxxxxxxx` nor `operator`, and names the commits: a PR with no
+card is either operator work, which should say so, or a worker going around the board. It is
+checked there and never written there — an attribution the commits did not make is a guess, and
+rewriting them would change the history the review covered. As with the push guard, `--no-verify`
+or deleting the hook makes an untrailered commit a deliberate act rather than an accident, and the
+merge route then refuses it.
 
 ## A merge needs the card in review or done
 
 The board is the intent record, so the merge route reads it before it gates anything. The PR's
 own card comes from the bridge's `ngit_links` row for the PR root; every card a `Card:` trailer
-names is read as well. A card in `running`, `ready`, `todo`, `scheduled`, `triage` or `archived`
-refuses the merge (exit 7) and names the card and the status it has.
+names is read as well (both tables are described in [`ngit-bridge.md`](ngit-bridge.md)). A card
+in `running`, `ready`, `todo`, `scheduled`, `triage` or `archived` refuses the merge (exit 7) and
+names the card and the status it has; the remedy is on the board, not in the patch: move the card
+to `review`, or let its work finish.
 
 `review` and `done` allow it, because both mean nobody is still working on it. So does `blocked`
 for the PR's **own** card, and that exception is the review lane's shape: the brief tells a
@@ -93,8 +97,9 @@ The same answer without applying anything:
 hng ngit merge-check <pr-id|nevent> [--card t_xxxxxxxx]... [--repo <checkout>]
 ```
 
-It exits 0 allowed, 7 refused, 3 when the box cannot answer (no `store:`, no board for the
-checkout). `scripts/merge_pr.sh` calls the same module (`python -m
+`--card` adds a card the way a `Card:` trailer would — repeat it per card — so a refusal can be
+reproduced without applying anything. It exits 0 allowed, 7 refused, 3 when the box cannot answer
+(no `store:`, no board for the checkout). `scripts/merge_pr.sh` calls the same module (`python -m
 hermes_nostr_gateway.ngit_merge`).
 
 ## The live checkout stays on master

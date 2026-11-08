@@ -157,10 +157,10 @@ installed once per clone (`scripts/card_trailer.sh install`); the operator's che
 silent absence. A message that already carries a trailer is left alone, so an operator working
 for a card writes the id themselves.
 
-The merge route refuses a PR any of whose commits carries no trailer (exit 6) and names them. It
-never writes one: the attribution is the worker's fact, and a merge-time guess would attribute
-lines to a card nobody named, while rewriting the commits would change the history the review
-covered.
+The merge route refuses a PR any of whose commits carries no trailer, or one that names something
+that is not a card (exit 6), and names them. It never writes one: the attribution is the worker's
+fact, and a merge-time guess would attribute lines to a card nobody named, while rewriting the
+commits would change the history the review covered.
 
 **Enforced in** `scripts/card_trailer.sh` (the hook) and `scripts/merge_pr.sh` exit 6 (the
 route). `tests/test_merge_route.py` commits in a card worktree for real and checks the trailer,
