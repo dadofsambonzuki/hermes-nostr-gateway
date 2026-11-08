@@ -4328,6 +4328,7 @@ def test_issue_labels_ignores_a_label_for_another_repository():
     assert labels[issue_id] == ()
 
 
+
 # -- the verdict on the PR -----------------------------------------------------
 
 def verdict_detail(harness, pr_id: str) -> dict:
@@ -4490,3 +4491,71 @@ def test_a_verdict_publishing_pass_still_reads_the_verdict_off_the_pr(harness):
     # been published, which is what the next pass (or a relay read) turns into `approved`.
     assert harness.read_calls
     assert harness.label_calls[-1][2] == ("review-required",)
+
+
+# -- the ngit 3.0.5 re-push, from the recorded events -------------------------
+#
+# One branch pushed twice, published as two kind-1618 roots: the shape that made two review
+# cards (`t_b88f06ec`, `t_f21e5cbc`) for one piece of work. The events below are the two real
+# ones, kept whole in `fixtures/ngit-repush-two-roots.json`; the fixture's note says where
+# they came from and why the `(<8 hex>)` in `ngit pr view --json` is not on the wire.
+
+REPUSH_FIXTURE = Path(__file__).parent / "fixtures" / "ngit-repush-two-roots.json"
+
+
+def repush_events() -> list[dict]:
+    return list(json.loads(REPUSH_FIXTURE.read_text())["events"])
+
+
+def repush_feed(events) -> ngit.PrFeed:
+    """What the pass reads for these events: the repository's own 1618s, parsed as usual."""
+    return ngit.RelayPrs(["wss://relay.example"], ADDRESS,
+                         fetcher=lambda **kwargs: list(events)).events(0)
+
+
+def test_the_repush_fixture_carries_two_roots_of_one_published_branch():
+    """The wire has no `(<pr id>)`: both roots name the same branch, each with its own tip."""
+    feed = repush_feed(repush_events())
+    first, second = sorted(feed.prs, key=lambda pr: pr.created_at)
+
+    assert (first.id, second.id) == (
+        "5e1f9dbe4280cb804d5d0197472e5c5d6914d68e3df2127b07d5d48aaad63051",
+        "08baeaaf6792bd3d1361ceed725d03271f3a2ad77d284963a41dbb93a5451b63")
+    assert first.branch == second.branch
+    assert first.branch == "hermes-nostr-gateway/t_fc8bf1c9-merge-route-the-rest-of-the-"
+    # ngit cuts `branch-name` to 60 characters and never decorates it. The client's
+    # `pr/<branch>-(<8 hex>)` is a ref it builds to tell two roots apart on screen; a test
+    # that folds on it would be folding on a string no relay ever carried.
+    assert len(first.branch) == 60
+    assert "(" not in first.branch and not first.branch.startswith("pr/")
+    # Neither names a root (`E`), so both are proposals, and the second's `merge-base` is
+    # the first's tip: a re-push, not a rebase.
+    assert (first.commit, second.commit) == (
+        "1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7",
+        "0ad9f8dad061e7505f9acad6d7f2bf9b6c6a6c6a")
+    assert feed.revisions == []
+
+
+def test_the_two_roots_of_one_repush_make_one_card(harness):
+    """The incident's shape, folded: one root, one card, one link, one announcement."""
+    events = repush_events()
+    harness.prs_data = repush_feed(events[:1])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+
+    harness.prs_data = repush_feed(events[1:])
+    report = harness.sync()
+
+    tasks = review_tasks(harness)
+    assert len(tasks) == 1 and tasks[0]["id"] == task_id
+    assert len(pr_links(harness)) == 1
+    # The oldest proposal is the root: the card keeps the id it was made with.
+    assert tasks[0]["idempotency_key"] == f"ngit:pr:{events[0]['id']}"
+    # The second root is the same work: the card reopens with its tip, and no second card,
+    # link or channel message follows.
+    assert report.prs["reopened"] == 1 and report.prs["tasks"] == 0
+    assert harness.task(task_id)["status"] == "ready"
+    assert events[1]["tags"][[tag[0] for tag in events[1]["tags"]].index("c")][1] in \
+        harness.comments(task_id)[-1]["body"]
+    assert len(harness.messages) == 1

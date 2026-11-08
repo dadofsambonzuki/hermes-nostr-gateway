@@ -1,0 +1,148 @@
+{
+  "what": [
+    "Two kind-1618 roots ngit 3.0.5 published for ONE source branch, 108 seconds apart,",
+    "when a second commit was pushed and the GRASP answered the ref update with 404 so",
+    "the client could not see the branch it had already proposed.",
+    "",
+    "Verbatim events, fetched from the repository's relay and kept whole (content, sig and",
+    "every tag) so a test reads what the bridge reads. The client's own view of these two",
+    "is `pr/hermes-nostr-gateway/t-fc8bf1c9-merge-route-the-rest-of-the-(5e1f9dbe)` and",
+    "`...-(08baeaaf)`: a local ref name, built from the branch with `_` turned to `-` and",
+    "`(<8 hex>)` appended. That string is NOT in `branch-name` -- see the `branch-name`",
+    "tag below, which is identical in both events."
+  ],
+  "relay": "wss://relay.ngit.dev",
+  "address": "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+  "events": [
+    {
+      "id": "5e1f9dbe4280cb804d5d0197472e5c5d6914d68e3df2127b07d5d48aaad63051",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794152305,
+      "kind": 1618,
+      "tags": [
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "subject",
+          "Merge route: a commit names its card, and a merge needs the card finished"
+        ],
+        [
+          "alt",
+          "git Pull Request: Merge route: a commit names its card, and a merge needs the card finished"
+        ],
+        [
+          "branch-name",
+          "hermes-nostr-gateway/t_fc8bf1c9-merge-route-the-rest-of-the-"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ],
+        [
+          "c",
+          "1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7"
+        ],
+        [
+          "clone",
+          "https://relay.ngit.dev/npub1cn670f663n3ks02jnnlsvd5y88zjnefy8343ykaxs7y3nzzketrsrjwt8a/hermes-nostr-gateway.git"
+        ],
+        [
+          "merge-base",
+          "9b52622679dccf34e7fe646da8ac9fe70beaf112"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ]
+      ],
+      "content": "The authorship half of the merge route had one part: a verdict signed by a different npub. The\nother two are what make \"who wrote this, and may it land\" answerable from the tree itself rather\nthan only from the board.\n\n- `scripts/card_trailer.sh` is a `commit-msg` hook, installed once per clone exactly like the\n  push guard. A card workspace writes `Card: t_xxxxxxxx` (the dispatcher's marker, or the id at\n  the front of the `.worktrees/` path); the operator's checkout writes `Card: operator`, so\n  operator work says so instead of saying nothing. A message that already carries a trailer is\n  left alone, so an operator working for a card writes the id themselves. Hooks live in the\n  shared git directory, so one install covers every card the dispatcher creates afterwards, and\n  `status` says whether the installed copy has drifted from the script.\n\n- `scripts/merge_pr.sh` refuses (exit 6) a PR any of whose commits carries no `Card:` trailer,\n  and names them. It is checked there and never written there: a merge-time attribution would\n  be a guess for a PR whose commits never said, and rewriting them would change the history the\n  review covered. `git log` therefore answers \"which card wrote this line\" without the board,\n  and because an ngit PR's description is built from its commits' messages, the PR says it too.\n\n- `ngit_merge.py` is the board's half: the merge route refuses (exit 7) a PR whose card is not\n  in `review` or `done`, naming the card and the status it actually has. The card comes from\n  the bridge's `ngit_links` row for the PR root and from every card the trailers name, so\n  `Card: operator` cannot release a card the bridge linked. When the bridge has not linked the\n  PR yet the board comes from the checkout's `concord.projects` entry, so a block of operator\n  work under a card is still checked rather than skipped. `hng ngit merge-check <pr> --repo\n  <checkout>` is the same answer without applying anything: 0 allowed, 7 refused, 3 when the\n  box cannot answer.\n\n- The docs say what is enforced: `working-on-this-repo.md` gains both sections and the exit\n  codes, `queue-and-prs.md` goes from four rules to six, and its \"In this tree\" lines now say\n  what is on `master` rather than what was in review when the doc was written.\n\nTests: `tests/test_merge_route.py` commits in a real card worktree through the installed hook\n(path, dispatcher marker, operator, amend, an existing trailer, a workspace that cannot name its\ncard, a stale install) and runs the real `merge_pr.sh` against a fake `ngit` for a PR with no\ntrailer, one untrailered commit of two, a trailer that names nothing, a running card, a blocked\ncard, a card named by a commit but not by the link, `Card: operator` against a linked running\ncard, a PR the bridge has not seen, and the two allowed cases. `ruff check src tests scripts\nbenchmarks` clean; `pytest -q` 1252 passed.\n\nCard: t_fc8bf1c9",
+      "sig": "1515aaa93d742c2486af5f51081383e2fa6a11cacdc0d243aaf2cb5fa079296eee66e162c9dfce5c89cd12c263c6a9bb70165f6f794236c97861023b1da714cf"
+    },
+    {
+      "id": "08baeaaf6792bd3d1361ceed725d03271f3a2ad77d284963a41dbb93a5451b63",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794152413,
+      "kind": 1618,
+      "tags": [
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "subject",
+          "Docs: the two authorship decisions, and why the trailer is not written at merge"
+        ],
+        [
+          "alt",
+          "git Pull Request: Docs: the two authorship decisions, and why the trailer is not written at merge"
+        ],
+        [
+          "branch-name",
+          "hermes-nostr-gateway/t_fc8bf1c9-merge-route-the-rest-of-the-"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ],
+        [
+          "c",
+          "0ad9f8dad061e7505f9acad6d7f2bf9b6c6a6c6a"
+        ],
+        [
+          "clone",
+          "https://relay.ngit.dev/npub1cn670f663n3ks02jnnlsvd5y88zjnefy8343ykaxs7y3nzzketrsrjwt8a/hermes-nostr-gateway.git"
+        ],
+        [
+          "merge-base",
+          "1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ]
+      ],
+      "content": "The rules are in `working-on-this-repo.md` and `queue-and-prs.md`; this is the record of what was\nchosen and what was rejected, next to the other decisions in `docs/decisions.md`:\n\n- the trailer is the worker's fact, written by a `commit-msg` hook \u2014 not a merge-time\n  attribution. A merge can only guess for a PR whose commits never said which card they were\n  done under, and rewriting the commits to insert one would change the history the verdict\n  covered. An ngit PR lands as `git am`, so the commits are what reach `master`: the trailer\n  written once, at commit time, is the one `git log` reads afterwards.\n- a merge requires the card in `review` or `done`: `review` is a reviewer's turn, `done` is\n  finished, and refusing either would make the rule about a status the merge itself writes.\n  `running`, `ready`, `blocked`, `todo`, `scheduled`, `triage` and `archived` are all work that\n  has not reached a reviewer.\n- the bridge's `ngit_links` row is the PR's card and the trailers are the cards the work was\n  done under; both are checked, so `Card: operator` never releases a card the bridge linked.\n\nCard: t_fc8bf1c9",
+      "sig": "03f0ac0246407ea9259bc0e087fb1c97d8d7bf7a5d25dfdb93f1919668ab2bd58266c309996aef689ba6b34040d02bdbe3b4f2ddeddb6a5d8894dd3d1ba7b195"
+    }
+  ]
+}
