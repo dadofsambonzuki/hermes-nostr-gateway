@@ -184,9 +184,12 @@ Server frames:
 
 `route` is present only when `routing` is configured, and carries **names**: `provider` and
 `model` for the turn, and `key` naming the environment (or `.env`) entry to read — never its value.
-`rule` says which rule won (`channel`, `plane`, `default`) and `why` says what it beat. The adapter
-reports the route it ran on with its `send`, and that reply (`{"route":{…}}` on the `delivery`
-frame, and on the stored row) is the audit trail. A route that cannot be honoured is a `blocked`
+`rule` says which rule won (`channel`, `project`, `plane`, `default`) and `why` says what it beat.
+A `project` rule is keyed on the Hermes project a Concord channel declares in `concord.projects`,
+so one rule covers every channel mapped to that project; the gateway resolves the channel's
+project before it asks the routing table, which is why a project rule is never consulted for a DM
+or a group. The adapter reports the route it ran on with its `send`, and that reply (`{"route":{…}}`
+on the `delivery` frame, and on the stored row) is the audit trail. A route that cannot be honoured is a `blocked`
 frame with `reason: route_key_missing` or `route_unresolved`, never a message — and its row stays
 in the replay, so the frame says `final: false`: see docs/decisions.md.
 

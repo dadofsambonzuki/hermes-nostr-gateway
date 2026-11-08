@@ -23,16 +23,31 @@ routing:
       provider: p
       model: model-b
       key: WORK_CHANNEL_KEY
+  projects:                # Concord only: a project `concord.projects` declares
+    - project: example-project
+      provider: p
+      model: model-b
+      key: PROJECT_MODEL_KEY
   # env_file: ~/.config/hermes-nostr-gateway/.env   # default: a .env beside the config
 ```
 
 The decisions, in the order they matter:
 
-**Precedence is channel > plane > default, and it is total.** `routing.default` is required
-once `routing` is configured, so every conversation resolves to exactly one rule and
+**Precedence is channel > project > plane > default, and it is total.** `routing.default` is
+required once `routing` is configured, so every conversation resolves to exactly one rule and
 `hng route` can say which one won and what it beat. A channel rule matches on id before
 name, so a renamed channel keeps its route; an entry with a `community` only matches that
 community.
+
+**A project is the set of channels that belong to it, and the unit a key is pinned to.** A
+project rule names a Hermes project slug -- the `project` a `concord.projects` entry declares
+for a channel -- and applies to every channel mapped to it, so one key is written once
+instead of repeated on every room the project has. It is narrower than a plane and wider
+than a channel, which is why a channel rule for one of those rooms still wins: a room is more
+specific than the project it sits in. Only a Concord conversation has a project, so a project
+rule never applies to a DM or a Marmot group, and a conversation whose channel no longer
+resolves has no project either (see below). A project rule naming a project no channel maps
+to is dead configuration: `hng route --check` reports it, and nothing can resolve through it.
 
 **A name that is not known is an error, not a guess.** `routing.models` lists the model
 names this config may use, and a rule naming anything else is a load error. The gateway has
@@ -91,6 +106,13 @@ RULE_FIELDS: tuple[str, ...] = ("provider", "model", "key")
 
 #: Channel-rule identity fields, on top of the rule's own.
 CHANNEL_IDENTITY: tuple[str, ...] = ("community", "channel")
+
+#: Project-rule identity field, on top of the rule's own.
+PROJECT_IDENTITY: tuple[str, ...] = ("project",)
+
+#: A project slug: one path segment, the same grammar `concord.projects` accepts for the
+#: `project` it declares. A rule keyed on anything else could never match that declaration.
+_PROJECT_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class RouteKeyMissing(LookupError):
@@ -201,6 +223,17 @@ class ChannelRule:
 
 
 @dataclass(frozen=True)
+class ProjectRule:
+    """A Hermes project's route, applying to every channel `concord.projects` maps to it."""
+
+    #: The project slug, as `concord.projects` declares it (compared case-insensitively).
+    project: str
+    route: Route
+    #: Where this entry sits in the config, for `hng route` and the frame's audit trail.
+    origin: str = ""
+
+
+@dataclass(frozen=True)
 class Resolution:
     """What one conversation resolves to, and why — the answer `hng route` prints.
 
@@ -209,7 +242,7 @@ class Resolution:
     """
 
     route: Optional[Route] = None
-    #: Which rule won: `channel`, `plane`, `default`, `validation` or `none`.
+    #: Which rule won: `channel`, `project`, `plane`, `default`, `validation` or `none`.
     rule: str = "none"
     #: The rule that won, in words, including what it beat.
     why: str = ""
@@ -328,12 +361,14 @@ class Router:
     def __init__(self, *, configured: bool = False, default: Optional[Route] = None,
                  planes: Optional[dict[str, Route]] = None,
                  channels: Optional[list[ChannelRule]] = None,
+                 projects: Optional[list[ProjectRule]] = None,
                  models: tuple[str, ...] = (), env_file: str = "",
                  problems: Iterable[str] = ()):
         self.configured = configured
         self.default = default
         self.planes: dict[str, Route] = dict(planes or {})
         self.channels: list[ChannelRule] = list(channels or [])
+        self.projects: list[ProjectRule] = list(projects or [])
         self.models = tuple(models)
         self.env_file = env_file
         self.problems: tuple[str, ...] = tuple(problems)
@@ -362,10 +397,10 @@ class Router:
             env_file = str((Path(config_path).absolute().parent / ".env"))
         problems: list[str] = []
         unknown = sorted(set(map(str, raw)) - {"models", "default", "planes", "channels",
-                                               "env_file"})
+                                               "projects", "env_file"})
         if unknown:
             problems.append(f"routing: unknown field(s) {', '.join(unknown)} (expected models, "
-                            "default, planes, channels, env_file)")
+                            "default, planes, channels, projects, env_file)")
         models, model_problems = _models_from(raw.get("models"))
         problems.extend(model_problems)
 
@@ -435,8 +470,47 @@ class Router:
             channels.append(ChannelRule(community=community, channel=channel,
                                         route=route, origin=origin))
 
+        projects: list[ProjectRule] = []
+        raw_projects = raw.get("projects") or []
+        if isinstance(raw_projects, dict):
+            problems.append("routing.projects: expected a list of entries, not a mapping")
+            raw_projects = []
+        if not isinstance(raw_projects, (list, tuple)):
+            problems.append(f"routing.projects: expected a list, got "
+                            f"{type(raw_projects).__name__}")
+            raw_projects = []
+        for position, entry in enumerate(raw_projects):
+            origin = f"routing.projects[{position}]"
+            if not isinstance(entry, dict):
+                problems.append(f"{origin}: expected a mapping with project, provider, model "
+                                "and key")
+                continue
+            unknown = sorted(set(map(str, entry)) - set(RULE_FIELDS) - set(PROJECT_IDENTITY))
+            if unknown:
+                problems.append(f"{origin}: unknown field(s) {', '.join(unknown)} "
+                                f"(expected {', '.join((*PROJECT_IDENTITY, *RULE_FIELDS))})")
+            project = str(entry.get("project") or "").strip()
+            if not project:
+                problems.append(f"{origin}: names no project (the slug concord.projects "
+                                "declares for the channel)")
+            elif not _PROJECT_SLUG.match(project):
+                problems.append(f"{origin}: project {project!r} is not a slug (letters, digits,"
+                                " '.', '_' and '-')")
+            route, rule_problems = _rule_from(entry, origin=origin, models=models,
+                                              env_file=env_file, allowed=PROJECT_IDENTITY)
+            problems.extend(rule_problems)
+            if route is None or not project or not _PROJECT_SLUG.match(project):
+                continue
+            duplicate = next((seen for seen in projects
+                              if seen.project.lower() == project.lower()), None)
+            if duplicate is not None:
+                problems.append(f"{origin}: project {project!r} is already routed by "
+                                f"{duplicate.origin}; keeping that one")
+                continue
+            projects.append(ProjectRule(project=project, route=route, origin=origin))
+
         return cls(configured=True, default=default, planes=planes, channels=channels,
-                   models=models, env_file=env_file, problems=problems)
+                   projects=projects, models=models, env_file=env_file, problems=problems)
 
     # -- questions the gateway asks -------------------------------------
 
@@ -449,12 +523,20 @@ class Router:
         return self.configured and not self.problems and self.default is not None
 
     def resolve(self, plane: str = "", conversation: str = "", *,
-                known_channels: Optional[Iterable[Any]] = None) -> Resolution:
+                known_channels: Optional[Iterable[Any]] = None,
+                project: str = "") -> Resolution:
         """The route for one conversation, with the rule that won and what it beat.
 
         `known_channels` is what the Concord plane holds right now (objects with
         `community_id`, `channel_id` and `name`). `None` means "not known yet" — the check
         is skipped rather than guessing — while an empty list means "known to hold nothing".
+
+        `project` is the Hermes project slug this conversation's channel belongs to, resolved
+        by the caller from `concord.projects` (this module knows nothing about that map). ""
+        means the conversation has no project: a DM, a Marmot group, a channel mapped to no
+        project, or a caller that could not tell yet. A project is only ever accepted for a
+        Concord conversation — it is the only plane that has one, so a project handed in for
+        a DM would be a channel's route applied to a private conversation.
         """
         if not self.configured:
             return Resolution(rule="none",
@@ -464,8 +546,10 @@ class Router:
             return Resolution(rule="validation", error="route_invalid",
                               detail="; ".join(self.problems) or "routing.default is missing")
         plane = str(plane or "").strip().lower()
+        project = str(project or "").strip().lower() if plane == "concord" else ""
+        project_rule = self._match_project(project) if project else None
 
-        if plane == "concord" and self.channels:
+        if plane == "concord" and (self.channels or self.projects):
             parsed = _parse_concord(conversation)
             if parsed is not None:
                 community, channel = parsed
@@ -473,15 +557,23 @@ class Router:
                 if known is not None and not _holds(known, community, channel):
                     # The rule is not consulted: a route for a room this gateway does not
                     # hold is the stale entry to show, not a plane default to hide behind.
+                    # The project is unknown too, so a project rule cannot be consulted
+                    # either — and a fallback would bill the turn to whatever the plane's
+                    # key is.
                     return Resolution(
                         rule="channel", error="route_unresolved",
                         detail=f"no channel {channel} in community {community or '(any)'} "
-                               "among the channels this gateway holds")
+                               "among the channels this gateway holds, so no channel or "
+                               "project rule names it")
                 matched = self._match_channel(community, channel, known)
                 if matched is not None:
                     return self._resolution(matched.route, "channel",
                                             f"channel rule {matched.origin} "
-                                            f"{self._beaten('channel', plane)}")
+                                            f"{self._beaten('channel', plane, project_rule)}")
+                if project_rule is not None:
+                    return self._resolution(project_rule.route, "project",
+                                            f"project rule {project_rule.origin} "
+                                            f"{self._beaten('project', plane)}")
 
         route = self.planes.get(plane)
         if route is not None:
@@ -525,12 +617,27 @@ class Router:
                 return rule
         return None
 
-    def _beaten(self, rule: str, plane: str) -> str:
+    def _match_project(self, project: str) -> Optional[ProjectRule]:
+        """The rule for this project slug, or None. Slugs are compared case-insensitively.
+
+        A slug is one name, not a path: `hng route` prints the rule and the project it is
+        keyed on, so a typo shows up as a project nothing maps to rather than as a rule
+        that silently never wins.
+        """
+        wanted = str(project or "").strip().lower()
+        if not wanted:
+            return None
+        return next((rule for rule in self.projects if rule.project.lower() == wanted), None)
+
+    def _beaten(self, rule: str, plane: str,
+                project_rule: Optional[ProjectRule] = None) -> str:
         """What a winning rule outranks, so `hng route` explains itself."""
         below: list[str] = []
-        if rule == "channel" and plane in self.planes:
+        if rule == "channel" and project_rule is not None:
+            below.append(f"{project_rule.origin} (project {project_rule.project})")
+        if rule in ("channel", "project") and plane in self.planes:
             below.append(f"routing.planes.{plane}")
-        if rule in ("channel", "plane"):
+        if rule in ("channel", "project", "plane"):
             below.append("routing.default")
         return f"beats {' and '.join(below)}" if below else "is the only rule"
 
@@ -554,6 +661,23 @@ class Router:
             problems.append(f"{rule.origin}: no channel {rule.channel!r} is held in {where}")
         return problems
 
+    def project_problems(self, declared: Iterable[str]) -> list[str]:
+        """Project rules keyed on a project no channel is mapped to.
+
+        `hng route --check` asks this once it has read `concord.projects`: a rule keyed on a
+        slug nothing declares can never win, and a key written for it is a key somebody
+        believes is in force. `declared` is every project slug the mapping declares.
+        """
+        known = {str(name or "").strip().lower() for name in declared or ()}
+        known.discard("")
+        problems: list[str] = []
+        for rule in self.projects:
+            if rule.project.lower() in known:
+                continue
+            problems.append(f"{rule.origin}: no channel maps to project {rule.project!r} "
+                            "in concord.projects, so the rule can never win")
+        return problems
+
     def describe(self) -> list[str]:
         """The whole table as lines, for `hng route` with no conversation."""
         if not self.configured:
@@ -566,6 +690,9 @@ class Router:
             lines.append(f"  {'default':<22} {_rule_line(self.default)}")
         for plane in sorted(self.planes):
             lines.append(f"  {'planes.' + plane:<22} {_rule_line(self.planes[plane])}")
+        for rule in self.projects:
+            lines.append(f"  {(rule.origin or 'project'):<22} project {rule.project}  "
+                         f"{_rule_line(rule.route)}")
         for rule in self.channels:
             where = f"{rule.channel} @ {rule.community or 'any community'}"
             lines.append(f"  {(rule.origin or 'channel'):<22} {where}  "
@@ -681,7 +808,7 @@ def reported_route(raw: Any) -> dict[str, str]:
         if value and _NAME.match(value):
             out[name] = value
     rule = str(raw.get("rule") or "").strip().lower()
-    if rule in ("channel", "plane", "default"):
+    if rule in ("channel", "project", "plane", "default"):
         out["rule"] = rule
     key = str(raw.get("key") or "").strip()
     if key and not _key_problem(key):

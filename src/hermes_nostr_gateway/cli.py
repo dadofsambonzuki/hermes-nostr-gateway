@@ -42,7 +42,7 @@ from .profiles import (
     hermes_profile_state,
     load_profiles,
 )
-from .projects import Project, ProjectMap, checks_for, load_registry
+from .projects import Project, ProjectMap, checks_for, load_registry, project_for_conversation
 from .publisher import publish
 from .routing import Route, Router, RoutingConfigError
 from .store import Store, drops_ttl_seconds
@@ -1018,13 +1018,15 @@ def _config_path(explicit: str | None = None) -> Path | None:
 
 
 def _model_route_lines(cfg: dict[str, Any], config_path: Any, plane: str,
-                       conversation: str) -> list[str]:
+                       conversation: str, project: str = "") -> list[str]:
     """The model route for one conversation, when model routing is in this build.
 
     Model routing is its own block with its own card (`pr/route-model`): it decides provider,
     model and credential where this decides identity. It is imported rather than assumed, so
     `hng route` works in a build that has one and not the other and prints both when it has
-    both -- which is the point of one verb.
+    both -- which is the point of one verb. `project` is the conversation's project, when the
+    caller could resolve one, so a project rule is printed as the winner rather than hidden
+    behind the plane's route.
     """
     try:
         routing = importlib.import_module(f"{__package__}.routing")
@@ -1034,7 +1036,7 @@ def _model_route_lines(cfg: dict[str, Any], config_path: Any, plane: str,
         return []
     try:
         router = routing.Router.from_config(cfg.get("routing"), config_path=config_path)
-        resolution = router.resolve(plane, conversation)
+        resolution = router.resolve(plane, conversation, project=project)
         data = resolution.as_dict()
     except Exception as exc:  # noqa: BLE001 - an older module must not break `hng route`
         return [f"  model      unavailable ({type(exc).__name__}: {exc})"[:200]]
@@ -1096,6 +1098,12 @@ def cmd_route(args) -> int:
     plane, how = _plane_for(cfg, conversation, args.plane)
     known = _held_concord_channels(cfg)
     wants_json = getattr(args, "json", False)
+    # A project rule is keyed on the project `concord.projects` maps the conversation's
+    # channel to, so that map is read once here and handed to both halves of the answer.
+    projects = ProjectMap.from_config(cfg.get("concord"))
+    project = (project_for_conversation(conversation, projects, known or ())
+               if plane == "concord" else "")
+    declared_projects = [entry.project for entry in projects.all() if entry.project]
 
     if args.check:
         status = 0
@@ -1128,6 +1136,10 @@ def cmd_route(args) -> int:
                       "against a channel list", file=sys.stderr)
             elif known is not None:
                 routing_problems.extend(routing.channel_problems(known))
+            # Project rules are checked against the mapping, which needs no live plane: a
+            # rule keyed on a project no channel declares can never win.
+            if routing.projects:
+                routing_problems.extend(routing.project_problems(declared_projects))
             for problem in routing_problems:
                 print(f"config: {problem}", file=sys.stderr)
             if routing_problems:
@@ -1135,6 +1147,9 @@ def cmd_route(args) -> int:
             elif not wants_json:
                 also = "" if routing_unchecked else (
                     ", and every channel rule names a channel this gateway holds")
+                if routing.projects:
+                    also += (", and every project rule names a project concord.projects "
+                             "maps a channel to")
                 print(f"routing loads: every rule names a model in routing.models{also}")
 
         if wants_json:
@@ -1175,14 +1190,14 @@ def cmd_route(args) -> int:
 
     profile_route = profiles.resolve(plane, conversation,
                                      known_channels=known if plane == "concord" else None)
-    model_route = (routing.resolve(plane, conversation, known_channels=known)
+    model_route = (routing.resolve(plane, conversation, known_channels=known, project=project)
                    if routing is not None and getattr(routing, "configured", True) else None)
     # With no plane in hand, a plane rule may be exactly what decides this conversation, and
     # printing `profiles.default` would answer a question that was not decidable.
     undecided = (profile_route.ok and not plane and bool(profiles.planes)
                  and profile_route.rule == "default")
 
-    model_lines = _model_route_lines(cfg, config_path, plane, conversation)
+    model_lines = _model_route_lines(cfg, config_path, plane, conversation, project)
     if wants_json:
         data = {**profile_route.as_dict(), "conversation": conversation, "plane": plane,
                 "plane_from": how, "model": model_lines}
@@ -1228,6 +1243,8 @@ def _routing_table(router: Router) -> dict[str, Any]:
         "env_file": router.env_file,
         "default": rule(router.default) if router.default else None,
         "planes": {plane: rule(r) for plane, r in router.planes.items()},
+        "projects": [{"project": p.project, "origin": p.origin, **rule(p.route)}
+                     for p in router.projects],
         "channels": [{"community": c.community, "channel": c.channel,
                       "origin": c.origin, **rule(c.route)} for c in router.channels],
     }

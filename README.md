@@ -279,8 +279,10 @@ the board and appears on the PR, so a reader of either one sees the same thing.
   `control.marmot`) and whose word needs none (`trusted_npubs`, global plus per plane, a union of
   the two). A plane with no destination is reported as unconfigured, never guessed.
 - **`profiles`** — which Hermes profile a conversation's turn runs as.
-- **`routing`** — which provider, model and *named* environment variable it uses. Both this and
-  `profiles` resolve `channel > plane > default`, and both refuse a route they cannot honour
+- **`routing`** — which provider, model and *named* environment variable it uses. `routing`
+  resolves `channel > project > plane > default` and `profiles` resolves `channel > plane >
+  default`: a project is the set of channels `concord.projects` maps to it, so a key can be
+  pinned once per project instead of once per room. Both refuse a route they cannot honour
   rather than falling back to one.
 - **`concord.projects`** — where a channel's work lives: the checkout (`path`), the Hermes project
   (`project`) and the kanban board (`board`). Three names with three jobs, none inferred from

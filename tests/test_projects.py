@@ -9,13 +9,14 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from hermes_nostr_gateway import cli
 from hermes_nostr_gateway.planes.concord.plane import ConcordPlane
-from hermes_nostr_gateway.projects import ProjectMap, load_registry
+from hermes_nostr_gateway.projects import ProjectMap, load_registry, project_for_conversation
 from hermes_nostr_gateway.store import Store
 
 COMMUNITY = "ab" * 32
@@ -403,6 +404,62 @@ def test_plain_listing_shows_the_queue_each_channel_declares(tmp_path, capsys):
     out = capsys.readouterr().out
     assert f"project={PROJECT} board={BOARD}" in out
     assert "project=- board=-" in out
+
+
+# -- identity, for routing -------------------------------------------------
+
+
+def test_identify_answers_for_a_checkout_that_is_not_there(tmp_path):
+    """Routing asks which project a channel is, not where its work starts."""
+    mapping = ProjectMap.from_config({"projects": [
+        {"channel": CHANNEL_NAME, "path": str(tmp_path / "gone"), "project": PROJECT},
+    ]})
+    (entry,) = mapping.all()
+
+    assert not entry.ok, "the checkout is missing, so resolve() refuses it"
+    assert mapping.resolve(channel_name=CHANNEL_NAME) is None
+    assert mapping.identify(channel_name=CHANNEL_NAME).project == PROJECT
+
+
+def test_identify_does_not_answer_for_a_mapping_with_no_project(checkout):
+    mapping = ProjectMap.from_config({"projects": [
+        {"channel": CHANNEL_NAME, "path": str(checkout)},
+    ]})
+
+    assert mapping.identify(channel_name=CHANNEL_NAME) is None
+
+
+def test_project_for_conversation_reads_a_name_mapped_entry_by_channel_id(checkout):
+    mapping = ProjectMap.from_config({"projects": [
+        {"channel": CHANNEL_NAME, "path": str(checkout), "project": PROJECT},
+    ]})
+    known = [SimpleNamespace(community_id=COMMUNITY, channel_id=CHANNEL_ID,
+                             name=CHANNEL_NAME)]
+
+    assert project_for_conversation(f"concord:{COMMUNITY}:{CHANNEL_ID}", mapping,
+                                    known) == PROJECT
+
+
+def test_project_for_conversation_reads_an_id_mapped_entry_by_channel_name(checkout):
+    mapping = ProjectMap.from_config({"projects": [
+        {"channel": CHANNEL_ID, "path": str(checkout), "project": PROJECT},
+    ]})
+    known = [SimpleNamespace(community_id=COMMUNITY, channel_id=CHANNEL_ID,
+                             name=CHANNEL_NAME)]
+
+    assert project_for_conversation(f"concord:{COMMUNITY}:{CHANNEL_NAME}", mapping,
+                                    known) == PROJECT
+
+
+def test_project_for_conversation_is_empty_for_anything_but_a_channel(checkout):
+    mapping = ProjectMap.from_config({"projects": [
+        {"channel": CHANNEL_ID, "path": str(checkout), "project": PROJECT},
+    ]})
+
+    # A DM peer is a hex string too, so only the `concord:` shape may resolve a project.
+    assert project_for_conversation("ab" * 32, mapping) == ""
+    assert project_for_conversation(f"concord:{COMMUNITY}:{'99' * 32}", mapping) == ""
+    assert project_for_conversation("", mapping) == ""
 
 
 # -- the plane's own view --------------------------------------------------

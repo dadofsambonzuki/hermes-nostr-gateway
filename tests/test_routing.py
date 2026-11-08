@@ -65,6 +65,7 @@ def keys(monkeypatch):
     monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
     monkeypatch.setenv("CONCORD_KEY", "concord-value")
     monkeypatch.setenv("WORK_KEY", "work-value")
+    monkeypatch.setenv("PROJECT_KEY", "project-value")
 
 
 # ── precedence ──────────────────────────────────────────────────────────────
@@ -297,6 +298,121 @@ def test_a_channel_rule_matching_a_held_id_is_not_reported(keys):
     assert problems == []
 
 
+# ── project scope ───────────────────────────────────────────────────────────
+
+PROJECT = "example-project"
+
+
+def project_router(**overrides) -> Router:
+    """The base table plus one project rule: the work project's own model and key."""
+    return Router.from_config({
+        **CONFIG,
+        "projects": [{"project": PROJECT, "provider": "p4", "model": "model-a",
+                      "key": "PROJECT_KEY"}],
+        **overrides,
+    })
+
+
+def test_a_project_rule_beats_the_plane_and_the_default(keys):
+    resolution = project_router().resolve("concord", chat(GENERAL), project=PROJECT)
+
+    assert resolution.ok, resolution.detail
+    assert (resolution.rule, resolution.route.provider, resolution.route.model,
+            resolution.route.key) == ("project", "p4", "model-a", "PROJECT_KEY")
+    assert "beats routing.planes.concord and routing.default" in resolution.why
+
+
+def test_a_channel_rule_beats_the_project_rule(keys):
+    resolution = project_router().resolve("concord", chat(OPS), project=PROJECT)
+
+    assert (resolution.rule, resolution.route.key) == ("channel", "WORK_KEY")
+    assert "routing.projects[0] (project example-project)" in resolution.why
+
+
+def test_a_project_rule_covers_every_channel_the_project_has(keys):
+    """The project is the key's unit: one rule answers for every channel mapped to it."""
+    router = project_router()
+    resolutions = [router.resolve("concord", chat(ident), project=PROJECT)
+                   for ident in (GENERAL, "33" * 32, "44" * 32)]
+
+    assert {resolution.rule for resolution in resolutions} == {"project"}
+    assert {resolution.route.key for resolution in resolutions} == {"PROJECT_KEY"}
+
+
+def test_a_project_without_a_rule_falls_to_the_plane(keys):
+    resolution = project_router().resolve("concord", chat(GENERAL),
+                                          project="another-project")
+
+    assert (resolution.rule, resolution.route.key) == ("plane", "CONCORD_KEY")
+
+
+def test_a_project_rule_never_applies_to_a_dm(keys):
+    """A DM has no channel, so no project: a project handed in for one is ignored."""
+    resolution = project_router().resolve("nip17", "ab" * 32, project=PROJECT)
+
+    assert resolution.rule == "default" and resolution.route.key == "GATEWAY_KEY"
+
+
+def test_a_missing_project_key_fails_closed_and_never_borrows_the_plane_key(monkeypatch):
+    monkeypatch.setenv("CONCORD_KEY", "concord-value")
+    monkeypatch.setenv("GATEWAY_KEY", "gateway-value")
+    monkeypatch.delenv("PROJECT_KEY", raising=False)
+
+    resolution = project_router().resolve("concord", chat(GENERAL), project=PROJECT)
+
+    assert resolution.error == "route_key_missing" and resolution.route is None
+    assert "$PROJECT_KEY" in resolution.detail
+    assert "concord-value" not in resolution.detail
+    assert "gateway-value" not in resolution.detail
+
+
+def test_a_project_rule_must_name_a_project():
+    router = router_for(projects=[{"provider": "p", "model": "model-a"}])
+
+    assert any("names no project" in problem for problem in router.problems)
+
+
+def test_a_project_rule_keyed_on_a_bad_slug_is_a_load_error():
+    router = router_for(projects=[{"project": "../../etc", "provider": "p",
+                                   "model": "model-a"}])
+
+    assert any("is not a slug" in problem for problem in router.problems)
+
+
+def test_a_duplicate_project_rule_keeps_the_first():
+    router = router_for(projects=[
+        {"project": PROJECT, "provider": "first", "model": "model-a"},
+        {"project": PROJECT.upper(), "provider": "second", "model": "model-b"},
+    ])
+
+    assert any("already routed" in problem for problem in router.problems)
+    assert [rule.route.provider for rule in router.projects] == ["first"]
+
+
+def test_a_project_rule_that_no_channel_maps_to_is_reported():
+    problems = project_router().project_problems(["another-project"])
+
+    assert problems and PROJECT in problems[0] and "can never win" in problems[0]
+
+
+def test_a_project_rule_that_a_channel_maps_to_is_not_reported():
+    assert project_router().project_problems([PROJECT]) == []
+
+
+def test_the_table_prints_project_rules(keys):
+    lines = project_router().describe()
+
+    assert any("routing.projects[0]" in line and f"project {PROJECT}" in line
+               and "$PROJECT_KEY" in line for line in lines)
+
+
+def test_a_reported_project_rule_is_kept():
+    reported = reported_route({"provider": "p4", "model": "model-a", "key": "PROJECT_KEY",
+                               "rule": "project"})
+
+    assert reported["rule"] == "project" and reported["key"] == "PROJECT_KEY"
+
+
 # ── the conversation's plane ────────────────────────────────────────────────
 
 
@@ -319,7 +435,7 @@ def test_an_unconfigured_gateway_resolves_nothing():
 # ── the gateway: frames, replay, the reply's audit ──────────────────────────
 
 
-def gateway_for(tmp_path, routing=None) -> Gateway:
+def gateway_for(tmp_path, routing=None, concord=None) -> Gateway:
     secret_file = tmp_path / "identity.json"
     secret_file.write_text(json.dumps({"secret_key_hex": sdk.Keys.generate()
                                        .secret_key().to_hex()}))
@@ -333,6 +449,8 @@ def gateway_for(tmp_path, routing=None) -> Gateway:
     }
     if routing is not None:
         cfg["routing"] = routing
+    if concord is not None:
+        cfg["concord"] = concord
     return Gateway(cfg, socket_path=tmp_path / "gateway.sock")
 
 
@@ -365,6 +483,44 @@ def test_a_frame_carries_the_route_its_turn_was_asked_for(tmp_path, keys, monkey
         assert frame["route"]["key"] == "WORK_KEY"
         assert frame["route"]["rule"] == "channel"
         assert "work-value" not in json.dumps(frame)
+    finally:
+        gw.store.close()
+
+
+def test_a_frame_carries_the_project_route_of_the_channel_it_came_from(tmp_path, keys):
+    """A project rule needs the channel's project, which `concord.projects` answers."""
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    routing = {**CONFIG, "projects": [{"project": PROJECT, "provider": "p4",
+                                       "model": "model-a", "key": "PROJECT_KEY"}]}
+    gw = gateway_for(tmp_path, routing, concord={"projects": [
+        {"channel": GENERAL, "path": str(checkout), "project": PROJECT},
+    ]})
+    learn_channel(gw, channel_id=GENERAL, name="general")
+    try:
+        frame = gw.frame_for(inbound(chat(GENERAL)))
+
+        assert frame["type"] == "message"
+        assert frame["route"]["rule"] == "project"
+        assert (frame["route"]["provider"], frame["route"]["key"]) == ("p4", "PROJECT_KEY")
+        assert "project-value" not in json.dumps(frame)
+    finally:
+        gw.store.close()
+
+
+def test_a_channel_rule_still_beats_the_project_it_belongs_to(tmp_path, keys):
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    routing = {**CONFIG, "projects": [{"project": PROJECT, "provider": "p4",
+                                       "model": "model-a", "key": "PROJECT_KEY"}]}
+    gw = gateway_for(tmp_path, routing, concord={"projects": [
+        {"channel": OPS, "path": str(checkout), "project": PROJECT},
+    ]})
+    learn_channel(gw)
+    try:
+        frame = gw.frame_for(inbound(chat(OPS)))
+
+        assert frame["route"]["rule"] == "channel" and frame["route"]["key"] == "WORK_KEY"
     finally:
         gw.store.close()
 
@@ -458,15 +614,18 @@ def test_a_reported_key_that_is_a_value_is_dropped_not_stored():
 # ── the CLI ─────────────────────────────────────────────────────────────────
 
 
-def write_config(tmp_path, routing) -> str:
+def write_config(tmp_path, routing, concord=None) -> str:
     path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump({
+    body = {
         "identity": {"secret_file": str(tmp_path / "identity.json")},
         "relays": {"read": [], "publish": []},
         "store": str(tmp_path / "cli.db"),
         "groups": {}, "policies": [], "defaults": {},
         "routing": routing,
-    }))
+    }
+    if concord is not None:
+        body["concord"] = concord
+    path.write_text(yaml.safe_dump(body))
     return str(path)
 
 
@@ -536,6 +695,53 @@ def test_hng_route_check_passes_for_a_channel_rule_the_gateway_holds(tmp_path, k
 
     assert cli.main(["--config", path, "route", "--check"]) == 0
     assert "routing loads" in capsys.readouterr().out
+
+
+def project_config(**overrides) -> dict:
+    """The base table plus one project rule: the work project's own model and key."""
+    return {**CONFIG, "projects": [{"project": PROJECT, "provider": "p4",
+                                    "model": "model-a", "key": "PROJECT_KEY"}],
+            **overrides}
+
+
+def test_hng_route_names_the_project_rule_that_won(tmp_path, keys, capsys):
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    path = write_config(tmp_path, project_config(), concord={"projects": [
+        {"channel": GENERAL, "path": str(checkout), "project": PROJECT},
+    ]})
+
+    assert cli.main(["--config", path, "route", chat(GENERAL)]) == 0
+
+    out = capsys.readouterr().out
+    assert "p4/model-a" in out and "project rule routing.projects[0]" in out
+    assert "project-value" not in out
+
+
+def test_hng_route_check_reports_a_project_rule_no_channel_maps_to(tmp_path, keys, capsys):
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    path = write_config(tmp_path, project_config(projects=[
+        {"project": "unmapped-project", "provider": "p4", "model": "model-a"},
+    ]), concord={"projects": [
+        {"channel": GENERAL, "path": str(checkout), "project": PROJECT},
+    ]})
+
+    assert cli.main(["--config", path, "route", "--check"]) == 1
+
+    err = capsys.readouterr().err
+    assert "no channel maps to project 'unmapped-project'" in err
+
+
+def test_hng_route_check_passes_for_a_project_rule_a_channel_maps_to(tmp_path, keys, capsys):
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    path = write_config(tmp_path, project_config(), concord={"projects": [
+        {"channel": GENERAL, "path": str(checkout), "project": PROJECT},
+    ]})
+
+    assert cli.main(["--config", path, "route", "--check"]) == 0
+    assert "every project rule names a project" in capsys.readouterr().out
 
 
 def test_hng_serve_refuses_to_start_on_a_block_it_cannot_route_by(tmp_path, capsys):

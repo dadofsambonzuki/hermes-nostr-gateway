@@ -235,7 +235,8 @@ defaults:
 # Ordinary turns run on whatever Hermes is configured with; a route lets one
 # conversation ask for a specific provider, model and credential instead -- a cheap model for a
 # noisy feed, a stronger one for a work channel, a dedicated key so one channel's usage is
-# accountable. Precedence is channel > plane > default, and `hng route` prints which rule won.
+# accountable. Precedence is channel > project > plane > default, and `hng route` prints
+# which rule won.
 #
 # `key` is the NAME of an environment variable, never a value. The adapter asks Hermes's secret
 # scope for it at the moment the turn runs, so the name has to be visible to the Hermes profile
@@ -260,6 +261,11 @@ defaults:
 #       provider: provider-b
 #       model: model-b
 #       key: WORK_CHANNEL_KEY
+#   projects:                          # Concord only: the Hermes project a channel declares
+#     - project: example-project       # one rule covers every channel mapped to it
+#       provider: provider-c
+#       model: model-b
+#       key: PROJECT_MODEL_KEY
 #   # env_file: ~/.config/hermes-nostr-gateway/.env   # default: a .env beside this file
 # The ngit bridge: the same channel mapping, used in both directions. Issues on the channel's
 # repository become tasks on its board; PRs on that repository are announced in the channel.

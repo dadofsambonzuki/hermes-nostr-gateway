@@ -375,6 +375,26 @@ class ProjectMap:
                 for check in registry_checks(project, registry)
                 if not check.ok]
 
+    def _match(self, *, community_id: str, channel_id: str, channel_name: str,
+               usable_only: bool) -> Optional[Project]:
+        """The mapping for this channel: an id match beats a name match, first entry wins."""
+        community = (community_id or "").strip().lower()
+        ident = (channel_id or "").strip().lower()
+        name = (channel_name or "").strip().lower()
+
+        def eligible(project: Project) -> bool:
+            if usable_only and not project.ok:
+                return False
+            return not project.community or project.community.strip().lower() == community
+
+        for project in self._projects:
+            if eligible(project) and ident and project.channel.strip().lower() == ident:
+                return project
+        for project in self._projects:
+            if eligible(project) and name and project.channel.strip().lower() == name:
+                return project
+        return None
+
     def resolve(self, *, community_id: str = "", channel_id: str = "",
                 channel_name: str = "") -> Optional[Project]:
         """The checkout for this channel, or None (unmapped or unusable path).
@@ -382,24 +402,24 @@ class ProjectMap:
         Id matches are tried before name matches, across the whole map, so renaming a
         channel cannot silently steal another channel's project.
         """
-        community = (community_id or "").strip().lower()
-        ident = (channel_id or "").strip().lower()
-        name = (channel_name or "").strip().lower()
+        return self._match(community_id=community_id, channel_id=channel_id,
+                           channel_name=channel_name, usable_only=True)
 
-        def scoped(project: Project) -> bool:
-            return not project.community or project.community.strip().lower() == community
+    def identify(self, *, community_id: str = "", channel_id: str = "",
+                 channel_name: str = "") -> Optional[Project]:
+        """The mapping's project for this channel, by identity alone — no path check.
 
-        for project in self._projects:
-            if not project.ok or not scoped(project):
-                continue
-            if ident and project.channel.strip().lower() == ident:
-                return project
-        for project in self._projects:
-            if not project.ok or not scoped(project):
-                continue
-            if name and project.channel.strip().lower() == name:
-                return project
-        return None
+        Routing asks which *project* a channel belongs to, not where its work starts: a
+        checkout that is moved, unmounted or briefly missing is a fact about the tree, and a
+        route that fell back to the plane's model and key because a directory was gone would
+        be exactly the silent substitution routing exists to prevent. The match is the same
+        one `resolve` makes (id before name, community scoping, first entry wins), minus the
+        path check; an entry that declares no project is not a project route and returns
+        None.
+        """
+        found = self._match(community_id=community_id, channel_id=channel_id,
+                            channel_name=channel_name, usable_only=False)
+        return found if found is not None and found.project else None
 
     def resolve_id(self, channel_id: str) -> Optional[Project]:
         """The usable entry keyed by this channel id, across every community.
@@ -416,3 +436,46 @@ class ProjectMap:
             if project.ok and project.channel.strip().lower() == ident:
                 return project
         return None
+
+
+#: A Concord conversation names its channel: `concord:<community>:<channel id or name>`.
+_CONVERSATION_PREFIX = "concord:"
+
+#: A channel id: 64 hex characters. Anything else is a name, which an entry may use too.
+_CHANNEL_ID = re.compile(r"^[0-9a-f]{64}$")
+
+
+def project_for_conversation(conversation: str, mapping: "ProjectMap",
+                             known_channels: Iterable[Any] = ()) -> str:
+    """The Hermes project a `concord:` conversation belongs to, or "" when it has none.
+
+    Routing pins a key per project, so something has to turn a conversation into a project
+    before the routing table is asked. That lookup is this map's business, not routing's:
+    `mapping` is `concord.projects`, and `known_channels` is whatever the caller holds
+    (objects with `community_id`, `channel_id` and `name`) -- which is how a conversation
+    naming a channel by id reaches an entry that names it by name, and the other way round.
+
+    Only a Concord conversation has a project, and only the conversation's shape is read: a
+    DM peer is a hex string too, so anything that is not `concord:` returns "" rather than a
+    guessed project. "" also covers a channel mapped to no project (manual work), an entry
+    whose `project` a config error cleared, and a channel this map does not know.
+    """
+    text = str(conversation or "").strip()
+    if not text.lower().startswith(_CONVERSATION_PREFIX):
+        return ""
+    community, _, token = text[len(_CONVERSATION_PREFIX):].partition(":")
+    community, token = community.strip().lower(), token.strip()
+    if not community or not token:
+        return ""
+    ident = token.lower() if _CHANNEL_ID.match(token.lower()) else ""
+    name = "" if ident else token
+    for channel in known_channels or ():
+        known_id = str(getattr(channel, "channel_id", "") or "").strip()
+        known_name = str(getattr(channel, "name", "") or "").strip()
+        if (ident and known_id.lower() == ident) or (
+                name and known_name.lower() == name.lower()):
+            ident, name = ident or known_id.lower(), name or known_name
+            community = str(getattr(channel, "community_id", "") or community).strip().lower()
+            break
+    found = mapping.identify(community_id=community, channel_id=ident, channel_name=name)
+    return found.project if found is not None else ""

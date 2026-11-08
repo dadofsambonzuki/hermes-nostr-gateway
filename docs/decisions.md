@@ -113,6 +113,33 @@ to the plane's route. `hng route --check` reports the same entry as a problem.
 Why: a route is configuration, not protocol. Deleting a channel does not rewrite this file, so a
 stale entry silently falling back to the plane's model is exactly the shape of bug nobody finds:
 the room's answers are on a model chosen for background traffic, and the config says otherwise.
+
+## A project route is the channel's project, not its checkout
+
+`routing.projects` keys a route on the Hermes project slug a `concord.projects` entry declares,
+so one rule covers every channel mapped to that project. Precedence is
+channel > project > plane > default: a channel rule still wins, because a room is more specific
+than the project it sits in.
+
+Why the extra scope: a project is the unit an account is billed in, and without it the same key
+has to be copied onto every channel rule the project has — where the copy nobody updated is the
+one that bills the wrong account. A plane rule is too wide (a whole transport) and a channel rule
+too narrow (one room), so the project is the only scope that can say "this project's work runs on
+this key" once.
+
+Two consequences worth keeping. Project rules are Concord-only: a DM or a Marmot group has no
+channel, so no project, and a project handed in for one is ignored rather than applied to a
+private conversation. And the lookup is by identity, not by path (`ProjectMap.identify`): a moved
+or unmounted checkout still has its project, so its route stays in force — falling back to the
+plane's key because a directory was missing is the silent substitution this whole block exists to
+prevent. A project rule naming a slug no channel declares can never win, and `hng route --check`
+reports it.
+
+`profiles` deliberately has no project scope: a profile is a whole brain (its own sessions,
+memory and skills), and that is a property of the room a conversation is held in, not of the
+checkout its work lands in. `routing` is the block whose subject is the credential, so it is the
+one that gets the project.
+
 ## A profile route is the frame's, and Hermes runs it
 
 Routing a plane or a Concord channel to a Hermes profile is a routing-table entry, not a second

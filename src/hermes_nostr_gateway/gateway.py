@@ -71,7 +71,7 @@ from .planes.nip17 import Nip17Plane
 from .policy import Policy
 from .pool import PoolWorker, RelayPool
 from .profiles import hermes_config_path, require_profiles
-from .projects import ProjectMap
+from .projects import ProjectMap, project_for_conversation
 from .publisher import Publisher, make_publisher
 from .routing import Resolution, load_router, reported_route
 from .server import SocketServer
@@ -1239,11 +1239,18 @@ class Gateway:
         The Concord channel list is consulted only once the plane has learned it: before the
         first refresh the list is empty because nothing has been asked yet, not because every
         channel is gone, and a route that may be fine must not be refused on a not-yet.
+
+        A project rule needs the channel's project, which is `concord.projects`'s answer, not
+        this table's: `project_for_conversation` reads it from the same channel list. Only a
+        Concord conversation has one — a DM or a group is not a channel of any project.
         """
         if not self.routing:
             return Resolution(rule="none")
         known = self.concord.channels() if self.concord.refreshed else None
-        return self.routing.resolve(plane, conversation, known_channels=known)
+        project = (project_for_conversation(conversation, self.projects, known or ())
+                   if plane == "concord" else "")
+        return self.routing.resolve(plane, conversation, known_channels=known,
+                                    project=project)
 
     def frame_for(self, msg: Any) -> dict[str, Any]:
         """A message frame, a `reaction` frame, or a `blocked` frame when policy refused it.
