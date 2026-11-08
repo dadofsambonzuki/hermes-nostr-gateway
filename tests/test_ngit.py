@@ -19,7 +19,7 @@ from pathlib import Path
 import nostr_sdk as sdk
 import pytest
 
-from hermes_nostr_gateway import cli, ngit, ngit_labels, pr_status
+from hermes_nostr_gateway import cli, ngit, ngit_labels, ngit_verdict, pr_status
 from hermes_nostr_gateway.applied import Evidence
 from hermes_nostr_gateway.control import ControlConfig
 from hermes_nostr_gateway.kanban import Anchor, Board
@@ -202,7 +202,7 @@ class Harness:
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
                  notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
-                 applied: FakeApplied | None = None, sweep=None):
+                 applied: FakeApplied | None = None, sweep=None, verdicts=None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -235,6 +235,10 @@ class Harness:
         self.comment_reads: list[tuple[str, ...]] = []
         self.issue_label_reads: list[tuple[str, ...]] = []
         self.state = state or _Reader(self)
+        #: What the sync asked to publish on a PR, and what the publisher says it did.
+        self.verdict_calls: list[tuple[str, str, int, str]] = []
+        self.verdict_ok = True
+        self.verdict_publisher = verdicts or self._publish_verdict
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
         self.config = bridge_config(assignee=assignee, lookback_hours=0,
@@ -362,6 +366,17 @@ class Harness:
                                         lookback_hours=self.config.lookback_hours,
                                         ready_label="")
 
+    def _publish_verdict(self, pr_id: str, body: str, *, created_at: int = 0,
+                         author: str = "", covers_after: int = 0):
+        """Record what the sync asked to publish on the PR, and say it landed."""
+        self.verdict_calls.append((pr_id, body, created_at, author))
+        if not self.verdict_ok:
+            return ngit_verdict.VerdictResult(
+                error="the relay did not serve it back on the PR")
+        event = f"v{len(self.verdict_calls):03d}".ljust(64, "0")
+        return ngit_verdict.VerdictResult(ok=True, event=event,
+                                          relays=("wss://relay.example",))
+
     def sync(self, **kwargs):
         return self._sync().run(**kwargs)
 
@@ -376,7 +391,7 @@ class Harness:
             prs=self.prs, statuses=self.statuses, sweep=self.sweep,
             notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state, applied=self.applied,
-            self_npub=self.self_npub)
+            self_npub=self.self_npub, verdicts=self.verdict_publisher)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -4297,3 +4312,167 @@ def test_issue_labels_ignores_a_label_for_another_repository():
     labels = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch).issue_labels(
         [issue_id])
     assert labels[issue_id] == ()
+
+
+# -- the verdict on the PR -----------------------------------------------------
+
+def verdict_detail(harness, pr_id: str) -> dict:
+    """What the link row remembers about the verdict it published."""
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr_id) or {}
+    return json.loads(link.get("detail") or "{}").get("verdict_published") or {}
+
+
+def review_task_comment(harness, task_id: str, body: str) -> int:
+    """A reviewer's comment on the card, as the board records it."""
+    return harness.board.comment(task_id, "review", body)
+
+
+def test_a_review_cards_verdict_is_published_on_the_pr_once(harness):
+    """The card is the queue; the PR is the record. One pass carries the words across."""
+    pr, task_id = pr_with_review_task(harness)
+    body = "Verdict: approved\n\nReviewed the diff and ran both gates: 1204 passed."
+    review_task_comment(harness, task_id, body)
+
+    report = harness.sync()
+
+    assert harness.verdict_calls == [(pr.id, body, harness.comments(task_id)[0]["created_at"],
+                                     npub(TRUSTED_HEX))]
+    assert report.prs["verdicts"] == 1
+    assert verdict_detail(harness, pr.id)["task"] == task_id
+    assert verdict_detail(harness, pr.id)["event"].startswith("v001")
+
+    # A quiet poll publishes nothing: the row remembers what the PR already carries.
+    harness.prs_data = ([], [])
+    report = harness.sync()
+    assert len(harness.verdict_calls) == 1
+    assert report.prs["verdicts"] == 0
+
+
+def test_the_verdict_is_published_verbatim_not_summarised(harness):
+    """`ngit pr view --comments` shows the review's own words, so the body is copied whole."""
+    pr, task_id = pr_with_review_task(harness)
+    body = ("## Verdict: changes needed (2 small items)\n\n"
+            "1. src/x.py:41 — the second hunk drops the await.\n"
+            "2. tests/test_x.py:9 — the gate passes on an empty result.\n\n"
+            "Everything else is right; the diagnosis is sound.")
+    review_task_comment(harness, task_id, body)
+
+    harness.sync()
+
+    published = ngit_verdict.card_verdict(task_id, harness.comments(task_id))
+    assert published is not None
+    assert published.label == "changes-requested"
+    assert published.body == body
+    assert harness.verdict_calls[0][1] == body
+
+
+def test_a_review_verdict_publishes_once_per_card_not_once_per_poll(harness):
+    """Idempotent on the card: a verdict nobody changed is not republished."""
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+
+    harness.sync()
+    harness.sync()
+    harness.sync()
+
+    assert len(harness.verdict_calls) == 1
+
+
+def test_a_second_review_card_publishes_its_own_verdict(harness):
+    """A re-review is a new card and a new statement; the PR gets that one too."""
+    pr, first = pr_with_review_task(harness)
+    review_task_comment(harness, first, "Verdict: changes-requested\n\nTwo fixes.")
+    harness.sync()
+
+    second = hand_queued_review_task(harness, pr)
+    review_task_comment(harness, second, "Verdict: approved\n\nBoth fixed.")
+    harness.sync()
+
+    assert [call[1] for call in harness.verdict_calls] == [
+        "Verdict: changes-requested\n\nTwo fixes.", "Verdict: approved\n\nBoth fixed."]
+    assert verdict_detail(harness, pr.id)["task"] == second
+
+
+def test_a_failed_publish_is_reported_and_retried_on_the_next_pass(harness):
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+    harness.verdict_ok = False
+
+    report = harness.sync()
+
+    assert report.prs["verdict_errors"] == 1
+    assert any("did not serve it back" in error for error in report.errors)
+    assert verdict_detail(harness, pr.id) == {}
+
+    harness.verdict_ok = True
+    report = harness.sync()
+    assert report.prs["verdicts"] == 1
+    assert verdict_detail(harness, pr.id)["task"] == task_id
+
+
+def test_a_dry_run_publishes_no_verdict_and_says_what_it_would_do(harness):
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+
+    report = harness.sync(dry_run=True)
+
+    assert harness.verdict_calls == []
+    assert report.prs["would_verdict"] == 1
+    assert any("verdict(s) would be published" in line for line in report.lines())
+
+
+def test_a_merged_pr_is_not_given_a_verdict_after_the_fact(harness):
+    """The verdict is what the merge was decided on; publishing it afterwards is noise."""
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+    merge = ngit.Merge(pr_id=pr.id, commit="b" * 40, created_at=1100)
+    harness.prs_data = ([], [merge])
+
+    harness.sync()
+
+    assert harness.verdict_calls == []
+
+
+def test_the_channel_gets_one_review_line_naming_the_card(harness):
+    """`review <pr> -> approved (task <id>)`, through the queue, and only once."""
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+
+    harness.sync()
+
+    line = f"review {pr.id} -> approved (task {task_id})"
+    assert [text for _who, text in harness.messages].count(line) == 1
+
+    # The notice is a receipt in the outbox, not a link state: the PR's lifecycle did not
+    # move because a message about it went out.
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)
+    assert link["state"] == "signalled"
+
+    harness.prs_data = ([], [])
+    harness.sync()
+    assert [text for _who, text in harness.messages].count(line) == 1
+
+
+def test_a_verdict_with_no_publisher_configured_publishes_nothing(harness):
+    """A deployment that has not adopted the review bot is quiet, not broken."""
+    pr, task_id = pr_with_review_task(harness)
+    harness.verdict_publisher = None
+    review_task_comment(harness, task_id, "Verdict: approved")
+
+    report = harness.sync()
+
+    assert report.prs["verdicts"] == 0 and report.prs["verdict_errors"] == 0
+
+
+def test_a_verdict_publishing_pass_still_reads_the_verdict_off_the_pr(harness):
+    """One event, two readers: the label pass sees what the verdict publisher put there."""
+    pr, task_id = pr_with_review_task(harness)
+    review_task_comment(harness, task_id, "Verdict: approved")
+
+    harness.sync()
+
+    # The relay reader is asked for the PR's verdict every label pass; the test's answer is
+    # empty here, so the label keeps its `review-required` -- but the card's own words have
+    # been published, which is what the next pass (or a relay read) turns into `approved`.
+    assert harness.read_calls
+    assert harness.label_calls[-1][2] == ("review-required",)

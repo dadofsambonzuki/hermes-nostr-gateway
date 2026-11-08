@@ -118,6 +118,7 @@ from .ngit_labels import (
     reconcile_labels,
     review_labels,
 )
+from .ngit_verdict import VerdictPublisherFn, card_verdict
 from .projects import ProjectMap, board_dir, hermes_home
 from .store import Store
 
@@ -624,11 +625,15 @@ class BridgeConfig:
     #: the review role's word, and "anyone who tags the PR" is the vulnerability this key
     #: removes.
     reviewers: tuple[str, ...] = ()
-    #: The review role's signing key, when it is stored where the bridge can read it. It is
-    #: only used to derive `reviewers` when that list is empty, so one source of truth.
+    #: The review role's signing key, when it is stored where the bridge can read it. It
+    #: derives `reviewers` when that list is empty, so one source of truth, and it is the
+    #: key a published verdict is signed with: a path outside every checkout (mode 0600),
+    #: never a value, because this config is tracked.
     review_secret_file: str = ""
-    #: Whether a verdict is read at all. False is the same posture as an empty reviewer
-    #: list, and it keeps a deployment that wants labels only from acting on a comment.
+    #: Whether a verdict is read and published at all. False is the same posture as an empty
+    #: reviewer list, and it keeps a deployment that wants labels only from acting on a
+    #: comment; it also turns off publishing the review card's verdict on the PR as a NIP-22
+    #: kind-1111 comment (inert until `review_secret_file` names the review role's key).
     verdicts: bool = True
     #: How many new tasks one poll may create. A backlog (or a spam run of issues from an
     #: open relay) is spread over polls instead of filling the board and the channel in one
@@ -764,6 +769,7 @@ class Report:
         "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
         "approved": 0, "changes": 0, "applied": 0, "ignored": 0,
         "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0,
+        "verdicts": 0, "verdict_errors": 0, "would_verdict": 0,
         #: Status events the trailing sweep re-read: applied/closed only, never a proposal.
         "swept": 0})
     posted: int = 0
@@ -838,6 +844,10 @@ class Report:
                    + (f", {p['review_errors']} review failure(s)" if p["review_errors"] else "")
                    + (f", {p['labels']} label(s) published" if p["labels"] else "")
                    + (f", {p['label_errors']} label failure(s)" if p["label_errors"] else "")
+                   + (f", {p['verdicts']} verdict(s) published" if p["verdicts"] else "")
+                   + (f", {p['verdict_errors']} verdict failure(s)" if p["verdict_errors"] else "")
+                   + (f", {p['would_verdict']} verdict(s) would be published"
+                      if self.dry_run and p["would_verdict"] else "")
                    + (f", {p['deferred']} waiting for the next poll" if p["deferred"] else "")
                    + (f", {p['would_post']} would be posted" if self.dry_run else ""))
         if self.sweep_hours:
@@ -1842,18 +1852,19 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "   what ran and what it printed, including anything that was already failing.",
         "   Run them in this card's worktree only -- never in the deploy checkout -- and do",
         "   not give the PR's code the daemon's keys or its live config.",
-        "3. Publish the verdict on the PR, then report it on this task with the reasons --",
-        "   merge, or changes needed -- and say what the gates could not catch: behaviour,",
-        "   tests that do not exercise the change, and anything the PR leaves out.",
-        "4. Start both with exactly one of these lines:",
+        "3. Report the verdict on this task with the reasons -- merge, or changes needed --",
+        "   and say what the gates could not catch: behaviour, tests that do not exercise the",
+        "   change, and anything the PR leaves out.",
+        "4. Start that comment with exactly one of these lines:",
         "",
         "       Verdict: approved",
         "       Verdict: changes-requested",
         "",
-        "   Publish it with `ngit pr comment <id|nevent> --body 'Verdict: ...'` and name the",
-        "   comment's event id in your note here. The PR's label is derived from the newest",
-        "   verdict comment on the PR root, not from this card: a verdict recorded only here",
-        "   leaves the label where it was, because a reader of the PR could not check it.",
+        "   The bridge publishes this comment on the PR, signed by the review identity, so",
+        "   write it as the text a reader of the PR should see: it is published verbatim, not",
+        "   summarised. The PR's label is derived from the newest kind-1111 verdict on the PR",
+        "   root, and the merge guard reads the same event; a verdict recorded only here is",
+        "   neither, and cannot count as a second signature.",
     ]
     return "\n".join([
         f'PR "{pr.subject}" by {pr.author}',
@@ -1873,12 +1884,12 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "",
         "The verdict finishes this card, and the bridge applies it: `approved` completes the",
         "card -- the merge is still a person's -- and `changes-requested` sends it back to",
-        "the implementer with your findings. So publish the verdict on the PR, record it",
-        "here as a comment naming the comment's event id and the tip it covers, then park",
-        "the card with `kanban_block`, putting `Verdict: approved` or",
-        "`Verdict: changes-requested` first in the reason and the tip after it. That park",
-        "is a hand-off, not a question: the bridge reads the verdict from the PR root and",
-        "finishes the card on its next pass. **Do not call kanban_complete** -- the board",
+        "the implementer with your findings. So write the verdict on this card as a comment,",
+        "naming the tip it covers, then park the card with `kanban_block`, putting",
+        "`Verdict: approved` or `Verdict: changes-requested` first in the reason and the tip",
+        "after it. That park is a hand-off, not a question: the bridge publishes the comment",
+        "on the PR and reads the verdict back from the PR root, and it finishes the card on",
+        "its next pass. **Do not call kanban_complete** -- the board",
         "refuses it while the PR is open, and a verdict recorded only on this card leaves",
         "the PR's label where it was.",
         "",
@@ -1967,6 +1978,16 @@ def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> st
     if pr is None:
         return f"PR {nevent or merge.pr_id} {how}"
     return f'PR "{pr.subject}" by {pr.author} {how}\n{pr.nevent or nevent}'
+
+
+def review_verdict_message(pr_id: str, verdict: str, task_id: str) -> str:
+    """The one line a published verdict puts in the channel.
+
+    The PR's own event id, not its subject: the line is read next to the label and the card,
+    and the id is what all three have in common. The card is named because that is where the
+    reasoning lives, and the verdict word is the label's word.
+    """
+    return f"review {pr_id} -> {verdict} (task {task_id})"
 
 
 def closed_message(pr: PullRequest, stopped: Closed) -> str:
@@ -2108,7 +2129,12 @@ class AppliedSource(Protocol):
 
 
 def notice_state(kind: int, notice: str) -> str:
-    """The link state a notice earns once the daemon has taken it."""
+    """The link state a notice earns once the daemon has taken it.
+
+    A verdict notice earns none: the verdict event is already on the PR, and the link row's
+    state is the PR's lifecycle (`pending`, `signalled`, `merged`), not a message's. "" is
+    "the receipt is the whole change".
+    """
     if int(kind) == KIND_PR:
         if notice == "merged":
             return "merged"
@@ -2116,6 +2142,8 @@ def notice_state(kind: int, notice: str) -> str:
             return "closed"
         if notice == "question":
             return "asked"
+        if notice.startswith("review:"):
+            return ""
         return "signalled"
     if notice == "question":
         return "asked"
@@ -2143,6 +2171,7 @@ class Sync:
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
                  applied: Optional[AppliedSource] = None, self_npub: str = "",
+                 verdicts: Optional[VerdictPublisherFn] = None,
                  now: Callable[[], float] = time.time):
         self.store = store
         self.board = board
@@ -2174,6 +2203,7 @@ class Sync:
         #: This gateway's own key, hex: a mention is a `p` tag naming it, and a comment that
         #: carries it is the one thing in a repo addressed to the bot rather than the repo.
         self.self_npub = str(self_npub or "").lower()
+        self.verdicts = verdicts
         self._now = now
 
     # -- entry point -----------------------------------------------------
@@ -2878,6 +2908,12 @@ class Sync:
         # closed ones refuse it and name the closing event. Last, so it sees the state this
         # pass actually left the cards in -- and `open_why` so its refusal names the evidence.
         self._guards(feed, report, dry_run=dry_run, why=open_why)
+
+        # The verdict goes on the PR before the label is read: the label is derived from the
+        # PR root's newest verdict, so publishing first is what lets one pass carry a card's
+        # verdict all the way to the label where the relays let it; the next pass does when
+        # they do not, because the card is still there to read.
+        self._verdicts(report, dry_run=dry_run)
 
         # Labels last: every task the poll just made or closed is state the label walk has
         # to see, and a label that cannot be published must not hold the cursor -- the next
@@ -3676,6 +3712,73 @@ class Sync:
         except (BoardError, sqlite3.Error) as exc:
             report.errors.append(f"guard prune: {exc}")
 
+    # -- verdicts ---------------------------------------------------------
+
+    def _verdicts(self, report: Report, *, dry_run: bool) -> None:
+        """Publish each review card's verdict on its PR, once per verdict comment.
+
+        The card is the queue; the PR is the record. A reviewer writes the verdict on the
+        card, and until it is also a kind-1111 comment on the PR, `ngit pr view --comments`
+        says nothing about the review, the label pass has nothing to derive a label from, and
+        the merge guard has no second signature to check. This is the one writer of that
+        event, and it publishes the comment's words exactly as the reviewer wrote them.
+
+        Idempotent on the card and the comment. The link row remembers which comment of which
+        card was published as which event, so a quiet poll does nothing; and the published
+        event's timestamp is the comment's own, so a retry after a lost acknowledgement signs
+        the same event id rather than a second comment. A newer verdict comment on the same
+        card is a new statement and is published -- the words are the record.
+
+        A review that was already published by hand is left alone: the publisher reads the
+        PR's thread first and treats the same text from the same key as done.
+        """
+        if self.verdicts is None or not self.config.verdicts:
+            return
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            pr_id = str(link.get("source_id") or "")
+            detail = _detail(link)
+            if (not pr_id or str(link.get("state") or "") in ("merged", "closed")
+                    or detail.get("merge")):
+                # Applied is final: a verdict after the merge is somebody else's business,
+                # and a closed PR has nothing left to approve. The merge may have been
+                # recorded earlier in this same pass, before the link state moved.
+                continue
+            task_id = self._review_anchor(link)
+            if not task_id:
+                continue
+            found = card_verdict(task_id, self.board.comments(task_id))
+            if found is None:
+                continue
+            published = detail.get("verdict_published") or {}
+            if (str(published.get("task") or "") == task_id
+                    and int(published.get("comment") or 0) == found.comment_id):
+                continue
+            if dry_run:
+                report.prs["would_verdict"] += 1
+                continue
+            try:
+                result = self.verdicts(pr_id, found.body, created_at=found.created_at,
+                                       author=str(detail.get("author") or ""),
+                                       covers_after=int(detail.get("tip_at") or 0))
+            except Exception as exc:  # noqa: BLE001 - a publisher may raise; the pass may not die
+                report.prs["verdict_errors"] += 1
+                report.errors.append(
+                    f"verdict {pr_id[:8]} (task {task_id}): {type(exc).__name__}: {exc}"[:200])
+                continue
+            if not result.ok:
+                report.prs["verdict_errors"] += 1
+                report.errors.append(
+                    f"verdict {pr_id[:8]} (task {task_id}): {result.error}"[:200])
+                continue
+            detail["verdict_published"] = {"task": task_id, "comment": found.comment_id,
+                                           "event": result.event}
+            self._save_detail(link, detail, task_id=task_id)
+            report.prs["verdicts"] += 1
+            self._enqueue(KIND_PR, pr_id, f"review:{task_id}",
+                          review_verdict_message(pr_id, found.label, task_id))
+            log.info("ngit: PR %s verdict published from %s as %s",
+                     pr_id[:8], task_id, (result.event or "")[:8])
+
     # -- the verdict's consequence, and the label ---------------------------------
 
     def _review_states(self, feed: PrFeed, report: Report) -> None:
@@ -4121,7 +4224,7 @@ class Sync:
             self.store.ngit_notice_sent(repo, row["kind"], row["source_id"], row["notice"],
                                         state=state)
             report.posted += 1
-            if int(row["kind"]) == KIND_PR:
+            if int(row["kind"]) == KIND_PR and state:
                 report.prs[state if state in ("merged", "closed") else "signalled"] += 1
 
 

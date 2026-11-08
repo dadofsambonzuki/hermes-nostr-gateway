@@ -48,7 +48,7 @@ closing event named in the comment), because dropping or re-filing the work is a
 decision too; and a review's hand-off parks the card (`Verdict:`/`Revision:` in the reason)
 only until the bridge acts on the verdict or the fix, which it does on its next pass.
 
-## The six rules
+## The seven rules
 
 ### One card per PR root
 
@@ -254,6 +254,29 @@ row names the survivor and that a row whose event is gone republishes the label.
 **Check:** `git grep -n '"in-review"' -- src/` finds nothing — the prose still mentions the old
 word, the code does not — and `ngit pr list` shows one label per PR once the pass has run.
 
+### A verdict is published, not just recorded
+
+A verdict written only into the card's comments is a review nobody outside the board can see.
+The pass publishes the newest verdict comment from the review card on the PR itself, as a
+NIP-22 kind-1111 comment signed by the review identity — the card's words exactly, not a
+summary — so `ngit pr view <pr> --comments` shows the review that decided the PR, the label
+pass derives the label from that event, and the merge guard checks the same one. Idempotent on
+the card and the comment: a quiet poll publishes nothing, and a retry signs the same event id
+because the timestamp is the comment's own. A review already published by hand is left alone.
+The channel gets one line when it lands: `review <pr> -> approved|changes-requested (task <id>)`.
+
+**Enforced in** `src/hermes_nostr_gateway/ngit_verdict.py` (the only writer of a verdict
+comment), called from the pass in `ngit.py`, with the review role's key from
+`ngit.review_secret_file`; `ngit.verdicts: false` turns it off, and with no key configured the
+pass publishes nothing and says so. `tests/test_ngit_verdict.py` pins the event shape (root
+`E`/`K`/`P`, parent `e`/`k`/`p`, no `a`), verbatim content, one publish per card, and the
+guard's accept/refuse.
+
+**In this tree:** yes.
+
+**Check:** `ngit pr view <pr> --comments --json` names a kind-1111 comment by the review npub
+whose body is the card's verdict comment, and a second pass publishes nothing.
+
 ### A worker cannot merge
 
 A card workspace may push its own branch; `master` is the operator's. A pre-push hook refuses
@@ -264,17 +287,22 @@ anything.
 This is not a security boundary and this document will not pretend it is: a worker can delete
 the hook or pass `--no-verify`. What the hook buys is that an accidental merge becomes a
 deliberate one. The durable half is identity — a merge signed with a key no worker profile
-holds — and that is host configuration, not this repository.
+holds — and that is host configuration, not this repository. The other durable half is
+authorship: `scripts/merge_pr.sh` refuses a PR whose newest verdict is its own author's, so a
+self-authored change lands only with a second party's signature on it.
 
 **Enforced in** `scripts/worker_push_guard.sh` (the `pre-push` hook; installed once per clone
-into the hooks directory every worktree shares) and `scripts/merge_pr.sh` (exit 4 in a card
-workspace).
+into the hooks directory every worktree shares), `scripts/merge_pr.sh` (exit 4 in a card
+workspace, exit 5 with no verdict from a different npub), and
+`src/hermes_nostr_gateway/ngit_verdict.py` (the authorship check the merge route calls).
 
 **In this tree:** yes — the hook and `merge_pr.sh`'s exit-4 refusal are on `master` (PR
-`b81a2d50`).
+`b81a2d50`); the verdict refusal is this change, and `tests/test_ngit_verdict.py` runs the real
+`merge_pr.sh` against a fake `ngit` to pin both the refusal and the pass-through.
 
 **Check:** `scripts/worker_push_guard.sh status` reports whether the hook is installed and
-whether this shell is a card workspace.
+whether this shell is a card workspace; `bash scripts/merge_pr.sh <pr> --check` exits 5 for a
+self-authored verdict before it applies anything.
 
 ## Transitions
 
@@ -315,11 +343,11 @@ binds only cards that review a PR.
 
 ## Which of this is enforced, and which is convention
 
-All six rules are now code on `master` or in this change: one card per PR root, `done` requires
-applied, a merge requires the card finished, every commit carries its card, three labels written
-by one pass, and a worker cannot merge. The **In this tree** lines above name each one's check,
-and they are the part of this document that is allowed to be wrong when the code moves: run them
-against the tree you are about to trust.
+All seven rules are now code on `master` or in this change: one card per PR root, `done`
+requires applied, a merge requires the card finished, every commit carries its card, three
+labels written by one pass, a verdict published on the PR, and a worker cannot merge. The
+**In this tree** lines above name each one's check, and they are the part of this document that
+is allowed to be wrong when the code moves: run them against the tree you are about to trust.
 
 What the rules still cannot do:
 
@@ -340,14 +368,13 @@ Still convention, with nothing enforcing it:
 - **A work card is not the PR's card.** The bridge's review card is the one the board holds to
   the merge; nothing adopts the card the implementation ran on. Its `done` says the work is
   finished, not that the change landed.
-- **A verdict is published, not just recorded.** The label pass reads kind-1111 on the PR
-  root; a verdict written only into the card's comments publishes nothing. The review brief
-  asks for both.
 - **Branches land as `pr/<slug>`.** Naming, and the operator's habit; nothing checks it.
 
 ## What a reviewer can hold
 
-- The card is in `review`, and the verdict is a comment naming the PR and the tip it covers.
+- The card is in `review`, and the verdict comment names the PR and the tip it covers.
+- The verdict is on the PR as a kind-1111 comment signed by the review identity, and
+  `ngit pr view <pr> --comments` shows it.
 - The PR carries exactly one label, and it is the verdict's, when `ngit.labels` is on.
 - The card is not `done` while the PR is open — the guard's refusal is the proof.
 - The PR cannot be merged while its card is `running`: `hng ngit merge-check <pr>
@@ -355,4 +382,5 @@ Still convention, with nothing enforcing it:
 - Every commit the PR adds carries a `Card:` trailer, so the merge route will not refuse it
   for saying nothing.
 - A revision after the verdict reopens the same card; it does not create a second one.
-- Nothing was pushed to `master` from a card workspace; the merge was the operator's.
+- Nothing was pushed to `master` from a card workspace; the merge was the operator's, and the
+  merge route saw a verdict from a different npub.

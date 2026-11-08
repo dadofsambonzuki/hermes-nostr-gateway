@@ -41,6 +41,11 @@ ngit:
   mentions: true           # an @mention in an issue/PR comment becomes a reply task
   mention_assignee: default  # profile a mention reply task is dispatched to
   reply_secret_file: /path/to/reply.json  # key a reply is signed with; default identity.secret_file
+  verdicts: true           # publish the review card's verdict on the PR as a kind-1111
+                           # comment, signed by the review role; inert until the key below
+  # review_secret_file: /etc/hermes-nostr-gateway/review.json
+                           # the review role's key (nsec or hex): outside every checkout,
+                           # mode 0600 -- the same rule as --nsec-file below
   watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
                            # default on once `assignee` is set, `false` is the timer alone
   watch_debounce_s: 30     # coalesce a channel's events this long before the pass
@@ -464,6 +469,40 @@ same branch and a revision all land on that one card; none of them makes a secon
   covered, and it never moves `prs`. A relay that is slow or refuses the read costs the pass a
   report line (`sweep: …`), not its news.
 
+## The verdict on the PR
+
+A reviewer's verdict is one comment on the review card, and the pass publishes it where a
+reader of the PR will find it: the same text, as a NIP-22 kind-1111 comment on the PR root,
+signed by the review identity. Nothing is summarised and nothing is added —
+`ngit pr view <id> --comments` shows the wording the reviewer wrote, which is what the label
+pass derives the PR's label from and what `scripts/merge_pr.sh` reads before it merges. One
+verdict, one place, two readers.
+
+The event's shape is the one ngit 3.0.5 publishes: root `E`/`K`/`P` naming the PR, its kind
+(`1618`) and its author, and parent `e`/`k`/`p` naming the PR itself for a top-level comment —
+no `a` tag, which is why every reader matches it by its root `E`. `ngit.review_secret_file` is
+the review role's key; the pass refuses to publish with the gateway's own key, because a
+verdict signed by the identity that authored the PR is a self-review, and the merge route will
+not accept it as a second signature.
+
+Three properties the pass keeps:
+
+- **Once per card, not once per poll.** The link row remembers which comment of which card was
+  published as which event, so a quiet poll publishes nothing. The event's `created_at` is the
+  comment's own timestamp, so a retry signs the identical event id rather than a second
+  comment — and a verdict the reviewer already published by hand is recognised by its text and
+  key and left alone, as long as it is at least as new as the tip it has to cover.
+- **Read back before it is recorded.** A relay's OK is not the thread: the pass fetches the
+  PR's comments again and records the verdict only when the event is on the PR. A failure is
+  reported as an error and retried on the next poll; it never holds the cursor.
+- **One line in the channel.** `review <pr> -> approved|changes-requested (task <id>)` is
+  queued through the same outbox as every other notice, so it is delivered once and a busy
+  daemon is a delay rather than a loss.
+
+`ngit.verdicts: false` turns the publication off; with no `review_secret_file` the pass
+publishes nothing and says so in its report — a deployment that has not adopted the review bot
+is quiet, not broken.
+
 ## The label on the PR
 
 `ngit pr list` has a LABELS column, and it is where a reader looks before opening anything. The
@@ -481,15 +520,15 @@ second word for "a reviewer is looking at it" says nothing a reader cannot see o
 `stale` is gone the same way — a revision after a verdict means `review-required`, which says
 the same thing in the one word a reader has to look at.
 
-**The verdict is read from the PR root, not from the board.** A reviewer publishes its verdict
-as a NIP-22 kind-1111 comment on the PR (`ngit pr comment ...`; root `E` = the PR) and reports
-the same verdict on the task, naming the comment's event id. The newest verdict comment wins —
-**from a configured reviewer**. The `reviewers` list (or the review key it is derived from) is
-applied in the relay read and again on the parsed comment; an empty list means no verdict is
-in force, and no card is finished or re-queued by one.
+**The verdict is read from the PR root, not from the board.** The bridge publishes the review
+card's verdict as a NIP-22 kind-1111 comment on the PR (root `E` = the PR, signed by the review
+identity — see "The verdict on the PR"), and the label pass reads the newest verdict comment off
+the PR root. The newest verdict wins — **from a configured reviewer**. The `reviewers` list (or
+the review key it is derived from) is applied in the relay read and again on the parsed comment;
+an empty list means no verdict is in force, and no card is finished or re-queued by one.
 The card is the queue and the PR is the record: a reader of the label can fetch the comment it
-was derived from, and a verdict recorded only on the card leaves the label where it was rather
-than publishing a state the PR itself does not carry.
+was derived from, and a verdict nobody published leaves the label where it was rather than
+publishing a state the PR itself does not carry.
 
 **The same read finishes the card.** The verdict a label is derived from is the review's end,
 so the pass applies it to the PR's card in the same step: `approved` completes the card with
@@ -600,8 +639,10 @@ Rules that keep the pairing honest:
   and hand it to a command by path (`--nsec-file <path>`), never as an argument value, never
   into a log, never into a tracked file. A role that borrows the default profile's key is not
   a role: its work becomes unattributable.
-- **The verdict goes on the PR.** A review publishes its verdict as a NIP-34 comment signed as
-  its own identity, then reports the same verdict on the task, naming the event:
+- **The verdict goes on the PR.** The bridge publishes the review card's verdict as a NIP-34
+  comment signed as the review role's own identity, from `ngit.review_secret_file` (see "The
+  verdict on the PR"). The manual route is still there for a card that is gone, or a review
+  that predates the bridge:
 
   ```bash
   ngit pr comment <id|nevent> --body "<verdict>" --nsec-file <path to the review key>

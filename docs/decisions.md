@@ -653,10 +653,21 @@ A PR's review state is one of three words — `review-required`, `changes-reques
 open PR with a review card already *is* in review, and a revision that leaves a verdict behind
 means `review-required`, in one word rather than two labels a reader has to combine.
 
-**The verdict is read from the PR root.** A reviewer publishes its verdict as a NIP-22
-kind-1111 comment on the PR and reports the same verdict on the task, naming the event id. The
-newest comment wins. The card is the queue; the PR is the record, and a label derived from the
-card would say something a reader of the PR cannot check. The review brief says so.
+**The verdict is read from the PR root, and the bridge puts it there.** A verdict written only
+into the card is a review nobody outside the board can see, so the pass publishes the newest
+verdict comment from the review card on the PR itself: a NIP-22 kind-1111 comment signed by the
+review identity, the card's words exactly. A reader of `ngit pr view <pr> --comments` then sees
+the review that decided the PR, the label pass derives the label from that event, and the merge
+route reads the same one. Idempotent on the card and the comment — the event's timestamp is the
+comment's own, so a retry signs the same event id rather than a second comment. The newest
+comment wins. The card is the queue; the PR is the record.
+
+**Authorship is part of the merge.** `scripts/merge_pr.sh` refuses a PR whose newest verdict is
+its own author's: a self-authored change lands only with a second party's signature on it.
+That is why the review identity has to be a different key from the gateway's — the pass refuses
+to publish a verdict with the gateway's own key, and the merge route refuses one from the PR's
+author. It is not a security boundary (a person can publish anything by hand); it is the line
+between "reviewed" and "the author says it is fine".
 
 **The pass corrects, it does not append.** It reads the label events the PR carries off the
 same relays it publishes to, publishes the one that belongs there and retracts every other one

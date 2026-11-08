@@ -140,6 +140,14 @@ reproduced without applying anything. It exits 0 allowed, 7 refused, 3 when the 
 (no `store:`, no board for the checkout). `scripts/merge_pr.sh` calls the same module (`python -m
 hermes_nostr_gateway.ngit_merge`).
 
+## A merge needs a second signature
+
+Before it applies anything `scripts/merge_pr.sh` refuses a PR whose newest kind-1111 verdict is
+its own author's (exit 5): a self-authored change lands only with a second party's signature on
+it, never on "the author looked at it". The verdict is the comment the review card publishes on
+the PR (see [ngit-bridge](ngit-bridge.md), "The verdict on the PR"); there is no second place to
+record one.
+
 ## The live checkout stays on master
 
 The daemon runs from this checkout — `.venv/bin/hng serve`, an editable install, whatever branch

@@ -106,6 +106,20 @@ if [ -n "$branch" ]; then
   tip=$(git -C "$REPO" ls-remote origin "refs/heads/$branch" 2>/dev/null | awk '{print $1}')
 fi
 
+# Authorship: a merge needs a verdict from a npub other than the PR's author. Stopping a card
+# from pushing master answers "who may merge"; this answers "did anyone else look at it". The
+# verdict is the NIP-22 kind-1111 comment on the PR root that the bridge publishes from the
+# review card and the label pass reads -- one event, two readers -- so a self-authored PR
+# merges only with a second party's signature. It reads the same `ngit pr view` the status
+# above does, and refuses before anything is applied.
+verdict_check=$(PYTHONPATH="${PYTHONPATH:-$REPO/src}" "$PYTHON" \
+  -m hermes_nostr_gateway.ngit_verdict "$pr" 2>&1)
+case $? in
+  0) ;;
+  3|127) echo "$verdict_check"; exit 3 ;;
+  *) echo "$verdict_check"; exit 5 ;;
+esac
+
 wt=$(mktemp -d "${TMPDIR:-/tmp}/merge-pr.XXXXXX")
 git worktree add --detach -q "$wt" origin/master || { echo "FAIL worktree"; exit 3; }
 

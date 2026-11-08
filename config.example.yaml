@@ -299,7 +299,12 @@ defaults:
 #                                # label. Empty + review_secret_file derives the review key;
 #                                # otherwise no verdict is applied at all
 #   review_secret_file: /etc/hermes-nostr-gateway/review.json
-#   verdicts: true               # false = read no verdict and finish no card by one
+#                                # the review role's own key (nsec or hex), and the one that
+#                                # signs the verdict it publishes: outside every checkout,
+#                                # mode 0600, never in this file
+#   verdicts: true               # read a verdict and finish a card by one, and publish the
+#                                # review card's verdict on the PR as a kind-1111 comment
+#                                # signed by the review role; false turns both off
 #   labels: true                 # publish each PR's review state (review-required,
 #                                # changes-requested, approved) as one NIP-34 label on the
 #                                # PR; false publishes no extra events

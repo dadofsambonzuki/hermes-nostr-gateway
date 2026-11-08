@@ -5,9 +5,10 @@ Two halves, one rule. Every commit a worker pushes carries `Card: t_xxxxxxxx`, w
 without the board; and a merge is refused while the card is still work in progress, read from
 the bridge's `ngit_links` row and the board's `tasks.status`.
 
-The merge tests run **the real script** against a fake `ngit`: a status answer, and an `apply`
-that commits the messages it is given the way `git am` does. Everything else — the worktree,
-the trailer walk, the board read, the gate, the exit code — is the code under test.
+The merge tests run **the real script** against a fake `ngit`: a status answer, the PR view the
+authorship check reads, and an `apply` that commits the messages it is given the way `git am`
+does. Everything else — the worktree, the trailer walk, the board read, the gate, the exit code
+— is the code under test.
 """
 
 from __future__ import annotations
@@ -204,14 +205,18 @@ def test_install_refuses_to_replace_a_hook_it_does_not_own(tmp_path: Path) -> No
 
 
 FAKE_NGIT = """#!/bin/sh
-# A stand-in for ngit, enough for scripts/merge_pr.sh: answer a status, and apply the commits
-# in $FAKE_PR_DIR the way `git am` does -- verbatim messages, and no commit-msg hook.
+# A stand-in for ngit, enough for scripts/merge_pr.sh: answer a status, answer the PR view the
+# authorship check reads, and apply the commits in $FAKE_PR_DIR the way `git am` does --
+# verbatim messages, and no commit-msg hook.
 case "${1:-} ${2:-}" in
   "pr view")
     if [ "${4:-}" = "--json" ]; then
       file="${FAKE_PR_JSON_DIR:-}/${3:-}.json"
-      [ -f "$file" ] || exit 1
-      cat "$file"
+      if [ -f "$file" ]; then
+        cat "$file"
+      else
+        cat "${FAKE_PR_JSON:-/dev/null}"
+      fi
     else
       printf 'Status:   %s\\n' "${FAKE_PR_STATUS:-open}"
     fi
@@ -300,6 +305,13 @@ def make_repo(tmp_path: Path) -> SimpleNamespace:
     bindir.mkdir()
     (bindir / "ngit").write_text(FAKE_NGIT, encoding="utf-8")
     (bindir / "ngit").chmod(0o755)
+    #: The PR's thread as the authorship check reads it: one verdict, from somebody other than
+    #: the PR's author, so the merge route is past that check and on to what a test is about.
+    (bindir / "pr.json").write_text(json.dumps({
+        "author": "1" * 64,
+        "comments": [{"id": "c" * 64, "author": "2" * 64,
+                      "body": "Verdict: approved", "created_at": 1}],
+    }), encoding="utf-8")
 
     # The gate is not this test's subject: a ruff that passes, and a pytest that says so --
     # or, when FAKE_GATE_LOG is set, one that records that it ran at all.
@@ -332,7 +344,7 @@ def merge_env(made: SimpleNamespace, bridge: SimpleNamespace | None = None,
               **extra: str) -> dict[str, str]:
     env = clean_env(PATH=f"{made.bindir}:{os.environ.get('PATH', '')}",
                     PYTHON=sys.executable, TMPDIR=str(made.repo.parent),
-                    FAKE_PR_DIR=str(made.messages))
+                    FAKE_PR_DIR=str(made.messages), FAKE_PR_JSON=str(made.bindir / "pr.json"))
     if bridge is not None:
         env.update(bridge.env)
     env.update(extra)
@@ -525,7 +537,9 @@ def test_a_rebased_proposal_names_the_successor_that_replaced_it(tmp_path: Path)
     jsondir.mkdir()
     (jsondir / f"{PR}.json").write_text(json.dumps({
         "id": PR, "branch": "pr/duplicate(2207969b)", "status": "open",
-        "subject": "the stale proposal"}), encoding="utf-8")
+        "subject": "the stale proposal",
+        "comments": [{"id": "c" * 64, "author": "2" * 64,
+                      "body": "Verdict: approved", "created_at": 1}],}), encoding="utf-8")
     (jsondir / f"{successor}.json").write_text(json.dumps({
         "id": successor, "branch": "pr/duplicate(bbbbbbbb)", "status": "open",
         "subject": "the proposal that survived",
@@ -555,7 +569,9 @@ def test_a_rebased_proposal_with_no_sibling_still_asks_for_a_named_successor(
     jsondir = tmp_path / "pr-json"
     jsondir.mkdir()
     (jsondir / f"{PR}.json").write_text(json.dumps({
-        "id": PR, "branch": "pr/only(2207969b)", "status": "open"}), encoding="utf-8")
+        "id": PR, "branch": "pr/only(2207969b)", "status": "open",
+        "comments": [{"id": "c" * 64, "author": "2" * 64,
+                      "body": "Verdict: approved", "created_at": 1}]}), encoding="utf-8")
     prlist = tmp_path / "pr-list.json"
     prlist.write_text(json.dumps([
         {"id": PR, "branch": "pr/only(2207969b)", "status": "open"},

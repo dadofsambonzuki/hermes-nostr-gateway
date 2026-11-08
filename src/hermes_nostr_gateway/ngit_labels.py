@@ -114,6 +114,8 @@ class Verdict:
     relay: str = ""
     readable: bool = True
     body: str = ""
+    #: Who signed the comment. The merge guard reads it: a verdict written by the PR's own
+    #: author is not a second opinion, and publishing it as one would be a lie.
     author: str = ""
 
 
@@ -365,6 +367,12 @@ def _author_hex(value: Any) -> str:
         return text.lower()
 
 
+#: The shared parser, by a name another module may use: the bridge reads the same lines off
+#: the review card, where the verdict is a task comment rather than a relay event, so one
+#: parser serves both and a card's verdict cannot be read as a different thing from a PR's.
+verdict_in = _verdict_in
+
+
 def newest_verdict(events: Iterable[Mapping[str, Any]],
                    authors: Optional[Sequence[str]] = None) -> Optional[Verdict]:
     """The newest verdict among a PR root's kind-1111 comments, or None for no verdict.
@@ -405,7 +413,7 @@ def newest_verdict(events: Iterable[Mapping[str, Any]],
                        created_at=int(event.get("created_at") or 0),
                        relay=str(event.get("relay") or ""), readable=bool(stated),
                        body=str(event.get("content") or "") if stated else "",
-                       author=_author_hex(event.get("pubkey")))
+                       author=_author_hex(event.get("pubkey") or event.get("author")))
     return None
 
 

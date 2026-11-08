@@ -181,6 +181,26 @@ def secret_from(cfg: dict[str, Any]) -> str:
     return _checked_secret(read_secret_file(path), f"secret_file {path}")
 
 
+def review_secret_from(cfg: dict[str, Any], ngit_cfg: Any) -> tuple[str, str]:
+    """The review role's key and, when it cannot be used, the reason it cannot.
+
+    The review identity is a bot role's own voice, not the host's: a verdict signed with the
+    gateway's key is the PR author reviewing their own work, and the merge guard refuses that
+    as a second signature. A path is the only form accepted -- the value never goes into a
+    config that is tracked, and it never appears in the reason.
+    """
+    path = str(getattr(ngit_cfg, "review_secret_file", "") or "").strip()
+    if not path:
+        return "", ("ngit.review_secret_file is not set: the verdict is not published on "
+                    "the PR")
+    located = os.path.expanduser(path)
+    secret = _checked_secret(read_secret_file(located), f"ngit.review_secret_file {located}")
+    if pubkey_from_secret(secret) == pubkey_from_secret(secret_from(cfg)):
+        return "", (f"ngit.review_secret_file ({located}) holds the gateway's own key: a "
+                    "verdict signed with it is a self-review, so none is published")
+    return secret, ""
+
+
 def _decode_npub(npub: str) -> str:
     from .fetch import hex_of
 
@@ -1336,6 +1356,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
 
     from . import ngit as bridge
     from . import ngit_labels as labels
+    from . import ngit_verdict as verdicts_mod
     from .gateway import default_socket_path
     from .kanban import Anchor, Board, BoardError
     from .projects import hermes_home
@@ -1389,6 +1410,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
     prs = None
     labeler = None
     state = None
+    verdicts = None
     note = ""
     relays: tuple[str, ...] = ()
     if target.address:
@@ -1406,12 +1428,20 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         else:
             prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg),
                                   maintainers=maintainers)
+            if ngit_cfg.verdicts:
+                # The review role's own key, and the same relay set the pass reads the PR
+                # from: a verdict published anywhere else is not on the PR.
+                review_secret, why = review_secret_from(cfg, ngit_cfg)
+                if review_secret:
+                    verdicts = verdicts_mod.VerdictPublisher(relays, secret=review_secret)
+                elif why:
+                    note = "; ".join(filter(None, [note, f"verdicts: {why}"]))
     # One reader serves four jobs -- PR labels, a reconcile's verdict, issue labels and
     # comment mentions -- so it is built whenever any of them needs a relay, not only when
     # PRs are announced. `reader` is the reconcile path: it reads a verdict to apply one
     # even when this deployment publishes no labels at all.
     if target.address and relays and (ngit_cfg.labels or ngit_cfg.mentions
-                                      or ngit_cfg.ready_label or reader):
+                                      or ngit_cfg.ready_label or ngit_cfg.prs or reader):
         state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg),
                                    reviewers=reviewers)
         if ngit_cfg.labels:
@@ -1447,7 +1477,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         statuses=prs.statuses if prs is not None else None,
         sweep=prs.sweep if prs is not None else None,
         notify=notifier, anchor=anchor, labels=labeler, state=state,
-        self_npub=crypto.our_pubkey())
+        self_npub=crypto.our_pubkey(), verdicts=verdicts)
     return board, sync, note
 
 

@@ -1700,6 +1700,10 @@ class Store:
 
         One transaction, because a receipt with a link that still says `pending` is a row
         the next poll would try to queue again, and the unique key would silently refuse it.
+
+        `state` empty is a notice that says nothing about the PR's lifecycle -- a verdict
+        line: the event it describes is already on the PR, and the link state it would write
+        (`signalled`) belongs to the announcement, not to a message about a review.
         """
         now = int(time.time())
         with self.db:
@@ -1708,6 +1712,8 @@ class Store:
                 " error = NULL, updated_at = ? WHERE repo = ? AND source_id = ? AND notice = ?",
                 (now, str(repo), str(source_id), str(notice)),
             )
+            if not str(state or ""):
+                return
             self.db.execute(
                 "UPDATE ngit_links SET state = ?, updated_at = ?"
                 " WHERE repo = ? AND kind = ? AND source_id = ?",
