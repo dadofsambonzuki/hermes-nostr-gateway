@@ -1209,7 +1209,9 @@ def test_an_open_pr_card_refuses_completion_at_the_board(harness):
 
     message = str(refused.value)
     assert pr.id[:8] in message and "open at c0ffee" in message
-    assert "kanban_block" in message  # the reviewer's remaining terminal action
+    # The refusal names both ways a PR card is finished, so a reviewer is not told to park
+    # the card as if the block were its end.
+    assert "approving verdict" in message and "merge completes" in message
     assert harness.task(task_id)["status"] == "ready"
 
 
@@ -1482,11 +1484,14 @@ def hand_queued_review_task(harness, pr, *, subject: str = "re-review") -> str:
 
 
 def review_verdict(harness, pr_id: str, label: str, *, event_id: str = "",
-                   created_at: int = 2000, relay: str = "wss://relay.example") -> str:
+                   created_at: int = 2000, relay: str = "wss://relay.example",
+                   body: str = "") -> str:
     """One verdict comment on the PR root, as a reviewer publishes it."""
     event_id = event_id or (label[:1] or "v").ljust(64, "0")
+    text = body or f"Verdict: {label}\n\nThe reviewer's reasons."
     harness.verdicts[pr_id] = ngit_labels.Verdict(label=label, event_id=event_id,
-                                                  created_at=created_at, relay=relay)
+                                                  created_at=created_at, relay=relay,
+                                                  body=text)
     return event_id
 
 
@@ -2097,6 +2102,186 @@ def test_a_revision_does_not_release_a_held_card(harness):
     assert report.prs["reopened"] == 0
     # The tip is still recorded: the label and the next pass read the revision.
     assert label_detail(harness, pr.id)["tip"] == "b" * 40
+
+
+# -- a verdict finishes its card ----------------------------------------------
+#
+# The reviewer publishes the verdict on the PR and parks the card as its hand-off. The
+# verdict's consequence is the bridge's: approved finishes the card, changes-requested puts
+# it back on the implementer's desk. Neither leaves it parked, because a verdict is not a
+# question and only a question is a person's.
+
+def task_events(harness, task_id: str, kind: str = "") -> list[dict]:
+    """One card's events, oldest first, with the payload already parsed."""
+    sql = "SELECT * FROM task_events WHERE task_id = ?"
+    params: list = [task_id]
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    rows = harness.board.db.execute(sql + " ORDER BY id", tuple(params)).fetchall()
+    out = []
+    for row in rows:
+        payload = json.loads(row["payload"] or "{}")
+        out.append({"kind": row["kind"], "run_id": row["run_id"], "payload": payload})
+    return out
+
+
+def park_with_verdict(harness, task_id: str, label: str, *, tip: str = "c0ffee") -> None:
+    """What the review brief tells a reviewer to do at the end of its run."""
+    assert harness.board.block(
+        task_id, kind="needs_input", author="review",
+        comment=f"Verdict: {label} -- comment {'a' * 64} on the PR root, covering tip {tip}.")
+
+
+def test_an_approved_verdict_finishes_the_review_card(harness):
+    """Approved -> `done`, the verdict as the result, and the merge still the operator's."""
+    pr, task_id = pr_with_review_task(harness)
+    event = review_verdict(
+        harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000,
+        body="Verdict: approved\n\nGates green at c0ffee; the docs claims check out.")
+    park_with_verdict(harness, task_id, "approved")
+
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done"
+    result = str(row["result"])
+    assert "Verdict: approved" in result and event in result
+    assert "Gates green at c0ffee" in result  # the verdict's own words, not a summary
+    # The public half says the same thing, and the guard is gone: nothing is left to refuse.
+    assert harness.label_calls[-1][2] == ("approved",)
+    assert guard_triggers(harness) == []
+    assert report.prs["approved"] == 1
+    assert any("approved, and finished" in note for note in report.notes)
+    # Finished is not merged: no merge event was invented for it.
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] != "merged"
+
+
+def test_an_approval_is_one_completion_however_many_passes_see_it(harness):
+    """A poll after the pass that acted writes nothing: the card's status is the state."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000)
+    park_with_verdict(harness, task_id, "approved")
+    harness.sync()
+    comments = len(harness.comments(task_id))
+
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "done"
+    assert len(harness.comments(task_id)) == comments
+    assert report.prs["approved"] == 0
+    assert len([e for e in task_events(harness, task_id, "completed")]) == 1
+
+
+def test_a_changes_requested_verdict_returns_the_card_to_its_implementer(harness):
+    """The card goes back to the queue that wrote the PR, `ready`, with the findings on it."""
+    pr, task_id = pr_with_review_task(harness)
+    event = review_verdict(
+        harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64, created_at=2000,
+        body="Verdict: changes-requested\n\nThe second claim is not what the code does.")
+    park_with_verdict(harness, task_id, "changes-requested")
+
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready"
+    assert row["assignee"] == "default"           # the implementer, not the reviewer
+    assert row["block_kind"] is None
+    # The brief is a fix brief now: the next claim must not review the same tip again.
+    assert "changes-requested" in row["body"] and "fix" in row["body"].lower()
+    assert "The second claim is not what the code does." in row["body"]
+    assert any("The second claim is not what the code does." in c["body"]
+               for c in harness.comments(task_id))
+    changes = task_events(harness, task_id, "changes_requested")
+    assert len(changes) == 1
+    assert changes[0]["payload"]["verdict"] == event
+    assert changes[0]["payload"]["implementer"] == "default"
+    assert report.prs["changes"] == 1
+    # The PR is still open, so nothing may complete the card by hand.
+    with pytest.raises(sqlite3.IntegrityError):
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+
+
+def test_a_verdict_does_not_answer_a_card_blocked_on_a_question(harness):
+    """A person's question is not a verdict's to settle, however green the verdict is."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000)
+    assert harness.board.block(
+        task_id, kind="needs_input", author="holly",
+        comment="The card's premise is disproved -- a person decides whether it is re-filed.")
+
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "blocked"
+    assert report.prs["approved"] == 0
+    # The label is still the verdict's: the PR is approved even though the card waits.
+    assert harness.label_calls[-1][2] == ("approved",)
+
+
+def test_a_revision_reopens_a_verdict_parked_card(harness):
+    """Belt and braces: a card parked by the old brief is not stranded by a re-push.
+
+    No verdict is readable in this pass (the relay has not served the comment), so the
+    revision is the only thing that can move the card -- and it must, or the fix nobody
+    saw lands on a card nobody runs.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    park_with_verdict(harness, task_id, "changes-requested")
+    assert harness.task(task_id)["status"] == "blocked"
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready"
+    assert report.prs["reopened"] == 1
+    assert len(harness.tasks()) == 1 and len(pr_links(harness)) == 1
+    assert len(task_events(harness, task_id, "review_reopened")) == 1
+    # The brief is the review brief again, for the new tip: this claim reviews, it does not fix.
+    assert "b" * 40 in row["body"] and "Review this PR" in row["body"]
+
+
+def test_a_revision_leaves_a_card_blocked_on_a_question_alone(harness):
+    """The marker is what separates the bridge's park from a person's: no marker, no reopen."""
+    pr, task_id = pr_with_review_task(harness)
+    assert harness.board.block(
+        task_id, kind="needs_input", author="holly",
+        comment="Which of the two incompatible claims is the intended behaviour? A person.")
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    report = harness.sync()
+
+    assert harness.task(task_id)["status"] == "blocked"
+    assert report.prs["reopened"] == 0
+    assert task_events(harness, task_id, "review_reopened") == []
+
+
+def test_a_pushed_fix_puts_the_card_back_in_the_review_queue(harness):
+    """The fix round's other end: `Revision:` is a pushed fix, and the next claim reviews it."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64,
+                   created_at=2000)
+    park_with_verdict(harness, task_id, "changes-requested")
+    harness.sync()
+    assert harness.task(task_id)["status"] == "ready"
+
+    # The implementer's run: it pushes the fix (the revision lands first) and then says so.
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+    assert harness.board.block(
+        task_id, kind="needs_input", author="default",
+        comment="Revision: bbbb -- the fix is pushed and the gates are green.")
+
+    harness.prs_data = ([], [])
+    report = harness.sync()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready"
+    assert report.prs["reopened"] == 1
+    # The claim reviews the tip the PR carries, not the fix that already happened.
+    assert "Review this PR" in row["body"] and "b" * 40 in row["body"]
+    assert any("Fix pushed" in c["body"] for c in harness.comments(task_id))
 
 
 def test_a_done_card_on_a_pr_that_never_merged_reopens(harness):

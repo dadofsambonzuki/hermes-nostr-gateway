@@ -14,7 +14,8 @@ next to the rows this bridge already writes. It is deliberately narrow:
   person reads (`PR <short> is open at <tip> -- a merge is the only thing ...`). SQLite's
   `RAISE(ABORT, ...)` takes a literal only, which is why the message is baked into the
   trigger and the trigger is re-made whenever the state or the tip moves;
-- no trigger at all once the PR is `applied`, so the merge path completes normally.
+- no trigger at all once the PR is `applied` (a merge) or `approved` (a reviewer's verdict):
+  those are the two ways a PR card is finished, and each completes normally.
 
 The board is the only place both completion paths meet: the CLI's `complete_task` and the
 agent's `kanban_complete` tool both write `tasks.status = 'done'`, so one trigger covers
@@ -44,6 +45,10 @@ TRIGGER_PREFIX = "ngit_pr_done_"
 OPEN = "open"
 APPLIED = "applied"
 CLOSED = "closed"
+#: A reviewer approved the PR. Not a merge: nothing landed, and the card is finished by the
+#: verdict rather than by the merge commit. The row stays (what a pass saw is worth reading),
+#: the trigger goes (nothing is left for it to refuse).
+APPROVED = "approved"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -78,9 +83,9 @@ def refusal(pr_id: str, state: str, tip: str = "", detail: str = "") -> str:
 
     It names the PR and the tip, because "completion refused" without either is the generic
     error this rule exists to replace. `closed` names the event that closed it: the card is
-    waiting for a person, not for a merge. The last clause tells a reviewer the one terminal
-    action that is still open to it -- the review lane's own tool (`kanban_complete`) is
-    exactly the one this guard refuses.
+    waiting for a person, not for a merge. The last clause tells a reviewer where its end
+    is: the review lane's own `kanban_complete` is exactly the one this guard refuses while
+    the PR is open, and the verdict -- not the card -- is what it writes.
     """
     short = str(pr_id or "")[:8] or "unknown"
     if state == CLOSED:
@@ -88,8 +93,8 @@ def refusal(pr_id: str, state: str, tip: str = "", detail: str = "") -> str:
         return (f"PR {short} was closed without a merge{by} -- a human must decide; "
                 "a closed PR does not finish a card")
     at = f" at {str(tip)[:12]}" if tip else ""
-    return (f"PR {short} is open{at} -- a merge is the only thing that completes a PR card."
-            " A reviewer parks the card with kanban_block; nobody else completes it.")
+    return (f"PR {short} is open{at} -- a merge completes a PR card, and a reviewer's"
+            " approving verdict finishes a review card. A worker's word does neither.")
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -115,7 +120,7 @@ def guard(conn: sqlite3.Connection, task_id: str, *, pr_id: str, state: str,
          str(detail or ""), int(time.time())),
     )
     conn.execute(f"DROP TRIGGER IF EXISTS {_trigger(task_id)}")
-    if state == APPLIED:
+    if state in (APPLIED, APPROVED):
         return
     message = _q(refusal(pr_id, state, tip, detail))
     conn.execute(
@@ -143,6 +148,21 @@ def close(conn: sqlite3.Connection, task_id: str, *, event_id: str = "") -> None
         return
     guard(conn, task_id, pr_id=str(row["pr_id"]), state=CLOSED,
           tip=str(row["tip"] or ""), detail=str(event_id or ""))
+
+
+def approve(conn: sqlite3.Connection, task_id: str, *, verdict: str = "") -> None:
+    """A reviewer approved the PR: the verdict finishes the review card.
+
+    The merge is still a person's, so nothing here claims the work landed -- the guard row
+    keeps the PR and the tip, and `detail` names the verdict comment that finished the card.
+    Dropping the trigger is the whole point: the completion that follows is the approval's,
+    not a worker's word about an open PR.
+    """
+    row = _row(conn, task_id)
+    if row is None:
+        return
+    guard(conn, task_id, pr_id=str(row["pr_id"]), state=APPROVED,
+          tip=str(row["tip"] or ""), detail=str(verdict or ""))
 
 
 def forget(conn: sqlite3.Connection, task_id: str) -> None:

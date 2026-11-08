@@ -37,14 +37,16 @@ a card moved.
 | `running` | a worker holds the claim | the dispatcher |
 | `blocked` | a person has to act; `block_kind` says what for | `kanban_block` with `needs_input`, `capability` or `transient` |
 | `review` | the worker's work is done; a reviewer decides | `kanban_request_review` |
-| `done` | landed | a merge, for a card that reviews a PR; the worker, for a card that has none |
+| `done` | landed, or reviewed and approved; the merge is still a person's | a merge, or a reviewer's approving verdict, for a card that reviews a PR; the worker, for a card that has none |
 | `archived` | outside the board — not a column, not a status to work from | archive |
 
 A dependency is not a block. The kernel routes `block_kind=dependency` to `todo`, gated by the
 parent card, and returns it to `ready` by itself when the parent is done. `blocked` means a
-person, which is the only meaning the word is allowed here — with one exception: a PR closed
-without a merge blocks its card (kind `dependency`, the closing event named in the comment),
-because dropping or re-filing the work is a person's decision too.
+person, which is the only meaning the word is allowed here — with two exceptions that are
+events, not questions: a PR closed without a merge blocks its card (kind `dependency`, the
+closing event named in the comment), because dropping or re-filing the work is a person's
+decision too; and a review's hand-off parks the card (`Verdict:`/`Revision:` in the reason)
+only until the bridge acts on the verdict or the fix, which it does on its next pass.
 
 ## The six rules
 
@@ -58,9 +60,11 @@ published as a second proposal, and a revision all land on that card.
   (same author, same source branch); a later 1618 for that branch, or one that names the root
   explicitly, is folded back onto it, and so is a 1619.
 - **A revision reopens the card; it never creates one.** `review`/`done` -> `ready`, with one
-  comment naming the new tip and the event that moved it. A card already `ready` or `running`
-  only gets the comment; a `blocked` card is waiting for a person and is not released by a
-  revision; an `applied` PR is final, so a late revision cannot revive it.
+  comment naming the new tip and the event that moved it, and the review brief rewritten for
+  that tip. A card already `ready` or `running` only gets the comment; a `blocked` card is
+  waiting for a person unless the bridge itself parked it (`Verdict:`/`Revision:` in the
+  reason), in which case the revision reopens it; an `applied` PR is final, so a late
+  revision cannot revive it.
 
 **Enforced in** `_fold_repeats` and `_revisions` in `src/hermes_nostr_gateway/ngit.py`, the
 `ngit:pr:<root>` idempotency key on the card, and `Board.reopen` in
@@ -223,16 +227,22 @@ ready -> running              the dispatcher claims it
 running -> review             the worker's last act on the card: kanban_request_review
 review -> ready -> running    a new revision, or a changes-requested verdict
 review -> blocked             the PR was closed without a merge; a person decides
-review -> done                a merge, and only a merge
+review -> done                a merge, or a reviewer's approving verdict on a review card
 done -> ready                 a revision on a PR that never merged (the repair path)
+blocked -> ready              a fix that was pushed, or a revision on a verdict-parked card
 any -> archived               out of the board
 ```
 
 `review -> running` has two triggers, and neither is silent. A **new revision** reopens the
 card by itself, because the tip the verdict covered is no longer the tip on the PR. A
-**changes-requested verdict** is a person's: `kanban_request_changes` sends a card in the
-review lane back to its implementer, and for the bridge's review card a person re-queues the
-work after reading the verdict.
+**verdict** ends the review: the bridge reads it from the PR root and applies it — `approved`
+completes the card with the verdict as its result (the merge stays the operator's), and
+`changes-requested` puts it back on the implementer's desk as `ready` with the findings, which
+is the transition `kanban_request_changes` writes for a card the kernel handed to a reviewer.
+
+A **blocked** card is released by an event only when the bridge parked it: `Verdict:` or
+`Revision:` as the first word of the reason says the next event is what it waits for, and a
+person's question matches neither.
 
 `review -> done` for a card with **no** PR link is the ordinary `kanban_complete`; the guard
 binds only cards that review a PR.

@@ -136,6 +136,9 @@ def comment(body: str, comment_id: str = "c" * 64, created_at: int = 1000,
 def test_a_verdict_line_is_read_in_the_spellings_reviewers_use(body, expected):
     found = labels.newest_verdict([comment(body)])
     assert found is not None and found.label == expected and found.readable
+    # The comment's own words travel with it: the card that answers the verdict quotes the
+    # findings rather than pointing a worker at a relay it may not read.
+    assert found.body == body
 
 
 @pytest.mark.parametrize("body", [

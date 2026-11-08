@@ -11,15 +11,19 @@ the same lookup serves the inbound and the outbound half of this module:
                                    merging is the operator's)
               kind-1619 revision -> reopens that one task with the new tip, as one comment;
                                    a revision never makes a second card
+              a verdict comment  -> finishes that task: approved completes it with the
+                                   verdict as its result, changes-requested returns it to
+                                   its implementer as ready, with the findings
               kind-1631 applied  -> one "merged as <commit>" follow-up, which also completes
                                    every card the PR owns, naming the merge commit
               kind-1632 closed   -> blocks the PR's cards for a person, naming the event:
                                    a close is not a merge and cannot finish a card
 
-**`done` requires `applied`.** A PR card whose PR is still open cannot be completed by
-anyone -- the agent's tool, `hermes kanban complete`, or `--force` -- because the bridge
-installs a guard on the board itself (`ngit_guard`). A merge releases it; a close keeps it
-refusing. A worker finishes at `review`; the merge finishes the card.
+**`done` requires `applied`, or an approval.** A PR card whose PR is still open cannot be
+completed by a worker -- the agent's tool, `hermes kanban complete`, or `--force` -- because
+the bridge installs a guard on the board itself (`ngit_guard`). A merge releases it, a
+reviewer's approving verdict releases it, and a close keeps it refusing. A worker finishes at
+`review`; the verdict or the merge finishes the card.
 
 A review task is a task like any other: the bridge names the PR, says which profile it is
 dispatched to, and stops there. The model is the board's to decide -- the board's default,
@@ -69,13 +73,16 @@ import nostr_sdk as sdk
 
 from .control import ControlConfig, as_hex
 from .fetch import fetch_many_blocking, fetch_tagged_blocking
-from .kanban import BLOCKED, DONE, REVIEW, Anchor, Board, BoardError
+from .kanban import BLOCKED, DONE, FIXED_MARK, REVIEW, Anchor, Board, BoardError
 from .ngit_labels import (
     ANCHOR_KEYS,
+    APPROVED,
+    CHANGES_REQUESTED,
     KIND_LABEL,
     Label,
     Labeler,
     Verdict,
+    VerdictAnchor,
     anchor_detail,
     anchor_verdict,
     live_label,
@@ -520,6 +527,7 @@ class Report:
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
         "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
+        "approved": 0, "changes": 0,
         "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0})
     posted: int = 0
     #: Channel messages that did not reach the daemon. Counted, not repeated: a relay-free
@@ -565,6 +573,9 @@ class Report:
                    + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
                    + (f", {p['revisions']} revision(s)" if p["revisions"] else "")
                    + (f", {p['reopened']} card(s) reopened" if p["reopened"] else "")
+                   + (f", {p['approved']} card(s) finished by an approval"
+                      if p["approved"] else "")
+                   + (f", {p['changes']} card(s) returned for changes" if p["changes"] else "")
                    + (f", {p['completed']} card(s) completed by a merge" if p["completed"] else "")
                    + (f", {p['unblocked']} card(s) released by a merge" if p["unblocked"] else "")
                    + (f", {p['blocked']} card(s) blocked by a close" if p["blocked"] else "")
@@ -1204,14 +1215,58 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "Review this PR and report a verdict. Do not merge it: merging is the operator's,",
         "or a follow-up task. This task ends with a verdict, not a merge.",
         "",
-        "This card is finished by the merge, not by you: `done` requires the PR to be",
-        "`applied`, and the bridge completes the card when it sees the merge commit. **Do",
-        "not call kanban_complete** -- the board will refuse it. Record the verdict as a",
-        "comment, then park the card with `kanban_block`, putting the verdict and the tip it",
-        "covers in the reason. The bridge reads the verdict line and publishes it as the PR's",
-        "label either way; a person re-queues the work on a changes-requested verdict.",
+        "The verdict finishes this card, and the bridge applies it: `approved` completes the",
+        "card -- the merge is still a person's -- and `changes-requested` sends it back to",
+        "the implementer with your findings. So publish the verdict on the PR, record it",
+        "here as a comment naming the comment's event id and the tip it covers, then park",
+        "the card with `kanban_block`, putting `Verdict: approved` or",
+        "`Verdict: changes-requested` first in the reason and the tip after it. That park",
+        "is a hand-off, not a question: the bridge reads the verdict from the PR root and",
+        "finishes the card on its next pass. **Do not call kanban_complete** -- the board",
+        "refuses it while the PR is open, and a verdict recorded only on this card leaves",
+        "the PR's label where it was.",
         "",
         *steps,
+    ])
+
+
+def fix_body(pr: PullRequest, target: Target, *, tip: str, findings: str,
+             event_id: str) -> str:
+    """What a worker needs to make a changes-requested verdict go away.
+
+    The card is the queue, and this is the same card the review happened on: a new tip
+    reopens it for a fresh review, so the body has to say *fix*, not *review*, for as long
+    as the fix is the work in hand. The verdict's own words are quoted rather than
+    summarised -- a worker that has to open a relay to learn what is wrong is a worker
+    that fixes what it guessed.
+    """
+    branch = pr.branch or "(the PR names no branch)"
+    return "\n".join([
+        f'Changes requested on PR "{pr.subject}" -- this card is back in the queue to fix them.',
+        "",
+        f"PR:         {pr.id}",
+        f"nevent:     {pr.nevent}",
+        f"Repository: {target.address or target.repo}",
+        f"Branch:     {branch}",
+        *([f"Tip:        {tip}"] if tip else []),
+        f"Verdict:    comment {event_id or '(unknown)'}",
+        "",
+        "---",
+        "",
+        "The findings, as the reviewer published them:",
+        "",
+        findings.strip() or "(the verdict comment names them; read it on the PR)",
+        "",
+        "---",
+        "",
+        f"Fix them on the PR's own branch (`{branch}`), on top of the tip the verdict covers,",
+        "commit with the card trailer and push: the push publishes a revision (kind 1619) and",
+        "the bridge reopens this card for a fresh review of the new tip.",
+        "",
+        "Do not merge, and do not review the tip the verdict already covers. When the fix is",
+        "pushed, end your run by parking this card with `kanban_block` and `Revision: <tip>`",
+        "as the first line of the reason -- the bridge reopens it for review when it reads",
+        "the revision.",
     ])
 
 
@@ -1698,6 +1753,11 @@ class Sync:
         self._revisions(feed, report, dry_run=dry_run)
         settled.extend(revision.created_at for revision in feed.revisions)
 
+        # The other end of the fix hand-off: a worker that pushed and parked says where it
+        # left the branch, and the card goes back to the review queue. Before the guards so
+        # the reopened card is the one they see.
+        self._released_fixes(report, dry_run=dry_run)
+
         # The guard follows the link: open PRs refuse completion, applied ones allow it,
         # closed ones refuse it and name the closing event. Last, so it sees the state this
         # pass actually left the cards in.
@@ -1707,7 +1767,7 @@ class Sync:
         # to see, and a label that cannot be published must not hold the cursor -- the next
         # poll retries it from the link, which still records the label it last published.
         if not dry_run:
-            self._labels(feed, report)
+            self._review_states(feed, report)
 
         # The cursor promises that everything before it has been dealt with. A queued notice
         # counts: it is durable, and the next poll delivers it. A deferred event does not --
@@ -1801,24 +1861,39 @@ class Sync:
             task_id = self._review_anchor(link)
             task = self.board.task(task_id) if task_id else None
             status = str(task.get("status") or "") if task else ""
+            # A card this bridge parked is waiting for the next event, not for a person:
+            # `verdict:` is a review the bridge had not finished when the tip moved, and
+            # `revision:` is a fix whose worker said where it left it. Any other block is a
+            # question, and a revision is not an answer to one.
+            reopen = status in (REVIEW, DONE) or (
+                status == BLOCKED and self.board.parked_by_bridge(task_id))
             if dry_run:
-                if status in (REVIEW, DONE):
+                if reopen:
                     report.prs["would_reopen"] += 1
                 continue
-            if task_id and status in (REVIEW, DONE, "ready", "running"):
+            if task_id and (reopen or status in ("ready", "running")):
                 text = revision_note(note, revision)
+                brief = self._review_brief(task, note, pr_id=revision.pr_id, tip=tip)
                 try:
-                    if status in (REVIEW, DONE):
-                        if self.board.reopen(task_id, author="ngit", comment=text):
+                    if reopen:
+                        if self.board.reopen(task_id, author="ngit", comment=text,
+                                             statuses=(REVIEW, DONE, BLOCKED), body=brief):
                             report.prs["reopened"] += 1
                             log.info("ngit: reopened %s for PR %s at %s",
                                      task_id, revision.pr_id[:8], tip[:12])
                         else:
                             # The card moved under us (a worker finished it, a person
-                            # archived it). The tip stays unrecorded so the next pass
-                            # decides from the state it actually finds.
+                            # archived it, a block turned out to be a question). The tip
+                            # stays unrecorded so the next pass decides from the state it
+                            # actually finds.
                             continue
                     else:
+                        # Queued or running: the card keeps its claim, and the brief moves
+                        # back to review because the tip it was told to fix is gone -- the
+                        # revision is the fix. A card the bridge did not write keeps its
+                        # body: it is not the bridge's instruction to rewrite.
+                        if brief:
+                            self.board.set_body(task_id, brief)
                         self.board.comment(task_id, "ngit", text)
                 except (BoardError, sqlite3.Error) as exc:
                     # The tip is not recorded, so the next pass tries the card again
@@ -1830,6 +1905,49 @@ class Sync:
             # hand), or one waiting on a human: the tip is still recorded, so the label
             # and any later pass read it.
             self._save_detail(link, note, task_id=task_id)
+
+    def _released_fixes(self, report: Report, *, dry_run: bool) -> None:
+        """Put a fixed card back in the review queue: the worker's park is the news.
+
+        A fix round ends with the worker pushing (which publishes the revision) and then
+        parking the card with `Revision: <tip>` -- the fix brief writes that marker. The
+        push usually lands before the park, so by the time the park arrives the revision is
+        already recorded and `_revisions` has nothing new to act on. This is the other end
+        of the same hand-off: the card goes back for review, with the review brief, and the
+        next claim reviews the tip the PR carries.
+
+        Only `FIXED_MARK` qualifies: a `Verdict:` park is healed by the verdict pass and by
+        a revision, and anything else is a person's question.
+        """
+        if dry_run:
+            return
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            if str(link.get("state") or "") in ("merged", "closed"):
+                continue
+            pr_id = str(link.get("source_id") or "")
+            note = _detail(link)
+            if note.get("merge"):
+                continue  # applied is final: a park after the merge is a person's
+            task_id = self._review_anchor(link)
+            task = self.board.task(task_id) if task_id else None
+            if task is None or str(task.get("status") or "") != BLOCKED:
+                continue
+            if self.board.park_marker(task_id) != FIXED_MARK:
+                continue
+            tip = str(note.get("tip") or note.get("commit") or "")
+            brief = self._review_brief(task, note, pr_id=pr_id, tip=tip)
+            try:
+                if self.board.reopen(
+                        task_id, author="ngit", statuses=(BLOCKED,), body=brief,
+                        comment="Fix pushed"
+                                + (f" at {tip}" if tip else "")
+                                + ": this card is back in the review queue for the tip"
+                                " the PR carries."):
+                    report.prs["reopened"] += 1
+                    log.info("ngit: reopened %s after its fix was pushed", task_id)
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"fixed card {task_id} for PR {pr_id[:8]}: {exc}")
 
     def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool) -> tuple[str, str]:
         """One review task for this PR, or the reason there is none.
@@ -2091,6 +2209,8 @@ class Sync:
                 elif state != "merged" and not note.get("merge"):
                     tip = str(note.get("tip") or note.get("commit") or "")
                     for card in cards:
+                        if str(card.get("status") or "") in (DONE, "archived"):
+                            continue  # finished by a merge or by an approval; prune drops it
                         self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip)
             except (BoardError, sqlite3.Error) as exc:
                 report.prs["review_errors"] += 1
@@ -2100,21 +2220,36 @@ class Sync:
         except (BoardError, sqlite3.Error) as exc:
             report.errors.append(f"guard prune: {exc}")
 
-    # -- labels ----------------------------------------------------------
+    # -- the verdict's consequence, and the label ---------------------------------
 
-    def _labels(self, feed: PrFeed, report: Report) -> None:
-        """Publish each PR's review state as the one label it carries.
+    def _review_states(self, feed: PrFeed, report: Report) -> None:
+        """Act on each PR's newest verdict, and publish the one label it carries.
 
-        This pass is the only writer. It reads the PR root's newest verdict and the labels
-        the PR currently carries off the relays, decides the one label that belongs there,
-        publishes it and retracts every other one -- including a label an earlier writer
-        left, which no link row here names. The link row only remembers what this pass
-        published, so a poll with no news publishes nothing, and a leftover is corrected in
-        one pass rather than by hand.
+        Two consequences of one read, in the order that keeps them consistent:
+
+        * the **verdict finishes or re-queues the PR's card** -- `approved` completes it,
+          `changes-requested` sends it back to the implementer with the findings. The card
+          is the queue; a verdict is the review's end, so a card it was given for does not
+          stay parked on it;
+        * the PR carries **one label**, derived from the same verdict: it is the public
+          half, and a reader who never opens the board has to be able to check it.
+
+        Both use one rule for "this verdict is in force" (`review_labels`): the anchor's
+        tip is the PR's tip. They run together so the label and the card cannot disagree
+        about which verdict they answered.
+
+        This pass is the only writer of both. It reads the PR root's newest verdict and the
+        labels the PR currently carries off the relays, publishes the label that belongs
+        there and retracts every other one -- including a label an earlier writer left,
+        which no link row here names. The link row only remembers what this pass published,
+        so a poll with no news writes nothing, and a leftover is corrected in one pass
+        rather than by hand.
         """
-        if self.labels is None or not self.config.labels or not self.target.address:
+        if self.state is None:
+            if self._labeler() is not None:
+                report.notes.append(
+                    "labels: no relay reader configured, so no label was changed")
             return
-        labeler: Labeler = self.labels
         tips = feed.newest_tips()
         # Every proposal the poll carried counts, including one with no `c` tag: the docs
         # promise a new PR gets its label, and a proposal whose branch has no tip named is
@@ -2122,6 +2257,7 @@ class Sync:
         active = {pr.id for pr in feed.prs} | {merge.pr_id for merge in feed.merges}
         finished = ({merge.pr_id for merge in feed.merges}
                     | {item.pr_id for item in feed.closed})
+        wired = self._labeler() is not None
         pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             pr_id = str(link.get("source_id") or "")
@@ -2135,8 +2271,10 @@ class Sync:
             if pr_id not in active and not published and not detail.get("label_pending"):
                 # A PR announced before the bridge published labels. Retrofitting a label
                 # onto every one of them is a burst of events nobody asked for; a revision
-                # puts it back in the window.
-                continue
+                # puts it back in the window. With labels off the verdict is still worth
+                # reading, but only for a PR the bridge has a card for.
+                if wired or not link.get("task_id"):
+                    continue
             pending.append((link, detail))
         if not pending:
             return
@@ -2145,17 +2283,104 @@ class Sync:
         for link, detail in pending:
             pr_id = str(link.get("source_id") or "")
             try:
-                self._one_label(labeler, pr_id, link, detail, tips, reads, report,
-                                merged=pr_id in finished)
+                self._one_review_state(pr_id, link, detail, tips, reads, report,
+                                       merged=pr_id in finished)
             except (BoardError, sqlite3.Error) as exc:
-                report.prs["label_errors"] += 1
-                report.errors.append(f"label {pr_id[:8]}: {exc}")
+                report.prs["review_errors"] += 1
+                report.errors.append(f"review state {pr_id[:8]}: {exc}")
+
+    def _labeler(self) -> Optional[Labeler]:
+        """The publisher this deployment labels with, or None when it publishes none.
+
+        The verdict's consequence runs either way: the card is local state, and a deployment
+        that asked for no label events still wants its review cards finished.
+        """
+        if self.labels is None or not self.config.labels or not self.target.address:
+            return None
+        return self.labels
+
+    def _apply_verdict(self, pr_id: str, card: dict[str, Any], verdict: Verdict,
+                       anchor: VerdictAnchor, detail: dict[str, Any], report: Report) -> None:
+        """Finish the PR's card on an approval, or send it back on a changes request.
+
+        The verdict is the review's end, so the card it was given for does not stay parked
+        on one. `approved` completes it -- the merge is still a person's, and the PR's
+        `approved` label is what the merge route reads. `changes-requested` puts it back on
+        the implementer's desk as `ready`, with the findings, which is the transition the
+        kernel's `request_changes` writes.
+
+        Only a card the bridge parked is touched: `blocked` with one of `PARK_MARKERS`, or
+        `review`. A `running` card is a reviewer still working -- its verdict is read again
+        on the next pass -- and a card blocked on a question is never answered by a verdict.
+
+        One verdict, one consequence: the card's own status is the state, so a second pass
+        over the same verdict finds a `done` or `ready` card and writes nothing. The
+        `changes_requested` event carries the verdict's event id so the two changes paths
+        cannot both fire on it.
+        """
+        task_id = str(card.get("id") or "")
+        status = str(card.get("status") or "")
+        if not task_id or status not in (BLOCKED, REVIEW):
+            return
+        if status == BLOCKED and not self.board.parked_by_bridge(task_id):
+            return
+        tip = str(anchor.tip or detail.get("tip") or "")
+        try:
+            if anchor.label == APPROVED:
+                result = (f"Verdict: approved -- comment {anchor.event_id or '(unknown)'}"
+                          f" on PR {pr_id[:8]}"
+                          + (f", covering tip {tip}" if tip else ""))
+                body = str(verdict.body or "").strip()
+                if body:
+                    result += f"\n\n{body}"
+                self.board.approve_guard(task_id, verdict=anchor.event_id)
+                if self.board.complete(
+                        task_id, author="ngit", result=result,
+                        comment=f"Approved by comment {anchor.event_id or '(unknown)'} on"
+                                f" PR {pr_id[:8]}"
+                                + (f" at {tip}" if tip else "")
+                                + ". The merge is the operator's."):
+                    report.prs["approved"] += 1
+                    report.notes.append(
+                        f"card {task_id} for PR {pr_id[:8]}: approved, and finished")
+            elif anchor.label == CHANGES_REQUESTED:
+                findings = str(verdict.body or "").strip() or (
+                    f"The verdict comment {anchor.event_id or '(unknown)'} on PR"
+                    f" {pr_id[:8]} asks for changes; read it on the PR.")
+                # A card the bridge wrote gets the fix brief; a re-review a person filed keeps
+                # its own words and carries the findings in the comment instead.
+                brief = ""
+                if str(card.get("idempotency_key") or "").startswith("ngit:pr:"):
+                    brief = fix_body(pr_from_note(pr_id, detail, tip=tip), self.target,
+                                     tip=tip, findings=findings, event_id=anchor.event_id)
+                if self.board.request_changes(
+                        task_id, reason=findings, implementer=self.config.assignee or "",
+                        body=brief, verdict=anchor.event_id):
+                    report.prs["changes"] += 1
+                    report.notes.append(
+                        f"card {task_id} for PR {pr_id[:8]}: changes requested,"
+                        " returned to its implementer")
+        except (BoardError, sqlite3.Error) as exc:
+            report.prs["review_errors"] += 1
+            report.errors.append(
+                f"verdict on PR {pr_id[:8]} (card {task_id}): {exc}")
+
+    def _review_brief(self, task: Optional[dict[str, Any]], note: Mapping[str, Any], *,
+                      pr_id: str, tip: str = "") -> str:
+        """The review brief for a card this bridge wrote, or "" for one it did not.
+
+        The body is the instruction the next worker reads, so it follows the work: a fix
+        round replaces the review brief, and a revision puts it back for the new tip. A
+        re-review a person filed under the brief's own title has a body of theirs, and
+        replacing it would be the bridge editing someone else's instruction.
+        """
+        if task is None or not str(task.get("idempotency_key") or "").startswith("ngit:pr:"):
+            return ""
+        return review_body(pr_from_note(pr_id, note, tip=tip), self.target)
 
     def _read_labels(self, pr_ids: Sequence[str], report: Report) -> ReadState:
         """One relay read for the whole pass, or the reason there is none."""
         if self.state is None:
-            report.notes.append(
-                "labels: no relay reader configured, so no label was changed")
             return ReadState()
         try:
             state = self.state(list(pr_ids))
@@ -2168,10 +2393,10 @@ class Sync:
             report.errors.append(f"label read: {problem}"[:200])
         return state
 
-    def _one_label(self, labeler: Labeler, pr_id: str, link: dict[str, Any],
-                   detail: dict[str, Any], tips: dict[str, tuple[str, int]],
-                   reads: ReadState, report: Report, *, merged: bool) -> None:
-        """Decide the one label this PR carries, publish the change, record what it did.
+    def _one_review_state(self, pr_id: str, link: dict[str, Any],
+                          detail: dict[str, Any], tips: dict[str, tuple[str, int]],
+                          reads: ReadState, report: Report, *, merged: bool) -> None:
+        """One PR: what its verdict does to its card, then what it does to the PR's label.
 
         The verdict comes from the PR root, and so does the label set: `read.labels` is what
         the relays say the PR currently carries, including anything an earlier writer left.
@@ -2191,15 +2416,16 @@ class Sync:
             # a verdict, and without the verdict the only safe thing to say is nothing: the
             # row keeps what readers already see and the next pass asks again.
             report.notes.append(
-                f"label {pr_id[:8]}: no verdict could be read; the label is left as it is")
+                f"review state {pr_id[:8]}: no verdict could be read;"
+                " the label is left as it is and no card is touched")
             self._save_detail(link, detail, task_id=task_id)
             return
         verdict = read.verdict
         if verdict is not None and not verdict.readable:
             report.notes.append(
-                f"label {pr_id[:8]}: the newest verdict (event {verdict.event_id or '?'}"
+                f"review state {pr_id[:8]}: the newest verdict (event {verdict.event_id or '?'}"
                 f" on {verdict.relay or 'a relay'}) states a verdict that cannot be read;"
-                " the label is left as it is")
+                " the label is left as it is and no card is touched")
             self._save_detail(link, detail, task_id=task_id)
             return
         anchor = anchor_verdict(detail, verdict, tip=tip, tip_at=tip_at)
@@ -2213,8 +2439,15 @@ class Sync:
         desired = review_labels(verdict=anchor, review_card=card is not None, tip=tip,
                                 tip_at=tip_at, labelled=bool(detail.get("label") or ()),
                                 merged=merged)
+        if anchor is not None and verdict is not None and card is not None \
+                and tuple(desired or ()) == (anchor.label,):
+            # The verdict is in force: it decided the label, so it decides the card too.
+            self._apply_verdict(pr_id, card, verdict, anchor, detail, report)
         if desired is None:
             self._save_detail(link, detail, task_id=task_id)
+            return
+        labeler = self._labeler()
+        if labeler is None:
             return
         changed = tuple(desired) != tuple(detail.get("label") or ())
         add = desired if changed else ()
@@ -2413,6 +2646,19 @@ def pr_detail(pr: PullRequest, *, task_error: str = "") -> dict[str, Any]:
         # already told there is none, so the retry posts nothing and only makes the task.
         detail["task_error"] = task_error
     return detail
+
+
+def pr_from_note(pr_id: str, note: Mapping[str, Any], *, tip: str = "") -> PullRequest:
+    """A PR as the link row remembers it, for a brief a later pass rewrites.
+
+    A revision and a verdict can both arrive on a poll that no longer carries the PR's own
+    event, so the row's note is what the new brief is built from. `tip` is the commit the
+    brief is written for -- the new one on a revision, the reviewed one on a fix.
+    """
+    return PullRequest(id=str(pr_id), author=str(note.get("author") or ""),
+                       subject=str(note.get("subject") or ""),
+                       branch=str(note.get("branch") or ""),
+                       nevent=str(note.get("nevent") or ""), commit=str(tip or ""))
 
 
 def task_body(issue: Issue, target: Target) -> str:

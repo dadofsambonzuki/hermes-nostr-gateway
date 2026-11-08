@@ -471,17 +471,19 @@ complete` is the worker's word, and a worker's word is not a merge: a card that 
 an open PR made the board report work as finished that a human still had to land.
 
 **The rule.** Completion of a PR-backed card requires the link to be `applied` with a merge
-commit id. The bridge enforces it on the board itself (`ngit_guard`): one row per PR card and
+commit id, or a reviewer's approving verdict (`approved` — see "A verdict finishes its card"
+below). The bridge enforces it on the board itself (`ngit_guard`): one row per PR card and
 one `BEFORE UPDATE OF status` trigger whose refusal names the state it saw — `PR <short> is
 open at <tip>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
 covers the agent's tool and the CLI without either knowing the bridge exists. A merge releases
-the guard; a close keeps it refusing.
+the guard, an approval releases it, and a close keeps it refusing.
 
 **A worker finishes at `review`.** The reviewer records a verdict as a comment and parks the
 card with `kanban_block` (the review lane's own approval tool, `kanban_complete`, is exactly
-what the guard refuses); the card then waits for the merge, and the bridge completes it with
-the merge commit in the result and a comment on the card. A merge completes **every** card the
-PR owns, including a re-review a person filed, and releases any card whose own premise was
+what the guard refuses while the PR is open). The verdict, not the park, is what the card
+waits on: the bridge reads it from the PR root and finishes the card — `done` on an approval,
+back to the implementer on a changes request. The merge then completes every remaining card
+the PR owns, including a re-review a person filed, and releases any card whose own premise was
 `after PR X merges`.
 
 **Two decisions.** A card with no PR link — ops, docs, a fix card — is completed by its worker
@@ -561,12 +563,12 @@ Everything else — `running`, `ready`, `todo`, `scheduled`, `triage`, `archived
 has not reached a reviewer, and the refusal names the card and the status it has.
 
 **`blocked` is allowed on the PR's own card, and nowhere else.** The review brief's last
-instruction is to park a reviewed PR's card with `kanban_block`, because `done` requires applied
-and a reviewer may not complete it; the person such a card waits for is the person who merges.
-Refusing it would mean no PR that went through the review lane could ever land — the card cannot
-be `done` before the merge, so the merge would be refused for waiting on itself. A *work* card
-named by a trailer is the other case: a block there is the work saying it is not finished, and a
-merge does not overrule it.
+instruction is to park a reviewed PR's card with `kanban_block`, because the guard refuses a
+completion the verdict has not earned yet; the person such a card waits for is the person who
+merges. Refusing it would mean no PR that went through the review lane could ever land — the
+card cannot be `done` before the merge, so the merge would be refused for waiting on itself. A
+*work* card named by a trailer is the other case: a block there is the work saying it is not
+finished, and a merge does not overrule it.
 
 **Which card is the bridge's answer.** The `ngit_links` row for the PR root is the PR's card,
 and every `Card:` trailer names a card the work was done under; the merge route checks both, so
@@ -579,3 +581,40 @@ rather than as a reason to skip the check.
 before `git am`) lists `blocked` among the statuses the merge refuses. On the PR's own card it
 does not, for the reason above. The message stays as written — it is the history the verdict
 covered — and this line is the correction.
+
+## A verdict finishes its card
+
+A review used to end by blocking its own card: the reviewer published the verdict on the PR,
+parked the card with the verdict in the reason, and the card stayed `blocked` until a person
+merged. That one choice broke the loop in both directions. **Approved work was invisible** — a
+blocked card is not finished, so three approved PRs read as "not approved yet" on a board whose
+labels said `approved`. And **a re-push could not resurrect the review** — `blocked` was outside
+the reopen set, so a revision against a parked card was acknowledged in a comment nobody ran on.
+
+**The verdict is the state.** The bridge already reads the newest verdict from the PR root for
+the label; the same read now applies it to the PR's one card, in the same pass, under the same
+rule (`review_labels`: a verdict covers the tip it was given for). `approved` **completes** the
+card with the verdict as its result; `changes-requested` puts it back on the implementer's desk
+as `ready`, with the fix brief and the findings — the transition the kernel's
+`request_changes` writes, written by the bridge because the review card was never claimed from
+`review` and the kernel's provenance check has nothing to route on. The merge stays a person's:
+the card being `done` says the review is over, and the PR's label is what the merge route reads.
+
+**Why the bridge and not the reviewer.** The reviewer cannot complete the card (the guard
+refuses a completion on an open PR, and it must: a worker's word is not a review), and it cannot
+call `kanban_request_changes` (not a review-lane claim). Making the reviewer do it would mean
+either trusting a tool that refuses or re-shaping the card into a handoff it is not. The bridge
+is the one reader of the verdict, and one writer per fact is the rule this board is built on.
+
+**A card blocked on a question is never a verdict's.** A person's block matches no marker and is
+left exactly where it is, by both the verdict pass and a revision. The one reason a blocked card
+can still move is the bridge's own hand-off: `Verdict:` (old brief) or `Revision:` (a fix that
+was pushed) as the first word. That is a tag, not a state — once the consequence is applied the
+card is `done` or `ready`, so nothing re-reads the reason in steady state. The tag exists to heal
+cards parked before the rule, and to let a fix round hand itself back.
+
+**The fix round is a round.** A changes-requested verdict re-queues the same card rather than
+opening a second one, and its body becomes the fix brief — otherwise the next claim would review
+the same tip again and publish the same verdict for ever. The fix worker pushes and parks with
+`Revision: <tip>`; the push usually lands first, so the park is the news, and the card goes back
+to the review queue with the review brief for the tip the PR carries.

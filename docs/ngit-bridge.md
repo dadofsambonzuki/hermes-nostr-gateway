@@ -256,9 +256,11 @@ same branch and a revision all land on that one card; none of them makes a secon
 - A **revision** is an event, not an observation: kind 1619 (`E` names the PR, `c` the new
   tip), or a republished proposal carrying the same `E`/`P`/`c` tags. It reopens the PR's one
   card — `review`/`done` -> `ready` — with one comment naming the new tip and the event that
-  moved it. A card already `ready` or `running` only gets the comment (the queue, or the
-  worker reading it, now knows which tip is current); a `blocked` card is waiting for a
-  person's authorisation and is not released by a revision; an `archived` one is left alone.
+  moved it, and with the review brief rewritten for that tip (a fix round left the fix brief
+  behind). A card already `ready` or `running` only gets the comment and the brief (the
+  queue, or the worker reading it, now knows which tip is current); a `blocked` card is
+  waiting for a person unless the bridge itself parked it (`Verdict:`/`Revision:` in the
+  reason), in which case the revision reopens it; an `archived` one is left alone.
   A branch that moved without an event changes nothing: the tip the bridge knows is the tip
   an event published.
 - **Reopening is not a fresh start in every respect.** `consecutive_failures` is reset — the
@@ -296,20 +298,30 @@ same branch and a revision all land on that one card; none of them makes a secon
   merge commit and a comment saying what landed. A merge that arrives for a card already
   completed is a no-op: nothing is written twice. A 1631 that names **no commit** is not
   evidence and completes nothing: the card stays open and the pass says why.
-- **`done` requires `applied`.** A card whose PR is still open cannot be completed by anyone
-  — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not `--force`.
-  The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
+- **`done` requires `applied`.** A PR card whose PR is still open cannot be completed by a
+  worker — not the agent's `kanban_complete` tool, not `hermes kanban complete`, not
+  `--force`. The bridge installs a guard on the board (`ngit_guard`): one row per PR card in
   `ngit_pr_guards` and one `BEFORE UPDATE OF status` trigger whose message is the refusal a
-  person reads (`PR <short> is open at <tip> -- a merge is the only thing that completes a
-  PR card`). A merge releases the guard (the commit is the proof) and the completion
-  succeeds; a close keeps it refusing and names the closing event. A card with no PR link —
-  ops, docs, a fix card — is untouched.
-- **A worker finishes at `review`.** The review brief says so, and the guard enforces it: the
-  reviewer records a verdict as a comment and **parks the card** with `kanban_block` instead of
-  completing it — the review lane's own approval tool is `kanban_complete`, which the guard
-  refuses, so the brief names the parking action and the refusal repeats it. The merge completes
-  the parked card; a changes-requested verdict leaves a person to re-queue the work, and the
-  label pass publishes either verdict.
+  person reads (`PR <short> is open at <tip> -- a merge completes a PR card, and a reviewer's
+  approving verdict finishes a review card`). A merge releases the guard (the commit is the
+  proof) and the completion succeeds; an approving verdict releases it too (the verdict is
+  the review's proof); a close keeps it refusing and names the closing event. A card with no
+  PR link — ops, docs, a fix card — is untouched.
+- **A verdict finishes its card.** The reviewer records the verdict as a comment and **parks
+  the card** with `kanban_block`, the first line of the reason being `Verdict: approved` or
+  `Verdict: changes-requested` and the tip it covers. That park is a hand-off, not a
+  question: the bridge reads the newest verdict from the PR root and applies it to the card
+  the verdict covers — `approved` **completes** it with the verdict as the result (the merge
+  is still a person's), and `changes-requested` puts it back on the implementer's desk as
+  `ready` with the fix brief and the findings. The same pass publishes the label, so the
+  board and the PR cannot disagree about which verdict they answered. A card blocked on a
+  real question is never finished or re-queued by a verdict: only one the bridge parked (a
+  `Verdict:`/`Revision:` reason) or a card in the `review` lane is touched.
+- **The fix round ends the same way.** The fix brief tells the implementer to push the fix
+  and park the card with `Revision: <tip>`. The push usually lands first, so the park is the
+  news: the bridge reopens the card for review with the review brief for the tip the PR
+  carries. `Revision:` is the only marker that does that, and a card blocked on a person's
+  question is left where it is.
 - A kind-1632 **closed** status is not a merge and never completes a card. The PR's cards are
   blocked with `block_kind=dependency`, a comment naming the closing event, and a guard that
   refuses completion — a person decides whether the work is re-filed, re-proposed or dropped.
@@ -358,6 +370,16 @@ the same verdict on the task, naming the comment's event id. The newest verdict 
 The card is the queue and the PR is the record: a reader of the label can fetch the comment it
 was derived from, and a verdict recorded only on the card leaves the label where it was rather
 than publishing a state the PR itself does not carry.
+
+**The same read finishes the card.** The verdict a label is derived from is the review's end,
+so the pass applies it to the PR's card in the same step: `approved` completes the card with
+the verdict as its result (the merge stays the operator's, and the `approved` label is what
+the merge route reads), and `changes-requested` returns the card to the implementer as `ready`
+with the fix brief and the findings. One rule decides both — a verdict covers the tip it was
+given for — so a revision that moves the tip leaves the label at `review-required` and the
+card untouched until a reviewer reads the new tip. Only a card the bridge parked, or one in
+the `review` lane, is acted on: a card blocked on a person's question is never finished or
+re-queued by a verdict, however green it is.
 
 **One writer.** The label pass — the sync that walks `ngit_links` — is the only thing that
 writes a label. It reads each open PR's verdict comments and the label events the PR currently
@@ -537,8 +559,8 @@ Recovery:
 - Publishing status events from the board back to Nostr (a task completing does not close or
   apply the issue). The mapping is one-way for status on purpose: the board's lifecycle is the
   board's, and a status event is a public statement someone should choose.
-- Merging. A review task ends with a verdict and a comment on the task; the merge is the
-  operator's (`ngit pr merge`), and the bridge only watches for the status event it produces.
+- Merging. A review task ends with a verdict; the merge is the operator's (`ngit pr merge`), and
+  the bridge only watches for the status event it produces.
 - Retrofitting review tasks for PRs announced before this bridge made them. A PR already
   `signalled` with no task stays that way: the channel was told what happened at the time, and
   a change of behaviour is not a reason to rewrite it.

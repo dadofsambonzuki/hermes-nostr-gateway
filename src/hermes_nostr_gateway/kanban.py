@@ -41,6 +41,19 @@ BLOCKED = "blocked"
 REVIEW = "review"
 DONE = "done"
 
+#: How a block reason says the *bridge* parked the card rather than a person: a verdict it
+#: could not act on yet, or a fix it handed back. A revision may reopen a card parked this
+#: way -- the next event is what it waits for. A reason beginning any other way is a human
+#: question, and a revision does not answer questions.
+#:
+#: This is a hand-off tag, not a state machine: once the bridge acts on a verdict it finishes
+#: the card instead of parking it, so the only cards that carry a marker are the ones parked
+#: before that rule existed. The marker is what lets those heal; it is not how the loop runs.
+PARK_MARKERS = ("verdict:", "revision:")
+#: The one marker a fix worker writes: "the fix is pushed, at this tip". The bridge reopens
+#: the card for review on its own, because the push usually lands before the worker parks.
+FIXED_MARK = "revision:"
+
 
 class BoardError(RuntimeError):
     """The file is not a board, or a write could not be made."""
@@ -313,7 +326,7 @@ class Board:
         return rowid
 
     def reopen(self, task_id: str, *, author: str = "ngit", comment: str = "",
-               statuses: Sequence[str] = (REVIEW, DONE)) -> bool:
+               statuses: Sequence[str] = (REVIEW, DONE), body: str = "") -> bool:
         """Put a reviewed or finished card back in the queue, with the reason on it.
 
         A revision is news about a PR that already has a card, so that card is reopened
@@ -329,9 +342,16 @@ class Board:
         reopen (which treats review as "not a success signal"), so this is the bridge's
         own decision and is recorded as one.
 
+        `blocked` is in the set only for a card this bridge parked itself (`parked_by_bridge`):
+        a verdict or a fix it could not act on at the time, waiting for the next event rather
+        than for a person. A card blocked on a question is not in the revision's gift.
+
+        `body` replaces the card's brief when the new tip needs a different instruction --
+        a revision after a fix round puts the review brief back. Empty keeps what is there.
+
         False when the card was not in one of `statuses`: a card already queued or running
-        is left to finish the tip it started on, and a blocked card is waiting for a human,
-        not for a revision.
+        is left to finish the tip it started on, and a blocked card waiting for a human is
+        not released by a revision.
         """
         now = int(time.time())
         allowed = tuple(dict.fromkeys(str(status) for status in statuses))
@@ -346,12 +366,20 @@ class Board:
                 self.db.execute("ROLLBACK")
                 return False
             prior = str(row["status"])
+            if prior == BLOCKED and not self.parked_by_bridge(task_id):
+                self.db.execute("ROLLBACK")
+                return False
+            sets = ("status = ?, completed_at = NULL, claim_lock = NULL,"
+                    " claim_expires = NULL, current_run_id = NULL, worker_pid = NULL,"
+                    " consecutive_failures = 0, last_failure_error = NULL,"
+                    " block_kind = NULL")
+            params: list[Any] = [READY]
+            if body:
+                sets += ", body = ?"
+                params.append(str(body))
             self.db.execute(
-                "UPDATE tasks SET status = ?, completed_at = NULL, claim_lock = NULL,"
-                " claim_expires = NULL, current_run_id = NULL, worker_pid = NULL,"
-                " consecutive_failures = 0, last_failure_error = NULL"
-                f" WHERE id = ? AND status IN ({marks})",
-                (READY, str(task_id), *allowed),
+                f"UPDATE tasks SET {sets} WHERE id = ? AND status IN ({marks})",
+                (*params, str(task_id), *allowed),
             )
             if comment:
                 self.db.execute(
@@ -423,6 +451,11 @@ class Board:
         The kernel's own `block` writes `block_kind` so a re-block loop can be detected; this
         does the same, and takes the comment as the record of *why* (the CLI has no
         `--reason` flag either). False when the card is already terminal.
+
+        The reason is written into the event payload as well as the comment, the shape the
+        kernel's own block writes: that payload is what `parked_by_bridge` reads, and a
+        board written by only one of the two writers would make the same card look parked
+        and un-parked depending on who blocked it.
         """
         now = int(time.time())
         self.db.execute("BEGIN IMMEDIATE")
@@ -443,7 +476,94 @@ class Board:
                 "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
                 " VALUES (?,?,?,?,?)",
                 (str(task_id), None, "blocked",
-                 json.dumps({"kind": str(kind or "dependency"), "by": author or "ngit"},
+                 json.dumps({"kind": str(kind or "dependency"), "reason": comment,
+                             "by": author or "ngit"}, separators=(",", ":")), now),
+            )
+            self.db.execute("COMMIT")
+            return True
+        except sqlite3.Error:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def parked_by_bridge(self, task_id: str) -> bool:
+        """Whether the newest block on this card is the bridge's own hand-off.
+
+        The reason is the only thing a block carries, so this is the one place a reason is
+        read as a fact -- and it is read as a *tag*, not a state: the bridge's briefs write
+        one of `PARK_MARKERS` as the first word, and anything else is a person's question.
+        A card with no block event (status moved by hand, a board from another tool) has no
+        marker and is never the bridge's to reopen.
+        """
+        return bool(self.park_marker(task_id))
+
+    def park_marker(self, task_id: str) -> str:
+        """Which `PARK_MARKERS` word the newest block starts with, or "" for a question."""
+        row = self.db.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'"
+            " ORDER BY id DESC LIMIT 1", (str(task_id),)).fetchone()
+        if row is None:
+            return ""
+        try:
+            reason = str((json.loads(row["payload"] or "{}") or {}).get("reason") or "")
+        except ValueError:
+            return ""
+        head = reason.strip().lower()
+        return next((mark for mark in PARK_MARKERS if head.startswith(mark)), "")
+
+    def request_changes(self, task_id: str, *, reason: str, implementer: str = "",
+                        reviewer: str = "ngit", body: str = "", verdict: str = "") -> bool:
+        """`* -> ready` on the implementer's desk, with the findings on the card.
+
+        The kernel's `request_changes` is the shape, not a call: it refuses a card whose run
+        was not claimed from `review`, and the bridge's review card is claimed from `ready`
+        (it is made for one PR, not handed over by an implementer). So the rows the kernel
+        would have written are written here, against the card the bridge owns: the status,
+        the router (`assignee`), an ended run, and one `changes_requested` event naming the
+        verdict it answers and the implementer it went to.
+
+        `body` replaces the review brief with the fix brief: the card is the queue, and a
+        worker claiming it must be told to fix this tip rather than review it again. Empty
+        leaves the body alone, which is what a card the bridge did not write needs.
+
+        Idempotent on the verdict event: a second pass over the same verdict writes nothing.
+        False when the card is finished or archived (a merged PR is final), or when this
+        verdict's consequence is already recorded.
+        """
+        now = int(time.time())
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT status FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
+            if row is None or str(row["status"]) in (DONE, "archived"):
+                self.db.execute("ROLLBACK")
+                return False
+            prior = str(row["status"])
+            if verdict and self._answers_verdict(task_id, verdict):
+                self.db.execute("ROLLBACK")
+                return False
+            sets = ("status = ?, completed_at = NULL, claim_lock = NULL,"
+                    " claim_expires = NULL, current_run_id = NULL, worker_pid = NULL,"
+                    " block_kind = NULL, block_recurrences = 0, last_failure_error = NULL")
+            params: list[Any] = [READY]
+            if implementer:
+                sets += ", assignee = ?"
+                params.append(str(implementer))
+            if body:
+                sets += ", body = ?"
+                params.append(str(body))
+            self.db.execute(f"UPDATE tasks SET {sets} WHERE id = ?",
+                            (*params, str(task_id)))
+            if reason:
+                self.db.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at)"
+                    " VALUES (?,?,?,?)", (str(task_id), reviewer or "ngit", reason, now))
+            self.db.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (str(task_id), None, "changes_requested",
+                 json.dumps({"status": READY, "from": prior, "reason": reason,
+                             "implementer": implementer or None,
+                             "reviewer": reviewer or "ngit", "verdict": verdict or None},
                             separators=(",", ":")), now),
             )
             self.db.execute("COMMIT")
@@ -451,6 +571,32 @@ class Board:
         except sqlite3.Error:
             self.db.execute("ROLLBACK")
             raise
+
+    def _answers_verdict(self, task_id: str, verdict: str) -> bool:
+        """Whether this verdict event's consequence is already on the card."""
+        row = self.db.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested'"
+            " ORDER BY id DESC LIMIT 1", (str(task_id),)).fetchone()
+        if row is None:
+            return False
+        try:
+            return str((json.loads(row["payload"] or "{}") or {}).get("verdict") or "") == verdict
+        except ValueError:
+            return False
+
+    def set_body(self, task_id: str, body: str) -> bool:
+        """Replace the card's brief. False for a card that is gone or archived.
+
+        The body is the instruction the dispatcher hands the next worker, so it is rewritten
+        whenever the same card is queued for different work (a fix round, then a fresh
+        review of the new tip). It is not a status: nothing reads it back.
+        """
+        if not body:
+            return False
+        cur = self.db.execute(
+            "UPDATE tasks SET body = ? WHERE id = ? AND status != 'archived'",
+            (str(body), str(task_id)))
+        return cur.rowcount == 1
 
     # -- the `done` requires `applied` guard -------------------------------
 
@@ -474,6 +620,19 @@ class Board:
             ngit_guard.release(self.db, task_id, merge_commit=merge_commit)
         except sqlite3.Error as exc:
             raise BoardError(f"could not release {task_id} on {self.path}: {exc}") from exc
+
+    def approve_guard(self, task_id: str, *, verdict: str = "") -> None:
+        """The reviewer approved the PR: the verdict, not the merge, finishes this card.
+
+        A review card's `done` is the review's end, and an approval is the review's end. The
+        merge stays a person's -- the card is finished, the PR is not landed, and the label
+        on the PR says `approved` for the merge route to read. Releasing rather than
+        removing the trigger keeps the guard row, so the pass can say what it saw.
+        """
+        try:
+            ngit_guard.approve(self.db, task_id, verdict=verdict)
+        except sqlite3.Error as exc:
+            raise BoardError(f"could not approve {task_id} on {self.path}: {exc}") from exc
 
     def close_guard(self, task_id: str, *, event_id: str = "") -> None:
         """The PR was closed without a merge: completion stays refused, naming the event."""

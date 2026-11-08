@@ -95,6 +95,10 @@ class Verdict:
     words this module does not recognise is newer than the last one it *could* read, and
     falling back to an older approval over it is the one direction that could publish a
     green light nobody gave. The caller leaves the label untouched and says why.
+
+    `body` is the comment's own words -- the findings, when the verdict asks for changes.
+    The card that answers the verdict carries them so the work is queued with the reasons,
+    not only with a pointer to a relay a worker may not read.
     """
 
     label: str = ""
@@ -102,6 +106,7 @@ class Verdict:
     created_at: int = 0
     relay: str = ""
     readable: bool = True
+    body: str = ""
 
 
 @dataclass(frozen=True)
@@ -363,7 +368,8 @@ def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
             continue
         return Verdict(label=stated, event_id=str(event.get("id") or ""),
                        created_at=int(event.get("created_at") or 0),
-                       relay=str(event.get("relay") or ""), readable=bool(stated))
+                       relay=str(event.get("relay") or ""), readable=bool(stated),
+                       body=str(event.get("content") or "") if stated else "")
     return None
 
 

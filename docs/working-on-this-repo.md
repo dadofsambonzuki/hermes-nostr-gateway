@@ -83,10 +83,12 @@ finish.
 
 `review` and `done` allow it, because both mean nobody is still working on it. So does `blocked`
 for the PR's **own** card, and that exception is the review lane's shape: the brief tells a
-reviewer to park a reviewed PR's card with `kanban_block` (a reviewer cannot complete it —
-`done` requires applied), and the person a blocked card waits for is the person who merges. A
-blocked **work** card named by a trailer is still refused: a block there says the work is not
-finished, and a merge does not overrule it.
+reviewer to park a reviewed PR's card with `kanban_block` (a reviewer cannot complete it — the
+guard refuses a completion the verdict has not earned), and the person such a card waits for is
+the person who merges. The bridge reads the verdict and finishes or re-queues the card on its
+next pass; until it does, a parked review card must not block the merge route. A blocked **work**
+card named by a trailer is still refused: a block there says the work is not finished, and a
+merge does not overrule it.
 
 `Card: operator` names operator work, and is not a bypass — a PR the bridge has linked still has
 to satisfy its linked card, so operator work cannot land a worker's PR early. When the bridge
