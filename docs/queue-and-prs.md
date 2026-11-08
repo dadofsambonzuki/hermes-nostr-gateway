@@ -55,8 +55,8 @@ card for the life of the PR. A re-poll, a retry after a failed send, a re-push a
 published as a second proposal, and a revision all land on that card.
 
 - **A second proposal for the same branch is a revision.** The oldest proposal is the root
-  (same author, same source branch); a later 1618 that names a root, like a 1619, is folded
-  back onto it.
+  (same author, same source branch); a later 1618 for that branch, or one that names the root
+  explicitly, is folded back onto it, and so is a 1619.
 - **A revision reopens the card; it never creates one.** `review`/`done` -> `ready`, with one
   comment naming the new tip and the event that moved it. A card already `ready` or `running`
   only gets the comment; a `blocked` card is waiting for a person and is not released by a
@@ -162,8 +162,8 @@ are the authority and this paragraph is not: run them against the tree you are a
 
 Still convention, with nothing enforcing it:
 
-- **A worker ends at `review`.** For a PR card the board now refuses `done`; for a work card
-  it does not — nothing stops a worker completing its own card while the PR it published is
+- **A worker ends at `review`.** For a linked PR card the guard refuses `done`; for a work card
+  nothing does — nothing stops a worker completing its own card while the PR it published is
   open.
 - **A work card is not the PR's card.** The bridge's review card is the one the board holds to
   the merge; nothing adopts the card the implementation ran on. Its `done` says the work is
