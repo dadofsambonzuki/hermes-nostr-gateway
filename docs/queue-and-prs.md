@@ -227,9 +227,11 @@ ready -> running              the dispatcher claims it
 running -> review             the worker's last act on the card: kanban_request_review
 review -> ready -> running    a new revision, or a changes-requested verdict
 review -> blocked             the PR was closed without a merge; a person decides
-review -> done                a merge, or a reviewer's approving verdict on a review card
+review -> done                a merge, or a reviewer's approving verdict
 done -> ready                 a revision on a PR that never merged (the repair path)
-blocked -> ready              a fix that was pushed, or a revision on a verdict-parked card
+blocked -> ready              a fix that was pushed, a revision on a verdict-parked card,
+                              or a changes-requested verdict
+blocked -> done               the approving verdict on a review card the reviewer parked
 any -> archived               out of the board
 ```
 
