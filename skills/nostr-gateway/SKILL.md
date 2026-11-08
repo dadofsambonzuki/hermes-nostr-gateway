@@ -113,8 +113,9 @@ Every refusal is a word, and the word decides what to do.
 - **Merge a PR with `scripts/merge_pr.sh <pr-id>`**, not with `git merge`: an ngit fetch prunes
   `pr/*` refs to `master`, so the branch is not there to merge. The script applies the PR to a
   fresh worktree, runs the gates on the merged tree and pushes, in one command. It refuses a PR
-  whose commits carry no `Card:` trailer (exit 6) and one whose card is not finished (exit 7:
-  `review` or `done`; the PR's own card may also be the `blocked` a reviewer parks it as).
+  whose commits carry no card trailer — none at all, or one that names something that is not a
+  card (exit 6) — and one whose card is not finished (exit 7: `review` or `done`; the PR's own
+  card may also be the `blocked` a reviewer parks it as).
   `hng ngit merge-check <pr> --repo <checkout>` is the same card answer on its own.
 - **Every commit says which card wrote it.** A `commit-msg` hook installed by
   `scripts/card_trailer.sh install` writes `Card: t_xxxxxxxx` from a card workspace and

@@ -74,10 +74,12 @@ merge route then refuses it.
 
 The board is the intent record, so the merge route reads it before it gates anything. The PR's
 own card comes from the bridge's `ngit_links` row for the PR root; every card a `Card:` trailer
-names is read as well (both tables are described in [`ngit-bridge.md`](ngit-bridge.md)). A card
-in `running`, `ready`, `todo`, `scheduled`, `triage` or `archived` refuses the merge (exit 7) and
-names the card and the status it has; the remedy is on the board, not in the patch: move the card
-to `review`, or let its work finish.
+names is read as well. The link table is described under "State and recovery" in
+[`ngit-bridge.md`](ngit-bridge.md); the board is the one `concord.projects` maps the checkout to,
+a mapping defined in the [README](../README.md). A card in `running`, `ready`, `todo`,
+`scheduled`, `triage` or `archived` refuses the merge (exit 7) and names the card and the status
+it has; the remedy is on the board, not in the patch: move the card to `review`, or let its work
+finish.
 
 `review` and `done` allow it, because both mean nobody is still working on it. So does `blocked`
 for the PR's **own** card, and that exception is the review lane's shape: the brief tells a
