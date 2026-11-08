@@ -5,7 +5,8 @@
 #   scripts/merge_pr.sh <pr-id|nevent> --check    apply and gate only, never push
 #
 # Exit: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage/state error,
-#       4 a card workspace (not the operator's), 5 the live checkout moved.
+#       4 a card workspace (not the operator's), 5 the live checkout moved,
+#       6 a commit does not say which card wrote it, 7 the card is not in review or done.
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -25,6 +26,7 @@ set -uo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 VENV=${VENV:-$REPO/.venv}
+PYTHON=${PYTHON:-$VENV/bin/python}
 GUARD="$REPO/scripts/live_checkout_guard.sh"
 export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}"
 
@@ -93,6 +95,78 @@ if ! (cd "$wt" && timeout 180 ngit pr apply "$pr" >/dev/null 2>&1); then
   git -C "$wt" diff --name-only --diff-filter=U | head -5
   exit 1
 fi
+
+# Authorship, on the commits this PR adds. Every one of them has to say which card wrote it,
+# because the trailer is the only place `git log` can answer that without the board. It is
+# checked here and never written here: a merge-time attribution would be a guess for a PR whose
+# commits never said, and rewriting them would change the history the review covered. The
+# trailer itself is the worker's, written by the commit-msg hook in scripts/card_trailer.sh.
+commits=$(git -C "$wt" rev-list origin/master..HEAD)
+if [ -z "$commits" ]; then
+  echo "FAIL $pr applies no commits onto origin/master"
+  echo "     it is already in master (a rebased proposal): close it with a kind-1632 status event"
+  exit 3
+fi
+missing=()
+unnamed=()
+cards=" "
+for sha in $commits; do
+  values=$(git -C "$wt" show -s --format='%(trailers:key=Card,valueonly)' "$sha" \
+    | sed '/^[[:space:]]*$/d')
+  if [ -z "$values" ]; then
+    missing+=("$(git -C "$wt" show -s --format='%h %s' "$sha")")
+    continue
+  fi
+  while IFS= read -r value; do
+    [ -n "$value" ] || continue
+    case "$value" in
+      operator|t_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) unnamed+=("'$value' (on $(git -C "$wt" show -s --format='%h' "$sha"))"); continue ;;
+    esac
+    case "$cards" in
+      *" $value "*) ;;
+      *) cards="$cards$value " ;;
+    esac
+  done <<< "$values"
+done
+
+if [ ${#unnamed[@]} -gt 0 ]; then
+  printf 'REFUSED: a Card trailer names something that is not a card.\n' >&2
+  for item in "${unnamed[@]}"; do printf '  %s\n' "$item" >&2; done
+  printf '  A trailer is `Card: t_xxxxxxxx` (a board card) or `Card: operator`.\n' >&2
+  printf '  Rule: docs/working-on-this-repo.md, "Every commit says which card wrote it".\n' >&2
+  exit 6
+fi
+
+if [ ${#missing[@]} -gt 0 ]; then
+  printf 'REFUSED: these commits carry no `Card:` trailer, so nothing says which wrote them:\n' >&2
+  for item in "${missing[@]}"; do printf '  %s\n' "$item" >&2; done
+  printf '\n  Install the hook once per clone, then push the branch again:\n\n' >&2
+  printf '      scripts/card_trailer.sh install\n' >&2
+  printf '      git push origin HEAD:refs/heads/pr/<slug>\n\n' >&2
+  printf '  Or write the trailer yourself -- git commit --amend --trailer "Card: operator"\n' >&2
+  printf '  fixes the tip; a whole branch takes a rebase with the same --trailer.\n' >&2
+  printf '  Rule: docs/working-on-this-repo.md, "Every commit says which card wrote it".\n' >&2
+  exit 6
+fi
+
+# And the board's half: the card has to be in `review` or `done`. The helper reads the bridge's
+# `ngit_links` row for the PR root (the PR's own card) and every card a trailer names, so an
+# operator's `Card: operator` does not release a worker's running card. Exit 7 is the refusal;
+# 3 means the box cannot answer (no config, no board), which is this script's own state error.
+set -- "$pr" --repo "$REPO"
+for value in $cards; do
+  [ "$value" = operator ] && continue
+  set -- "$@" --card "$value"
+done
+answer=$(PYTHONPATH="${PYTHONPATH:-$REPO/src}" "$PYTHON" -m hermes_nostr_gateway.ngit_merge \
+  "$@" 2>&1)
+code=$?
+case "$code" in
+  0) ;;
+  7) printf '%s\n' "$answer" >&2; exit 7 ;;
+  *) printf '%s\n' "${answer:-FAIL the card check did not run (exit $code)}"; exit 3 ;;
+esac
 
 (cd "$wt" && "$VENV/bin/ruff" check src tests scripts benchmarks >/dev/null 2>&1) \
   || { echo "FAIL ruff"; exit 2; }

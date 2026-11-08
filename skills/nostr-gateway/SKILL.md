@@ -112,7 +112,13 @@ Every refusal is a word, and the word decides what to do.
   card — `--no-verify` is the deliberate act the guard exists to make visible.
 - **Merge a PR with `scripts/merge_pr.sh <pr-id>`**, not with `git merge`: an ngit fetch prunes
   `pr/*` refs to `master`, so the branch is not there to merge. The script applies the PR to a
-  fresh worktree, runs the gates on the merged tree and pushes, in one command.
+  fresh worktree, runs the gates on the merged tree and pushes, in one command. It refuses a PR
+  whose commits carry no `Card:` trailer (exit 6) and one whose card is not in `review`/`done`
+  (exit 7); `hng ngit merge-check <pr> --repo <checkout>` is the same card answer on its own.
+- **Every commit says which card wrote it.** A `commit-msg` hook installed by
+  `scripts/card_trailer.sh install` writes `Card: t_xxxxxxxx` from a card workspace and
+  `Card: operator` from the operator's checkout. Write the id yourself when the work belongs to
+  another card — the hook leaves an existing trailer alone — and never `--no-verify` it away.
 - **Gate the merged tree.** PRs touching `README.md`, `gateway.py` or `cli.py` merge clean alone
   and can still disagree together.
 - **One command per sub-procedure, output clipped at the source.** A status check costs the same

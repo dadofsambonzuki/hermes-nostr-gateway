@@ -1242,11 +1242,25 @@ def _read_relays(cfg: dict[str, Any]) -> list[str]:
 
 
 def cmd_ngit(args) -> int:
-    """The ngit bridge: one sync pass, or one answer to a held issue."""
+    """The ngit bridge: one sync pass, one answer to a held issue, or a merge's card check."""
     cfg = load_config(args.config)
     if args.ngit_cmd == "answer":
         return cmd_ngit_answer(cfg, args)
+    if args.ngit_cmd == "merge-check":
+        return cmd_ngit_merge(cfg, args)
     return cmd_ngit_sync(cfg, args)
+
+
+def cmd_ngit_merge(cfg: dict[str, Any], args) -> int:
+    """Would a merge of this PR land a card that is still running? See `ngit_merge`.
+
+    The same answer `scripts/merge_pr.sh` acts on, exposed so an operator can ask without
+    applying anything: 0 allowed, 7 refused (the card is named), 3 the box cannot answer.
+    """
+    from . import ngit_merge
+
+    return ngit_merge.run(cfg, args.pr, cards=args.card, repo=args.repo or "",
+                          board=args.board or "", as_json=args.json)
 
 
 def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
@@ -1857,6 +1871,17 @@ def main(argv: list[str] | None = None) -> int:
     p_ngit_answer.add_argument("--reason", default="", help="why, for a no")
     p_ngit_answer.add_argument("--json", action="store_true")
     p_ngit_answer.set_defaults(func=cmd_ngit)
+
+    p_ngit_merge = ngit_sub.add_parser(
+        "merge-check", help="what a merge requires: the PR's card is in review or done")
+    p_ngit_merge.add_argument("pr", help="the PR's event id, nevent, or short id")
+    p_ngit_merge.add_argument("--card", action="append", default=[],
+                              help="a card named by a commit trailer (repeatable)")
+    p_ngit_merge.add_argument("--repo", default=None,
+                              help="checkout whose board owns the cards (for the mapping)")
+    p_ngit_merge.add_argument("--board", default=None, help="board slug override")
+    p_ngit_merge.add_argument("--json", action="store_true")
+    p_ngit_merge.set_defaults(func=cmd_ngit)
 
     p_deps = sub.add_parser(
         "deps", help="dependency proposals: scan, gate and push a pr/deps-* branch")

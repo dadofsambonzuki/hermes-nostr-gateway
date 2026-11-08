@@ -46,7 +46,7 @@ person, which is the only meaning the word is allowed here — with one exceptio
 without a merge blocks its card (kind `dependency`, the closing event named in the comment),
 because dropping or re-filing the work is a person's decision too.
 
-## The four rules
+## The six rules
 
 ### One card per PR root
 
@@ -109,12 +109,62 @@ refusal is the sentence a person reads. `tests/test_ngit.py` drives both complet
 (`test_the_cli_refuses_an_open_pr_card`,
 `test_an_open_pr_card_refuses_completion_at_the_board`).
 
-**In this tree:** no — `ngit_guard.py` and its tests land with PR `14bd6ea3`, so until it merges
-`done` on an open PR card is convention.
+**In this tree:** yes — `ngit_guard.py` and its trigger are on `master` (PR `14bd6ea3`).
 
 **Check:** `sqlite3 <board>/kanban.db "select name from sqlite_master where type='trigger'"`
 lists `ngit_pr_done_*` for the open PRs' cards, and
 `test -f src/hermes_nostr_gateway/ngit_guard.py` answers true.
+
+### A merge requires the card finished
+
+The other direction of the same rule. `done` requires applied, and an applied PR requires a card
+that is not still being worked on: the merge route reads the PR's card and refuses when its
+status is anything but `review` or `done`. `review` is a reviewer's turn and `done` is finished,
+so both mean nobody is still working on it; `running`, `ready` and `blocked` do not, and a
+`triage`, `todo`, `scheduled` or `archived` card is no better. The refusal names the card and the
+status the board actually holds, because a merge that says only "refused" is the generic error
+this rule exists to replace.
+
+Which card is read is the bridge's answer, not the merge's: the `ngit_links` row for the PR root
+names the PR's card, and every `Card:` trailer in the commits names the card the work was done
+under, so both are checked. When the bridge has not linked the PR yet, the board comes from the
+checkout's `concord.projects` entry. `Card: operator` says the work is nobody's card; it does not
+release a card the bridge linked, so operator work cannot land a worker's PR early.
+
+**Enforced in** `src/hermes_nostr_gateway/ngit_merge.py` (the read) and `scripts/merge_pr.sh`
+exit 7 (the route). `tests/test_merge_route.py` runs the real script against a fake `ngit` for a
+running card, a blocked card, a card the PR's commits name but the link does not, and the
+`Card: operator` case.
+
+**In this tree:** yes — `ngit_merge.py`, the exit-7 check and its tests are this change.
+
+**Check:** `hng ngit merge-check <pr> --repo <checkout>` exits 7 and prints the card, or 0 and
+prints the statuses it read.
+
+### Every commit carries its card
+
+A card's commits say which card they belong to, so `git log` answers "which card wrote this
+line" without the board — and because an ngit PR's description is built from its commits'
+messages, the PR says it too. The trailer is `Card: t_xxxxxxxx`, written by a `commit-msg` hook
+installed once per clone (`scripts/card_trailer.sh install`); the operator's checkout writes
+`Card: operator`, which is the explicit statement that the work is nobody's card rather than a
+silent absence. A message that already carries a trailer is left alone, so an operator working
+for a card writes the id themselves.
+
+The merge route refuses a PR any of whose commits carries no trailer (exit 6) and names them. It
+never writes one: the attribution is the worker's fact, and a merge-time guess would attribute
+lines to a card nobody named, while rewriting the commits would change the history the review
+covered.
+
+**Enforced in** `scripts/card_trailer.sh` (the hook) and `scripts/merge_pr.sh` exit 6 (the
+route). `tests/test_merge_route.py` commits in a card worktree for real and checks the trailer,
+then refuses a PR that carries none.
+
+**In this tree:** yes — the hook and the exit-6 check are this change.
+
+**Check:** `scripts/card_trailer.sh status` says whether the hook is installed and what this
+shell would write; `git log --format='%(trailers:key=Card,valueonly)'` on a merged branch names
+the card.
 
 ### Three labels, one writer
 
@@ -131,12 +181,10 @@ kind-1985 label, called from the pass in `ngit.py`; on by default, and `ngit.lab
 turns it off. `tests/test_ngit_labels.py` pins "a verdict replaces the previous one, never adds
 to it" and "every live label outside the desired set is unmanaged".
 
-**In this tree:** no — the three-word vocabulary lands with PR `870a47fc`; the `ngit_labels.py`
-here still carries `in-review`.
+**In this tree:** yes — the three-word vocabulary is on `master` (PR `870a47fc`).
 
-**Check:** with `870a47fc` applied, `git grep -n '"in-review"' -- src/` finds nothing — the
-prose still mentions the old word, the code does not — and `ngit pr list` shows one label per PR
-once the pass has run.
+**Check:** `git grep -n '"in-review"' -- src/` finds nothing — the prose still mentions the old
+word, the code does not — and `ngit pr list` shows one label per PR once the pass has run.
 
 ### A worker cannot merge
 
@@ -154,12 +202,11 @@ holds — and that is host configuration, not this repository.
 into the hooks directory every worktree shares) and `scripts/merge_pr.sh` (exit 4 in a card
 workspace).
 
-**In this tree:** no — the hook is absent, and `merge_pr.sh` here has no card-workspace refusal;
-both halves land with PR `b81a2d50`.
+**In this tree:** yes — the hook and `merge_pr.sh`'s exit-4 refusal are on `master` (PR
+`b81a2d50`).
 
 **Check:** `scripts/worker_push_guard.sh status` reports whether the hook is installed and
-whether this shell is a card workspace; until `b81a2d50` merges the script is absent and the
-check cannot run.
+whether this shell is a card workspace.
 
 ## Transitions
 
@@ -186,19 +233,28 @@ binds only cards that review a PR.
 
 ## Which of this is enforced, and which is convention
 
-The **In this tree** lines above are written against `master` at `e1d843d`, where only the first
-rule is enforced end to end. The `done` guard and the three-word labeler are code in review —
-PRs `14bd6ea3` and `870a47fc` — and the merge route exists without a card-workspace refusal
-while the pre-push hook is absent: both halves land with PR `b81a2d50`. The model does not
-change when they land — the rule, the writer and the transition are as written above, and only
-the check starts answering. That is why the checks are the authority and this paragraph is not:
-run them against the tree you are about to trust.
+All six rules are now code on `master` or in this change: one card per PR root, `done` requires
+applied, a merge requires the card finished, every commit carries its card, three labels written
+by one pass, and a worker cannot merge. The **In this tree** lines above name each one's check,
+and they are the part of this document that is allowed to be wrong when the code moves: run them
+against the tree you are about to trust.
+
+What the rules still cannot do:
+
+- **A hook is not a boundary.** `--no-verify`, deleting `.git/hooks/*`, or committing from a
+  hand-made worktree with the markers cleared all skip the hooks that write the trailer and
+  refuse a push to `master`. Each of those turns an accident into a deliberate act; the durable
+  answer is identity (a merge signed by a key no worker profile holds), which is host
+  configuration.
+- **The merge route is a script in this checkout.** It refuses in a card workspace and checks
+  the card, but a shell that edits the script can do what it likes. Its job is to make the
+  documented route the safe one, not to be the only route.
 
 Still convention, with nothing enforcing it:
 
-- **A worker ends at `review`.** For a linked PR card the guard refuses `done` once `14bd6ea3`
-  lands; for a work card nothing does — nothing stops a worker completing its own card while the
-  PR it published is open.
+- **A worker ends at `review`.** For a linked PR card the guard refuses `done`; for a work card
+  nothing does — nothing stops a worker completing its own card while the PR it published is
+  open.
 - **A work card is not the PR's card.** The bridge's review card is the one the board holds to
   the merge; nothing adopts the card the implementation ran on. Its `done` says the work is
   finished, not that the change landed.
@@ -211,7 +267,10 @@ Still convention, with nothing enforcing it:
 
 - The card is in `review`, and the verdict is a comment naming the PR and the tip it covers.
 - The PR carries exactly one label, and it is the verdict's, when `ngit.labels` is on.
-- The card is not `done` while the PR is open — with `14bd6ea3` applied, the guard's refusal is
-  the proof.
+- The card is not `done` while the PR is open — the guard's refusal is the proof.
+- The PR cannot be merged while its card is `running`: `hng ngit merge-check <pr>
+  --repo <checkout>` exits 7 and names it.
+- Every commit the PR adds carries a `Card:` trailer, so the merge route will not refuse it
+  for saying nothing.
 - A revision after the verdict reopens the same card; it does not create a second one.
 - Nothing was pushed to `master` from a card workspace; the merge was the operator's.

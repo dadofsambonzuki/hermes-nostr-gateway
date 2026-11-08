@@ -10,6 +10,12 @@ scripts/merge_pr.sh <pr-id|nevent>            # apply onto master, gate, push
 scripts/merge_pr.sh <pr-id|nevent> --check    # apply and gate only
 ```
 
+Exit codes: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage or state error, 4 a card
+workspace (not the operator's), 5 the live checkout moved, 6 a commit does not say which card
+wrote it, 7 the card is not in `review` or `done`. The last two are the authorship route:
+[every commit says which card wrote it](#every-commit-says-which-card-wrote-it) and
+[a merge needs the card finished](#a-merge-needs-the-card-in-review-or-done).
+
 **PRs are not branches here.** The remote is an ngit remote: a fetch prunes `pr/*` refs back to
 `master`, so `git merge origin/pr/<something>` answers *"not something we can merge"* however
 cleanly the PR would apply. The patches ride on the PR event itself, so `ngit pr apply` is the
@@ -19,6 +25,65 @@ of someone else's event).
 
 The script exists because the hand-rolled loop — status lookup, worktree, merge, ruff, pytest,
 push — is a dozen tool round-trips, and each one re-sends the caller's entire context.
+
+## Every commit says which card wrote it
+
+A worker's commit carries a trailer naming the card it was done under; the operator's says
+`Card: operator`, which is how operator work says so instead of saying nothing:
+
+```text
+Add the frame replay guard
+
+Card: t_0123abcd
+```
+
+`git log` then answers "which card wrote this line" without the board, and because an ngit PR's
+description is built from its commits' messages, the PR names it too.
+
+The trailer is written by a `commit-msg` hook, installed once per clone exactly like the push
+guard:
+
+```sh
+scripts/card_trailer.sh install     # once per clone
+scripts/card_trailer.sh status      # installed? and what would this shell write?
+```
+
+Hooks live in the clone's shared git directory, so one install covers every worktree — and
+therefore every card the dispatcher creates afterwards. The hook takes the id from the
+dispatcher's marker (`HERMES_KANBAN_TASK`, or the `t_xxxxxxxx` at the front of a
+`.worktrees/` path) and writes `Card: operator` from a shell that is nobody's card. A message
+that already has a `Card:` trailer is left exactly as it is, so an operator working for a card
+writes the id themselves and the hook never overwrites it.
+
+`scripts/merge_pr.sh` refuses a PR (exit 6) when any commit it adds carries no trailer, and
+names the commits: a PR with no card is either operator work, which should say so, or a worker
+going around the board. It is checked there and never written there — an attribution the commits
+did not make is a guess, and rewriting them would change the history the review covered. As with
+the push guard, `--no-verify` or deleting the hook makes an untrailered commit a deliberate act
+rather than an accident, and the merge route then refuses it.
+
+## A merge needs the card in review or done
+
+The board is the intent record, so the merge route reads it before it gates anything. The PR's
+own card comes from the bridge's `ngit_links` row for the PR root; every card a `Card:` trailer
+names is read as well. A card in `running`, `ready`, `blocked`, `todo`, `scheduled`, `triage` or
+`archived` refuses the merge (exit 7) and names the card and the status it has. `review` and
+`done` are both allowed: both mean nobody is still working on it.
+
+`Card: operator` names operator work, and is not a bypass — a PR the bridge has linked still has
+to satisfy its linked card, so operator work cannot land a worker's PR early. When the bridge
+has not linked the PR yet, the board comes from the checkout's `concord.projects` entry, so a
+block of operator work under a card is still checked rather than skipped.
+
+The same answer without applying anything:
+
+```sh
+hng ngit merge-check <pr-id|nevent> [--card t_xxxxxxxx]... [--repo <checkout>]
+```
+
+It exits 0 allowed, 7 refused, 3 when the box cannot answer (no `store:`, no board for the
+checkout). `scripts/merge_pr.sh` calls the same module (`python -m
+hermes_nostr_gateway.ngit_merge`).
 
 ## The live checkout stays on master
 
