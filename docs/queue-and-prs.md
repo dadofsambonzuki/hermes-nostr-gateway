@@ -67,8 +67,11 @@ published as a second proposal, and a revision all land on that card.
 `src/hermes_nostr_gateway/kanban.py`. `tests/test_ngit.py` pins one card across two passes, a
 republished proposal and a revision of a `done` card.
 
-**Check:** `hng ngit sync --channel <id> --dry-run --json` counts a revision under
-`prs.revisions` and a reopen under `prs.reopened`; and
+**In this tree:** yes — all three are on `master`.
+
+**Check:** `hng ngit sync --channel <id> --dry-run --json` counts a new tip under
+`prs.revisions` and the reopen it would cause under `prs.would_reopen`; `prs.reopened` moves
+only on a real pass. And
 `sqlite3 <board>/kanban.db "select idempotency_key from tasks where idempotency_key like 'ngit:pr:%'"`
 has one row per PR root.
 
@@ -90,8 +93,12 @@ refusal is the sentence a person reads. `tests/test_ngit.py` drives both complet
 (`test_the_cli_refuses_an_open_pr_card`,
 `test_an_open_pr_card_refuses_completion_at_the_board`).
 
+**In this tree:** no — `ngit_guard.py` and its tests land with PR `14bd6ea3`, so until it merges
+`done` on an open PR card is convention.
+
 **Check:** `sqlite3 <board>/kanban.db "select name from sqlite_master where type='trigger'"`
-lists `ngit_pr_done_*` for the open PRs' cards.
+lists `ngit_pr_done_*` for the open PRs' cards, and
+`test -f src/hermes_nostr_gateway/ngit_guard.py` answers true.
 
 ### Three labels, one writer
 
@@ -104,12 +111,16 @@ including one an earlier writer left. That correction is what makes it the only 
 cleanup follows by hand.
 
 **Enforced in** `src/hermes_nostr_gateway/ngit_labels.py`, the only module that signs a
-kind-1985 label, called from the pass in `ngit.py`; on only when `ngit.labels` is set.
-`tests/test_ngit_labels.py` pins "a verdict replaces the previous one, never adds to it" and
-"every live label outside the desired set is unmanaged".
+kind-1985 label, called from the pass in `ngit.py`; on by default, and `ngit.labels: false`
+turns it off. `tests/test_ngit_labels.py` pins "a verdict replaces the previous one, never adds
+to it" and "every live label outside the desired set is unmanaged".
 
-**Check:** `git grep -n in-review -- src/` finds nothing when the three-word vocabulary is in
-force, and `ngit pr list` shows one label per PR.
+**In this tree:** no — the three-word vocabulary lands with PR `870a47fc`; the `ngit_labels.py`
+here still carries `in-review`.
+
+**Check:** with `870a47fc` applied, `git grep -n '"in-review"' -- src/` finds nothing — the
+prose still mentions the old word, the code does not — and `ngit pr list` shows one label per PR
+once the pass has run.
 
 ### A worker cannot merge
 
@@ -123,11 +134,16 @@ the hook or pass `--no-verify`. What the hook buys is that an accidental merge b
 deliberate one. The durable half is identity — a merge signed with a key no worker profile
 holds — and that is host configuration, not this repository.
 
-**Enforced in** `scripts/worker_push_guard.sh` (the hook; installed once per clone into the
-hooks directory every worktree shares) and `scripts/merge_pr.sh` (exit 4 in a card workspace).
+**Enforced in** `scripts/worker_push_guard.sh` (the `pre-push` hook; installed once per clone
+into the hooks directory every worktree shares) and `scripts/merge_pr.sh` (exit 4 in a card
+workspace).
+
+**In this tree:** no — the hook is absent, and `merge_pr.sh` here has no card-workspace refusal;
+both halves land with PR `b81a2d50`.
 
 **Check:** `scripts/worker_push_guard.sh status` reports whether the hook is installed and
-whether this shell is a card workspace.
+whether this shell is a card workspace; until `b81a2d50` merges the script is absent and the
+check cannot run.
 
 ## Transitions
 
@@ -154,17 +170,19 @@ binds only cards that review a PR.
 
 ## Which of this is enforced, and which is convention
 
-Written against a tree in which only the first rule is enforced end to end: the merge route
-exists but does not yet refuse a card workspace, and the guard and the three-word labeler are
-code in review. The model does not change when they land — the rule, the writer and the
-transition are as written above, and only the check starts answering. That is why the checks
-are the authority and this paragraph is not: run them against the tree you are about to trust.
+The **In this tree** lines above are written against `master` at `e1d843d`, where only the first
+rule is enforced end to end. The `done` guard and the three-word labeler are code in review —
+PRs `14bd6ea3` and `870a47fc` — and the merge route exists without a card-workspace refusal
+while the pre-push hook is absent: both halves land with PR `b81a2d50`. The model does not
+change when they land — the rule, the writer and the transition are as written above, and only
+the check starts answering. That is why the checks are the authority and this paragraph is not:
+run them against the tree you are about to trust.
 
 Still convention, with nothing enforcing it:
 
-- **A worker ends at `review`.** For a linked PR card the guard refuses `done`; for a work card
-  nothing does — nothing stops a worker completing its own card while the PR it published is
-  open.
+- **A worker ends at `review`.** For a linked PR card the guard refuses `done` once `14bd6ea3`
+  lands; for a work card nothing does — nothing stops a worker completing its own card while the
+  PR it published is open.
 - **A work card is not the PR's card.** The bridge's review card is the one the board holds to
   the merge; nothing adopts the card the implementation ran on. Its `done` says the work is
   finished, not that the change landed.
@@ -177,6 +195,7 @@ Still convention, with nothing enforcing it:
 
 - The card is in `review`, and the verdict is a comment naming the PR and the tip it covers.
 - The PR carries exactly one label, and it is the verdict's, when `ngit.labels` is on.
-- The card is not `done` while the PR is open — the guard's refusal is the proof.
+- The card is not `done` while the PR is open — with `14bd6ea3` applied, the guard's refusal is
+  the proof.
 - A revision after the verdict reopens the same card; it does not create a second one.
 - Nothing was pushed to `master` from a card workspace; the merge was the operator's.
