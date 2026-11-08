@@ -140,6 +140,7 @@ def test_the_dependency_run_may_write_only_where_it_must():
     assert "/opt/deps-bot" in writable, "the workspace and its clones"
     assert "/var/lib/nostr-deps" in writable, "state and caches"
     assert "/var/log/nostr-deps.log" in writable
+    assert "/.hermes/kanban" in writable, "the board a proposal's review task is filed on"
     path = environment(unit, "PATH")
     assert "/.local/bin" in path, "ngit comes from the operator's local bin"
     assert "/usr/local/bin" in path, "osv-scanner lives there"

@@ -23,8 +23,11 @@ TimeoutStartSec=3600
 Nice=10
 IOSchedulingClass=idle
 
-# The run writes only inside its own workspace, its state and the log.
+# The run writes only inside its own workspace, its state and the log -- plus the kanban
+# directory, where a published proposal's review task is filed (`deps.board`). The board is
+# Hermes' own state, so it is named narrowly: never the whole of `~/.hermes`, which holds
+# the config and the identity keys. If HERMES_HOME is ever moved, this path moves with it.
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/opt/deps-bot /var/lib/nostr-deps /var/log/nostr-deps.log /tmp
+ReadWritePaths=/opt/deps-bot /var/lib/nostr-deps /var/log/nostr-deps.log /home/ubuntu/.hermes/kanban /tmp
 PrivateTmp=false

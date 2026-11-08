@@ -8,8 +8,11 @@ write. Placeholders only: no real npub, host or repository belongs in this file.
 
 from __future__ import annotations
 
+import datetime as dt
 import io
+import json
 import re
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -114,6 +117,10 @@ def test_the_example_config_documents_the_block_with_placeholders_only():
     assert cfg.signer.startswith("<"), cfg.signer
     assert cfg.coordinator.startswith("<"), cfg.coordinator
     assert cfg.open_prs is True
+    # No board is named in a tracked file, and none is invented: a card is a deployment's
+    # choice, and the example is not one.
+    assert cfg.board == "" and not cfg.files_tasks
+    assert cfg.review_assignee == "default"
 
 
 # -- report helpers -----------------------------------------------------------
@@ -189,6 +196,10 @@ def checkout(tmp_path):
     origin = tmp_path / "origin.git"
     seed = tmp_path / "seed"
     subprocess.run(["git", "init", "--quiet", "--bare", str(origin)], check=True)
+    # `git push -o title=…` is how a proposal carries its title; a bare repository has to be
+    # told to accept push options (the real `nostr://` remote does).
+    subprocess.run(["git", "-C", str(origin), "config", "receive.advertisePushOptions", "true"],
+                   check=True)
     subprocess.run(["git", "init", "--quiet", "-b", "main", str(seed)], check=True)
     (seed / "package.json").write_text('{"name":"example","version":"1.0.0"}\n')
     (seed / "package-lock.json").write_text('{"lockfileVersion":3,"packages":{}}\n')
@@ -329,6 +340,291 @@ def test_a_passing_run_leaves_no_build_log_behind(checkout, tmp_path):
     assert run_deps(cfg, dry_run=True, out=out, env=env_for(checkout)) == 0
     assert "gates passed" in out.getvalue()
     assert not (cfg.state_dir / "build-example-repo.log").exists()
+
+
+# -- the board: one card per proposal, completed by the merge ------------------
+
+BOARD = "gateway"
+#: A PR event id, and the short spelling every title and `Merge #…` commit uses.
+PR_HEX = "de" * 32
+PR_SHORT = PR_HEX[:8]
+
+#: The kernel's own columns, as `tests/test_ngit.py` writes them: a card only proves the
+#: board can hold it if the row is written against the real schema.
+BOARD_SCHEMA = """
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+    status TEXT NOT NULL, priority INTEGER DEFAULT 0, created_by TEXT,
+    created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
+    workspace_kind TEXT NOT NULL DEFAULT 'scratch', workspace_path TEXT,
+    branch_name TEXT, project_id TEXT, claim_lock TEXT, claim_expires INTEGER,
+    tenant TEXT, result TEXT, idempotency_key TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0, worker_pid INTEGER,
+    last_failure_error TEXT, current_run_id INTEGER,
+    block_kind TEXT, block_recurrences INTEGER NOT NULL DEFAULT 0,
+    model_override TEXT, provider_override TEXT
+);
+CREATE TABLE task_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+    author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER,
+    kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
+);
+"""
+
+#: `ngit`, as `hng deps` calls it: the queue's list (progress line first, like the real
+#: command) and a scan trigger that does nothing. The proposal is listed only once its
+#: branch is in the clone -- which is what a push does -- so a run's first look is honest.
+NGIT_STUB = """#!/bin/sh
+case "$1 $2" in
+  "pr list")
+    echo "no updates"
+    if git for-each-ref --format='%(refname:short)' refs/heads | grep -q '^pr/deps-'; then
+      cat "@PRS@" 2>/dev/null || printf '[]'
+    else
+      printf '[]'
+    fi
+    ;;
+esac
+exit 0
+"""
+
+
+def today() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def install_ngit(checkout, prs: Path) -> None:
+    tools, _workspace, _seed = checkout
+    script = tools / "ngit"
+    script.write_text(NGIT_STUB.replace("@PRS@", str(prs)))
+    script.chmod(0o755)
+
+
+def prs_document(branch: str, *, subject: str = "Dependency bumps") -> str:
+    """`ngit pr list --json` for the one proposal the bot publishes: branch `(short)`."""
+    return json.dumps([{"author": SIGNER, "branch": f"{branch}({PR_SHORT})", "id": PR_HEX,
+                        "labels": [], "status": "open", "subject": subject,
+                        "target_branch": None}])
+
+
+@pytest.fixture()
+def board(tmp_path, monkeypatch):
+    """A miniature Hermes home holding one board, with `HERMES_HOME` pointing at it."""
+    home = tmp_path / "hermes-home"
+    where = home / "kanban" / "boards" / BOARD
+    where.mkdir(parents=True)
+    db = sqlite3.connect(where / "kanban.db")
+    try:
+        db.executescript(BOARD_SCHEMA)
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return where / "kanban.db"
+
+
+def rows(db: Path, sql: str) -> list[tuple]:
+    handle = sqlite3.connect(db)
+    try:
+        return handle.execute(sql).fetchall()
+    finally:
+        handle.close()
+
+
+def card_count(db: Path) -> int:
+    return int(rows(db, "select count(*) from tasks")[0][0])
+
+
+def publishing(checkout, tmp_path, **overrides):
+    """A run that publishes one proposal, with `ngit` naming it from a fixture file."""
+    prs = tmp_path / "prs.json"
+    branch = f"pr/deps-{today()}"
+    prs.write_text(prs_document(branch))
+    install_ngit(checkout, prs)
+    return config(checkout, tmp_path, **overrides), prs, branch
+
+
+def merge_on_origin(checkout, short: str, subject: str) -> str:
+    """The commit ngit's apply route leaves on the target: `Merge #<short>: <subject>`.
+
+    Measured against a live kind-1631: its `merge-commit-id` was exactly this commit, which
+    is why a run can see a merge in the clone rather than in the relay's status (that lags).
+    """
+    _tools, _workspace, seed = checkout
+    (seed / "merged.txt").write_text("merged\n")
+    env = {"GIT_AUTHOR_NAME": "maintainer", "GIT_AUTHOR_EMAIL": "maintainer@example",
+           "GIT_COMMITTER_NAME": "maintainer", "GIT_COMMITTER_EMAIL": "maintainer@example"}
+    subprocess.run(["git", "add", "."], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", f"Merge #{short}: {subject}"],
+                   cwd=seed, check=True, env=env)
+    subprocess.run(["git", "push", "--quiet", "origin", "main"], cwd=seed, check=True)
+    done = subprocess.run(["git", "rev-parse", "HEAD"], cwd=seed, check=True,
+                          capture_output=True, text=True)
+    return done.stdout.strip()
+
+
+def test_the_board_keys_are_read_and_unset_means_no_card():
+    cfg = load_deps_config(block())
+    assert cfg.board == "" and not cfg.files_tasks
+    assert cfg.review_assignee == "default"
+    cfg = load_deps_config(block(board="gateway", review_assignee="review"))
+    assert cfg.board == "gateway" and cfg.files_tasks
+    assert cfg.review_assignee == "review"
+
+
+@pytest.mark.parametrize("value", ["Gateway", "../ops", "with space", "-lead"])
+def test_a_board_that_is_not_a_slug_is_refused_by_name(value):
+    with pytest.raises(DepsConfigError) as exc:
+        load_deps_config(block(board=value))
+    assert "deps.board must be a board slug" in str(exc.value)
+
+
+def test_a_proposal_files_one_review_task_on_the_board(checkout, board, tmp_path):
+    cfg, _prs, branch = publishing(checkout, tmp_path, board=BOARD, review_assignee="review")
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0
+    assert f"pushed {branch}" in out.getvalue()
+
+    cards = rows(board, "select id, title, body, assignee, status, idempotency_key from tasks")
+    assert len(cards) == 1
+    task_id, title, body, assignee, status, key = cards[0]
+    assert title == f"Review PR {PR_SHORT}: dependency bumps"
+    assert (assignee, status) == ("review", "ready")
+    assert key == f"deps:pr:{PR_HEX}"
+    # The body carries the facts a reviewer cannot get from the column: which PR, in which
+    # repository, against which branch, and what the scan measured.
+    for fact in (PR_HEX, f"nostr://{OWNER}/example-repo", "Target:     main", "1 -> 0"):
+        assert fact in body, fact
+    assert "GHSA-test-0001" in body
+
+    # The card is the PR's, so it cannot be completed while the PR is open.
+    assert rows(board, "select state, pr_id from ngit_pr_guards") == [("open", PR_HEX)]
+    handle = sqlite3.connect(board)
+    try:
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            handle.execute("update tasks set status = 'done' where id = ?", (task_id,))
+    finally:
+        handle.close()
+    assert "is open" in str(refused.value)
+
+    record = json.loads((cfg.state_dir / "proposal-example-repo.json").read_text())
+    assert record["branch"] == branch and record["pr_id"] == PR_HEX
+    assert (record["findings_before"], record["findings_after"]) == ("1", "0")
+    assert record["task_id"] == task_id
+
+
+def test_a_second_run_of_the_scan_files_no_second_task(checkout, board, tmp_path):
+    cfg, _prs, _branch = publishing(checkout, tmp_path, board=BOARD)
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    # The stub scanner's marker: without it the second run derives the same proposal again,
+    # which is the case this pins -- a pending proposal is not published, or filed, twice.
+    (cfg.workspace / "example-repo" / ".fixed").unlink()
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0
+    assert "same proposal as the last run - not repeating it" in out.getvalue()
+    assert card_count(board) == 1
+    assert rows(board, "select count(*) from task_comments") == [(0,)]
+
+
+def test_the_merge_completes_the_task_and_names_the_commit(checkout, board, tmp_path):
+    cfg, _prs, _branch = publishing(checkout, tmp_path, board=BOARD)
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    merge = merge_on_origin(checkout, PR_SHORT, "Dependency bumps")
+    (cfg.workspace / "example-repo" / ".fixed").unlink()
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0
+    assert f"merged as {merge}" in out.getvalue()
+
+    assert rows(board, "select status from tasks") == [("done",)]
+    assert merge in str(rows(board, "select result from tasks")[0][0])
+    comments = rows(board, "select author, body from task_comments order by id")
+    assert comments and merge in comments[-1][1]
+    assert "closed by the merge" in comments[-1][1]
+    # Released, not left refusing: the merge is the proof the card waited for. The row stays
+    # (it is the bridge's record of what the card was guarding) but the trigger is gone.
+    assert rows(board, "select state from ngit_pr_guards") == [("applied",)]
+    assert rows(board, "select count(*) from sqlite_master where type = 'trigger'") == [(0,)]
+    record = json.loads((cfg.state_dir / "proposal-example-repo.json").read_text())
+    assert record["merged"] == merge
+
+    # Seen again, it is old news: no second comment, no reopened card.
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    assert rows(board, "select status from tasks") == [("done",)]
+    assert len(rows(board, "select id from task_comments")) == len(comments)
+
+
+def test_a_withdrawn_proposal_parks_its_card_for_a_person_once(checkout, board, tmp_path):
+    cfg, prs, _branch = publishing(checkout, tmp_path, board=BOARD)
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    prs.write_text("[]")  # the queue no longer lists it, and origin has no merge commit
+    (cfg.workspace / "example-repo" / ".fixed").unlink()
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0
+    assert "withdrawn without a merge" in out.getvalue()
+    assert rows(board, "select status, block_kind from tasks") == [("blocked", "dependency")]
+    body = rows(board, "select body from task_comments order by id desc limit 1")[0][0]
+    assert "no longer open" in body and "no `Merge #" in body
+
+    # One question, not one per run: a blocked card is already waiting for the person.
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    assert len(rows(board, "select id from task_comments")) == 1
+
+
+def test_a_run_without_a_board_pushes_the_proposal_and_files_nothing(checkout, tmp_path,
+                                                                     monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "no-home"))
+    cfg, _prs, branch = publishing(checkout, tmp_path)
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0, out.getvalue()
+    assert f"pushed {branch}" in out.getvalue()
+    assert "review task" not in out.getvalue()
+    assert not (tmp_path / "no-home").exists(), "no board, so nothing should have been opened"
+
+
+def test_the_open_proposal_is_adopted_when_a_run_finds_no_record(checkout, board, tmp_path):
+    """A run after a lost state directory still files the card -- with the counts it measures."""
+    cfg, _prs, branch = publishing(checkout, tmp_path, board=BOARD)
+    assert run_deps(cfg, out=io.StringIO(), env=env_for(checkout)) == 0
+    (cfg.state_dir / "proposal-example-repo.json").unlink()
+    (cfg.workspace / "example-repo" / ".fixed").unlink()
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0, out.getvalue()
+    assert f"adopting the open proposal {branch}" in out.getvalue()
+    assert card_count(board) == 1
+    assert "1 -> 0 at or above CVSS 7" in rows(board, "select body from tasks")[0][0]
+    # The guard is armed on the tip the proposal published, so the refusal names it.
+    tip = subprocess.run(["git", "rev-parse", branch], cwd=cfg.workspace / "example-repo",
+                         check=True, capture_output=True, text=True).stdout.strip()
+    assert rows(board, "select tip from ngit_pr_guards") == [(tip,)]
+    record = json.loads((cfg.state_dir / "proposal-example-repo.json").read_text())
+    assert record["branch"] == branch and record["pr_id"] == PR_HEX
+    assert (record["findings_before"], record["findings_after"]) == ("1", "0")
+
+
+def test_an_open_proposal_that_is_not_the_bots_is_left_alone(checkout, board, tmp_path):
+    """`pr/deps-*` is the bot's namespace, but a branch someone else pushed is not ours."""
+    prs = tmp_path / "prs.json"
+    branch = f"pr/deps-{today()}"
+    prs.write_text(json.dumps([{"author": "npub1someoneelse", "branch": f"{branch}({PR_SHORT})",
+                                "id": PR_HEX, "labels": [], "status": "open",
+                                "subject": "Dependency bumps", "target_branch": None}]))
+    install_ngit(checkout, prs)
+    # Publishing off: this is about the reconcile step alone, which runs before the scan.
+    cfg = config(checkout, tmp_path, board=BOARD, open_prs=False)
+    repo = cfg.workspace / "example-repo"
+    subprocess.run(["git", "branch", branch], cwd=repo, check=True)
+
+    out = io.StringIO()
+    assert run_deps(cfg, out=out, env=env_for(checkout)) == 0, out.getvalue()
+    assert "is not this bot's proposal" in out.getvalue()
+    assert card_count(board) == 0
 
 
 # -- the CLI ------------------------------------------------------------------

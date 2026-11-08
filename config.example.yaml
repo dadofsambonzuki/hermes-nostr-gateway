@@ -366,3 +366,7 @@ deps:
   coordinator: <coordinator npub>   # whose name a manual CI run is requested from
   workflow: .ngit/act/workflows/dependencies.yml
   open_prs: true             # false = scan, bump and gate, publish nothing
+  # The board a published proposal's review task is filed on, and the profile that runs it.
+  # Empty is "no card": the proposal is still pushed, but nothing appears in the queue.
+  board: ""
+  review_assignee: default   # a review role of its own is the usual choice, as with `ngit`
