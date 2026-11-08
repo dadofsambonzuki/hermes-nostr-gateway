@@ -575,9 +575,12 @@ card would say something a reader of the PR cannot check. The review brief says 
 
 **The pass corrects, it does not append.** It reads the label events the PR carries off the
 same relays it publishes to, publishes the one that belongs there and retracts every other one
-— including a leftover from an earlier writer that this bridge's link row never recorded. That
-is what makes a leftover a one-pass fix; a writer that only retracted events it remembered
-would leave the column with a history nobody could trust.
+— including a leftover from an earlier writer that this bridge's link row never recorded, and
+including a second event carrying the *same* value. Two publishes racing leave a pair that
+says one thing twice, and a test by value cannot see the second one; the pass picks the
+survivor first (the row's own event when the relays still serve it, otherwise the newest live
+one) and retracts the rest. That is what makes a leftover a one-pass fix; a writer that only
+retracted events it remembered would leave the column with a history nobody could trust.
 
 **Unknown is not stale.** A newest verdict the parser cannot read leaves the label untouched
 and records the event and relay; so does a relay read that failed, and a PR the pass has

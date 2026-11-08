@@ -183,13 +183,15 @@ A PR carries one of `review-required`, `changes-requested`, `approved`. There is
 than the verdict is `review-required`, which is the same fact in the one word a reader has to
 look at. The label is derived from the newest kind-1111 verdict on the PR root and the tip it
 covers; the pass publishes the one that belongs there and retracts every other live label,
-including one an earlier writer left. That correction is what makes it the only writer: no
-cleanup follows by hand.
+including one an earlier writer left and a second event carrying the same word (a duplicate
+publish; selecting leftovers by value alone cannot see it). That correction is what makes it
+the only writer: no cleanup follows by hand.
 
 **Enforced in** `src/hermes_nostr_gateway/ngit_labels.py`, the only module that signs a
 kind-1985 label, called from the pass in `ngit.py`; on by default, and `ngit.labels: false`
 turns it off. `tests/test_ngit_labels.py` pins "a verdict replaces the previous one, never adds
-to it" and "every live label outside the desired set is unmanaged".
+to it" and "two live events with the desired value leave one"; the pass's tests pin that the
+row names the survivor and that a row whose event is gone republishes the label.
 
 **In this tree:** yes — the three-word vocabulary is on `master` (PR `870a47fc`).
 

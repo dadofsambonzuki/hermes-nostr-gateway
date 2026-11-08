@@ -100,8 +100,8 @@ from .ngit_labels import (
     anchor_verdict,
     live_label,
     newest_verdict,
+    reconcile_labels,
     review_labels,
-    unmanaged,
 )
 from .projects import ProjectMap, board_dir, hermes_home
 from .store import Store
@@ -2848,15 +2848,20 @@ class Sync:
         labeler = self._labeler()
         if labeler is None:
             return
-        changed = tuple(desired) != tuple(detail.get("label") or ())
-        add = desired if changed else ()
-        retract: list[str] = []
-        if changed:
-            retract.extend(str(event) for event in (detail.get("label_events") or ())
-                           if event)
-        for label in unmanaged(read.labels, desired):
-            if label.event_id and label.event_id not in retract:
-                retract.append(label.event_id)
+        # One label per PR, and the relays decide which event carries it. The row only says
+        # what this pass published last: a second event carrying the same word is invisible
+        # to a value test, so the survivor is chosen first and every other live event goes.
+        # A row whose own event is no longer live publishes the label again rather than
+        # leaving the PR with none.
+        row_events = [str(event) for event in (detail.get("label_events") or ()) if event]
+        keep, stale = reconcile_labels(read.labels, desired, row_events)
+        add = tuple(desired) if desired and keep is None else ()
+        retract = [label.event_id for label in stale]
+        for event_id in row_events:
+            if keep is not None and event_id == keep.event_id:
+                continue
+            if event_id not in retract:
+                retract.append(event_id)
         if not add and not retract:
             self._save_detail(link, detail, task_id=task_id)
             return
@@ -2879,7 +2884,11 @@ class Sync:
         detail["label"] = list(desired)
         if add:
             detail["label_events"] = list(result.events)
-        elif not desired:
+        elif keep is not None:
+            # A correction pass: the event that stayed is the label, and the row names it so
+            # the next pass keeps choosing the same one.
+            detail["label_events"] = [keep.event_id]
+        else:
             # A retraction-only pass: the PR carries no label now, and the row must say so
             # or every later pass would treat it as one that never published.
             detail["label_events"] = []
@@ -2887,15 +2896,21 @@ class Sync:
             detail["label_relay"] = read.relay
         else:
             detail.pop("label_relay", None)
-        if changed:
+        if add:
             report.prs["labels"] += 1
+            log.info("ngit: PR %s labelled %s", pr_id[:8], ", ".join(desired))
             where = f" from {read.relay}" if read.relay else ""
-            report.notes.append(f"label {pr_id[:8]}: {', '.join(desired) or 'none'}{where}")
+            report.notes.append(f"label {pr_id[:8]}: {', '.join(desired)}{where}")
             if read.disagreement():
                 report.notes.append(
                     f"label {pr_id[:8]}: relays disagreed ({read.disagreement()});"
                     " the newest verdict won")
-            log.info("ngit: PR %s labelled %s", pr_id[:8], ", ".join(desired) or "none")
+        elif desired:
+            # The label was live and stayed; the pass only took a duplicate -- or a leftover
+            # from another writer -- off the PR.
+            report.notes.append(
+                f"label {pr_id[:8]}: {', '.join(desired)}; retracted {len(retract)}"
+                " other live label event(s)")
         else:
             report.notes.append(
                 f"label {pr_id[:8]}: removed {len(retract)} label(s) that did not belong")

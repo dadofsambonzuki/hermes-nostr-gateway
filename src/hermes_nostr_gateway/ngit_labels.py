@@ -40,8 +40,12 @@ each one decides how the bridge must publish:
 
 A label this bridge did not write is corrected the same way it writes its own: the pass
 reads the live label events off the relays, publishes the one that belongs there and
-retracts every other one -- including `in-review` and `stale` left by an earlier writer.
-That is what makes the pass the only writer: no cleanup follows it by hand.
+retracts every other one -- including `in-review` and `stale` left by an earlier writer,
+and including a second event carrying the *same* value. A duplicate publish (two passes
+racing, or a pass that did not read the first event) leaves a pair that says one thing
+twice; selecting the leftovers by value alone cannot see it. So the survivor is chosen
+first, and everything else live is retracted. That is what makes the pass the only writer:
+no cleanup follows it by hand.
 """
 
 from __future__ import annotations
@@ -373,16 +377,32 @@ def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
     return None
 
 
-def unmanaged(labels: Iterable[Label], desired: Sequence[str]) -> list[Label]:
-    """The live labels that do not belong: anything not in the desired set.
+def reconcile_labels(labels: Iterable[Label], desired: Sequence[str],
+                     recorded: Sequence[str] = ()) -> tuple[Optional[Label], list[Label]]:
+    """The live event that *is* the label, and the ones that have to go.
 
-    This is the correction path, and it is why the pass reads the relays before it writes:
-    a label an earlier writer left (`in-review`, `stale`, a second word from a version that
-    had more of them) is not in this bridge's link row, but it is still on the PR. Every
-    one of those is retracted by the same pass that publishes the right label.
+    `desired` is the one value the PR should carry -- empty for "no label at all" -- and
+    `recorded` the event ids the link row says it published last. Selecting the leftovers
+    by value alone cannot see a second live event carrying the desired value (two passes
+    racing, or one that did not read the other's publish), so the survivor is chosen first:
+    the row's own event when the relays still serve it, otherwise the newest live event
+    carrying the desired value. Every other live event is retracted, whatever it says.
+
+    `keep` is None when no live event carries the desired value. A row that says the label
+    is there is not evidence the relays still hold it: the caller publishes one rather than
+    leaving the PR with no label at all.
     """
+    live = [label for label in labels if label.event_id]
     wanted = set(desired)
-    return [label for label in labels if label.value not in wanted]
+    if not wanted:
+        return None, live
+    candidates = [label for label in live if label.value in wanted]
+    if not candidates:
+        return None, live
+    published = {str(event) for event in recorded if event}
+    ours = [label for label in candidates if label.event_id in published]
+    keep = max(ours or candidates, key=lambda label: (label.created_at, label.event_id))
+    return keep, [label for label in live if label.event_id != keep.event_id]
 
 
 # -- publishing ---------------------------------------------------------------

@@ -192,10 +192,24 @@ class Harness:
             relays=("wss://relay.example",))
 
     def _label(self, pr_id: str, address: str, add, retract=()):
-        """Record what the sync asked to publish, and say it landed."""
+        """Record what the sync asked to publish, apply it to the fake relays, and land it.
+
+        A published label has to become one the next read serves, and a retraction has to
+        take its event away: the pass now decides from what the relays hold, so a fake that
+        forgot its own writes would make every poll republish.
+        """
         self.label_calls.append((pr_id, address, tuple(add), tuple(retract)))
-        event = f"l{len(self.label_calls):03d}".ljust(64, "0")
-        return ngit_labels.LabelResult(ok=True, events=(event,), retracted=True, relays=2)
+        gone = set(retract)
+        held = [label for label in self.carried.get(pr_id, ()) if label.event_id not in gone]
+        events = []
+        for value in add:
+            event = f"l{len(self.label_calls):03d}{len(events)}".ljust(64, "0")
+            events.append(event)
+            held.append(ngit_labels.Label(value=value, event_id=event,
+                                          created_at=2000 + len(self.label_calls),
+                                          relay="wss://relay.example"))
+        self.carried[pr_id] = tuple(held)
+        return ngit_labels.LabelResult(ok=True, events=tuple(events), retracted=True, relays=2)
 
     def sync(self, **kwargs):
         return self._sync().run(**kwargs)
@@ -1768,6 +1782,9 @@ def test_a_label_left_over_from_a_previous_writer_is_corrected_by_one_pass(harne
     """The old writer's `in-review` is in the link row and on the relay; one pass fixes it."""
     pr, _task = pr_with_review_task(harness)
     old = "o" * 64
+    # The relays hold the previous writer's label and nothing of ours: this is the PR as a
+    # bridge that has only ever read it sees.
+    harness.carried[pr.id] = ()
     carry_label(harness, pr.id, "in-review", old)
     detail = label_detail(harness, pr.id)
     detail["label"] = ["in-review"]
@@ -1795,6 +1812,67 @@ def test_a_label_the_link_row_never_recorded_is_still_retracted(harness):
     retracted = harness.label_calls[-1][3]
     assert foreign in retracted
     assert set(label_detail(harness, pr.id)["label"]) == {"approved"}
+
+
+def test_a_second_live_label_with_the_same_value_is_retracted(harness):
+    """Two publishes of `approved` leave two live events: the older one goes, one stays."""
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.sync()
+    survivor = tuple(label_detail(harness, pr.id)["label_events"])
+    assert len(survivor) == 1
+    # A second pass published the same word: both events are live, and a value test cannot
+    # see the pair.
+    duplicate = "8" * 64
+    carry_label(harness, pr.id, "approved", duplicate)
+
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, (), (duplicate,))
+    detail = label_detail(harness, pr.id)
+    assert detail["label"] == ["approved"]
+    assert tuple(detail["label_events"]) == survivor
+    # Nothing was published: the counter says "labels published", and this pass removed one.
+    assert report.prs["labels"] == 0
+    assert any("retracted 1 other live label event" in note for note in report.notes)
+
+
+def test_a_duplicate_neither_the_row_nor_the_relay_names_keeps_the_newest(harness):
+    """The row names an event that is gone; two live duplicates remain. Newest survives."""
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.sync()
+    lost = tuple(label_detail(harness, pr.id)["label_events"])
+    older, newer = "7" * 64, "8" * 64
+    harness.carried[pr.id] = (
+        ngit_labels.Label("approved", older, created_at=1000, relay="wss://relay.example"),
+        ngit_labels.Label("approved", newer, created_at=3000, relay="wss://relay.example"))
+
+    harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, (), (older, *lost))
+    detail = label_detail(harness, pr.id)
+    assert detail["label"] == ["approved"]
+    assert detail["label_events"] == [newer]
+
+
+def test_a_row_that_says_approved_over_a_stale_relay_label_republishes_it(harness):
+    """The row is not evidence the label is live: publish when no live event carries it."""
+    pr, _task = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    harness.sync()
+    lost = tuple(label_detail(harness, pr.id)["label_events"])
+    stale = "9" * 64
+    harness.carried[pr.id] = (
+        ngit_labels.Label("in-review", stale, created_at=500, relay="wss://relay.example"),)
+
+    report = harness.sync()
+
+    assert harness.label_calls[-1] == (pr.id, ADDRESS, ("approved",), (stale, *lost))
+    detail = label_detail(harness, pr.id)
+    assert detail["label"] == ["approved"]
+    assert len(detail["label_events"]) == 1 and detail["label_events"][0] not in lost
+    assert report.prs["labels"] == 1
 
 
 def test_no_verdict_and_no_review_card_carries_no_label(harness):

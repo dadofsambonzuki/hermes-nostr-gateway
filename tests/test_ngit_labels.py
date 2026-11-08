@@ -257,12 +257,56 @@ def test_a_label_in_another_namespace_is_not_ours():
     assert labels.live_label(label_event("approved", kind=1984)) is None
 
 
-def test_every_live_label_outside_the_desired_set_is_unmanaged():
-    held = [labels.Label("in-review", "1" * 64), labels.Label("approved", "2" * 64),
-            labels.Label("stale", "3" * 64)]
-    assert [(label.value, label.event_id) for label in
-            labels.unmanaged(held, (labels.APPROVED,))] == [("in-review", "1" * 64),
-                                                           ("stale", "3" * 64)]
+def held(value: str, event_id: str, created_at: int = 1000) -> labels.Label:
+    return labels.Label(value=value, event_id=event_id, created_at=created_at,
+                        relay=RELAY)
+
+
+def test_the_rows_own_event_is_the_one_kept_and_the_duplicate_goes():
+    """Two live `approved` events: the row names one, and that is the one readers keep."""
+    older, newer = held(labels.APPROVED, "1" * 64, 1000), held(labels.APPROVED, "2" * 64, 2000)
+    keep, stale = labels.reconcile_labels([newer, older], (labels.APPROVED,), ["1" * 64])
+    assert keep == older
+    assert [label.event_id for label in stale] == ["2" * 64]
+
+
+def test_two_live_events_with_the_desired_value_leave_the_newest_one():
+    """Neither event is the row's (a row from another writer, or one that never recorded):
+    the newest live event is the label and the older duplicate is retracted."""
+    older, newer = held(labels.APPROVED, "1" * 64, 1000), held(labels.APPROVED, "2" * 64, 2000)
+    keep, stale = labels.reconcile_labels([older, newer], (labels.APPROVED,))
+    assert keep == newer
+    assert [label.event_id for label in stale] == ["1" * 64]
+
+
+def test_a_row_event_the_relays_no_longer_serve_does_not_keep_a_duplicate():
+    live = [held(labels.APPROVED, "2" * 64, 1000), held(labels.APPROVED, "3" * 64, 2000)]
+    keep, stale = labels.reconcile_labels(live, (labels.APPROVED,), ["1" * 64])
+    assert keep == held(labels.APPROVED, "3" * 64, 2000)
+    assert [label.event_id for label in stale] == ["2" * 64]
+
+
+def test_a_live_event_of_another_value_is_stale_beside_the_kept_one():
+    keep, stale = labels.reconcile_labels(
+        [held(labels.APPROVED, "1" * 64), held("in-review", "2" * 64)], (labels.APPROVED,))
+    assert keep is not None and keep.event_id == "1" * 64
+    assert [label.event_id for label in stale] == ["2" * 64]
+
+
+def test_no_live_event_with_the_desired_value_means_publish_one():
+    """The row saying `approved` is not evidence the relays still hold it."""
+    keep, stale = labels.reconcile_labels([held("in-review", "2" * 64)], (labels.APPROVED,),
+                                          ["1" * 64])
+    assert keep is None
+    assert [label.event_id for label in stale] == ["2" * 64]
+
+
+def test_no_label_at_all_retracts_every_live_event():
+    keep, stale = labels.reconcile_labels(
+        [held(labels.APPROVED, "1" * 64), held("in-review", "2" * 64)], ())
+    assert keep is None
+    assert [label.event_id for label in stale] == ["1" * 64, "2" * 64]
+
 
 
 # -- publishing ----------------------------------------------------------------

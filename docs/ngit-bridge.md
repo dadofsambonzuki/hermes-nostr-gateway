@@ -408,11 +408,15 @@ re-queued by a verdict, however green it is.
 writes a label. It reads each open PR's verdict comments and the label events the PR currently
 carries off the same relay set it publishes to, decides the one label that belongs there,
 publishes it and retracts every other label event the PR carries — including one an earlier
-writer left (`in-review`, `stale`, a second word from a version with more of them) and one this
-bridge's link row never recorded. That is what makes a leftover a one-pass correction rather
-than a manual cleanup. The link row only remembers what this pass published, so a poll with no
-news publishes nothing. A merge leaves the last verdict in place: it is the verdict the merge
-was decided on.
+writer left (`in-review`, `stale`, a second word from a version with more of them), one this
+bridge's link row never recorded, and a second event carrying the same value (two publishes
+racing; a test by value cannot see the pair). The survivor is chosen first — the row's own
+event when the relays still serve it, otherwise the newest live one — and the rest are
+retracted. A row that says the label is there is not evidence the relays still hold it: when
+no live event carries the word, the pass publishes it again. That is what makes a leftover a
+one-pass correction rather than a manual cleanup. The link row only remembers what this pass
+published, so a poll with no news publishes nothing. A merge leaves the last verdict in place:
+it is the verdict the merge was decided on.
 
 **A verdict that cannot be read does not fall back.** If the newest comment states a verdict in
 words the bridge does not recognise, the label is left untouched and the pass records the event
