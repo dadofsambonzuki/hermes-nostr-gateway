@@ -99,9 +99,10 @@ def parse_patch_ids(value: str) -> list[tuple[str, str]]:
 class Checkout:
     """The checkout's answer to "is this proposal already on the base branch?".
 
-    One instance per sync pass: the base ref is resolved once (preferring `origin/<base>`,
-    which is what landed, over a local branch that may not have been pulled), and `head()`
-    is the tip a caller stamps its answers with so an unmoved proposal is not probed twice.
+    One instance per sync pass: the base ref is resolved once -- the descendant of
+    `origin/<base>` and the local branch, because a merge lands on the remote and this
+    checkout is not pulled after every one -- and `head()` is the tip a caller stamps its
+    answers with, so an unmoved proposal is not probed twice.
     """
 
     def __init__(self, repo: Path, base: str = "master", *,
