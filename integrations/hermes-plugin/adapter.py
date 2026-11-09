@@ -16,12 +16,17 @@ prove landed, and the daemon can have published one whose reply frame never arri
 adapter remembers what it has actually put on the wire and drops an identical send to the
 same chat instead of letting a replay publish the same reply twice.
 
-A blocking approval prompt is the one exception to "the adapter never decides": the host
-posts it with `metadata={"is_approval_prompt": True}` and blocks the agent thread, so the
-message id it was given is remembered here and a NIP-25 reaction on that message — from the
-conversation it was sent to — resolves the same queue the typed `/approve` and `/deny`
-commands do. Nothing else about the gate changes: a reaction that cannot be matched to a
-prompt, from anyone else, or with an emoji that is not a decision leaves the gate blocked.
+A blocking approval prompt is the one exception to "the adapter never decides": Hermes hands
+it to a button-capable platform through `send_exec_approval`, which this adapter renders as a
+text message in `_send_exec_approval_prompt` and blocks the agent thread on. The host's
+`request_id` for that gate travels with the prompt and nowhere else, so the message id it was
+given is remembered here *with* that id, and a NIP-25 reaction on the message — from the
+conversation it was sent to, and only from someone the host's approver list allows — resolves
+that one request: exact, so a stale 👍 cannot answer whatever the session asked next. A prompt
+the host fell back to sending as plain text (or an older host that names no request) is not
+remembered and is answered with the typed `/approve` and `/deny` only. Nothing else about the
+gate changes: a reaction that cannot be matched to a prompt, comes from someone else, or uses
+an emoji that is not a decision leaves the gate blocked.
 
 A Hermes profile is a whole instance — its own config, sessions, skills and memory — and the
 gateway decides which one a conversation's turns run as (`profiles:` in its config; the
@@ -38,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -95,18 +101,33 @@ REACTION_CHOICES = {
 
 logger = logging.getLogger(__name__)
 
-#: Appended to an approval prompt: the host's text names the typed commands only, because it
-#: cannot know which adapter can carry a reaction. This one can, so it says so where the
-#: person is actually reading — next to the commands, not in a manual.
-REACTION_HINT = ("React 👍 to approve once or 👎 to deny — or reply /approve, /deny "
-                 "(add \"session\" to approve for the rest of it).")
+#: The approval choices that have a typed spelling, in the order the prompt offers them. The
+#: vocabulary is Hermes' own (`ExecApprovalPrompt.actions`); a smart deny drops the session and
+#: permanent rows, and the text we send lists exactly what the host would accept.
+APPROVAL_COMMANDS = ("once", "session", "always")
 
 
-def with_reaction_hint(text: str) -> str:
-    """The prompt with the reaction options named, once (a re-sent prompt keeps one copy)."""
-    if "\U0001f44d" in text:
-        return text
-    return text.rstrip() + "\n\n" + REACTION_HINT
+def approval_hint(choices: list[str]) -> str:
+    """The typed and reaction answers for the choices an approval prompt actually offers.
+
+    Hermes renders the card body (`prompt.text`: the command, why it was flagged, and how long
+    the wait lasts) but not the answers on a surface with no buttons — those are the adapter's
+    to name. A choice the prompt does not offer is never named: with a smart deny there is no
+    `/approve session` to type, and a deny-only card must not offer an approve reaction the
+    host would refuse.
+    """
+    typed = [f"/approve {choice}" for choice in APPROVAL_COMMANDS if choice in choices]
+    if "deny" in choices:
+        typed.append("/deny")
+    if not typed:
+        return ""
+    reactions = []
+    if "once" in choices:
+        reactions.append("👍 to approve once")
+    if "deny" in choices:
+        reactions.append("👎 to deny")
+    lead = ("React " + " or ".join(reactions) + " — or reply ") if reactions else "Reply "
+    return lead + ", ".join(typed[:-1]) + (" or " if len(typed) > 1 else "") + typed[-1] + "."
 
 
 def reaction_choice(content: str) -> Optional[str]:
@@ -116,6 +137,24 @@ def reaction_choice(content: str) -> Optional[str]:
     and some keyboards add a space; none of that is a different answer.
     """
     return REACTION_CHOICES.get((content or "").replace("\ufe0f", "").strip())
+
+
+def accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    """Whether *fn* takes *keyword* — the host's approval helpers gained arguments over time."""
+    try:
+        return keyword in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # a C callable or a mock: assume the documented shape
+        return False
+
+
+def _nak_env() -> dict[str, str]:
+    """The environment `nak decode` gets: PATH and nothing else.
+
+    The child is a third-party binary asked to decode one string in this process; handing it
+    the gateway's whole environment would pass every provider key the host holds to a program
+    that needs none of them (catalog rule 11).
+    """
+    return {"PATH": os.environ.get("PATH", "")}
 
 
 def is_reaction_frame(frame: dict[str, Any]) -> bool:
@@ -159,18 +198,31 @@ def socket_path(config: Any) -> Path:
 def profile_missing(name: str) -> bool:
     """True when Hermes has no such profile, so the turn could only fall back to default.
 
-    Asked of Hermes when it is importable -- it is, in production, because this adapter runs
-    inside Hermes, and `hermes_cli.profiles.profile_exists` is the one definition of "there"
-    (a live directory with identity and no tombstone). A build where that import fails answers
-    "not missing" and leaves Hermes' own resolver as the next gate, rather than dropping every
-    routed frame in a test harness.
+    Answered from `hermes_constants`, a module Hermes' plugin docs list as public: a named
+    profile is a directory under `<hermes home>/profiles/` carrying an identity and no deletion
+    tombstone (`named_profile_is_live`), and `default` is the home itself. That is the same
+    pair of facts `hermes_cli.profiles.profile_exists` states, rebuilt on the public surface so
+    a release that moves the profile manager cannot break this adapter; the id grammar
+    (`PROFILE_ID_RE`) is the one the host validates `-p` against, so the answer cannot drift
+    from what Hermes would accept either. A build where the import fails answers "not missing"
+    and leaves Hermes' own resolver as the next gate, rather than dropping every routed frame
+    in a test harness.
     """
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_constants import PROFILE_ID_RE, get_default_hermes_root, named_profile_is_live
     except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
         return False
+    if not isinstance(name, str):
+        return True  # the host refuses a non-string name too; no such profile can exist
+    canonical = name.strip().lower()
+    if not canonical:
+        return True
+    if canonical == "default":
+        return False  # always present, whatever the named-profile tree looks like
+    if not PROFILE_ID_RE.match(canonical):
+        return True  # cannot be a profile directory: the host would refuse the name
     try:
-        return not profile_exists(name)
+        return not named_profile_is_live(get_default_hermes_root() / "profiles" / canonical)
     except Exception:  # noqa: BLE001 - an unanswerable question is not a refusal
         return False
 
@@ -620,7 +672,8 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # replay window is a safety net, and this is the consumer's half of at-least-once.
         self._delivered_ids: deque[str] = deque(maxlen=512)
         # Approval prompts this adapter delivered, newest last: event id → (chat_id,
-        # session_key). A reaction on one of these is a decision about that gate.
+        # session_key, request_id). A reaction on one of these is a decision about that gate;
+        # the request id is what lets the answer name that gate and no other.
         self._approval_prompts: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
         #: conversation → the route its last delivered turn ran on, so the reply can report it
         #: back for the audit trail. Bounded: a busy gateway hears from many peers.
@@ -675,7 +728,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         try:  # a bad home channel must not fail a send that would otherwise work
             import subprocess
             out = subprocess.run(["nak", "decode", raw], capture_output=True, text=True,
-                                 timeout=10)
+                                 timeout=10, env=_nak_env())
             self._home_hex = (out.stdout or "").strip().lower()
         except Exception:  # noqa: BLE001
             self._home_hex = ""
@@ -717,7 +770,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         try:
             import subprocess
             out = subprocess.run(["nak", "decode", first], capture_output=True, text=True,
-                                 timeout=10)
+                                 timeout=10, env=_nak_env())
             self._control_hex = (out.stdout or "").strip().lower()
         except Exception:  # noqa: BLE001
             self._control_hex = ""
@@ -733,7 +786,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 
     # -- approval reactions ---------------------------------------------
     def _approvals(self) -> OrderedDict[str, tuple[str, str, str]]:
-        """Prompt id → (chat_id, session_key, request_id) for gates a reaction can answer."""
+        """Prompt id → (chat_id, session_key, request_id) for gates still answerable."""
         tracked = getattr(self, "_approval_prompts", None)
         if tracked is None:  # an adapter built by __new__ in a test or a wrapper
             tracked = self._approval_prompts = OrderedDict()
@@ -741,40 +794,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 
     def _remember_approval_prompt(self, message_id: str, chat_id: str, session_key: str,
                                   request_id: str = "") -> None:
-        """Remember a delivered prompt, keeping only the newest few.
-
-        `request_id` is the gate this exact prompt opened. It is what makes a late 👍 a
-        stale tap rather than an approval of whatever is pending next: resolving by
-        "the only one waiting" approves a different command after the first is gone.
-        """
+        """Remember a delivered prompt under the host request it answers, keeping the newest few."""
         if not message_id:
             return
         tracked = self._approvals()
-        tracked[message_id] = (chat_id.lower(), session_key, str(request_id or ""))
+        tracked[message_id] = (chat_id.lower(), session_key, request_id)
         tracked.move_to_end(message_id)
         while len(tracked) > MAX_TRACKED_APPROVALS:
             tracked.popitem(last=False)
-
-    def _pending_request_id(self, session_key: str) -> str:
-        """The request id of the one gate waiting for *session_key*, or "" when unsure.
-
-        The host enqueues the approval before it asks the adapter to send the prompt, so at
-        send time this is exactly the gate the prompt names. Two pending means it is not
-        one question, and no id is safer than the wrong one.
-        """
-        if not session_key:
-            return ""
-        try:
-            from tools.approval import list_gateway_approvals
-        except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
-            return ""
-        try:
-            pending = list_gateway_approvals(session_key) or []
-        except Exception:  # noqa: BLE001 - an unreadable queue is not a guess
-            return ""
-        if len(pending) != 1:
-            return ""
-        return str(pending[0].get("request_id") or "")
 
     def _session_key_for_chat(self, chat_id: str) -> str:
         """The session key this chat's gates are registered under.
@@ -820,43 +847,78 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         while len(known) > MAX_TRACKED_APPROVALS * 8:
             known.popitem(last=False)
 
-    def _resolve_approval(self, session_key: str, choice: str,
-                          request_id: str = "") -> int:
-        """Resolve the gate named by *request_id*; 0 when it cannot be pinned down.
+    def _approval_refusal(self, session_key: str, actor: str, request_id: str) -> tuple[bool, str]:
+        """Whether *actor* may answer this gate, and the requester's name when they may not.
 
-        Zero is the safe answer at every step: no session key, no request id, no pending
-        approval with that id. The prompt's own gate is the only one a reaction may answer,
-        and a reaction that names a prompt whose gate is gone resolves nothing -- it must
-        never fall through to whichever gate happens to be waiting now.
+        `approvals.approvers` is narrowed on some installs: a room of admitted members can
+        then see a prompt that only one of them may answer. The rule is the host's
+        (`gateway.approval_actor.approval_refusal`), so ask it instead of re-deriving it; a
+        host predating the approver list has no narrowed list to honour and no helper to ask.
+        A check that cannot run is a refusal: a gate is never resolved on a question we could
+        not ask.
+        """
+        try:
+            from gateway.approval_actor import approval_refusal
+        except Exception:  # noqa: BLE001 - older host: no approver list exists there
+            return True, ""
+        kwargs: dict[str, Any] = {}
+        if accepts_keyword(approval_refusal, "request_id"):
+            kwargs["request_id"] = request_id or None
+        if accepts_keyword(approval_refusal, "extra"):
+            kwargs["extra"] = getattr(getattr(self, "_config", None), "extra", None)
+        try:
+            requester = approval_refusal(session_key, actor, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - an unanswerable check must not approve
+            logger.warning("nostr reaction ignored: the approver check failed (%s)", exc)
+            return False, ""
+        return (not requester), str(requester or "")
+
+    def _resolve_approval(self, session_key: str, choice: str, request_id: str,
+                          actor: str = "") -> int:
+        """Resolve the gate a reaction names; 0 when it cannot be pinned down.
+
+        Zero is the safe answer at every step: no session key, or no request id from the host.
+        The request id is what makes a reaction exact — `resolve_gateway_approval_card` answers
+        *that* gate or nothing (and re-checks the clicker inside the same critical section when
+        the host supports it), so a stale 👍 cannot approve whatever the session asked next.
+        Hosts that name no request on the prompt (`send_exec_approval` without a `request_id`,
+        as some releases do) fall back to the host's own FIFO answer, the same one its built-in
+        button adapters use — see `docs/decisions.md`.
         """
         if not session_key:
             logger.warning("nostr reaction ignored: no session key for that conversation")
             return 0
-        if not request_id:
-            logger.warning("nostr reaction ignored: the prompt is not bound to a request id")
-            return 0
+        # Both names are on Hermes' published plugin API (`hermes_cli/data/plugin_api.json`).
+        # Imported separately because a host release may predate the card helper; the plain
+        # resolver has existed for as long as gateway approvals have.
         try:
-            from tools.approval import list_gateway_approvals, resolve_gateway_approval
+            from tools.approval import resolve_gateway_approval_card
+        except Exception:  # noqa: BLE001 - older host: no card helper, keep the FIFO path
+            resolve_gateway_approval_card = None  # type: ignore[assignment]
+        try:
+            from tools.approval import resolve_gateway_approval
         except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
             logger.warning("nostr reaction ignored: tools.approval is not importable here")
             return 0
+        count: Any = 0
         try:
-            pending = list_gateway_approvals(session_key) or []
-        except Exception:  # noqa: BLE001 - never let a reaction break the reader loop
-            logger.warning("nostr reaction ignored: the approval queue could not be read",
-                           exc_info=True)
-            return 0
-        if not any(str(entry.get("request_id") or "") == request_id for entry in pending):
-            logger.warning("nostr reaction ignored: request %s is no longer pending",
-                           request_id[:12])
-            return 0
-        try:
-            count = resolve_gateway_approval(session_key, choice, request_id=request_id)
+            if request_id and callable(resolve_gateway_approval_card):
+                kwargs: dict[str, Any] = {}
+                if actor and accepts_keyword(resolve_gateway_approval_card, "actor_id"):
+                    kwargs["actor_id"] = actor
+                if accepts_keyword(resolve_gateway_approval_card, "extra"):
+                    kwargs["extra"] = getattr(getattr(self, "_config", None), "extra", None)
+                count = resolve_gateway_approval_card(session_key, choice, request_id, **kwargs)
+            else:
+                count = resolve_gateway_approval(session_key, choice, request_id=request_id or None)
         except Exception as exc:  # noqa: BLE001
             logger.error("nostr reaction could not resolve the approval: %s", exc, exc_info=True)
             return 0
         if count:
             logger.info("nostr reaction resolved %d approval(s) as %s", count, choice)
+        else:
+            logger.warning("nostr reaction ignored: %s is no longer pending",
+                           f"request {request_id}" if request_id else "no gate for that session")
         return int(count or 0)
 
     async def _deliver_reaction(self, frame: dict[str, Any], message_id: str) -> None:
@@ -904,12 +966,40 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             logger.debug("nostr reaction %r is not an approval decision", content[:8])
             await self._ack(message_id)
             return
+        key = session_key or self._session_key_for_chat(chat_id)
+        # A narrowed `approvals.approvers` list may name one person in a room only: the host
+        # owns that rule, so ask it before consuming the prompt. A refusal leaves the gate
+        # pending — the right person can still answer — and says so in the conversation.
+        allowed, requester = self._approval_refusal(key, sender, request_id)
+        if not allowed:
+            await self._refuse_approval(chat_id, requester)
+            await self._ack(message_id)
+            return
         # One reaction answers one prompt, once: a stale 👍 must never resolve the next gate
         # this session happens to open.
         del tracked[target]
-        self._resolve_approval(session_key or self._session_key_for_chat(chat_id), choice,
-                               request_id=request_id)
+        self._resolve_approval(key, choice, request_id, actor=sender)
         await self._ack(message_id)
+
+    async def _refuse_approval(self, chat_id: str, requester: str) -> None:
+        """Say who may answer, without resolving anything.
+
+        A refusal is a reply in the conversation the prompt is in — a room member who cannot
+        answer it needs to know why — and the gate stays pending for the person it names.
+        """
+        if not requester:
+            return
+        try:
+            from gateway.approval_actor import refusal_text
+            text = str(refusal_text(requester) or "")
+        except Exception:  # noqa: BLE001 - older host, or no i18n: say it plainly
+            text = f"Only {requester} can answer that approval. It is still pending."
+        if not text:
+            return
+        try:
+            await self.send(chat_id, text)
+        except Exception:  # noqa: BLE001 - a notice that cannot be sent must not break the loop
+            logger.debug("nostr approval refusal notice failed", exc_info=True)
 
     # -- attachments ----------------------------------------------------
     async def _blob(self, digest: str, message_id: str) -> dict[str, Any]:
@@ -1468,12 +1558,13 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # two different questions (each answerable by a reaction, each tracked under its own
         # message id), and dropping the second would leave the host blocked on a prompt the
         # human never saw. The gate owns its own replay semantics; this guard is for chat.
+        #
+        # A prompt that reaches `send()` is the host's *plain-text fallback* — the button hook
+        # was not offered or its send failed. It names the typed commands only, and it is
+        # deliberately not remembered: no `request_id` travelled with it, and a reaction that
+        # resolves "the oldest pending gate" is a different command's approval. The reaction
+        # hint belongs to `_send_exec_approval_prompt`, the one path that can honour it.
         prompt = bool((metadata or {}).get("is_approval_prompt"))
-        if prompt:
-            # Name the reaction options beside the typed ones. Content is what gets sent, so
-            # this has to happen before the payload is built, and body is recomputed to match.
-            content = with_reaction_hint(content)
-            body = reply_body(content)
         memory = None if prompt else self._dedupe()
         if memory is not None:
             duplicate = memory.claim(chat_id, body, recovered=recovered)
@@ -1537,19 +1628,39 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                               raw_response=frame, retryable=True)
         if memory is not None:
             memory.settle(chat_id, body, delivered=True)
-        result = SendResult(success=True, message_id=frame.get("message_id"), raw_response=frame)
-        if prompt:
-            # The host blocks the agent thread until this gate is answered, and the typed
-            # commands are not the only way in: remember which message carried the prompt so
-            # a reaction on it can resolve the same queue. Only a send that actually landed
-            # is remembered — a prompt nobody received must not be answerable. The request
-            # id is read now, while that gate is the one waiting: a reaction later must not
-            # be able to approve whatever gate happens to be open by then.
-            chat = str(chat_id or "").strip()
-            session_key = self._session_key_for_chat(chat)
+        return SendResult(success=True, message_id=frame.get("message_id"), raw_response=frame)
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Deliver an approval prompt as text, remembering the host request it answers.
+
+        Hermes hands a platform that renders approval prompts an ``ExecApprovalPrompt`` (see
+        ``BasePlatformAdapter.send_exec_approval``): the shared card body, the choices this gate
+        accepts, and — on hosts that correlate answers — the ``request_id`` naming this one gate.
+        Taking the prompt here, rather than letting the host fall back to plain text, is what
+        makes a reaction answerable at all: the id travels with the card and nowhere else.
+
+        The body is Hermes' own wording; what a text surface must add is the answers
+        (`approval_hint`). Only a send that actually landed is remembered — a prompt nobody
+        received must not be answerable.
+        """
+        choices = [choice for _label, choice, _style in (getattr(prompt, "actions", None) or [])]
+        hint = approval_hint(choices)
+        text = prompt.text if not hint else prompt.text.rstrip() + "\n\n" + hint
+        result = await self.send(
+            prompt.chat_id, text,
+            metadata={**(getattr(prompt, "metadata", None) or {}), "is_approval_prompt": True},
+        )
+        if result.success and result.message_id:
+            chat_id = str(prompt.chat_id or "").strip()
+            # The host names the key for the turn it is blocking. A host that names none (an
+            # older release, a test double) falls back to the builder this adapter already uses
+            # for the chat, so the gate still lands in the profile the turn ran under.
+            session_key = str(getattr(prompt, "session_key", "") or "") \
+                or self._session_key_for_chat(chat_id)
             self._remember_approval_prompt(
-                result.message_id or "", chat, session_key,
-                self._pending_request_id(session_key))
+                result.message_id, chat_id, session_key,
+                str(getattr(prompt, "request_id", "") or ""),
+            )
         return result
 
     async def _request(self, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
@@ -1571,11 +1682,17 @@ class NostrGatewayAdapter(BasePlatformAdapter):
 
 #: The daemon deliberately does not import Hermes (its `profiles.py` copies Hermes'
 #: profile grammar for the same reason), so the host's gateway-dispatchable commands cross
-#: the boundary as a file beside the gateway socket. This module *does* run inside Hermes,
-#: where `hermes_cli` is importable: writing the catalogue here is what keeps the slash menu
-#: the host's real catalogue instead of a list copied into the daemon and left to drift.
-#: Fully-qualified into `hermes_cli.commands*` on purpose -- it is the same source the
-#: Telegram menu is registered from, so a command that appears there appears here.
+#: the boundary as a file beside the gateway socket. This module *does* run inside Hermes:
+#: writing the catalogue here is what keeps the slash menu the host's real catalogue instead
+#: of a list copied into the daemon and left to drift.
+#:
+#: Two imports below are private core (`hermes_cli.commands` / `hermes_cli.commands_platforms`),
+#: the one rule-9 coupling this plugin has left: Hermes documents no public read surface for a
+#: platform's command catalogue, and every in-tree adapter reads the same two functions. They
+#: stay until that seam exists -- upstream issue NousResearch/hermes-agent#149673 asks for
+#: exactly it (`gateway_command_catalog()`: the registry filtered for the gateway, plus plugin
+#: commands, as plain data). The failure tests in `tests/test_adapter_catalogue.py` pin the two
+#: names, and `record_catalogue_status` puts the failure where `hng status` can show it.
 COMMANDS_FILE = "commands.json"
 
 

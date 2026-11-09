@@ -422,6 +422,39 @@ rewrites a file Hermes may be mid-import on, with no backup and nothing for `doc
 The comparison has no such window, and it answers the question an operator actually asks — which
 file is the running process holding?
 
+## A reaction answers the one gate the host named, not the oldest one waiting
+
+An approval prompt delivered to Nostr is a message someone can react to: 👍 is the `/approve` they
+would have typed. The adapter takes the prompt through Hermes' platform hook
+(`send_exec_approval` / `_send_exec_approval_prompt`) rather than letting the host fall back to
+plain text, because that is the only surface that carries the `request_id` naming *this* gate. The
+reaction settles through `resolve_gateway_approval_card(session_key, choice, request_id, …)`, so a
+stale 👍 on an old prompt cannot approve whatever the session asked next, and two gates waiting at
+once are not guessed between.
+
+A prompt that names no request id is not answerable by reaction at all: the typed `/approve` and
+`/deny` still work, and leaving a reaction inert is the only safe answer when the host cannot say
+which gate it would settle. The adapter also stops tracking plain-text `is_approval_prompt`
+messages (an `/approve` confirmation carries that flag without being a gate), and it no longer
+reads `tools.approval.list_gateway_approvals` — that queue is not a public surface, and the request
+id the hook carries makes the read unnecessary.
+
+**A reaction is a click, and the host's approver list applies to it.** A room's admitted members
+all see the prompt, so `approvals.approvers` narrowed to one person must be honoured on this
+surface too — otherwise a 👍 from any admitted member is an approval the typed `/approve` would
+have refused. The adapter asks `gateway.approval_actor.approval_refusal` before it consumes the
+prompt, replies with the requester's name when the host refuses, and leaves the gate pending; it
+settles through `resolve_gateway_approval_card(..., actor_id=…, extra=…)`, whose own re-check
+happens in the same critical section as the settle. Those two names — `approval_refusal` and
+`refusal_text` — are public on hermes-agent main (verified at `9dcf7714df`, 2026-11-09:
+`gateway/approval_actor.py` is a tracked blob, `hermes_cli/data/plugin_api.json` lists both names
+at lines 94-95, and the adding-platform-adapters guide documents them under "Public helpers for
+platform plugins"). The core installed on this host predates them, so
+`hermes plugins validate` against *this* machine still names the two imports; that is a version
+warning, not a missing seam. A host without the helper has no narrowed list to honour, so the
+import failing there is not a silent bypass: the feature did not exist there.
+
+
 ## The slash menu is the host's catalogue, and this plane's subset of it
 
 Armada renders a bot's commands only from a replaceable **kind 10304** manifest, discovered per
@@ -435,6 +468,17 @@ writes `hermes_cli.commands_platforms._gateway_available_commands()` plus the pl
 `commands.json` beside the socket, and the daemon validates that file. A list maintained in this
 repository would drift, and a menu that offers `/whatever` the host no longer dispatches is worse
 than no menu: the person selects it and gets "unknown command".
+
+**That pair of imports is the one rule-9 coupling upstream has no seam for, and it is upstream's
+to close.** Hermes documents no public read surface for a platform's command catalogue, and its
+own in-tree adapters import the same two functions; the alternative — a snapshot regenerated at
+build time — is exactly the drift the previous paragraph rejects. Upstream issue
+`NousResearch/hermes-agent#149673` asks for the seam (`gateway_command_catalog()`: the registry
+filtered for the gateway, plugin commands included, as plain data), and the plugin moves onto it
+when it exists. Until then the failure is recorded where `hng status` reads it, so a rename is
+visible rather than silent. The approval helpers are the other two names a validator can print
+(the reaction decision above explains them); unlike the catalogue, those have a public home on
+main and only read as coupling against a core that predates it.
 
 **Three commands are not advertised, and the list is a deny-list.** `/topic` (Telegram DM topics),
 `/voice` (an audio surface this plane does not render) and `/save` (writes a file on the host that
@@ -559,7 +603,7 @@ below). `applied` is the status record *or* the content on the branch (see "Appl
 witnesses" below) — the distinction is what this rule needed most. The bridge enforces it on
 the board itself (`ngit_guard`): one row per PR card and one `BEFORE UPDATE OF status` trigger
 whose refusal names the state it saw and what was compared — `PR <short> is open at <tip> --
-<evidence>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
+`<evidence>`. Both completion paths write the same `tasks.status = 'done'`, so one trigger
 covers the agent's tool and the CLI without either knowing the bridge exists. A merge releases
 the guard, an approval releases it, and a close keeps it refusing.
 
@@ -882,3 +926,5 @@ Trust is the control pane's, as everywhere else: a stranger's mention is recorde
 The worker writes the reply; the bridge only routes it and supplies the spelling of the publish
 step, which is where a model left to guess would put the comment in the wrong thread or sign it
 as the wrong npub.
+
+

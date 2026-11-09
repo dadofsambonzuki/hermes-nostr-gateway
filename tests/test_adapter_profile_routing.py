@@ -14,7 +14,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 
-from adapter_harness import Kw, load_adapter, stub_profiles
+from adapter_harness import ApprovalPrompt, Kw, load_adapter, stub_profiles
 
 adapter = load_adapter("nostr_adapter_profiles")
 
@@ -118,14 +118,16 @@ def _keyed_adapter():
 
 
 def test_an_approval_prompt_on_a_routed_channel_keys_its_gate_with_the_profile():
-    """Without this the gate is registered in `agent:main` and no reaction can resolve it."""
+    """A host that names no session key leaves the fallback to do it; without this the gate is
+    registered in `agent:main` and no reaction can resolve it."""
     stub_profiles({"default", "ops"})
     inst = _keyed_adapter()
     asyncio.run(inst._deliver(_frame(profile="ops")))
 
-    asyncio.run(inst.send(ROOM, "may I touch production?", metadata={"is_approval_prompt": True}))
+    asyncio.run(inst._send_exec_approval_prompt(
+        ApprovalPrompt(ROOM, "", request_id="req-1")))
 
-    _chat, session_key, _request_id = inst._approval_prompts["sent-1"]
+    _chat, session_key, _request = inst._approval_prompts["sent-1"]
     assert session_key == f"agent:ops:nostr:dm:{ROOM}"
 
 
@@ -133,9 +135,22 @@ def test_a_prompt_on_an_unrouted_channel_keeps_the_default_namespace():
     stub_profiles({"default"})
     inst = _keyed_adapter()
     asyncio.run(inst._deliver(_frame(conversation=PEER)))
-    asyncio.run(inst.send(PEER, "may I?", metadata={"is_approval_prompt": True}))
-    _chat, session_key, _request_id = inst._approval_prompts["sent-1"]
+    asyncio.run(inst._send_exec_approval_prompt(
+        ApprovalPrompt(PEER, "", request_id="req-1")))
+    _chat, session_key, _request = inst._approval_prompts["sent-1"]
     assert session_key == f"agent:main:nostr:dm:{PEER}"
+
+
+def test_the_hosts_own_session_key_is_used_as_given():
+    """The gateway builds the key for the turn it is blocking; asking it again would only
+    re-derive what it already knows."""
+    stub_profiles({"default", "ops"})
+    inst = _keyed_adapter()
+    inst._peers.add(ROOM)
+    asyncio.run(inst._send_exec_approval_prompt(
+        ApprovalPrompt(ROOM, "agent:ops:nostr:concord:x", request_id="req-1")))
+
+    assert inst._approval_prompts["sent-1"][1] == "agent:ops:nostr:concord:x"
 
 
 def test_a_route_change_does_not_move_the_next_turn_into_the_old_profile():
@@ -150,33 +165,61 @@ def test_a_route_change_does_not_move_the_next_turn_into_the_old_profile():
 
 
 def test_a_reaction_reaches_the_gate_of_a_routed_channel(monkeypatch):
-    """End to end at this end: deliver a routed frame, send its prompt, react to the prompt."""
+    """End to end at this end: deliver a routed frame, hand the prompt to the adapter, react."""
     stub_profiles({"default", "ops"})
     inst = _keyed_adapter()
     asyncio.run(inst._deliver(_frame(profile="ops")))
+    asyncio.run(inst._send_exec_approval_prompt(
+        ApprovalPrompt(ROOM, "", request_id="req-1")))
+    session_key = inst._approval_prompts["sent-1"][1]
 
     seen = {}
-
-    def list_gateway_approvals(key):
-        seen["listed"] = key
-        return [{"request_id": "req-1"}]
 
     def resolve_gateway_approval(key, choice, request_id=None):
         seen["resolved"] = (key, choice, request_id)
         return 1
 
-    # Installed before the send: the adapter records the prompt's request id at send
-    # time, exactly as the host has already queued the gate by then.
     monkeypatch.setitem(__import__("sys").modules, "tools", type("m", (), {})())
     monkeypatch.setitem(__import__("sys").modules, "tools.approval", type("m", (), {
-        "list_gateway_approvals": staticmethod(list_gateway_approvals),
         "resolve_gateway_approval": staticmethod(resolve_gateway_approval),
     })())
-    asyncio.run(inst.send(ROOM, "may I?", metadata={"is_approval_prompt": True}))
-    session_key = inst._approval_prompts["sent-1"][1]
     asyncio.run(inst._deliver_reaction(
         {"type": "reaction", "sender": PEER, "reply_to": "sent-1",
          "content": "\U0001f44d", "authority": "instructions"},
         "reaction-id"))
-    assert seen["listed"] == session_key == f"agent:ops:nostr:dm:{ROOM}"
+    assert session_key == f"agent:ops:nostr:dm:{ROOM}"
     assert seen["resolved"] == (session_key, "once", "req-1")
+
+
+# -- the question itself: asked of the host, answered on its public surface ---------------
+
+def test_a_named_profile_is_live_when_its_directory_is():
+    stub_profiles({"default", "ops"})
+    assert adapter.profile_missing("ops") is False
+
+
+def test_a_ghost_directory_that_is_not_a_live_profile_is_missing():
+    """A directory a delete tombstoned is not a profile the host would run a turn in."""
+    stub_profiles({"default"}, tombstoned={"ghost"})
+    assert adapter.profile_missing("ghost") is True
+
+
+def test_the_id_grammar_is_the_hosts():
+    """Anything `-p` would refuse cannot name a profile, whatever is on disk."""
+    stub_profiles({"default", "ops"})
+    for name in ("../ops", "Ops!", "a" * 65, ".hidden", "/abs"):
+        assert adapter.profile_missing(name) is True, name
+
+
+def test_a_name_is_matched_the_way_the_host_matches_it():
+    stub_profiles({"default", "ops"})
+    assert adapter.profile_missing("  OPS  ") is False   # normalized, like `-p OPS`
+    assert adapter.profile_missing("default") is False
+    assert adapter.profile_missing("DEFAULT") is False
+
+
+def test_an_empty_or_non_string_name_is_missing():
+    stub_profiles({"default"})
+    assert adapter.profile_missing("") is True
+    assert adapter.profile_missing("   ") is True
+    assert adapter.profile_missing(None) is True

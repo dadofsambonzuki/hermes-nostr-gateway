@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import types
@@ -109,6 +110,33 @@ def get_scoped_secret(name: str, default=None, *, external_fallback: bool = Fals
     return os.environ.get(name, default)
 
 
+class ApprovalPrompt:
+    """Hermes' ``ExecApprovalPrompt``: the card body, the choices, and the request it answers.
+
+    Built here rather than imported so a test can shape the host's half: the choices a smart
+    deny removes, and a host release that names no request id at all (``request_id=None``).
+    """
+
+    def __init__(self, chat_id: str, session_key: str, *, text: str = "Run this command?",
+                 actions=None, request_id: str | None = "req-1", metadata=None) -> None:
+        self.chat_id = chat_id
+        self.session_key = session_key
+        self.text = text
+        self.actions = list(actions) if actions is not None else [
+            ("Approve once", "once", "primary"), ("Approve for session", "session", ""),
+            ("Always approve", "always", ""), ("Deny", "deny", "danger"),
+        ]
+        self.request_id = request_id
+        self.metadata = metadata or {}
+        self.command = "rm -rf /tmp/x"
+        self.description = "destructive"
+        self.smart_denied = False
+
+    @property
+    def choices(self) -> list[str]:
+        return [choice for _label, choice, _style in self.actions]
+
+
 def load_adapter(name: str = "nostr_adapter"):
     """Import the plugin module against the stubs and return it.
 
@@ -125,8 +153,9 @@ def load_adapter(name: str = "nostr_adapter"):
     # Credentials and settings are read through the host's secret route (catalog rule 11), so
     # the harness has to answer that route rather than let the adapter fall back to `os.environ`.
     _stub("gateway.platforms._shared", get_scoped_secret=get_scoped_secret)
-    # The adapter asks Hermes whether a routed profile exists; without the stub that question
-    # is unanswerable outside Hermes and every profile would be "not missing".
+    # The adapter asks Hermes whether a routed profile exists, through the public
+    # `hermes_constants`; without the stub that question is unanswerable outside Hermes and
+    # every profile would be "not missing".
     stub_profiles()
     spec = importlib.util.spec_from_file_location(name, PLUGIN)
     module = importlib.util.module_from_spec(spec)
@@ -135,22 +164,38 @@ def load_adapter(name: str = "nostr_adapter"):
     return module
 
 
-#: The profiles `hermes_cli.profiles.profile_exists` answers for, in a test's own terms. A
-#: module-level set because the stub is installed once, in `sys.modules`, and a test may change
-#: its mind between adapters.
+#: The named profiles Hermes' public predicates call live, in a test's own terms. A module-level
+#: set because the stub is installed once, in `sys.modules`, and a test may change its mind
+#: between adapters.
 KNOWN_PROFILES: set[str] = set()
 
 
-def stub_profiles(names: Iterable[str] = ()) -> None:
-    """Make Hermes' own profile lookup answer for *names* (default: none at all)."""
+def stub_profiles(names: Iterable[str] = (), *, tombstoned: Iterable[str] = ()) -> None:
+    """Make `hermes_constants` answer as Hermes' own profile predicates do.
+
+    Hermes decides "there is such a profile" itself, and `hermes_constants` is its public half
+    of that answer: `named_profile_is_live` is a directory with identity and no tombstone, and
+    `PROFILE_ID_RE` is the id grammar `-p` validates against. The stub keeps the split — a temp
+    home carrying `profiles/<name>/` for the live names, and a bare directory for the ones a
+    delete tombstoned — so a test can see that the adapter asks the host's question rather than
+    inventing a second answer.
+    """
     KNOWN_PROFILES.clear()
     KNOWN_PROFILES.update(str(name) for name in names or ())
+    dead = {str(name) for name in tombstoned or ()}
+    root = Path(tempfile.mkdtemp(prefix="hermes-home-"))
+    (root / "profiles" / ".deleted").mkdir(parents=True, exist_ok=True)
+    for name in KNOWN_PROFILES | dead:
+        if name != "default":
+            (root / "profiles" / name).mkdir(exist_ok=True)
 
-    def profile_exists(name: str) -> bool:
-        return str(name).strip() in KNOWN_PROFILES
+    def get_default_hermes_root() -> Path:
+        return root
 
-    _stub("hermes_cli")
-    _stub("hermes_cli.profiles", profile_exists=profile_exists,
-          get_profile_dir=lambda name: Path(f"/nonexistent/profiles/{name}"))
-    # `from hermes_cli.profiles import …` resolves the submodule through its parent.
-    sys.modules["hermes_cli"].profiles = sys.modules["hermes_cli.profiles"]  # type: ignore[attr-defined]
+    def named_profile_is_live(profile_home) -> bool:
+        path = Path(profile_home)
+        return path.is_dir() and path.name in KNOWN_PROFILES
+
+    _stub("hermes_constants", PROFILE_ID_RE=re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$"),
+          get_default_hermes_root=get_default_hermes_root,
+          named_profile_is_live=named_profile_is_live)
