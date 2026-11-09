@@ -452,7 +452,7 @@ def merge_route(tmp_path: Path) -> SimpleNamespace:
         "case \"$*\" in\n"
         "  *--json*) cat \"$FAKE_PR_JSON\" ;;\n"
         "  *apply*) exit 9 ;;\n"
-        "  *) printf 'Status: open\\nBranch: pr/test\\n' ;;\n"
+        "  *) printf 'Status: open\\nBranch: %s\\n' \"${FAKE_PR_BRANCH:-pr/test}\" ;;\n"
         "esac\n",
         encoding="utf-8")
     fake.chmod(0o755)
@@ -461,13 +461,13 @@ def merge_route(tmp_path: Path) -> SimpleNamespace:
                            venv=Path(sys.executable).parent.parent)
 
 
-def run_merge(made: SimpleNamespace, view: dict) -> subprocess.CompletedProcess:
+def run_merge(made: SimpleNamespace, view: dict, **extra: str) -> subprocess.CompletedProcess:
     made.view.write_text(json.dumps(view), encoding="utf-8")
     return subprocess.run(
         ["bash", str(made.repo / "scripts" / "merge_pr.sh"), PR, "--check"],
         cwd=made.repo,
         env=clean_env(PATH=f"{made.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
-                      VENV=str(made.venv), FAKE_PR_JSON=str(made.view)),
+                      VENV=str(made.venv), FAKE_PR_JSON=str(made.view), **extra),
         capture_output=True, text=True, timeout=180,
     )
 
@@ -504,6 +504,22 @@ def test_the_merge_route_lets_a_permitted_approval_of_the_current_tip_through(me
     past = run_merge(merge_route, a_view(AUTHOR, an_approval(REVIEWER, tip=merge_route.tip)))
 
     assert "REFUSED" not in past.stdout
+    assert past.returncode == 1 and "CONFLICT" in past.stdout
+
+
+def test_the_merge_route_finds_the_head_behind_a_decorated_branch_name(merge_route):
+    """`ngit pr view` writes `pr/x(2eeb43d6)`; the remote's ref is `pr/x`, and the same commit.
+
+    The decoration is the proposal id, not a branch, so a lookup on it alone answers nothing --
+    and a guard that answered "no tip" there would refuse every merge this repository makes.
+    """
+    git(merge_route.repo, "push", "-q", "origin", "HEAD:refs/heads/pr/undecorated")
+
+    past = run_merge(merge_route,
+                     a_view(AUTHOR, an_approval(REVIEWER, tip=merge_route.tip)),
+                     FAKE_PR_BRANCH="pr/undecorated(2eeb43d6)")
+
+    assert "REFUSED" not in past.stdout, past.stdout + past.stderr
     assert past.returncode == 1 and "CONFLICT" in past.stdout
 
 
