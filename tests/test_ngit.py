@@ -4956,6 +4956,88 @@ def test_issue_labels_ignores_a_label_for_another_repository():
     assert labels[issue_id] == ()
 
 
+class _LabelRelay:
+    """A relay answering one `#e` filter, conjoined with `#a` when the filter carries one.
+
+    That conjunction is the defect this section pins: the filter the gate used to send
+    carried both tags, so a label event with no `a` was never served, however tolerant the
+    parser was.
+    """
+
+    def __init__(self, events: list[dict]):
+        self.events = [dict(event) for event in events]
+        self.asks: list[dict] = []
+
+    def __call__(self, *, relays, kinds, tag, values, limit=50, a_tag=None, secret=None):
+        self.asks.append({"kinds": list(kinds), "tag": tag, "values": list(values),
+                          "a_tag": a_tag})
+        wanted = set(values)
+        return [("wss://relay.example", event) for event in self.events
+                if int(event["kind"]) in kinds
+                and any(t[0] == tag and t[1] in wanted for t in event["tags"])
+                and (not a_tag or ["a", a_tag] in event["tags"])]
+
+
+def issue_label_event(seed: str, issue_id: str, *, value: str = "ready", a_tag: str = "",
+                      author: str = TRUSTED_HEX) -> dict:
+    """A kind-1985 on an issue: `e`+`p` always, this repository's `a` only when carried.
+
+    This is the shape `ngit issue label` writes on 3.0.5 (`src/bin/ngit/sub_commands/
+    label.rs`): `["L", "#t"]`, one `["l", value, "#t"]`, `["e", id, relay]`, `["p", author]`
+    and `["alt", ...]` -- no `a` tag at all. The bridge's own writer carries this
+    repository's `a` (`ngit_labels.label_event`); both shapes have to count.
+    """
+    tags = [["L", "#t"], ["l", value, "#t"], ["e", issue_id, "wss://relay.example"],
+            ["p", author], ["alt", f"labelled issue with #{value}"]]
+    if a_tag:
+        tags.append(["a", a_tag])
+    return {"id": event_id(seed), "kind": ngit_labels.KIND_LABEL, "content": "",
+            "created_at": 1000, "pubkey": author, "tags": tags}
+
+
+def test_the_issue_gate_sees_both_label_shapes_and_queues(home, store):
+    """One issue, two live `ready` labels: this repository's `a`+`e`, and `e` alone."""
+    issue = make_issue("d7", subject="Add a flag")
+    carried = issue_label_event("d8", issue.hex, a_tag=ADDRESS)
+    bare = issue_label_event("d9", issue.hex)
+    relay = _LabelRelay([carried, bare])
+    reader = ngit.RelayLabels(["wss://relay.example"], ADDRESS, fetcher=relay)
+    made = Harness(home, store, issues=[issue], state=reader)
+    made.details = {issue.hex: issue}
+    try:
+        report = made.sync()
+
+        # The relay was asked by `#e` alone; the repository scoped the events afterwards.
+        read = [ask for ask in relay.asks if ask["kinds"] == [ngit_labels.KIND_LABEL]][0]
+        assert read == {"kinds": [ngit_labels.KIND_LABEL], "tag": "e",
+                        "values": [issue.hex], "a_tag": None}
+        labels = reader.issue_labels([issue.hex])[issue.hex]
+        assert {label.event_id for label in labels} == {carried["id"], bare["id"]}
+        assert report.issues["created"] == 1 and report.issues["ready"] == 1
+        task = made.tasks()[0]
+        assert task["status"] == "ready"
+        assert task["idempotency_key"] == f"ngit:issue:{issue.hex}"
+    finally:
+        made.close()
+
+
+def test_a_ready_label_for_another_repository_still_does_not_queue(home, store):
+    """Reading by `#e` alone lets the event through; its foreign `a` is what refuses it."""
+    issue = make_issue("da", subject="Add a flag")
+    foreign = issue_label_event("db", issue.hex, a_tag="30617:" + "99" * 32 + ":other")
+    relay = _LabelRelay([foreign])
+    reader = ngit.RelayLabels(["wss://relay.example"], ADDRESS, fetcher=relay)
+    made = Harness(home, store, issues=[issue], state=reader)
+    made.details = {issue.hex: issue}
+    try:
+        report = made.sync()
+
+        assert made.tasks() == []
+        assert report.issues["waiting"] == 1
+        assert reader.issue_labels([issue.hex])[issue.hex] == ()
+    finally:
+        made.close()
+
 
 # -- the verdict on the PR -----------------------------------------------------
 

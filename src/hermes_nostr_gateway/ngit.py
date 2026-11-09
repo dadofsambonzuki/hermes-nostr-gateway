@@ -1636,6 +1636,11 @@ class RelayLabels:
         uses is not necessarily the review writer, so no namespace is assumed. The target
         scopes it: an `e` tag naming *this* issue, plus this repository's `a` when the event
         carries one at all.
+
+        The read is by `e` alone. NIP-01 filters are conjunctive, so `#e` + `#a` never
+        serves a label event that carries no `a` -- the shape `ngit issue label` writes --
+        and the tolerance above could never fire for a repository the bridge knows the
+        address of. The repository scopes the *events*, after the relay has answered.
         """
         wanted = [str(root) for root in ids if str(root or "").strip()]
         if not wanted:
@@ -1643,8 +1648,7 @@ class RelayLabels:
         if not self.relays:
             raise NgitError("no relays configured: labels cannot be read")
         events = self._fetch(relays=self.relays, kinds=[KIND_LABEL], tag="e",
-                             values=wanted, limit=READ_AHEAD,
-                             a_tag=self.address or None, secret=self.secret)
+                             values=wanted, limit=READ_AHEAD, secret=self.secret)
         found: dict[str, list[Label]] = {root: [] for root in wanted}
         seen: set[tuple[str, str]] = set()
         for _relay, event in events or ():

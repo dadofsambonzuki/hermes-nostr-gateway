@@ -989,7 +989,12 @@ the contributor asking for something, and the maintainer deciding it is wanted.
 So the authorisation moved to a label: an issue becomes a card when a trusted npub has published
 `ready` (NIP-32 kind 1985, targeting the issue; any namespace, because the namespace is a display
 convention and the question is who said it) — `ngit.ready_label`, `""` to restore the author
-rule. Three consequences are deliberate:
+rule. The read asks for the issue's `e` **alone**: `#e` and `#a` in one filter conjoin, and
+`ngit issue label` writes the label with no repository `a`, so a read that asked for both would
+never be served the shape a maintainer actually publishes. The repository scopes the events
+afterwards instead — this repository's `a` when one is carried, no `a` at all accepted — which
+is the same tolerance the PR review read applies, for the same reason. Three consequences are
+deliberate:
 
 - **The decision is public and durable.** It is written on the issue, where the contributor and
   every other reader can see it, instead of in a channel the contributor may not be in. Taking
