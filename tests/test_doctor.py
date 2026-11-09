@@ -314,6 +314,27 @@ def test_a_missing_live_adapter_fails_the_run(good, monkeypatch, capsys):
     assert "hng adapter install" in adapter["fix"]
 
 
+def test_an_unreadable_live_adapter_fails_the_check_without_losing_the_report(
+        good, monkeypatch, capsys):
+    """`run` never raises for a bad host: an unreadable copy is one failing check, not no report."""
+    tmp_path, home, checkout, config = good
+    live = stub_adapter(monkeypatch, tmp_path)
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    reported = set(checks_by_name(capsys))
+    live.chmod(0o000)
+    if os.access(live, os.R_OK):
+        pytest.skip("this process can read a 000 file, so the read cannot fail")
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    checks = checks_by_name(capsys)
+    assert set(checks) == reported, "the preflight still reports every check"
+    adapter = checks["adapter"]
+    assert not adapter["ok"]
+    assert "cannot read" in adapter["detail"]
+    assert str(live) in adapter["detail"]
+    assert adapter["fix"], "a failing check must name its fix"
+
+
 def test_the_adapter_check_is_not_a_failure_without_a_checkout(good, monkeypatch, capsys):
     """A wheel build carries no repository copy: named as not applicable, not failed."""
     from hermes_nostr_gateway import adapter_copy

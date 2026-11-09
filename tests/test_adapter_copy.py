@@ -82,6 +82,67 @@ def test_a_missing_live_copy_is_a_failure_naming_the_path(tmp_path, monkeypatch)
     assert state.live_hash == ""
 
 
+def test_an_unreadable_live_copy_is_a_problem_and_not_an_exception(tmp_path, monkeypatch):
+    """A copy that exists but cannot be read fails the check: `status` never raises."""
+    _, live = make_copies(tmp_path, monkeypatch)
+    live.chmod(0o000)
+    if os.access(live, os.R_OK):  # root opens a 000 file regardless; nothing to prove here
+        pytest.skip("this process can read a 000 file, so the read cannot fail")
+
+    state = adapter_copy.status({})
+
+    assert not state.ok
+    assert state.live_hash == ""
+    assert "the live copy is unreadable" in state.detail()
+    assert str(live) in state.detail()
+    assert any(line.startswith("problem:") for line in state.lines())
+
+
+def test_an_unreadable_repository_copy_is_a_problem_and_not_an_exception(tmp_path, monkeypatch):
+    repo, _ = make_copies(tmp_path, monkeypatch)
+    repo.chmod(0o000)
+    if os.access(repo, os.R_OK):
+        pytest.skip("this process can read a 000 file, so the read cannot fail")
+
+    state = adapter_copy.status({})
+
+    assert not state.ok
+    assert state.repo_hash == ""
+    assert "the repository copy is unreadable" in state.detail()
+    assert str(repo) in state.detail()
+
+
+def test_a_read_error_from_either_digest_is_a_problem_not_a_raised_error(tmp_path, monkeypatch):
+    """Whatever the host does to the read, `status` answers with a problem and exits a failure."""
+    repo, live = make_copies(tmp_path, monkeypatch)
+
+    def refuse(path):
+        raise adapter_copy.AdapterError(f"{path}: cannot read it (Permission denied)")
+
+    monkeypatch.setattr(adapter_copy, "digest", refuse)
+
+    state = adapter_copy.status({})
+
+    assert not state.ok
+    assert state.repo_hash == state.live_hash == ""
+    assert str(repo) in state.detail() and str(live) in state.detail()
+    assert state.detail().count("cannot read it") == 2
+
+
+def test_the_status_verb_reports_an_unreadable_copy_and_exits_one(tmp_path, monkeypatch, capsys):
+    _, live = make_copies(tmp_path, monkeypatch)
+    config = write_config(tmp_path, socket=str(tmp_path / "gateway.sock"))
+    live.chmod(0o000)
+    if os.access(live, os.R_OK):
+        pytest.skip("this process can read a 000 file, so the read cannot fail")
+
+    assert cli.main(["--config", str(config), "adapter", "status"]) == 1
+
+    out = capsys.readouterr().out
+    assert "problem: the live copy is unreadable" in out
+    assert "(unreadable)" in out, "the hash line must not call an unreadable copy missing"
+
+
 def test_a_build_with_no_checkout_is_reported_and_not_a_failure(tmp_path, monkeypatch):
     make_copies(tmp_path, monkeypatch)
     monkeypatch.setattr(adapter_copy, "source_path", lambda: None)

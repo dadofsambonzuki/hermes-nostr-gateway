@@ -137,11 +137,15 @@ class Status:
         """The same facts as `hng adapter status` prints them: two files, then the verdict."""
         if not self.applicable:
             return [self.reason]
+        # A stat still answers for a file that exists but cannot be read, so the mtime says
+        # which of the two a missing hash is: a missing copy, or one this user cannot open.
+        live_sha = self.live_hash or (
+            "(unreadable)" if self.live_mtime is not None else "(missing)")
         out = [
             f"repo: {self.repo}",
             f"  sha256 {self.repo_hash or '(unreadable)'}  mtime {_iso(self.repo_mtime)}",
             f"live: {self.live}",
-            f"  sha256 {self.live_hash or '(missing)'}  mtime {_iso(self.live_mtime)}",
+            f"  sha256 {live_sha}  mtime {_iso(self.live_mtime)}",
         ]
         out.extend(f"problem: {problem}" for problem in self.problems)
         if self.ok:
@@ -316,7 +320,13 @@ def unit_started(unit: str = UNIT) -> tuple[float | None, str]:
 
 def status(cfg: Mapping[str, Any] | None = None, *, live: str | Path | None = None,
            unit: str = UNIT) -> Status:
-    """Hash both copies, and ask the unit when it started. Never raises for a bad host."""
+    """Hash both copies, and ask the unit when it started. Never raises for a bad host.
+
+    A copy that exists but cannot be read -- a root-owned plugins directory, a file this user
+    may not open -- is a `problems` entry naming the copy and the reason, so the check fails
+    saying why instead of dying: a copy that cannot be read cannot be proven equal, and a
+    preflight that raises reports nothing at all.
+    """
     repo = source_path()
     target = live_path(cfg, live)
     problems: list[str] = []
@@ -330,11 +340,17 @@ def status(cfg: Mapping[str, Any] | None = None, *, live: str | Path | None = No
         if not repo.is_file():
             problems.append(f"the repository copy {repo} is not a file")
         else:
-            repo_hash = digest(repo)
+            try:
+                repo_hash = digest(repo)
+            except AdapterError as exc:
+                problems.append(f"the repository copy is unreadable: {exc}")
     if not target.is_file():
         problems.append(f"no live copy at {target} (Hermes loads the plugin from there)")
     else:
-        live_hash = digest(target)
+        try:
+            live_hash = digest(target)
+        except AdapterError as exc:
+            problems.append(f"the live copy is unreadable: {exc}")
     started, note = unit_started(unit)
     return Status(
         live=target, repo=repo, repo_hash=repo_hash, live_hash=live_hash,
