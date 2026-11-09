@@ -837,9 +837,10 @@ card with the verdict as its result; `changes-requested` puts it back on the imp
 as `ready`, with the fix brief and the findings — the transition the kernel's
 `request_changes` writes, written by the bridge because the review card was never claimed from
 `review` and the kernel's provenance check has nothing to route on. The merge stays a person's:
-the card being `done` says the review is over, and the bridge records the reviewed tip on the
-link (`verdict_tip`) so the merge route refuses a tip the approval does not cover. The label is
-a public copy of the state, not the gate.
+the card being `done` says the review is over, and the published verdict carries the tip it
+covers (the `Tip:` line) so the merge route refuses one that does not name the tip it would
+land. The link's `verdict_tip` is the same fact cached for the pass's own bookkeeping; the
+merge route reads the record. The label is a public copy of the state, not the gate.
 
 *Partly superseded — see "A changes-requested verdict queues a fix card" below: `approved` still
 completes the card, and `changes-requested` queues a fix card instead of re-queuing this one.*
