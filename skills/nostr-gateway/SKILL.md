@@ -171,8 +171,10 @@ manual — run `ngit skill install` for the rest.
   Do not fake one by hand and assume it lands: a hand-published comment is accepted by the
   relay and still does not appear in `ngit pr view --comments`.
 - **A proposal a rebase orphaned is closed with a status event, not a deletion, and the event
-  names what replaced it.** Merging a rebased branch leaves the PR's original commits outside
-  the target, so it reads `open` with its content already in `master`; a kind-5 deletion is
+  names what replaced it.** Only a proposal that will not land is closed this way; the proposal
+  whose own content landed takes the kind-1631 applied record below, never a close. Merging a
+  rebased branch leaves the PR's original commits outside the target,
+  so it reads `open` with its content already in `master`; a kind-5 deletion is
   refused (*authored by another pubkey*). Close it with **`hng ngit closed <id> --reason
   "<why>"`**, which publishes a kind 1632 carrying the repository `a` coordinate — `ngit pr
   close` writes the same kind without that tag, so a repository reader never sees the close —
