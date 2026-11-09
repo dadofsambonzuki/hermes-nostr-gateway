@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import nostr_sdk as sdk
 
@@ -27,7 +27,7 @@ from . import read as c
 from .channels import ChannelStream, decides, has_mention
 from .channels import streams as channel_streams
 from .derive import ConcordError, GroupKey
-from .read import Invite, open_wrap, verify_bundle
+from .read import Invite, open_wrap, same_community, verify_bundle
 
 log = logging.getLogger("hng.plane.concord")
 
@@ -49,6 +49,79 @@ def npub_of(pubkey_hex: str) -> str:
         return sdk.PublicKey.parse(text).to_bech32()
     except Exception:  # noqa: BLE001 - a bad key is worth showing, not raising for
         return text or "(none)"
+
+
+def channel_notice(name: str, community_id: str,
+                   channels: list[tuple[str, str]]) -> str:
+    """The operator-facing notice: the community, then one channel id and name per line.
+
+    `channel_id:` is spelled out because that is the config key an entry needs, and the
+    pitfall is named at the bottom: a name resolves locally and then loses every notice at
+    send time. The caller passes only the ids it has not announced before.
+    """
+    lines = [f"Concord: {name or '(unnamed)'}",
+             f"community: {community_id}", ""]
+    lines.extend(f"channel_id: {channel_id}  {channel_name}"
+                 for channel_id, channel_name in channels)
+    lines.extend([
+        "",
+        "Key concord.projects by the channel id: a name resolves locally, then loses "
+        "every notice at send time.",
+    ])
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class JoinedCommunity:
+    """A community this store has joined, and the bundle its channel grants come from."""
+
+    community_id: str
+    invite: Invite
+
+    @property
+    def name(self) -> str:
+        return str(self.invite.bundle.get("name") or "")
+
+
+def joined_communities(rows: Iterable[dict[str, Any]]) -> list[JoinedCommunity]:
+    """The communities this store has joined, one entry each, from invite rows.
+
+    The store keeps one row per invite and one owner action mints one invite per room, so
+    the grants a store holds for a community are only ever the union of its joined invites'
+    grants — the channel list itself comes from the Control plane. The newest accepted row
+    is the pin (its roots, control key, epoch and relays are this community's identity); a
+    row that disagrees with it is skipped, and the union keeps the first grant it sees for
+    each channel id. `Gateway.refresh_concord` and `hng concord channels` both start here,
+    so neither can act on a community — or a grant — the other cannot see.
+    """
+    by_community: dict[str, list[dict[str, Any]]] = {}
+    for row in rows or ():
+        by_community.setdefault(str(row.get("community_id") or ""), []).append(row)
+
+    out: list[JoinedCommunity] = []
+    for community_id, group in by_community.items():
+        joined = [row for row in group if str(row.get("status") or "") == "joined"]
+        if not joined:
+            continue
+        pinned = max(joined, key=lambda row: int(row.get("decided_at") or 0))
+        bundle = dict(pinned["bundle"])
+        grants: dict[str, dict[str, Any]] = {}
+        for row in joined:
+            row_bundle = row["bundle"]
+            if not same_community(row_bundle, pinned["bundle"]):
+                log.warning("concord: ignoring a re-invite for %s… that changes the "
+                            "community identity", community_id[:12])
+                continue
+            for channel in row_bundle.get("channels") or []:
+                if channel.get("id"):
+                    grants.setdefault(channel["id"], channel)
+        if grants:
+            bundle["channels"] = list(grants.values())
+        out.append(JoinedCommunity(
+            community_id=community_id,
+            invite=Invite(bundle=bundle, inviter=pinned["inviter"], relay="",
+                          wrap_id=pinned["id"])))
+    return out
 
 
 @dataclass(frozen=True)

@@ -33,7 +33,8 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | Is the daemon up, and are relays hearing anything? | `hng status --json` | `identity`, `checkout` (`branch`, `commit`, `behind`, `ahead`, `ok`), `daemon` (bool), `event_times`, `pending`, `blocked`, `drops`, `wraps`, `menu` (the catalogue the Hermes plugin wrote, and whether its last write failed), `relays[].verdict`/`detail`, `ngit_watch`. |
 | What did policy refuse, and why? | `hng drops --json` | `drops[]` (plane, sender, kind, rule, why, reason, received_at, age_s, expired), `total`, `live`, `expired`, `ttl_s`. Add `--plane`, `--reason`, `--since-hours`. |
 | What actually arrived? | `hng recent [N]` | Text rows only (no `--json`): time, direction, sender, reach, first 90 characters. |
-| Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `config`, `checkout`, `project`, `board`; exit 1 on any gap. Plain `hng projects --json` lists the map only. |
+| Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `channel`, `config`, `checkout`, `project`, `board`; exit 1 on any gap. A `channel` check appears only when the key is not a 64-hex channel id (or `concord:<community-id>:<channel-id>`): a name resolves inbound messages and then loses every notice at send time. Plain `hng projects --json` lists the map only. |
+| Which channel ids may I key `concord.projects` by? | `hng concord channels --json` | `[{id, name, community}]` for every readable channel of every joined community; `--community <id>` narrows it. It performs the same Control-plane read a refresh does (the store's grants alone are not the channel list) and falls back to the grants, with a note on stderr, when a relay is silent. A held invite contributes nothing. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
 | What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{seen,created,ready,held,existing,comments,deleted,deferred,waiting,would_create,would_wait}`, `mentions{seen,created,existing,ignored,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
 | Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
@@ -42,8 +43,8 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | One preflight of all of the above | `hng doctor --json` | `ok` and `checks[]` of `{name, ok, detail, fix}`; exit 1 when any check fails. |
 
 Read-only questions are safe to run at any time: `status`, `health`, `drops`, `recent`,
-`projects`, `route`, `profile`, `doctor`, `adapter status`, `ngit sync --dry-run` and
-`ngit reconcile --dry-run` write nothing. `hng profile publish` publishes the advertisement,
+`projects`, `concord channels`, `route`, `profile`, `doctor`, `adapter status`,
+`ngit sync --dry-run` and `ngit reconcile --dry-run` write nothing. `hng profile publish` publishes the advertisement,
 `hng adapter install` replaces the live plugin copy (after backing it up), `ngit sync` without
 `--dry-run` writes tasks, comments, notices and cursors — it is what the scheduled pass runs —
 and `ngit reconcile` without `--dry-run` moves the cards parked on a verdict (never a card

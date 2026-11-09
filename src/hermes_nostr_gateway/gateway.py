@@ -60,9 +60,10 @@ from .peer_inbox import (
 from .planes import nip04
 from .planes.concord import read as concord_read
 from .planes.concord import write as concord_write
+from .planes.concord.channels import ChannelStream
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.concord.channels import stream_key as concord_stream_key
-from .planes.concord.plane import ConcordPlane, InviteVerdict, npub_of
+from .planes.concord.plane import ConcordPlane, InviteVerdict, channel_notice, npub_of
 from .planes.marmot import (
     MarmotControl,
     MarmotError,
@@ -693,54 +694,98 @@ class Gateway:
         on the Control plane and Guestbook, both of which only need the `community_root` in the
         invite. So the plane learns its streams here, and the workers subscribe by author
         (the stream addresses) rather than by `#p` — a channel wrap is not addressed to us.
+
+        The notice comes last, after every community's streams exist: it is sent to the
+        control pane, which is itself a channel in one of those communities, and a pane whose
+        stream has not been built yet would fail as "no readable channel".
         """
-        from .planes.concord import read as concord_read
+        from .planes.concord.plane import joined_communities
 
-        by_community: dict[str, list[dict[str, Any]]] = {}
-        for row in self.store.concord_invites(50):
-            by_community.setdefault(row["community_id"], []).append(row)
-
-        watched = 0
-        for community_id, rows in by_community.items():
-            # Only an invite that was actually joined may build streams. A held question,
-            # a declined invite and a failed join are records, not subscriptions: using
-            # their bundle would put the agent in a room nobody accepted (and let a
-            # stranger's re-invite replace the relays and keys). The newest accepted row is
-            # the pin, and grants are unioned only from rows that agree with it -- a room
-            # added by the same owner is additive; a changed root, control key, epoch or
-            # relay set is not this community any more.
-            joined = [row for row in rows if str(row.get("status") or "") == "joined"]
-            if not joined:
-                continue
-            pinned = max(joined, key=lambda row: int(row.get("decided_at") or 0))
-            bundle = dict(pinned["bundle"])
-            grants: dict[str, dict[str, Any]] = {}
-            for row in joined:
-                row_bundle = row["bundle"]
-                if not concord_read.same_community(row_bundle, pinned["bundle"]):
-                    log.warning("concord: ignoring a re-invite for %s… that changes the "
-                                "community identity", community_id[:12])
-                    continue
-                for channel in row_bundle.get("channels") or []:
-                    if channel.get("id"):
-                        grants.setdefault(channel["id"], channel)
-            if grants:
-                bundle["channels"] = list(grants.values())
-            invite = concord_read.Invite(bundle=bundle, inviter=pinned["inviter"],
-                                         relay="", wrap_id=pinned["id"])
-            try:
-                community = await concord_read.load_community(invite)
-                members = await concord_read.read_guestbook(invite)
-            except Exception as exc:  # noqa: BLE001 - one dead community is not the daemon
-                log.warning("concord: cannot refresh %s…: %s", community_id[:12], exc)
-                continue
-            fresh = self.concord.set_streams(invite, community.channels,
-                                             {m.pubkey for m in members})
-            watched += len(fresh)
+        synced: list[tuple[Invite, list[ChannelStream]]] = []
+        for community in joined_communities(self.store.concord_invites(50)):
+            fresh = await self._read_concord_community(community.invite)
+            if fresh is not None:
+                synced.append((community.invite, fresh))
         await self._sync_concord_workers()
+        for invite, fresh in synced:
+            await self._announce_concord_channels(invite, fresh)
+        watched = sum(len(fresh) for _invite, fresh in synced)
         log.info("concord: %d channel stream(s) watched across %d community(ies)",
-                 watched, len(by_community))
+                 watched, len(synced))
         return watched
+
+    async def _read_concord_community(self, invite: Invite) -> list[ChannelStream] | None:
+        """One joined community's channels and roster, published to the plane.
+
+        Only an invite that was actually joined reaches this: a held question, a declined
+        invite and a failed join are records, not subscriptions — using their bundle would
+        put the agent in a room nobody accepted (and let a stranger's re-invite replace the
+        relays and keys). The union of grants lives in `joined_communities`, so `invite` is
+        already the pinned bundle with every channel its joined invites granted.
+        """
+        try:
+            community = await concord_read.load_community(invite)
+            members = await concord_read.read_guestbook(invite)
+        except Exception as exc:  # noqa: BLE001 - one dead community is not the daemon
+            log.warning("concord: cannot refresh %s…: %s", invite.community_id.hex()[:12], exc)
+            return None
+        return self.concord.set_streams(invite, community.channels,
+                                        {m.pubkey for m in members})
+
+    async def _announce_concord_channels(self, invite: Invite,
+                                         channels: list[ChannelStream]) -> None:
+        """Tell the operator the ids of channels this gateway now watches — once each.
+
+        The destination is the concord `control:` pane, never a guessed DM home channel:
+        aiming notices at home is how one bot aimed an echo loop at a peer. One notice per
+        community, listing only the ids the store has not announced before; that row is the
+        record a restart is checked against, so a second boot stays silent. An id is logged
+        at INFO either way, because the log is what a host with no pane configured has.
+
+        Claim-then-send: the claim keeps two racing refreshes to one notice, and a send
+        that fails gives the claim back so the next refresh retries instead of losing it.
+        """
+        community_id = invite.community_id.hex()
+        name = str(invite.bundle.get("name") or "")
+        claimed = self.store.claim_concord_channels(
+            community_id, [(stream.channel_id, stream.name) for stream in channels])
+        if not claimed:
+            return
+        for channel_id, channel_name in claimed:
+            log.info("concord: channel %s %r in %r", channel_id, channel_name, name or "?")
+        destination = self.control.target("concord")
+        if not destination:
+            log.warning(
+                "concord: %r has %d channel id(s) with no control pane to announce them to: "
+                "set control.concord, or read them with `hng concord channels`",
+                name or community_id[:12], len(claimed))
+            return
+        frame = await self._send_concord(
+            destination, channel_notice(name, community_id, claimed), None, None)
+        if frame.get("ok"):
+            log.info("concord: announced %d channel id(s) for %r in the control pane",
+                     len(claimed), name or community_id[:12])
+            return
+        self.store.release_concord_channels(community_id, [cid for cid, _ in claimed])
+        log.warning("concord: the channel notice for %r did not reach %s: %s; the next "
+                    "refresh retries it", name or community_id[:12], destination,
+                    frame.get("error") or frame.get("errors") or "unknown error")
+
+    async def _announce_joined(self, invite: Invite) -> None:
+        """A join just completed: read the community, then announce its channel ids.
+
+        Best-effort and deliberately outside the invite lock: a slow Control-plane read
+        delays a notice, never the decision a second invite is waiting on. Whatever this
+        pass cannot read, the next refresh announces — the claim is not written until a
+        read has actually produced the channel list.
+        """
+        try:
+            fresh = await self._read_concord_community(invite)
+            if fresh:
+                await self._announce_concord_channels(invite, fresh)
+        except Exception:  # noqa: BLE001 - a joined invite must not fail over a notice
+            log.exception("concord invite %s...: joined, but the channel notice failed",
+                          invite.wrap_id[:12])
 
     async def _sync_concord_workers(self) -> None:
         """(Re)start a read worker per relay for the channel addresses the plane knows."""
@@ -896,11 +941,19 @@ class Gateway:
 
         Returns the same frame the CLI prints, so a caller sees the words the daemon acted
         on: `status` is `joined`, `held` or `failed`, and `why` says what decided it.
+
+        A join that landed is followed by the channel-id notice *outside* the lock: the
+        notice reads the Control plane, and a slow relay must not make the next invite wait
+        on it. `already a member` is not a join: a re-invite's new grant is announced by the
+        next refresh, which performs the same read.
         """
         community = invite.community_id.hex()
+        frame: dict[str, Any]
+        joined_now = False
         async with self.invite_lock:
             if self.store.concord_joined(community):
                 pinned = self._pinned_invite(community)
+                held: InviteVerdict | None = None
                 if pinned is not None:
                     changed = not concord_read.same_community(invite.bundle, pinned["bundle"])
                     replaced = concord_read.replaced_grants(pinned["bundle"], invite.bundle)
@@ -919,27 +972,37 @@ class Gateway:
                             why += (f" (channels: {', '.join(cid[:8] for cid in replaced)})"
                                     if replaced else "")
                             why += f"; inviter {invite.inviter[:12]}… is neither trusted nor the owner"
-                            return await self._hold_invite(invite, InviteVerdict(False, why))
-                self._record_decision(invite, status="joined",
-                                      why="already a member of this community",
-                                      decided_by="auto")
-                log.info("concord invite %s...: already a member of %s...",
-                         invite.wrap_id[:12], community[:12])
-                return {**self._invite_base(invite), "status": "joined", "ok": True,
-                        "why": "already a member of this community"}
-            row = self.store.concord_invite(invite.wrap_id) or {}
-            if row.get("announced_at"):
-                # The same wrap reaches us from every relay that carries it: the question
-                # is already in the pane, and asking it twice would train people to ignore
-                # it. The row keeps the reason it was held.
-                log.info("concord invite %s...: already asked in the control pane",
-                         invite.wrap_id[:12])
-                return {**self._invite_base(invite), "status": "held", "announced": True,
-                        "why": str(row.get("why") or "")}
-            verdict = self.concord.invite_verdict(invite)
-            if verdict.accept:
-                return await self._join_invite(invite, verdict)
-            return await self._hold_invite(invite, verdict)
+                            held = InviteVerdict(False, why)
+                if held is not None:
+                    frame = await self._hold_invite(invite, held)
+                else:
+                    self._record_decision(invite, status="joined",
+                                          why="already a member of this community",
+                                          decided_by="auto")
+                    log.info("concord invite %s...: already a member of %s...",
+                             invite.wrap_id[:12], community[:12])
+                    frame = {**self._invite_base(invite), "status": "joined", "ok": True,
+                             "why": "already a member of this community"}
+            else:
+                row = self.store.concord_invite(invite.wrap_id) or {}
+                if row.get("announced_at"):
+                    # The same wrap reaches us from every relay that carries it: the question
+                    # is already in the pane, and asking it twice would train people to ignore
+                    # it. The row keeps the reason it was held.
+                    log.info("concord invite %s...: already asked in the control pane",
+                             invite.wrap_id[:12])
+                    frame = {**self._invite_base(invite), "status": "held", "announced": True,
+                             "why": str(row.get("why") or "")}
+                else:
+                    verdict = self.concord.invite_verdict(invite)
+                    if verdict.accept:
+                        frame = await self._join_invite(invite, verdict)
+                        joined_now = bool(frame.get("ok"))
+                    else:
+                        frame = await self._hold_invite(invite, verdict)
+        if joined_now:
+            await self._announce_joined(invite)
+        return frame
 
     async def _join_invite(self, invite: Invite, verdict: InviteVerdict) -> dict[str, Any]:
         """Publish the Guestbook join, and write down every way it can end.

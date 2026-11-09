@@ -261,7 +261,7 @@ def test_check_passes_when_the_checkout_project_and_board_are_all_there(tmp_path
     monkeypatch.setenv("HERMES_HOME", str(home))
     checkout = tmp_path / "example-checkout"
     checkout.mkdir()
-    path = config_file(tmp_path, [{"channel": CHANNEL_NAME, "path": str(checkout),
+    path = config_file(tmp_path, [{"channel": CHANNEL_ID, "path": str(checkout),
                                    "project": PROJECT, "board": BOARD}])
 
     assert cli.main(["--config", path, "projects", "--check"]) == 0
@@ -270,12 +270,43 @@ def test_check_passes_when_the_checkout_project_and_board_are_all_there(tmp_path
     assert "bound to project" in out
 
 
+def test_check_fails_a_name_keyed_entry_and_names_the_pitfall(tmp_path, monkeypatch, capsys):
+    """A name resolves locally, passes every other check, and then loses every notice."""
+    home = hermes_home(tmp_path)
+    write_board(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    path = config_file(tmp_path, [{"channel": CHANNEL_NAME, "path": str(checkout),
+                                   "project": PROJECT, "board": BOARD}])
+
+    assert cli.main(["--config", path, "projects", "--check"]) == 1
+    out = capsys.readouterr().out
+    assert verdict("channel", "MISSING") + f"channel '{CHANNEL_NAME}' is not a channel id" in out
+    assert "loses every notice at send time" in out
+    # Everything else about the entry is fine: the key is the one thing wrong with it.
+    assert verdict("checkout") in out and verdict("project") in out and verdict("board") in out
+
+
+@pytest.mark.parametrize("key", [CHANNEL_ID, f"concord:{COMMUNITY}:{CHANNEL_ID}",
+                                 f"concord:{COMMUNITY.upper()}:{CHANNEL_ID.upper()}"])
+def test_check_accepts_a_channel_id_or_the_whole_conversation(key, tmp_path, monkeypatch, capsys):
+    """The two keys both halves of a scheduled pass can act on: the id, or the conversation."""
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home(tmp_path, registry=False)))
+    checkout = tmp_path / "example-checkout"
+    checkout.mkdir()
+    path = config_file(tmp_path, [{"channel": key, "path": str(checkout)}])
+
+    assert cli.main(["--config", path, "projects", "--check"]) == 0
+    assert "is not a channel id" not in capsys.readouterr().out, "a usable key is no error"
+
+
 def test_check_names_each_missing_piece_per_channel(tmp_path, monkeypatch, capsys):
     home = hermes_home(tmp_path)          # the project is registered, the board is not
     monkeypatch.setenv("HERMES_HOME", str(home))
     checkout = tmp_path / "example-checkout"
     checkout.mkdir()
-    path = config_file(tmp_path, [{"channel": CHANNEL_NAME, "path": str(checkout),
+    path = config_file(tmp_path, [{"channel": CHANNEL_ID, "path": str(checkout),
                                    "project": PROJECT, "board": BOARD}])
 
     assert cli.main(["--config", path, "projects", "--check"]) == 1
@@ -337,7 +368,7 @@ def test_check_accepts_a_board_that_names_the_project_from_its_own_side(tmp_path
     monkeypatch.setenv("HERMES_HOME", str(home))
     checkout = tmp_path / "example-checkout"
     checkout.mkdir()
-    path = config_file(tmp_path, [{"channel": CHANNEL_NAME, "path": str(checkout),
+    path = config_file(tmp_path, [{"channel": CHANNEL_ID, "path": str(checkout),
                                    "project": PROJECT, "board": BOARD}])
 
     assert cli.main(["--config", path, "projects", "--check"]) == 0
@@ -382,7 +413,7 @@ def test_json_with_check_carries_the_verdicts(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(home))
     checkout = tmp_path / "example-checkout"
     checkout.mkdir()
-    path = config_file(tmp_path, [{"channel": CHANNEL_NAME, "path": str(checkout),
+    path = config_file(tmp_path, [{"channel": CHANNEL_ID, "path": str(checkout),
                                    "project": PROJECT, "board": BOARD}])
 
     assert cli.main(["--config", path, "projects", "--check", "--json"]) == 1

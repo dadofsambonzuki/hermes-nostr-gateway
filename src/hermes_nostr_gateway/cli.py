@@ -1690,18 +1690,25 @@ def cmd_control(args) -> int:
 
 
 def cmd_concord(args) -> int:
-    """Concord invites: what is held, and accepting one (the human's yes).
+    """Concord invites and channels: what is held, and accepting an invite (the human's yes).
 
     `hng concord` lists what this gateway recorded, with the state each invite is in.
     `hng concord <id>` publishes the Guestbook join the daemon would have published for a
     trusted inviter, so an invite held for a human can be released without editing config
     or waiting for the daemon to restart. Both read and write the same row, so the daemon's
     next refresh sees the community as joined.
+
+    `hng concord channels` is the other half of that: the channel ids every joined
+    community has, which are what `concord.projects` entries must be keyed by. It performs
+    the same Control-plane read the daemon's refresh does, so it sees the same channel list
+    (see `list_concord_channels`).
     """
     from .planes.concord import read as concord_read
     from .planes.concord import write as concord_write
 
     cfg = load_config(args.config)
+    if args.invite == "channels":
+        return list_concord_channels(cfg, args)
     crypto, store, _policy, _plane = build(cfg)
     if not args.invite:
         return list_invites(store, args)
@@ -1761,6 +1768,94 @@ def list_invites(store: Store, args) -> int:
         if row["status"] == "held":
             print(f"           accept: hng concord {row['id']}")
     return 0
+
+
+def list_concord_channels(cfg: dict[str, Any], args) -> int:
+    """The channel ids every joined community grants, as the keys `concord.projects` needs.
+
+    A channel's id and name live on the Control plane, not in any one invite: an owner mints
+    one invite per room, so the live store's joined rows can name only a fraction of the
+    community's channels. This therefore performs the same Control-plane read a refresh
+    does — no new kind of round trip — and falls back to the stored grants, with a note on
+    stderr, when a relay does not answer: a listing that cannot see the Control plane is
+    still better than no listing, as long as it says which it is.
+
+    A held invite contributes nothing: nothing joined it, so its channels are not live.
+
+    `--json` is `[{"id", "name", "community"}]` with a stable key order — ids first because
+    they are the value being copied into config, names as the human's check, and the
+    community because an entry may need `community:` to address a pass named by id alone.
+    """
+    from .planes.concord.plane import joined_communities
+
+    path = Path(os.path.expanduser(str(cfg.get("store") or "gateway.db")))
+    if not path.exists():
+        print(f"no store at {path}: nothing has been joined yet", file=sys.stderr)
+        return 1
+    store = Store(path)
+    try:
+        communities = joined_communities(store.concord_invites(limit=50))
+    finally:
+        store.close()
+    wanted = str(getattr(args, "community", "") or "").strip().lower()
+    if wanted:
+        communities = [community for community in communities
+                       if community.community_id.lower() == wanted]
+        if not communities:
+            print(f"no joined community {args.community!r}: `hng concord` lists what this "
+                  "gateway holds", file=sys.stderr)
+            return 1
+
+    rows, notes = asyncio.run(_concord_channels(communities))
+    for note in notes:
+        print(f"concord channels: {note}", file=sys.stderr)
+    rows.sort(key=lambda row: (row["community"], row["name"].lower(), row["id"]))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no concord channels recorded")
+        return 0
+    names = {community.community_id: community.name for community in communities}
+    print(f"{len(rows)} channel(s) in {len(names)} community(ies)")
+    for community_id in sorted(names, key=lambda cid: (names[cid].lower(), cid)):
+        print(f"{names[community_id] or '(unnamed)'}  {community_id}")
+        for row in rows:
+            if row["community"] == community_id:
+                print(f"  {row['id']}  {row['name'] or '(unnamed)'}")
+    return 0
+
+
+async def _concord_channels(communities: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Rows from the Control plane, or the stored grants when a relay does not answer."""
+    from .planes.concord import read as concord_read
+    from .planes.concord.channels import streams as channel_streams
+
+    rows: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for community in communities:
+        label = community.name or community.community_id[:12]
+        try:
+            loaded = await concord_read.load_community(community.invite)
+        except Exception as exc:  # noqa: BLE001 - a listing reports what it could not read
+            notes.append(f"{label}: cannot read the Control plane ({exc}); "
+                         f"listing the stored grants")
+            loaded = None
+        readable = channel_streams(community.invite, loaded.channels) if loaded else []
+        if readable:
+            rows.extend({"id": stream.channel_id, "name": stream.name,
+                         "community": community.community_id} for stream in readable)
+            continue
+        if loaded is not None:
+            notes.append(f"{label}: the Control plane names no readable channel; "
+                         f"listing the stored grants")
+        for grant in community.invite.bundle.get("channels") or []:
+            ident = str(grant.get("id") or "").strip()
+            if not ident:
+                continue
+            rows.append({"id": ident, "name": str(grant.get("name") or ""),
+                         "community": community.community_id})
+    return rows, notes
 
 
 def cmd_drops(args) -> int:
@@ -2293,11 +2388,15 @@ def main(argv: list[str] | None = None) -> int:
     p_control.set_defaults(func=cmd_control)
 
     p_concord = sub.add_parser(
-        "concord", help="concord invites: what is held, and accepting one")
+        "concord", help="concord invites: what is held, accepting one, and channel ids")
     p_concord.add_argument("invite", nargs="?", default=None,
-                           help="invite id (or community id) to accept; omit to list")
+                           help="invite id (or community id) to accept, or `channels` to "
+                                "list the channel ids every joined community grants; "
+                                "omit to list invites")
     p_concord.add_argument("--held", action="store_true",
                            help="list only the invites waiting for a human")
+    p_concord.add_argument("--community", default=None,
+                           help="with `channels`: only this community id")
     p_concord.add_argument("-n", "--limit", type=int, default=20)
     p_concord.add_argument("--json", action="store_true")
     p_concord.set_defaults(func=cmd_concord)

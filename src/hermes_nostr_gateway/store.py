@@ -35,7 +35,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from .writer import StoreWriter
@@ -160,6 +160,18 @@ CREATE TABLE IF NOT EXISTS concord_invites (
     decided_at   INTEGER,
     decided_by   TEXT,
     announced_at INTEGER
+);
+
+-- Every Concord channel id this gateway has already announced to the control pane, one
+-- row per community and channel. The id is the dedupe: a restart re-reads the same grants
+-- and finds the row, so it stays silent. The name is what the notice called the channel --
+-- a diagnostic, not an identity (a rename is the same channel and needs no second notice).
+CREATE TABLE IF NOT EXISTS concord_announced (
+    community_id TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    name         TEXT,
+    announced_at INTEGER NOT NULL,
+    PRIMARY KEY (community_id, channel_id)
 );
 
 -- The ngit bridge: what one Nostr issue or PR event became, and how far a repo has been
@@ -1712,6 +1724,45 @@ class Store:
         cur = self.db.execute("UPDATE concord_invites SET announced_at = ? WHERE id = ?",
                               (int(time.time()), str(invite_id)))
         return cur.rowcount > 0
+
+    # -- Concord channels the operator has been told about --------------
+    def claim_concord_channels(self, community_id: str,
+                               channels: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Claim the channel ids in this community that have not been announced yet.
+
+        One row per (community, channel id) is the record a restart is checked against: the
+        Control plane is re-read, the same ids come back, the row is found, and the notice
+        stays unsent. Claiming *before* the send is what keeps two refreshes racing each
+        other to one notice; `release_concord_channels` gives a failed send's claims back,
+        so the next refresh retries instead of losing the notice.
+        """
+        now = int(time.time())
+        claimed: list[tuple[str, str]] = []
+        for channel_id, name in channels:
+            ident = str(channel_id or "").strip()
+            if not ident:
+                continue
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO concord_announced"
+                " (community_id, channel_id, name, announced_at) VALUES (?,?,?,?)",
+                (str(community_id), ident, str(name or ""), now),
+            )
+            if cur.rowcount > 0:
+                claimed.append((ident, str(name or "")))
+        return claimed
+
+    def release_concord_channels(self, community_id: str,
+                                 channel_ids: Iterable[str]) -> None:
+        """Give back claims whose notice never left: the next refresh announces them."""
+        ids = [str(ident) for ident in channel_ids if str(ident or "").strip()]
+        if not ids:
+            return
+        marks = ",".join("?" for _ in ids)
+        self.db.execute(
+            "DELETE FROM concord_announced WHERE community_id = ?"
+            f" AND channel_id IN ({marks})",
+            (str(community_id), *ids),
+        )
 
     # -- the ngit bridge -------------------------------------------------
 

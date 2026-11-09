@@ -345,6 +345,10 @@ the board and appears on the PR, so a reader of either one sees the same thing.
 - **`concord.projects`** — where a channel's work lives: the checkout (`path`), the Hermes project
   (`project`) and the kanban board (`board`). Three names with three jobs, none inferred from
   another; a board without a project is a config error, because nothing anchors the worktree.
+  Key each entry by the channel **id** (64 hex) or the whole
+  `concord:<community-id>:<channel-id>`; `hng concord channels` prints the id of every readable
+  channel in each joined community, and `hng projects --check` fails a name-keyed entry — a
+  name resolves inbound messages and then loses every notice at send time.
 - **`ngit`** — the bridge, a sibling block rather than a corner of Concord: `assignee`, `reviews`,
   `review_assignee`, `relays`, `lookback_hours`, `sweep_hours`, `issues`, `prs`, `priority`,
   `max_new`, `max_prs`, `labels`, `ready_label`, `mentions`, `mention_assignee`,
@@ -398,7 +402,8 @@ and the pass touched nothing. `--dry-run` reports what would happen and writes n
 
 The rest answer one question each: `hng recent`, `hng drops`, `hng listen --once`,
 `hng send --to <conversation> --text <text>`, `hng media <sha256|url>`, `hng policy-test`,
-`hng concord`, `hng projects`, `hng profiles`, `hng route`, `hng control`, `hng replay-skip`,
+`hng concord` (`channels` for the ids a joined community grants), `hng projects`,
+`hng profiles`, `hng route`, `hng control`, `hng replay-skip`,
 `hng deps run` / `hng deps dry-run` (dependency proposals; see `docs/deps.md`).
 
 ## What it refuses
@@ -429,7 +434,9 @@ readers on that socket deliver every group message twice, so `hng serve` refuses
 **A Concord invite joins only on a trusted word or a human's.** An invite from a
 `control.trusted_npubs` key is accepted and the Guestbook join published; anyone else's is held,
 the question is posted into `control.concord`, and `hng concord <invite-id>` is the human's yes.
-Nothing joins silently, and a held invite stays visible even when there is nowhere to ask.
+Nothing joins silently, and a held invite stays visible even when there is nowhere to ask. A
+join then announces the community's channel ids into `control.concord` once — the store records
+each id, so a restart stays silent — and `hng concord channels` prints them at any time.
 
 ## Tests and CI
 

@@ -304,8 +304,13 @@ def _bound(board: str, registered: dict[str, Any], record: dict[str, Any]) -> bo
 
 
 def checks_for(project: Project, registry: Registry) -> list[Check]:
-    """Everything one channel declares: its checkout, its project, its board."""
+    """Everything one channel declares: its channel key, its checkout, its project, its board."""
     checks: list[Check] = []
+    # The failure this check exists for is silent: a name-keyed entry resolves inbound
+    # messages and passes every other check, and then loses every notice at send time.
+    key_problem = channel_key_error(project.channel)
+    if key_problem:
+        checks.append(Check("channel", False, key_problem))
     if project.config_error:
         checks.append(Check("config", False, project.config_error))
     checks.append(Check("checkout", not project.problem,
@@ -443,6 +448,22 @@ _CONVERSATION_PREFIX = "concord:"
 
 #: A channel id: 64 hex characters. Anything else is a name, which an entry may use too.
 _CHANNEL_ID = re.compile(r"^[0-9a-f]{64}$")
+
+#: A `concord.projects` key a scheduled pass can act on: the channel id itself, or the whole
+#: conversation in the one form both halves of which the daemon can address —
+#: `concord:<community id>:<channel id>`. A name (or a conversation naming a channel by
+#: name) resolves an inbound message against the map and then has no id to send a notice to.
+_CHANNEL_KEY = re.compile(r"^(?:concord:[0-9a-f]{64}:)?[0-9a-f]{64}$")
+
+
+def channel_key_error(channel: str) -> str:
+    """Why this `concord.projects` key cannot address a channel, or "" when it can."""
+    text = str(channel or "").strip().lower()
+    if _CHANNEL_KEY.match(text):
+        return ""
+    return (f"channel {channel!r} is not a channel id: key the entry by the 64-hex channel id "
+            f"(or `concord:<community-id>:<channel-id>`) — a name resolves locally, then "
+            f"loses every notice at send time")
 
 
 def project_for_conversation(conversation: str, mapping: "ProjectMap",

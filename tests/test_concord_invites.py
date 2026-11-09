@@ -18,6 +18,7 @@ import os
 import sqlite3
 
 import nostr_sdk as sdk
+import pytest
 import yaml
 
 from hermes_nostr_gateway import cli, crypto
@@ -89,6 +90,20 @@ def gateway_for(tmp_path, identity: sdk.Keys, *, control: dict | None = None) ->
 
 def npub(keys: sdk.Keys) -> str:
     return keys.public_key().to_bech32()
+
+
+@pytest.fixture(autouse=True)
+def offline_concord_reads(monkeypatch):
+    """The join path reads the community so it can announce the channel ids: answer cold.
+
+    These tests are about the decision, not a relay. An empty read is what a community
+    answers before its Control plane has propagated, and `load_community` then falls back
+    to the bundle's own grants — so no test here waits on DNS for `relay.example`.
+    """
+    async def no_events(relays, filters, **kwargs):
+        return []
+
+    monkeypatch.setattr(c, "fetch_events", no_events)
 
 
 def chat_for(invite: c.Invite, channel_id: str) -> str:

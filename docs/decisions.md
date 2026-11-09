@@ -1077,3 +1077,43 @@ never a second turn. An older daemon that ignores the extra fields answers with 
 so a scoped reply echoes `scoped`, `conversation`, `before_at` and `before_id`; an adapter
 that does not see its own request echoed back warns once and runs without context rather than
 treating another room's lines as this one's.
+
+## A channel id is announced, not guessed
+
+`concord.projects` is keyed by the channel id, and the failure mode of a name is silent: a
+name-keyed entry resolves an inbound message, passes every check, and then loses every notice
+at send time, because a notice is addressed by `concord:<community>:<channel-id>` and a name
+never becomes one. Two changes make that self-solving instead of a lesson learned per incident.
+
+**A join announces the ids.** On a successful join — a trusted invite, or the connect-time
+refresh a restart runs — the gateway logs each channel id at INFO and posts one notice per
+community into the concord `control:` pane: the community's name, then
+`channel_id: <64-hex>  <name>` per readable channel. The destination is the control pane and
+never a guessed DM home channel: a notice aimed at home is how one bot aimed an echo loop at a
+peer. A parked or untrusted invite stays silent, as it was — nothing joined it, so its rooms
+are not live.
+
+**The record is a store table, not a file.** `concord_announced` holds one row per community
+and channel id, written before the send (so two racing refreshes announce once) and given back
+if the send fails (so a transient relay is a delay, not a loss). A restart re-reads the same
+grants, finds the row, and says nothing. A JSON file beside the state dir would be a second
+writer — the daemon and `hng` both read these grants — and a thing a human could edit into a
+false claim.
+
+**The CLI can always print them.** `hng concord channels [--community <id>] [--json]` reads the
+Control plane exactly as a refresh does — one read per joined community, no new kind of round
+trip — because the grants in the store are not the channel list: one owner action mints one
+invite per room, so a joined row can name only a fraction of the community's channels. When a
+relay does not answer it falls back to the stored grants and says so on stderr, because a
+listing that cannot see the Control plane is still better than none as long as it says which it
+is. `--json` is `[{id, name, community}]` in a stable order; the bridge and the dashboard can
+consume it.
+
+**`projects --check` fails a name.** It is an error, not a warning, because the failure is
+silent loss. The entry is still resolved for inbound messages — removing that would break a
+working mapping for the sake of a notice — but the check names the key and the pitfall. A key is
+usable when it is the channel id or the whole `concord:<community-id>:<channel-id>`: the two
+forms a scheduled pass can act on.
+
+A channel the bot creates itself arrives through the same refresh, so it is announced by the
+same path; the claim makes a second restart harmless.
