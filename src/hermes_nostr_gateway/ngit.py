@@ -169,6 +169,11 @@ PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
 #: event behind the cursor for good. Rewriting `open` on that silence is what pinned a closed
 #: PR's card in place; on an `approved` guard it would re-make the refusal trigger on a card
 #: the verdict already finished (see docs/queue-and-prs.md, "The guard is monotonic").
+#:
+#: `approved` carries one caveat the other two do not: it is final only for the tip it was
+#: given for. The approval *released* the trigger, so an approval left standing over a newer
+#: tip is not merely stale -- it leaves the card `_revisions` just reopened with nothing to
+#: refuse its completion. `_guard_covers_tip` is where that is decided.
 TERMINAL_GUARD_STATES = frozenset({ngit_guard.APPLIED, ngit_guard.APPROVED, ngit_guard.CLOSED})
 
 #: Seconds of overlap on a relay cursor. Relays apply `since` inclusively and clocks drift;
@@ -3283,10 +3288,11 @@ class Sync:
                         if str(card.get("status") or "") in (DONE, "archived"):
                             continue  # finished by a merge or by an approval; prune drops it
                         held = self.board.guard_state(str(card["id"])) or {}
-                        if str(held.get("state") or "") in TERMINAL_GUARD_STATES:
+                        if _guard_covers_tip(held, tip):
                             # No news in this window is not evidence the PR is open: the
                             # feed is incremental and a status event can sit behind the
-                            # cursor for good. A terminal guard stays terminal.
+                            # cursor for good. A terminal guard stays terminal -- except an
+                            # approval, which is final only while it covers this tip.
                             continue
                         self.board.guard_pr(str(card["id"]), pr_id=pr_id, state="open", tip=tip,
                                             evidence=evidence)
@@ -3731,6 +3737,25 @@ def _detail(link: dict[str, Any]) -> dict[str, Any]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _guard_covers_tip(held: Mapping[str, Any], tip: str) -> bool:
+    """Whether a terminal guard still means what it says for the PR's current tip.
+
+    `applied` and `closed` are final however the feed moves: a PR does not un-merge, and a
+    closed proposal is not revived by a late event. `approved` is final only for the tip the
+    reviewer saw. That is the one terminal state that *released* the refusal trigger, and the
+    one a revision exists to make stale -- `_revisions` reopens the card for a newer tip
+    precisely because the old approval does not cover it. Keeping the row `approved` there
+    would leave the reopened card with no trigger and no approval over the tip a worker's
+    completion would claim. The caller re-arms the guard at the new tip instead.
+    """
+    state = str(held.get("state") or "")
+    if state not in TERMINAL_GUARD_STATES:
+        return False
+    if state != ngit_guard.APPROVED:
+        return True
+    return str(held.get("tip") or "") == str(tip or "")
 
 
 def pr_detail(pr: PullRequest, *, task_error: str = "") -> dict[str, Any]:

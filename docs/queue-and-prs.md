@@ -136,30 +136,43 @@ refusal is based on, and `test -f src/hermes_nostr_gateway/ngit_guard.py` answer
 
 #### The guard is monotonic
 
-`applied`, `closed` and `approved` are final: the pass never walks any of them back to `open`.
-Only the absence of a *newer* event could suggest a PR reopened, and the PR feed is incremental
-— each pass fetches from a stored cursor, so silence about a PR means "nothing arrived in this
-window", not "this PR is open". A status event that reaches the relays after the pass whose
-window covered its timestamp sits behind the cursor for good, and re-asserting `open` on that
-silence rewrites a truthful row into a refusal no later pass can undo. The guard reads each
-card's existing state before refreshing it and leaves a terminal one alone
-(`TERMINAL_GUARD_STATES` in `ngit.py`, used by `Sync._guards`); the **link** is another half,
-because a link whose state is `merged` or that carries `note["merge"]` is skipped outright,
-and so is a card already `done` or `archived` — a finished card has nothing left to guard.
+`applied`, `closed` and `approved` are terminal: the pass never walks any of them back to
+`open` on silence. Only the absence of a *newer* event could suggest a PR reopened, and the PR
+feed is incremental — each pass fetches from a stored cursor, so silence about a PR means
+"nothing arrived in this window", not "this PR is open". A status event that reaches the
+relays after the pass whose window covered its timestamp sits behind the cursor for good, and
+re-asserting `open` on that silence rewrites a truthful row into a refusal no later pass can
+undo. The guard reads each card's existing state before refreshing it and leaves a terminal
+one alone (`TERMINAL_GUARD_STATES` in `ngit.py`, used by `Sync._guards`); the **link** is
+another half, because a link whose state is `merged` or that carries `note["merge"]` is
+skipped outright, and so is a card already `done` or `archived` — a finished card has nothing
+left to guard.
 
-`approved` is in the set because an approving verdict releases the guard: the card is finished
-by the verdict, the merge stays a person's. A no-news pass that rewrote that row to `open`
-would re-make the trigger and refuse the completion the verdict earned — the one thing the
-review loop exists to prevent.
+`applied` is in the set because a merge is final, and `closed` because a proposal closed
+without one is a person's decision, not something a later event reverses.
+
+`approved` is in the set for a different reason, and it is the one state whose terminality
+has a condition: an approving verdict releases the guard — the card is finished by the verdict,
+the merge stays a person's, and a no-news pass that rewrote that row to `open` would re-make
+the trigger and refuse the completion the verdict earned. But an approval covers the tip it
+was given for, not the PR forever. A revision reopens the card precisely because the old
+verdict does not cover the new tip, so the row must not stay `approved`: `approve` *dropped*
+the refusal trigger, and leaving the row alone would leave the reopened card unguarded — a
+worker's word could finish a PR no approval covers. `_guard_covers_tip` is the rule: `applied`
+and `closed` stay final whatever the tip says, while `approved` stays final only while the
+row's tip is the PR's current tip. A tip that moved past it re-arms the guard at the new tip.
 
 This does not hide a missed event: a card whose close was never read stays open and still
-refuses completion. Curing that needs a lookback wider than the cursor — see
-`docs/ngit-bridge.md`, "A missed status event does not heal".
+refuses completion. The trailing sweep is the lookback — it re-reads the two status kinds over
+`ngit.sweep_hours` on every pass, so the next one sees the close. The manual
+`hng ngit sync --since` repair is only for an event older than that window, or when the sweep
+is turned off — see `docs/ngit-bridge.md`, "A missed status event heals on the next pass".
 
-**Enforced in** `Sync._guards` (`src/hermes_nostr_gateway/ngit.py`).
+**Enforced in** `Sync._guards` (`src/hermes_nostr_gateway/ngit.py`), via `_guard_covers_tip`.
 **Tested by** `test_a_pass_with_no_news_does_not_reopen_a_released_guard`,
 `test_a_pass_with_no_news_does_not_reopen_a_closed_guard`,
-`test_a_pass_with_no_news_does_not_reopen_an_approved_guard`, and the control
+`test_a_pass_with_no_news_does_not_reopen_an_approved_guard`,
+`test_a_revision_after_an_approval_reopens_the_card_and_the_guard`, and the control
 `test_a_pass_with_no_news_still_holds_an_open_guard` in `tests/test_ngit.py`.
 
 ### A merge requires the card finished

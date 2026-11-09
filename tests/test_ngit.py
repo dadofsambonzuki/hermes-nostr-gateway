@@ -2168,6 +2168,41 @@ def test_a_pass_with_no_news_does_not_reopen_an_approved_guard(harness):
         "UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,)).rowcount == 1
 
 
+def test_a_revision_after_an_approval_reopens_the_card_and_the_guard(harness):
+    """An approval covers the tip it saw; a newer tip must not inherit its release.
+
+    The approving verdict finishes the card and drops the refusal trigger, which is the
+    intended path. A revision then arrives at a new tip, and `_revisions` reopens the card
+    precisely because the old verdict is stale -- so the guard must stop saying `approved`
+    at the old tip. Otherwise the reopened card is unguarded: nothing re-makes the trigger
+    the approval dropped, and a worker's word finishes a PR no approval covers.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, "approved", event_id="a" * 64, created_at=2000)
+    park_with_verdict(harness, task_id, "approved")
+    report = harness.sync()
+
+    # The approval's own path: the card is finished, the trigger is gone.
+    assert report.prs["approved"] == 1
+    assert harness.task(task_id)["status"] == "done"
+    assert harness.board.guard_state(task_id)["state"] == "approved"
+    assert guard_triggers(harness) == []
+
+    revision = revision_of(pr, "b" * 40, created_at=3000, event="2")
+    harness.prs_data = ngit.PrFeed(revisions=[revision])
+    report = harness.sync()
+
+    assert report.prs["reopened"] == 1
+    assert harness.task(task_id)["status"] == "ready"
+    held = harness.board.guard_state(task_id) or {}
+    assert held.get("state") == "open", held
+    assert held.get("tip") == "b" * 40, held
+    assert guard_triggers(harness) == [f"ngit_pr_done_{task_id}"]
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        harness.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    assert "open at " + "b" * 12 in str(refused.value)
+
+
 def test_a_pass_with_no_news_still_holds_an_open_guard(harness):
     """The control: monotonic does not mean toothless -- an open guard keeps refusing."""
     pr, task_id = pr_with_review_task(harness)
