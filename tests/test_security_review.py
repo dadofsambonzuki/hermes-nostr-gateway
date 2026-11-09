@@ -7,13 +7,12 @@ the adapter half; no test here needs a relay, a daemon or a real `ngit` child.
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import replace
 
 import pytest
 
-from hermes_nostr_gateway import ngit, ngit_labels, ngit_merge, peer_inbox
+from hermes_nostr_gateway import ngit, ngit_labels, peer_inbox
 from hermes_nostr_gateway.gateway import Gateway
 from hermes_nostr_gateway.store import Inbound
 from test_ngit import (
@@ -313,34 +312,13 @@ def test_the_relay_read_applies_the_reviewer_filter_too():
 
 
 # -- the merge route --------------------------------------------------------
-
-def test_the_merge_route_refuses_a_tip_the_approval_does_not_cover():
-    link = {"detail": json.dumps({"verdict": "approved", "verdict_tip": "a" * 40,
-                                  "tip": "b" * 40})}
-    problem = ngit_merge.approval_problem(link)
-    assert "approval covers tip" in problem and "now at" in problem
-
-
-def test_the_merge_route_refuses_an_approval_with_no_tip():
-    link = {"detail": json.dumps({"verdict": "approved"})}
-    assert "does not name the tip" in ngit_merge.approval_problem(link)
-
-
-def test_the_merge_route_refuses_a_remote_tip_moved_since_the_link_was_read():
-    link = {"detail": json.dumps({"verdict": "approved", "verdict_tip": "a" * 40,
-                                  "tip": "a" * 40})}
-    assert ngit_merge.approval_problem(link, tip="b" * 40)
-
-
-def test_the_merge_route_refuses_a_changes_requested_verdict():
-    link = {"detail": json.dumps({"verdict": "changes-requested", "tip": "a" * 40})}
-    assert "asks for changes" in ngit_merge.approval_problem(link)
-
-
-def test_the_merge_route_allows_the_tip_the_approval_covers():
-    link = {"detail": json.dumps({"verdict": "approved", "verdict_tip": "a" * 40,
-                                  "tip": "a" * 40})}
-    assert ngit_merge.approval_problem(link) == ""
+#
+# The tip rule used to be tested here, on the link row (`approval_problem`). It is now answered
+# once, from the PR's own verdict comment, by `ngit_verdict.check_authorship`: stale tip,
+# missing tip and changes-requested are all pinned in `tests/test_ngit_verdict.py`, and the
+# card half of the merge route is `tests/test_merge_route.py`. Nothing on the merge route reads
+# the link's cached verdict any more -- a cache that disagrees with the record is how a merge
+# lands a revision nobody reviewed.
 
 
 # -- relay URLs: a bundle may not point at our own network ------------------

@@ -14,17 +14,18 @@ Exit codes: 0 applied (or would), 1 conflict, 2 gate failure or a refused push, 
 error, 4 a card workspace (not the operator's), 5 the live checkout moved mid-run, 6 a commit
 carries no card trailer (none at all, or one that names something that is not a card), 7 the card
 is not in `review` or `done`, 8 merged but the applied record (kind-1631) did not publish, 9 no
-verdict from a different npub. One code, one meaning: 5 says the checkout moved and the operator
-backs it out, 8 says the content is in `master` and the record is missing, and 6, 7 and 9 are the
-authorship route refusing — each names the part it refused:
+approved verdict from a permitted reviewer covering this tip. One code, one meaning: 5 says the
+checkout moved and the operator backs it out, 8 says the content is in `master` and the record is
+missing, and 6, 7 and 9 are the authorship route refusing — each names the part it refused:
 [the commit trailer](#every-commit-says-which-card-wrote-it),
 [the card](#a-merge-needs-the-card-in-review-or-done),
-[the signature](#a-merge-needs-a-second-signature).
+[the signature](#a-merge-needs-a-second-signature-covering-the-tip-it-lands).
 
-**A merge is for the tip a reviewer approved.** The check reads the bridge's `verdict_tip` for
-the PR and refuses when the tip differs — `merge_pr.sh` reads the branch's current tip from
-origin, so a push after the approval is caught even before the next bridge pass — or when an
-approval names no tip at all. Re-review the new tip; do not merge it on the old word.
+**A merge is for the tip a reviewer approved.** The guard reads the tip from the verdict comment
+itself — the `Tip: <sha>` line the pass publishes with it — and refuses when it differs from the
+branch's current tip, which `merge_pr.sh` reads from origin, so a push after the approval is
+caught before the next bridge pass. An approval that names no tip, or one that names an earlier
+one, is refused. Re-review the new tip; do not merge it on the old word.
 
 **PRs are not branches here.** The remote is an ngit remote: a fetch prunes `pr/*` refs back to
 `master`, so `git merge origin/pr/<something>` answers *"not something we can merge"* however
@@ -142,15 +143,28 @@ hng ngit merge-check <pr-id|nevent> [--card t_xxxxxxxx]... [--repo <checkout>]
 `--card` adds a card the way a `Card:` trailer would — repeat it per card — so a refusal can be
 reproduced without applying anything. It exits 0 allowed, 7 refused, 3 when the box cannot answer
 (no `store:`, no board for the checkout). `scripts/merge_pr.sh` calls the same module (`python -m
-hermes_nostr_gateway.ngit_merge`).
+hermes_nostr_gateway.ngit_merge`). This module answers the **card** half only; whether a verdict
+permits the merge is the next section's question, answered from the PR's own record.
 
-## A merge needs a second signature
+## A merge needs a second signature, covering the tip it lands
 
-Before it applies anything `scripts/merge_pr.sh` refuses a PR whose newest kind-1111 verdict is
-its own author's (exit 9): a self-authored change lands only with a second party's signature on
-it, never on "the author looked at it". The verdict is the comment the review card publishes on
-the PR (see [ngit-bridge](ngit-bridge.md), "The verdict on the PR"); there is no second place to
-record one.
+Before it applies anything `scripts/merge_pr.sh` answers three questions about the PR's newest
+kind-1111 verdict, and refuses with exit 9 unless all three hold:
+
+- **who signed it.** The signer must be a key `ngit.reviewers` names — the same list, resolved
+  by the same function (`cli.reviewer_keys`) that the label pass filters verdicts with, so the
+  pair cannot drift into two answers. A self-authored change lands only with a second party's
+  signature; a stranger's signature is not a review role's. The refusal names the npub it saw.
+- **what it says.** An approval, not a changes request: a merge does not overrule a reviewer who
+  asked for work.
+- **which revision it covers.** The published verdict carries a `Tip: <sha>` line (see
+  [ngit-bridge](ngit-bridge.md), "The verdict on the PR"), and it has to match the branch head
+  the merge would apply, read from the remote. An approval of an earlier revision is refused —
+  ask for a re-review of the tip that is there now.
+
+A check that cannot run — no config, no `ngit`, no branch head to compare against — is exit 3,
+not 9, because "ask a reviewer" would send the operator to the wrong person. The verdict is the
+comment the review card publishes on the PR; there is no second place to record one.
 
 ## The live checkout stays on master
 

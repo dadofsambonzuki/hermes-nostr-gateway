@@ -244,6 +244,8 @@ class Harness:
         self.state = state or _Reader(self)
         #: What the sync asked to publish on a PR, and what the publisher says it did.
         self.verdict_calls: list[tuple[str, str, int, str]] = []
+        #: The tip each published verdict was asked to cover, in the same order.
+        self.verdict_tips: list[str] = []
         self.verdict_ok = True
         self.verdict_publisher = verdicts or self._publish_verdict
         self.control = ControlConfig.from_config(
@@ -379,9 +381,10 @@ class Harness:
                                         ready_label="", owns=self.config.owns)
 
     def _publish_verdict(self, pr_id: str, body: str, *, created_at: int = 0,
-                         author: str = "", covers_after: int = 0):
+                         author: str = "", covers_after: int = 0, tip: str = ""):
         """Record what the sync asked to publish on the PR, and say it landed."""
         self.verdict_calls.append((pr_id, body, created_at, author))
+        self.verdict_tips.append(tip)
         if not self.verdict_ok:
             return ngit_verdict.VerdictResult(
                 error="the relay did not serve it back on the PR")
@@ -4841,7 +4844,7 @@ def review_task_comment(harness, task_id: str, body: str) -> int:
 
 def test_a_review_cards_verdict_is_published_on_the_pr_once(harness):
     """The card is the queue; the PR is the record. One pass carries the words across."""
-    pr, task_id = pr_with_review_task(harness)
+    pr, task_id = pr_with_review_task(harness, commit="c0ffee")
     body = "Verdict: approved\n\nReviewed the diff and ran both gates: 1204 passed."
     review_task_comment(harness, task_id, body)
 
@@ -4849,6 +4852,8 @@ def test_a_review_cards_verdict_is_published_on_the_pr_once(harness):
 
     assert harness.verdict_calls == [(pr.id, body, harness.comments(task_id)[0]["created_at"],
                                      npub(TRUSTED_HEX))]
+    # And the revision it was written about, which the merge route reads back.
+    assert harness.verdict_tips == ["c0ffee"]
     assert report.prs["verdicts"] == 1
     assert verdict_detail(harness, pr.id)["task"] == task_id
     assert verdict_detail(harness, pr.id)["event"].startswith("v001")
@@ -4858,6 +4863,21 @@ def test_a_review_cards_verdict_is_published_on_the_pr_once(harness):
     report = harness.sync()
     assert len(harness.verdict_calls) == 1
     assert report.prs["verdicts"] == 0
+
+
+def test_a_verdict_older_than_the_current_tip_is_published_without_one(harness):
+    """A comment written before the tip moved is about the earlier commit; saying otherwise
+    would let the merge route read an approval of a revision nobody looked at."""
+    later = int(time.time()) + 600
+    pr = make_pr("e7", commit="d0d0", created_at=later)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    review_task_comment(harness, review_tasks(harness)[0]["id"], "Verdict: approved")
+
+    harness.sync()
+
+    assert harness.verdict_calls, "the verdict was published"
+    assert harness.verdict_tips == [""]
 
 
 def test_the_verdict_is_published_verbatim_not_summarised(harness):

@@ -33,8 +33,10 @@ ngit:
   max_prs: 10              # PR messages per poll; the rest wait for the next one
   maintainers: [npub1...] # keys whose 1631/1632 status events are accepted; the repo
                            # announcement's maintainers are added, and empty accepts none
-  reviewers: [npub1...]   # keys whose `Verdict:` comment may finish a card; empty with
-                           # review_secret_file derives the review key, else none
+  reviewers: [npub1...]   # keys whose `Verdict:` comment may finish a card AND permit a
+                           # merge; empty with review_secret_file derives the review key,
+                           # else none (see "A merge needs a second signature" in
+                           # working-on-this-repo.md)
   verdicts: true           # false = read no verdict and finish no card by one
   labels: true             # publish each PR's review state as a NIP-34 label (see below)
   ready_label: ready       # an issue is queued only when a trusted npub labels it this
@@ -487,10 +489,18 @@ same branch and a revision all land on that one card; none of them makes a secon
 
 A reviewer's verdict is one comment on the review card, and the pass publishes it where a
 reader of the PR will find it: the same text, as a NIP-22 kind-1111 comment on the PR root,
-signed by the review identity. Nothing is summarised and nothing is added —
-`ngit pr view <id> --comments` shows the wording the reviewer wrote, which is what the label
-pass derives the PR's label from and what `scripts/merge_pr.sh` reads before it merges. One
-verdict, one place, two readers.
+signed by the review identity. Nothing is summarised — `ngit pr view <id> --comments` shows
+the wording the reviewer wrote, which is what the label pass derives the PR's label from and
+what `scripts/merge_pr.sh` reads before it merges. One verdict, one place, two readers.
+
+The one thing the pass adds is the revision the verdict is about. A review is a statement
+about a commit, and the merge route has to know which one it was, so the published comment
+carries a `Tip: <sha>` line: the reviewer's own when they wrote one, otherwise the tip the
+pass knows for the comment (the tip the review card was issued for). It is added rather than
+inferred later because nothing else records what the reviewer read — a `created_at` can say
+*when* a comment was written but not *what* it saw. A verdict written before the current tip
+event is published **without** a marker, deliberately: it is about an earlier commit, and
+claiming otherwise is exactly the lie the merge guard exists to catch.
 
 The event's shape is the one ngit 3.0.5 publishes: root `E`/`K`/`P` naming the PR, its kind
 (`1618`) and its author, and parent `e`/`k`/`p` naming the PR itself for a top-level comment —
@@ -505,7 +515,10 @@ Three properties the pass keeps:
   published as which event, so a quiet poll publishes nothing. The event's `created_at` is the
   comment's own timestamp, so a retry signs the identical event id rather than a second
   comment — and a verdict the reviewer already published by hand is recognised by its text and
-  key and left alone, as long as it is at least as new as the tip it has to cover.
+  key and left alone, as long as it is at least as new as the tip it has to cover. (A
+  hand-published comment that names no `Tip:` is published once more with the marker added:
+  the words are already on the thread, but an approval the merge route cannot match to a
+  revision is not one it can act on.)
 - **Read back before it is recorded.** A relay's OK is not the thread: the pass fetches the
   PR's comments again and records the verdict only when the event is on the PR. A failure is
   reported as an error and retried on the next poll; it never holds the cursor.
@@ -569,12 +582,16 @@ one-pass correction rather than a manual cleanup. The link row only remembers wh
 published, so a poll with no news publishes nothing. A merge leaves the last verdict in place:
 it is the verdict the merge was decided on.
 
-**The label says what the PR says; the merge guard decides who signed it.** The label pass does
-not look at the author of a verdict comment — the label reports the newest verdict on the PR
-root, whoever signed it, because that is what a reader of the PR can see. So a verdict the PR's
-own author published by hand puts `approved` on the column while `scripts/merge_pr.sh` still
-refuses the merge (exit 9). That is the intended split: the label is the state, the guard is the
-safety, and the guard is the authority when the two disagree.
+**The label and the merge guard ask the same question with the same list.** Both read the
+newest verdict from the PR root, and both accept it only from a key `ngit.reviewers` names (or
+the review identity that list is derived from) — one resolver, `cli.reviewer_keys`, feeds the
+label pass and the merge route alike. What they do with the answer differs by one step, and the
+gap is deliberate: the label reports the verdict (**`approved`**) as soon as a permitted
+reviewer says so, while `scripts/merge_pr.sh` additionally requires that the verdict names the
+tip the merge would land. So a PR approved at an earlier revision reads `approved` on the
+column and is still refused a merge (exit 9) until somebody reviews the tip that is there now;
+a stranger's or the author's own verdict moves neither. The label is the state, the guard is
+the safety, and the guard is the authority when the two disagree.
 
 **A verdict that cannot be read does not fall back.** If the newest comment states a verdict in
 words the bridge does not recognise, the label is left untouched and the pass records the event
@@ -787,8 +804,9 @@ Recovery:
   apply the issue). The mapping is one-way for status on purpose: the board's lifecycle is the
   board's, and a status event is a public statement someone should choose.
 - Merging. A review card ends with a verdict — published on the PR and on the card — and the
-  merge is the operator's (`scripts/merge_pr.sh`, which refuses it without a verdict from a
-  different npub); the bridge only watches for the status event a merge produces.
+  merge is the operator's (`scripts/merge_pr.sh`, which refuses it without an approved verdict
+  from a permitted reviewer covering the tip the merge would land); the bridge only watches for
+  the status event a merge produces.
 - Retrofitting review tasks for PRs announced before this bridge made them. A PR already
   `signalled` with no task stays that way: the channel was told what happened at the time, and
   a change of behaviour is not a reason to rewrite it.

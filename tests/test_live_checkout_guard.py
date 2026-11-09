@@ -106,34 +106,43 @@ def test_the_worktree_verb_leaves_the_clone_alone(tmp_path) -> None:
 
 
 #: What `ngit pr view <pr> --json --comments` answers here: a PR whose newest verdict was
-#: signed by someone other than its author. `scripts/merge_pr.sh` reads that before it applies
-#: anything, so a stand-in that refuses every call would stop it at the authorship check
-#: instead of at the step a test is about.
-SECOND_PARTY_VIEW = json.dumps({
+#: signed by a key the config's `ngit.reviewers` names, approving the tip the branch is on.
+#: `scripts/merge_pr.sh` reads that before it applies anything, so a stand-in that refuses
+#: every call would stop it at the approval check instead of at the step a test is about.
+SECOND_PARTY_VIEW = {
     "author": "1" * 64,
     "comments": [{"id": "c" * 64, "author": "2" * 64,
-                  "body": "Verdict: approved", "created_at": 1}],
-})
+                  "body": "Verdict: approved\n\nTip: {tip}", "created_at": 1}],
+}
 
 #: A stand-in ngit: answers the two reads the merge route makes, and fails everything else so
 #: the merge stops at the apply without a PR.
 FAKE_NGIT = """#!/bin/sh
 case "$*" in
   *--json*) cat "$FAKE_PR_JSON" ;;
-  "pr view"*) printf 'Status:   open\\n' ;;
+  "pr view"*) printf 'Status:   open\\nBranch:   pr/test\\n' ;;
   *) exit 1 ;;
 esac
 """
 
 
-def failing_merge_env(tmp_path: Path, bindir: Path) -> dict[str, str]:
+def failing_merge_env(tmp_path: Path, bindir: Path, made: Sandbox) -> dict[str, str]:
     """The environment a merge route needs to reach the apply step in a throwaway clone.
 
-    The authorship check is part of the route now and it shells out to python, with `$REPO/src`
-    on its path; a copied script in a sandbox clone has neither, so both are given here.
+    The approval check is part of the route now and it shells out to python, with `$REPO/src`
+    on its path, a config holding the reviewer allowlist, and the proposal's branch on the
+    remote so the approved tip can be matched against a real head. A copied script in a
+    sandbox clone has none of those, so all three are given here.
     """
+    git(made.repo, "push", "-q", "origin", "HEAD:refs/heads/pr/test")
     view = tmp_path / "pr.json"
-    view.write_text(SECOND_PARTY_VIEW, encoding="utf-8")
+    view.write_text(json.dumps({**SECOND_PARTY_VIEW, "comments": [
+        {**SECOND_PARTY_VIEW["comments"][0],
+         "body": SECOND_PARTY_VIEW["comments"][0]["body"].format(tip=made.head)}]}),
+        encoding="utf-8")
+    (made.repo / "config.yaml").write_text(
+        f"store: {tmp_path / 'gateway.db'}\nngit:\n  reviewers: [{'2' * 64}]\n",
+        encoding="utf-8")
     (bindir / "ngit").write_text(FAKE_NGIT, encoding="utf-8")
     (bindir / "ngit").chmod(0o755)
     return clean_env(PATH=f"{bindir}:{os.environ.get('PATH', '')}",
@@ -150,7 +159,7 @@ def test_merge_pr_leaves_the_clone_on_the_branch_it_found(tmp_path) -> None:
         shutil.copy2(script, scripts / script.name)
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    env = failing_merge_env(tmp_path, bindir)
+    env = failing_merge_env(tmp_path, bindir, made)
     before = (made.branch, made.head)
 
     result = subprocess.run(["bash", str(scripts / "merge_pr.sh"), "deadbeef"],
@@ -171,7 +180,7 @@ def test_merge_pr_leaves_a_clone_parked_on_a_proposal_branch_where_it_was(tmp_pa
         shutil.copy2(script, scripts / script.name)
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    env = failing_merge_env(tmp_path, bindir)
+    env = failing_merge_env(tmp_path, bindir, made)
     before = (made.branch, made.head)
 
     result = subprocess.run(["bash", str(scripts / "merge_pr.sh"), "deadbeef"],

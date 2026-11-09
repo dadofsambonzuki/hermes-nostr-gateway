@@ -2106,16 +2106,23 @@ def review_body(pr: PullRequest, target: Target, *,
         "3. Report the verdict on this task with the reasons -- merge, or changes needed --",
         "   and say what the gates could not catch: behaviour, tests that do not exercise the",
         "   change, and anything the PR leaves out.",
-        "4. Start that comment with exactly one of these lines:",
+        "4. Start that comment with exactly one of these lines, and name the commit you",
+        "   reviewed on a `Tip:` line right under it:",
         "",
         "       Verdict: approved",
+        "       Tip: <the 40-character sha you checked out>",
+        "",
         "       Verdict: changes-requested",
+        "       Tip: <the same sha>",
         "",
         "   The bridge publishes this comment on the PR, signed by the review identity, so",
         "   write it as the text a reader of the PR should see: it is published verbatim, not",
         "   summarised. The PR's label is derived from the newest kind-1111 verdict on the PR",
         "   root, and the merge guard reads the same event; a verdict recorded only here is",
-        "   neither, and cannot count as a second signature.",
+        "   neither, and cannot count as a second signature. The `Tip:` line is what lets a",
+        "   merge tell an approval of this revision from an approval of an earlier one, so an",
+        "   approval without it is refused (the pass appends the tip it knows when you leave it",
+        "   out, but yours is the one that says what you actually read).",
     ]
     opening: list[str] = []
     if history is not None and not history.empty():
@@ -3216,7 +3223,7 @@ class Sync:
         # PR root's newest verdict, so publishing first is what lets one pass carry a card's
         # verdict all the way to the label where the relays let it; the next pass does when
         # they do not, because the card is still there to read.
-        self._verdicts(report, dry_run=dry_run)
+        self._verdicts(feed, report, dry_run=dry_run)
 
         # Labels last: every task the poll just made or closed is state the label walk has
         # to see, and a label that cannot be published must not hold the cursor -- the next
@@ -4114,14 +4121,23 @@ class Sync:
 
     # -- verdicts ---------------------------------------------------------
 
-    def _verdicts(self, report: Report, *, dry_run: bool) -> None:
+    def _verdicts(self, feed: PrFeed, report: Report, *, dry_run: bool) -> None:
         """Publish each review card's verdict on its PR, once per verdict comment.
 
         The card is the queue; the PR is the record. A reviewer writes the verdict on the
         card, and until it is also a kind-1111 comment on the PR, `ngit pr view --comments`
         says nothing about the review, the label pass has nothing to derive a label from, and
         the merge guard has no second signature to check. This is the one writer of that
-        event, and it publishes the comment's words exactly as the reviewer wrote them.
+        event, and it publishes the comment's words exactly as the reviewer wrote them --
+        plus the one thing the words may not carry: the tip the verdict covers.
+
+        **A verdict names its tip.** The merge route refuses an approval that cannot show it
+        covers the branch it would land, so the pass publishes the tip it knows for the
+        revision the reviewer read. It will not stamp a tip the verdict is older than: a
+        comment written before the current tip event is about an earlier commit, and claiming
+        otherwise is the exact lie the guard exists to catch. Such a verdict is published
+        without a marker and refused at the merge, which sends the operator back for a review
+        of the revision that is there now.
 
         Idempotent on the card and the comment. The link row remembers which comment of which
         card was published as which event, so a quiet poll does nothing; and the published
@@ -4134,6 +4150,7 @@ class Sync:
         """
         if self.verdicts is None or not self.config.verdicts:
             return
+        tips = feed.newest_tips()
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             pr_id = str(link.get("source_id") or "")
             detail = _detail(link)
@@ -4156,10 +4173,17 @@ class Sync:
             if dry_run:
                 report.prs["would_verdict"] += 1
                 continue
+            # The tip this verdict is about: the revision the pass knows, from this poll when
+            # it carried the PR and from the row otherwise -- and only when the comment is at
+            # least as new as the event that moved the tip there.
+            tip, tip_at = tips.get(pr_id, (str(detail.get("tip") or detail.get("commit") or ""),
+                                          int(detail.get("tip_at") or 0)))
+            if tip and tip_at and found.created_at and found.created_at < tip_at:
+                tip = ""
             try:
                 result = self.verdicts(pr_id, found.body, created_at=found.created_at,
                                        author=str(detail.get("author") or ""),
-                                       covers_after=int(detail.get("tip_at") or 0))
+                                       covers_after=tip_at, tip=tip)
             except Exception as exc:  # noqa: BLE001 - a publisher may raise; the pass may not die
                 report.prs["verdict_errors"] += 1
                 report.errors.append(

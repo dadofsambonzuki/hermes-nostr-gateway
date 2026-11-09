@@ -8,7 +8,7 @@
 #       4 a card workspace (not the operator's), 5 the live checkout moved,
 #       6 a commit does not say which card wrote it, 7 the card is not in review or done,
 #       8 merged, but the applied record (kind-1631) did not publish,
-#       9 no verdict from a different npub.
+#       9 no approved verdict from a permitted reviewer covering this tip.
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -99,29 +99,36 @@ esac
 
 # The tip the merge will actually apply, read from the remote now rather than from the
 # bridge's last pass: a push after the approval is exactly the revision the merge must not
-# land on the old word. A fork branch the origin does not carry gives no tip, and the check
-# falls back to the link's recorded one.
+# land on the old word. A branch the origin does not carry gives no tip, and the verdict
+# check then refuses to run (exit 3) rather than judging an approval it cannot match.
 branch=$(timeout 60 ngit pr view "$pr" 2>/dev/null | awk '/^Branch:/ {print $2}')
 tip=""
 if [ -n "$branch" ]; then
   tip=$(git -C "$REPO" ls-remote origin "refs/heads/$branch" 2>/dev/null | awk '{print $1}')
+  # `ngit pr view` decorates a branch with the proposal it came from (`pr/x(9c043c51)`), and a
+  # remote that only carries the plain name answers nothing for the decorated one. The
+  # undecorated name is the same ref, so try it before deciding the head is unknown.
+  if [ -z "$tip" ]; then
+    plain=$(printf '%s' "$branch" | sed 's/([0-9a-fA-F]*)$//')
+    if [ -n "$plain" ] && [ "$plain" != "$branch" ]; then
+      tip=$(git -C "$REPO" ls-remote origin "refs/heads/$plain" 2>/dev/null | awk '{print $1}')
+    fi
+  fi
 fi
 
-# Authorship: a merge needs a verdict from a npub other than the PR's author. Stopping a card
-# from pushing master answers "who may merge"; this answers "did anyone else look at it". The
-# verdict is the NIP-22 kind-1111 comment on the PR root that the bridge publishes from the
-# review card and the label pass reads -- one event, two readers -- so a self-authored PR
-# merges only with a second party's signature. It reads the same `ngit pr view` the status
-# above does, and refuses before anything is applied. Exit 9 is its own code -- 5 is the live
-# checkout moving, 7 the card, 8 the applied record -- so a caller can tell which refusal it
-# got. (5, then 6 and 7, then 8 were each taken by master while this refusal was in review.)
+# The verdict: a merge needs an approval that permits *this* tip. Three questions, one answer,
+# and every one of them read from the PR's own record rather than from the bridge's cache:
+# who signed it (`ngit.reviewers` -- the same list the label pass resolves), what it says (an
+# approval, not a changes request), and which revision it covers (the `Tip:` line the pass
+# publishes with the verdict, compared against the branch head read above). The check is one
+# module, so the merge route and the labels cannot answer the same question differently.
 verdict_check=$(PYTHONPATH="${PYTHONPATH:-$REPO/src}" "$PYTHON" \
-  -m hermes_nostr_gateway.ngit_verdict "$pr" 2>&1)
+  -m hermes_nostr_gateway.ngit_verdict "$pr" --tip "$tip" 2>&1)
 case $? in
   0) ;;
   9) echo "$verdict_check"; exit 9 ;;
-  # Anything else is the check failing to run, not a verdict: a missing interpreter or an
-  # import error must not read as "ask a reviewer".
+  # Anything else is the check failing to run, not a verdict: a missing interpreter, an
+  # import error or no tip to compare against must not read as "ask a reviewer".
   *) echo "$verdict_check"; exit 3 ;;
 esac
 
@@ -204,7 +211,6 @@ fi
 # operator's `Card: operator` does not release a worker's running card. Exit 7 is the refusal;
 # 3 means the box cannot answer (no config, no board), which is this script's own state error.
 set -- "$pr" --repo "$REPO"
-if [ -n "$tip" ]; then set -- "$@" --tip "$tip"; fi
 for value in $cards; do
   [ "$value" = operator ] && continue
   set -- "$@" --card "$value"

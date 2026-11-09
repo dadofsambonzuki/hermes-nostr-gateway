@@ -220,59 +220,19 @@ def read_cards(slug: str, task_ids: Sequence[str],
     return cards, ""
 
 
-def _detail(link: Mapping[str, Any]) -> dict[str, Any]:
-    """The link's JSON note, decoded; empty when it is absent or unreadable."""
-    raw = link.get("detail") if isinstance(link, Mapping) else None
-    if isinstance(raw, dict):
-        return dict(raw)
-    try:
-        data = json.loads(str(raw or "{}"))
-    except (TypeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def approval_problem(link: Optional[Mapping[str, Any]], tip: str = "") -> str:
-    """Why the merge would apply a tip no approval covers, or "" when it may proceed.
-
-    The bridge anchors an approval to the tip the reviewer read (`verdict_tip`). A
-    revision after that verdict reopens the card and clears the anchor -- but the merge
-    route did not consult either, so a clean, green PR could land the revision nobody
-    reviewed. The link is the record both halves write, so it is also where the merge
-    checks them: an approval whose tip differs from the PR's current tip is a stale
-    approval, and it refuses rather than merging on a word that no longer covers the work.
-    """
-    detail = _detail(link or {})
-    verdict = str(detail.get("verdict") or "")
-    if verdict == "changes-requested":
-        return ("the newest verdict asks for changes; a merge does not overrule it -- "
-                "review the fix and approve the tip first")
-    if verdict != "approved":
-        return ""
-    approved = str(detail.get("verdict_tip") or "")
-    # `tip` is the tip the merge is about to apply, when the caller can read it from the
-    # remote (merge_pr.sh does). Falling back to the link's recorded tip keeps the CLI
-    # usable without a checkout, but the remote value closes the window between a push and
-    # the next bridge pass.
-    current = str(tip or detail.get("tip") or detail.get("commit") or "")
-    if not approved:
-        return ("the approval does not name the tip it covers; re-review the PR and "
-                "publish a verdict anchored to a tip")
-    if current and current != approved:
-        return (f"the approval covers tip {approved[:12]}, but the PR is now at "
-                f"{current[:12]}: review the new tip before merging")
-    return ""
-
-
 def check(pr: str, cards: Sequence[str] = (), *, config: Mapping[str, Any],
           repo: str = "", board: str = "", store: Optional[Path] = None,
-          home: Optional[str | Path] = None, tip: str = "",
+          home: Optional[str | Path] = None,
           store_conn: Optional[sqlite3.Connection] = None) -> Verdict:
     """Would a merge of this PR land work a card is still doing? The whole rule, in one call.
 
     `cards` is what the commits said (`Card:` trailers); `operator` is ignored here because it
     names no card. `store_conn` exists so a caller can reuse the connection; by default the
     store is opened from the config's `store:` path.
+
+    The verdict is not asked about here. Whether an approval permits the merge -- who signed
+    it, and which tip it covers -- is `ngit_verdict`'s question, answered from the PR's own
+    record; the link row is a cache of that record and must never be a second opinion.
     """
     closed = False
     conn = store_conn
@@ -288,15 +248,6 @@ def check(pr: str, cards: Sequence[str] = (), *, config: Mapping[str, Any],
     finally:
         if closed and conn is not None:
             conn.close()
-
-    stale = approval_problem(link, tip)
-    if stale:
-        linked: tuple[Card, ...] = ()
-        record = link or {}
-        if record.get("task_id"):
-            linked = (Card(task_id=str(record["task_id"]), source="link"),)
-        return Verdict(False, why=stale, pr=str(pr),
-                       board=str(record.get("board") or ""), cards=linked)
 
     slug = str(board or "").strip() or str((link or {}).get("board") or "") or \
         mapped_board(config, repo)
@@ -364,7 +315,7 @@ def summarise(verdict: Verdict) -> tuple[str, str]:
 
 
 def run(config: Mapping[str, Any], pr: str, *, cards: Sequence[str] = (), repo: str = "",
-        board: str = "", as_json: bool = False, tip: str = "",
+        board: str = "", as_json: bool = False,
         home: Optional[str | Path] = None) -> int:
     """The CLI's route: read the config's store, check the rule, print it, return the code."""
     store_value = str((config or {}).get("store") or "")
@@ -373,7 +324,7 @@ def run(config: Mapping[str, Any], pr: str, *, cards: Sequence[str] = (), repo: 
         return EXIT_UNREADABLE
     try:
         verdict = check(pr, cards, config=config, repo=repo, board=board,
-                        store=Path(store_value).expanduser(), home=home, tip=tip)
+                        store=Path(store_value).expanduser(), home=home)
     except OSError as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return EXIT_UNREADABLE
@@ -400,8 +351,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="a card named by a commit trailer (repeatable)")
     parser.add_argument("--repo", default="", help="the checkout, to resolve its board")
     parser.add_argument("--board", default="", help="board slug, when it cannot be derived")
-    parser.add_argument("--tip", default="",
-                        help="the tip the merge will apply (merge_pr.sh reads it from origin)")
     parser.add_argument("--json", action="store_true", help="machine-readable answer")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -413,7 +362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"FAIL {exc}", file=sys.stderr)
         return EXIT_UNREADABLE
     return run(config, args.pr, cards=args.card, repo=args.repo, board=args.board,
-               as_json=args.json, tip=args.tip)
+               as_json=args.json)
 
 
 if __name__ == "__main__":  # pragma: no cover - the shell route's entry point

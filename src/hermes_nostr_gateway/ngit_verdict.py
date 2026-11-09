@@ -28,14 +28,24 @@ from the same key -- a verdict the reviewer published by hand is left alone rath
 duplicated.
 
 The merge guard uses the other half of the same read: `check_authorship` takes
-`ngit pr view <pr> --json --comments` and refuses when the newest verdict is the PR author's
-own. A review that the author wrote about their own work is not a second signature.
+`ngit pr view <pr> --json --comments` and answers with the same rules the label pass applies
+— the newest verdict must come from a key in `ngit.reviewers` (or the review identity derived
+from `review_secret_file`), it must approve rather than ask for changes, and it must cover the
+tip the merge would land. A review the author wrote about their own work is not a second
+signature, a stranger's approval is not a review role's, and an approval of an earlier
+revision is not an approval of this one.
+
+The tip is carried in the verdict itself: the pass appends a `Tip: <sha>` line to every
+verdict it publishes, so the merge route compares the revision the reviewer saw against the
+branch the merge would apply. Nothing else knows what the reviewer looked at, and a verdict
+that does not say is refused rather than assumed to cover what is there now.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -47,7 +57,7 @@ import nostr_sdk as sdk
 from .control import as_hex
 from .crypto import parse_secret, pubkey_from_secret, sign_event
 from .fetch import fetch_tagged_blocking
-from .ngit_labels import Verdict, newest_verdict, verdict_in
+from .ngit_labels import APPROVED, Verdict, newest_verdict, verdict_in
 from .publisher import publish as publish_events
 
 #: A comment is NIP-22. See the module docstring for why 1111 and not 1622.
@@ -64,12 +74,23 @@ READ_LIMIT = 50
 #: timer, so it is generous rather than tight.
 NGIT_TIMEOUT_S = 120.0
 
+#: The line a verdict uses to name the revision it covers. Written by the publisher when the
+#: reviewer did not write one, and read back by the merge guard: a review is a statement about
+#: a commit, and a merge needs to know which. `Tip:` and not `tip` alone so the marker cannot
+#: be confused with the prose ("reviewed the tip at 45f4e8b") that a reviewer may also write.
+TIP_LINE = "Tip:"
+_TIP = re.compile(r"^\s*tip\s*:\s*(?P<sha>[0-9a-f]{7,64})\s*$", re.IGNORECASE)
+
+#: How many hex characters an abbreviated commit needs before it can be matched at all. Git's
+#: own default abbreviation is 7; anything shorter is a guess, not a revision.
+TIP_MIN_CHARS = 7
+
 #: Exit codes of `python -m hermes_nostr_gateway.ngit_verdict` (documented in merge_pr.sh).
-#: 9, not 5: `scripts/merge_pr.sh` answers 5 for "the live checkout moved", 6 for a commit with
-#: no card trailer, 7 for a card that is not in review or done, and 8 for a merge whose applied
-#: record did not publish. A shared code would make "ask a reviewer" indistinguishable from any
-#: of them. The number has moved twice while this PR was in review (master took 6 and 7, then
-#: 8): the next free code is the one to take, and `merge_pr.sh` names them all in its header.
+#: 9 is "the verdict does not permit the merge"; 3 is "the guard could not run" (no config, no
+#: tip, no `ngit`, a reply that is not a PR). 9 and not 5: `scripts/merge_pr.sh` answers 5 for
+#: "the live checkout moved", 6 for a commit with no card trailer, 7 for a card that is not in
+#: review or done, and 8 for a merge whose applied record did not publish. A shared code would
+#: make "ask a reviewer" indistinguishable from any of them.
 EXIT_UNREADABLE = 3
 EXIT_REFUSED = 9
 
@@ -108,6 +129,53 @@ def _tag_value(event: Mapping[str, Any], letter: str) -> str:
         if isinstance(tag, (list, tuple)) and len(tag) >= 2 and str(tag[0]) == letter:
             return str(tag[1])
     return ""
+
+
+def verdict_tip(body: str) -> str:
+    """The revision a verdict names it covers, or "" when it names none.
+
+    The last `Tip:` line wins: a review that opens with the tip it read and closes with a
+    "Scope: this covers tip X" line is saying the same thing twice, and the closing statement
+    is the one about the whole comment. A reviewer who names no tip has not said what they
+    looked at, and the merge route refuses that rather than guessing.
+    """
+    found = ""
+    for line in str(body or "").splitlines():
+        match = _TIP.match(line)
+        if match:
+            found = match.group("sha").lower()
+    return found
+
+
+def with_tip(body: str, tip: str) -> str:
+    """The verdict as it is published: the reviewer's words, and the tip they cover.
+
+    The reviewer's own `Tip:` line is left exactly as written -- their statement about which
+    commit they read is theirs. When they wrote none the pass appends one, because the marker
+    is what makes an approval checkable later, and a verdict that cannot be checked is not a
+    signature a merge can stand on. Nothing else is added: the prose stays verbatim.
+    """
+    tip = str(tip or "").strip().lower()
+    text = str(body or "").rstrip()
+    if not tip or verdict_tip(text):
+        return text
+    return f"{text}\n\n{TIP_LINE} {tip}".lstrip("\n")
+
+
+def same_commit(one: str, other: str) -> bool:
+    """Whether two spellings name the same commit: equal, or one an abbreviation of the other.
+
+    The marker may be abbreviated (`Tip: 45f4e8b`, which is how a person writes it) and the
+    tip from the remote never is. A prefix shorter than git's own default abbreviation is not
+    evidence of anything, so it matches nothing.
+    """
+    left, right = str(one or "").strip().lower(), str(other or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    return len(short) >= TIP_MIN_CHARS and long.startswith(short)
 
 
 # -- the verdict, on the card --------------------------------------------------
@@ -170,8 +238,8 @@ class VerdictResult:
 #: `read(pr_id) -> [(relay, event), ...]`: the PR root's comments, per relay.
 Reader = Callable[[str], Sequence[tuple[str, Mapping[str, Any]]]]
 
-#: `publish(pr_id, body, *, created_at, author, covers_after) -> VerdictResult`: what the
-#: pass calls.
+#: `publish(pr_id, body, *, created_at, author, covers_after, tip) -> VerdictResult`: what
+#: the pass calls.
 VerdictPublisherFn = Callable[..., "VerdictResult"]
 
 
@@ -270,7 +338,7 @@ class VerdictPublisher:
     # -- the call -------------------------------------------------------
 
     def __call__(self, pr_id: str, body: str, *, created_at: int = 0,
-                 author: str = "", covers_after: int = 0) -> VerdictResult:
+                 author: str = "", covers_after: int = 0, tip: str = "") -> VerdictResult:
         """Publish the verdict, unless it is already on the PR.
 
         `author` is the PR author's key, written into `P`/`p` so the thread says whose work
@@ -279,17 +347,22 @@ class VerdictPublisher:
 
         `covers_after` is the current tip's time: an identical verdict from this key that
         predates it does not cover the tip, so it does not stand in for this one.
+
+        `tip` is the revision this verdict is about, and it is published **in** the comment
+        (`with_tip`): the merge route reads it back and refuses an approval whose tip is not
+        the branch's head, so the revision a reviewer saw is part of the record rather than
+        something the merge has to infer from timestamps.
         """
         if not self.relays:
             return VerdictResult(error="no relays to publish a verdict to")
         if not self._secret:
             return VerdictResult(error="no review identity to sign with")
-        body = str(body)
-        existing = self._published(pr_id, body, covers_after=covers_after)
+        published = with_tip(body, tip)
+        existing = self._published(pr_id, published, covers_after=covers_after)
         if existing:
             return VerdictResult(ok=True, event=existing, relays=self.relays, existing=True)
         try:
-            signed = self._signed(comment_event(pr_id=pr_id, body=body,
+            signed = self._signed(comment_event(pr_id=pr_id, body=published,
                                                created_at=created_at,
                                                author=as_hex(author) or str(author or "")))
         except Exception as exc:  # noqa: BLE001 - a signing failure is a report line
@@ -315,10 +388,15 @@ class VerdictPublisher:
 
 @dataclass(frozen=True)
 class Authorship:
-    """Whether the PR's newest verdict is somebody else's signature.
+    """Whether the PR's newest verdict permits a merge, and why not when it does not.
 
-    `ok` is about the merge: a PR whose newest verdict came from its own author has no second
-    signature, and the guard refuses it rather than treating the author's word as a review.
+    `ok` is about the merge, and it is a conjunction of four answers, each of which the
+    message names when it fails: somebody signed it, that somebody is a permitted reviewer,
+    they approved rather than asked for changes, and the approval covers the tip the merge
+    would land.
+
+    `covers` is the revision the verdict names it saw (the `Tip:` line), and `tip` the one the
+    merge would apply.
     """
 
     ok: bool = False
@@ -326,10 +404,17 @@ class Authorship:
     author: str = ""
     verdict: Optional[Verdict] = None
     event: str = ""
+    covers: str = ""
+    tip: str = ""
+    reviewers: int = 0
 
     @property
     def label(self) -> str:
         return self.verdict.label if self.verdict is not None else ""
+
+    @property
+    def signer(self) -> str:
+        return _npub(self.verdict.author) if self.verdict is not None else ""
 
 
 def _as_verdict_events(comments: Iterable[Any]) -> list[dict[str, Any]]:
@@ -353,29 +438,81 @@ def _as_verdict_events(comments: Iterable[Any]) -> list[dict[str, Any]]:
     return events
 
 
-def check_authorship(view: Mapping[str, Any]) -> Authorship:
-    """Whether `ngit pr view --json --comments` carries a verdict by a different npub.
+def check_authorship(view: Mapping[str, Any], *, reviewers: Sequence[str] = (),
+                     tip: str = "") -> Authorship:
+    """Whether `ngit pr view --json --comments` carries a verdict that permits a merge.
 
-    Three refusals, each named: no verdict at all, a verdict whose words cannot be read, and
-    a verdict from the PR's own author. Falling back to "the author looked at it" is the one
-    direction that lets a PR merge with no second party on it, so it is never a fallback.
+    The comment is parsed once (`newest_verdict`, the same parse the label pass uses) and then
+    asked four questions in the order a reader would: who signed it, whether that key is a
+    permitted reviewer, whether they approved, and which revision they approved.
+
+    `reviewers` is `ngit.reviewers` -- the same list, resolved by the same function, that the
+    label pass and `Sync.reviewers` read. It defaults to empty on purpose: no configured
+    reviewer means **no verdict permits a merge**, never "anyone who tags the PR".
+
+    Falling back to "the author looked at it", to a stranger's approval, or to an approval of
+    whatever used to be on the branch is the direction that lands unreviewed work, so none of
+    the three is a fallback: each is a refusal that names what it saw.
     """
     author = str(view.get("author") or "")
     newest = newest_verdict(_as_verdict_events(view.get("comments") or ()))
+    allowed = {as_hex(value) for value in reviewers if str(value or "").strip()}
     if newest is None:
-        return Authorship(why="no verdict on the PR", author=author)
+        return Authorship(why="no verdict on the PR", author=author, tip=tip,
+                          reviewers=len(allowed))
     if not newest.readable:
         return Authorship(why="the newest verdict states a verdict that cannot be read",
-                          author=author, verdict=newest)
+                          author=author, verdict=newest, tip=tip, reviewers=len(allowed))
     who = as_hex(newest.author)
     if not who:
         return Authorship(why=f"the verdict's author {newest.author!r} is not a key",
-                          author=author, verdict=newest, event=newest.event_id)
+                          author=author, verdict=newest, event=newest.event_id, tip=tip,
+                          reviewers=len(allowed))
     if who == as_hex(author):
         return Authorship(why=f"the newest verdict is the PR author's own ({_npub(author)});"
                               " a merge needs a verdict from a different npub",
-                          author=author, verdict=newest, event=newest.event_id)
-    return Authorship(ok=True, author=author, verdict=newest, event=newest.event_id)
+                          author=author, verdict=newest, event=newest.event_id, tip=tip,
+                          reviewers=len(allowed))
+    if not allowed:
+        return Authorship(why="no reviewer is configured (`ngit.reviewers`), so no verdict"
+                              " permits a merge",
+                          author=author, verdict=newest, event=newest.event_id, tip=tip)
+    if who not in allowed:
+        return Authorship(
+            why=(f"the newest verdict was signed by {_npub(newest.author)}, which is not a"
+                 " configured reviewer (`ngit.reviewers`); a merge needs a verdict from a"
+                 " permitted reviewer"),
+            author=author, verdict=newest, event=newest.event_id, tip=tip,
+            reviewers=len(allowed))
+    if newest.label != APPROVED:
+        return Authorship(
+            why=(f"the newest verdict from {_npub(newest.author)} asks for changes"
+                 f" ({newest.label}); a merge does not overrule it -- review the fix and"
+                 " approve the tip first"),
+            author=author, verdict=newest, event=newest.event_id, tip=tip,
+            reviewers=len(allowed))
+    covers = verdict_tip(newest.body)
+    if not covers:
+        return Authorship(
+            why=(f"the approval from {_npub(newest.author)} does not name the tip it covers;"
+                 " the merge cannot show it covers the current revision -- ask for a"
+                 " re-review"),
+            author=author, verdict=newest, event=newest.event_id, tip=tip,
+            reviewers=len(allowed))
+    if not tip:
+        return Authorship(
+            why=("the PR's current tip was not supplied, so the approval cannot be matched"
+                 " to it"),
+            author=author, verdict=newest, event=newest.event_id, covers=covers,
+            reviewers=len(allowed))
+    if not same_commit(covers, tip):
+        return Authorship(
+            why=(f"the approval covers tip {short(covers)}, but the PR is now at"
+                 f" {short(tip)}: review the new tip before merging"),
+            author=author, verdict=newest, event=newest.event_id, covers=covers, tip=tip,
+            reviewers=len(allowed))
+    return Authorship(ok=True, author=author, verdict=newest, event=newest.event_id,
+                      covers=covers, tip=tip, reviewers=len(allowed))
 
 
 def _npub(key: str) -> str:
@@ -418,38 +555,75 @@ def read_view(pr: str, *, runner: Callable[..., Any] = subprocess.run) -> Mappin
     return data
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """The merge route's check: exit 0 when the verdict is somebody else's, 9 when it is not.
+def permitted_reviewers(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """The keys whose verdict permits a merge, from the one resolver the pass uses.
 
-    `scripts/merge_pr.sh` calls this before it applies anything. 3 is "could not read", which
-    is a state error like the rest of that script's refusals; 9 is the authorship refusal, so
-    a caller can tell "ask a reviewer" from "the relay is down". 9 and not 5 because the merge
-    route already spends 5 on the live checkout, 6 and 7 on the card checks and 8 on a missing
-    applied record: one code, one meaning, or the caller cannot tell which refusal it got.
+    `ngit.reviewers`, or the review identity's public half when only `review_secret_file`
+    names it. That rule lives in `cli.reviewer_keys`, and this function exists so the merge
+    guard cannot answer the same question a second way: the label pass resolves the list
+    there before it builds `Sync`, and the guard resolves it there before it reads a verdict.
+    """
+    from .cli import reviewer_keys  # noqa: PLC0415 - cli imports this module's publisher
+    from .ngit import BridgeConfig  # noqa: PLC0415 - same reason, one level down
+
+    return reviewer_keys(BridgeConfig.from_config((config or {}).get("ngit")))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """The merge route's check: 0 when a verdict permits the merge, 9 when it does not.
+
+    `scripts/merge_pr.sh` calls this before it applies anything. 3 is "could not run" -- no
+    config, no `ngit`, no tip to compare against, a reply that is not a PR -- and 9 is the
+    verdict refusal, so a caller can tell "ask a reviewer" from "the box is wrong". 9 and not
+    5 because the merge route already spends 5 on the live checkout, 6 and 7 on the card
+    checks and 8 on a missing applied record: one code, one meaning, or the caller cannot
+    tell which refusal it got.
     """
     parser = argparse.ArgumentParser(
         prog="python -m hermes_nostr_gateway.ngit_verdict",
-        description="Check that a PR carries a verdict from a different npub than its author.")
+        description="Check that a PR carries a verdict from a permitted reviewer that covers"
+                    " the tip the merge would land.")
     parser.add_argument("pr", help="the PR's event id or nevent")
+    parser.add_argument("--tip", default="",
+                        help="the PR's current head (merge_pr.sh reads it from origin)")
     parser.add_argument("--json", action="store_true", help="machine-readable answer")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    from .cli import load_config  # noqa: PLC0415 - lazy, like every other CLI one-shot
+
+    try:
+        config = load_config(None)
+    except SystemExit as exc:
+        print(f"FAIL {exc}", file=sys.stderr)
+        return EXIT_UNREADABLE
+    except OSError as exc:
+        print(f"FAIL the config cannot be read: {exc}", file=sys.stderr)
+        return EXIT_UNREADABLE
+    reviewers = permitted_reviewers(config)
+    if not args.tip:
+        # Not a refusal: with no tip there is nothing to compare the approval against, and
+        # calling that "ask a reviewer" would send the operator to the wrong person.
+        print("FAIL the PR's current tip was not given (--tip): the guard cannot show an"
+              " approval covers this revision", file=sys.stderr)
+        return EXIT_UNREADABLE
     try:
         view = read_view(args.pr)
     except VerdictError as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return EXIT_UNREADABLE
-    found = check_authorship(view)
+    found = check_authorship(view, reviewers=reviewers, tip=args.tip)
     if args.json:
         print(json.dumps({"ok": found.ok, "why": found.why, "pr_author": found.author,
-                          "verdict": found.label, "event": found.event}, indent=2))
+                          "verdict": found.label, "event": found.event,
+                          "signer": found.signer, "covers": found.covers,
+                          "tip": found.tip, "reviewers": found.reviewers}, indent=2))
     elif found.ok:
-        print(f"OK   {short(args.pr)} carries a verdict from a different npub"
-              f" ({_npub(found.verdict.author) if found.verdict else ''})")
+        print(f"OK   {short(args.pr)} carries an approval from {found.signer}"
+              f" covering tip {short(found.covers)}")
     else:
         print(f"REFUSED: {found.why}", file=sys.stderr)
-        print("  A merge needs a verdict from a different npub than the PR's author.",
-              file=sys.stderr)
+        print("  A merge needs an approving verdict from a permitted reviewer"
+              " (`ngit.reviewers`) that names the tip it covers.", file=sys.stderr)
     return 0 if found.ok else EXIT_REFUSED
 
 

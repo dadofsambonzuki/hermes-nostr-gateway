@@ -1143,6 +1143,37 @@ interpreter — and the daemon kept serving on 3.11 throughout, so nothing here 
 Consequence: a contributor on 3.11 gets a resolver refusal that names the floor, not a hung test
 run; and the tested range is the declared range, so the next floor change has to move CI with it.
 
+## The merge gate reads the record, and the verdict names the tip it covers
+
+The merge route checked one thing about a verdict: that its signer was not the PR's author. The
+label pass beside it checked more — it honoured `ngit.reviewers` — so the thing that gated a
+merge was looser than the thing that coloured a label, and the difference was invisible until a
+stranger's approval landed a change. The other half was just as weak: an approval was final
+forever, so a push after the review inherited it.
+
+**One allowlist, one place.** The guard resolves `ngit.reviewers` through `cli.reviewer_keys`,
+the same function `cmd_ngit_sync` uses to build `BridgeConfig.reviewers` before `Sync` exists.
+An empty list permits nothing — never "anyone who tags the PR". The refusal names the npub it
+saw and says which list refused it, because "not permitted" without a key is a message the
+operator cannot act on.
+
+**A verdict names its tip, in the comment.** The pass publishes the reviewer's words with a
+`Tip: <sha>` line — theirs if they wrote one, otherwise the tip the pass knows, and only when
+the comment is at least as new as the tip's event. The merge route reads that line back and
+compares it with the branch head `git ls-remote` reports. An approval of an earlier revision
+reads `approved` on the PR and is still refused at the merge (exit 9); the operator's answer is
+a re-review of the tip that is there, which is the one act that turns an unreviewed revision
+into a reviewed one. A verdict that cannot name its tip is refused rather than assumed to cover
+whatever is on the branch now.
+
+**The link row stops being a second opinion.** The bridge's `verdict`/`verdict_tip` note was
+also read by the merge route (`ngit_merge.approval_problem`), which meant a cache could refuse a
+merge the PR's own record allowed and allow one it refused — and it reported that refusal with
+the card-state code (7), a third meaning for a code the merge route documents as "the card is
+not in review or done". The rule now lives in `ngit_verdict` alone, reading the record; the note
+stays as the pass's own bookkeeping. Exit 9 is a verdict refusal and 3 is a guard that could not
+run (no config, no tip, no `ngit`), and nothing else.
+
 ## An unread config key is an advisory, never a refusal
 
 `hng doctor` names the top-level config keys this build does not read in one advisory line: the

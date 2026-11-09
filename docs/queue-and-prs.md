@@ -311,21 +311,24 @@ This is not a security boundary and this document will not pretend it is: a work
 the hook or pass `--no-verify`. What the hook buys is that an accidental merge becomes a
 deliberate one. The durable half is identity — a merge signed with a key no worker profile
 holds — and that is host configuration, not this repository. The other durable half is
-authorship: `scripts/merge_pr.sh` refuses a PR whose newest verdict is its own author's, so a
-self-authored change lands only with a second party's signature on it.
+authorship: `scripts/merge_pr.sh` refuses a PR whose newest verdict is its own author's, a
+stranger's, or an approval of a revision the branch has moved past, so a change lands only on a
+permitted reviewer's word about the tip it actually applies.
 
 **Enforced in** `scripts/worker_push_guard.sh` (the `pre-push` hook; installed once per clone
 into the hooks directory every worktree shares), `scripts/merge_pr.sh` (exit 4 in a card
-workspace, exit 9 with no verdict from a different npub), and
-`src/hermes_nostr_gateway/ngit_verdict.py` (the authorship check the merge route calls).
+workspace, exit 9 with no approved verdict from a permitted reviewer covering the current tip),
+and `src/hermes_nostr_gateway/ngit_verdict.py` (the check the merge route calls, reading
+`ngit.reviewers` through the same resolver the label pass uses).
 
 **In this tree:** yes — the hook and `merge_pr.sh`'s exit-4 refusal are on `master` (PR
 `b81a2d50`); the verdict refusal is this change, and `tests/test_ngit_verdict.py` runs the real
-`merge_pr.sh` against a fake `ngit` to pin both the refusal and the pass-through.
+`merge_pr.sh` against a fake `ngit` to pin the refusal (self-review, outside-allowlist,
+stale tip) and the pass-through.
 
 **Check:** `scripts/worker_push_guard.sh status` reports whether the hook is installed and
-whether this shell is a card workspace; `bash scripts/merge_pr.sh <pr> --check` exits 9 for a
-self-authored verdict before it applies anything.
+whether this shell is a card workspace; `bash scripts/merge_pr.sh <pr> --check` exits 9 before
+it applies anything when the approval does not permit that tip.
 
 ## Transitions
 
@@ -408,4 +411,4 @@ Still convention, with nothing enforcing it:
   for saying nothing.
 - A revision after the verdict reopens the same card; it does not create a second one.
 - Nothing was pushed to `master` from a card workspace; the merge was the operator's, and the
-  merge route saw a verdict from a different npub.
+  merge route saw an approved verdict from a permitted reviewer covering the tip it landed.

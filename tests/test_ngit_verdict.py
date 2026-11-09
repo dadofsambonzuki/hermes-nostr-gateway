@@ -221,6 +221,13 @@ def test_publishing_with_no_relays_is_a_failure_not_a_silent_success():
 
 # -- the merge guard's half ----------------------------------------------------
 
+#: The tip the merge would apply, and an earlier one: two full ids, as `ls-remote` prints them.
+TIP = "a" * 40
+EARLIER = "b" * 40
+#: A third key: a valid npub that is not the author and not a permitted reviewer.
+STRANGER = sdk.Keys.generate()
+
+
 def a_view(pr_author: sdk.Keys, *comments: dict) -> dict:
     return {"author": pr_author.public_key().to_bech32(), "comments": list(comments)}
 
@@ -231,16 +238,86 @@ def a_comment(keys: sdk.Keys, body: str, *, created_at: int = 1000,
             "created_at": created_at, "id": event_id or f"{created_at:064d}"}
 
 
-def test_a_verdict_from_another_npub_is_accepted():
-    found = verdicts.check_authorship(a_view(AUTHOR, a_comment(REVIEWER, "Verdict: approved")))
+def an_approval(keys: sdk.Keys, tip: str = TIP, **kwargs) -> dict:
+    """One `Verdict: approved` comment naming the tip it covers, as the pass publishes it."""
+    return a_comment(keys, f"Verdict: approved\n\nReasoning.\n\nTip: {tip}", **kwargs)
 
-    assert found.ok
+
+def a_guard(view: dict, *, reviewers=(REVIEWER,), tip: str = TIP):
+    """The guard, called the way `main` calls it: with the allowlist and the current tip."""
+    return verdicts.check_authorship(view, reviewers=[key(who) for who in reviewers], tip=tip)
+
+
+def test_a_permitted_reviewer_approving_the_current_tip_permits_the_merge():
+    found = a_guard(a_view(AUTHOR, an_approval(REVIEWER)))
+
+    assert found.ok, found.why
     assert found.label == "approved"
+    assert found.signer == REVIEWER.public_key().to_bech32()
+    assert found.covers == TIP and found.tip == TIP
     assert found.verdict is not None and key(REVIEWER) == as_hex(found.verdict.author)
 
 
+def test_a_verdict_from_outside_the_allowlist_is_refused_and_names_the_npub():
+    """The label pass honours `ngit.reviewers`; so does the thing that gates the merge."""
+    found = a_guard(a_view(AUTHOR, an_approval(STRANGER)))
+
+    assert not found.ok
+    assert STRANGER.public_key().to_bech32() in found.why
+    assert "not a configured reviewer" in found.why and "ngit.reviewers" in found.why
+
+
+def test_no_configured_reviewer_means_no_verdict_permits_a_merge():
+    found = a_guard(a_view(AUTHOR, an_approval(REVIEWER)), reviewers=())
+
+    assert not found.ok
+    assert "no reviewer is configured" in found.why
+
+
+def test_an_approval_of_an_earlier_tip_is_refused():
+    """The revision moved after the review; the word no longer covers the work."""
+    found = a_guard(a_view(AUTHOR, an_approval(REVIEWER, tip=EARLIER)))
+
+    assert not found.ok
+    assert EARLIER[:8] in found.why and TIP[:8] in found.why
+    assert "review the new tip" in found.why
+
+
+def test_a_re_review_of_the_new_tip_permits_the_merge():
+    """The refusal is not a dead end: a reviewer approving the tip there now is enough."""
+    found = a_guard(a_view(
+        AUTHOR,
+        an_approval(REVIEWER, tip=EARLIER, created_at=1000),
+        an_approval(REVIEWER, tip=TIP, created_at=2000,
+                    event_id="c" * 64),
+    ))
+
+    assert found.ok, found.why
+    assert found.covers == TIP
+
+
+def test_an_approval_that_names_no_tip_is_refused():
+    found = a_guard(a_view(AUTHOR, a_comment(REVIEWER, "Verdict: approved")))
+
+    assert not found.ok
+    assert "does not name the tip" in found.why
+
+
+def test_a_changes_request_from_a_permitted_reviewer_is_refused():
+    """A verdict is not an approval: the newest word decides, and this one says no."""
+    found = a_guard(a_view(
+        AUTHOR,
+        an_approval(REVIEWER, created_at=1000),
+        a_comment(REVIEWER, f"Verdict: changes-requested\n\nTwo fixes.\n\nTip: {TIP}",
+                  created_at=2000, event_id="d" * 64),
+    ))
+
+    assert not found.ok
+    assert "asks for changes" in found.why
+
+
 def test_the_pr_authors_own_verdict_is_refused():
-    found = verdicts.check_authorship(a_view(AUTHOR, a_comment(AUTHOR, "Verdict: approved")))
+    found = a_guard(a_view(AUTHOR, an_approval(AUTHOR, tip=TIP)))
 
     assert not found.ok
     assert "own" in found.why and "different npub" in found.why
@@ -248,19 +325,19 @@ def test_the_pr_authors_own_verdict_is_refused():
 
 def test_the_same_key_is_recognised_whatever_the_spelling():
     """npub and hex are the same signature; the guard compares keys, not strings."""
-    view = {"author": key(AUTHOR), "comments": [a_comment(AUTHOR, "Verdict: approved")]}
-    assert not verdicts.check_authorship(view).ok
+    view = {"author": key(AUTHOR), "comments": [an_approval(AUTHOR, tip=TIP)]}
+    assert not verdicts.check_authorship(view, reviewers=[key(REVIEWER)], tip=TIP).ok
 
 
 def test_no_verdict_on_the_pr_is_refused():
-    found = verdicts.check_authorship(a_view(AUTHOR, a_comment(REVIEWER, "Looks fine.")))
+    found = a_guard(a_view(AUTHOR, a_comment(REVIEWER, "Looks fine.")))
 
     assert not found.ok
     assert "no verdict" in found.why
 
 
 def test_an_unreadable_verdict_is_refused():
-    found = verdicts.check_authorship(a_view(AUTHOR, a_comment(REVIEWER, "Verdict: ???")))
+    found = a_guard(a_view(AUTHOR, a_comment(REVIEWER, "Verdict: ???")))
 
     assert not found.ok
     assert "cannot be read" in found.why
@@ -268,14 +345,48 @@ def test_an_unreadable_verdict_is_refused():
 
 def test_the_newest_verdict_decides_who_signed_it():
     """An old second opinion does not cover a PR the author then approved themselves."""
-    found = verdicts.check_authorship(a_view(
+    found = a_guard(a_view(
         AUTHOR,
-        a_comment(REVIEWER, "Verdict: approved", created_at=1000),
-        a_comment(AUTHOR, "Verdict: approved", created_at=2000),
+        an_approval(REVIEWER, created_at=1000),
+        an_approval(AUTHOR, created_at=2000, event_id="e" * 64),
     ))
 
     assert not found.ok
     assert "own" in found.why
+
+
+# -- the tip marker ------------------------------------------------------------
+
+def test_an_abbreviated_tip_matches_the_full_id():
+    """`Tip: 45f4e8b` is how a person writes a revision, and it is enough to identify one."""
+    assert verdicts.same_commit("45f4e8b", "45f4e8b" + "c" * 33)
+    assert verdicts.same_commit("45f4e8b" + "c" * 33, "45f4e8b")
+
+
+def test_a_marker_too_short_to_identify_a_commit_matches_nothing():
+    assert not verdicts.same_commit("45f4", "45f4" + "c" * 36)
+    assert not verdicts.same_commit("", TIP)
+
+
+def test_the_tip_is_read_from_the_verdict_s_own_line():
+    assert verdicts.verdict_tip(f"Verdict: approved\n\nTip: {TIP.upper()}") == TIP
+    assert verdicts.verdict_tip("Verdict: approved\n\ntip: 45f4e8b") == "45f4e8b"
+    # Prose is not a marker: "reviewed the tip at ..." says nothing a merge can compare.
+    assert verdicts.verdict_tip("Verdict: approved\n\nI read the tip at 45f4e8b.") == ""
+
+
+def test_the_publisher_appends_the_tip_the_reviewer_did_not_write():
+    published = verdicts.with_tip("Verdict: approved\n\nLooks right.", TIP)
+
+    assert published == f"Verdict: approved\n\nLooks right.\n\nTip: {TIP}"
+    assert verdicts.verdict_tip(published) == TIP
+    # Idempotent: a second pass over an already-stamped body changes nothing.
+    assert verdicts.with_tip(published, TIP) == published
+
+
+def test_the_reviewer_s_own_tip_line_is_left_exactly_as_written():
+    body = "Verdict: approved\n\nTip: 45f4e8b\n\nScope: this covers that revision."
+    assert verdicts.with_tip(body, TIP) == body
 
 
 # -- the merge route -----------------------------------------------------------
@@ -299,7 +410,12 @@ def clean_env(**extra: str) -> dict[str, str]:
 @pytest.fixture()
 def merge_route(tmp_path: Path) -> SimpleNamespace:
     """A throwaway clone carrying the real scripts, a symlink to this tree's src, and a fake
-    `ngit` that answers `pr view` from a JSON file the test writes."""
+    `ngit` that answers `pr view` from a JSON file the test writes.
+
+    The clone also carries the `config.yaml` the guard reads its reviewer allowlist from, and a
+    `pr/test` ref on the origin: the tip the merge would apply comes from `ls-remote`, so the
+    fixture has to have one.
+    """
     env = clean_env()
     origin, repo = tmp_path / "origin.git", tmp_path / "repo"
     git(tmp_path, "init", "--bare", "-b", "master", str(origin), env=env)
@@ -309,10 +425,24 @@ def merge_route(tmp_path: Path) -> SimpleNamespace:
     git(repo, "add", "a.txt", env=env)
     git(repo, "commit", "-qm", "one", env=env)
     git(repo, "push", "-q", "origin", "HEAD:refs/heads/master", env=env)
+    # The PR's branch, and the tip the approval must name.
+    git(repo, "checkout", "-q", "-b", "pr/test", env=env)
+    (repo / "b.txt").write_text("two\n", encoding="utf-8")
+    git(repo, "add", "b.txt", env=env)
+    git(repo, "commit", "-qm", "two", env=env)
+    git(repo, "push", "-q", "origin", "HEAD:refs/heads/pr/test", env=env)
+    tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, env=env, check=True,
+                         capture_output=True, text=True, timeout=60).stdout.strip()
     (repo / "scripts").mkdir()
     shutil.copy2(MERGE, repo / "scripts" / "merge_pr.sh")
     shutil.copy2(GUARD, repo / "scripts" / "worker_push_guard.sh")
     (repo / "src").symlink_to(REPO / "src", target_is_directory=True)
+    # The one allowlist: `ngit.reviewers`, read by the same resolver the label pass uses. The
+    # `store:` names a file that does not exist, so the card check has no links to read and the
+    # script does not fall back to whatever config this host holds.
+    (repo / "config.yaml").write_text(
+        f"store: {tmp_path / 'gateway.db'}\n"
+        f"ngit:\n  reviewers: [{key(REVIEWER)}]\n", encoding="utf-8")
 
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -322,12 +452,12 @@ def merge_route(tmp_path: Path) -> SimpleNamespace:
         "case \"$*\" in\n"
         "  *--json*) cat \"$FAKE_PR_JSON\" ;;\n"
         "  *apply*) exit 9 ;;\n"
-        "  *) echo \"Status: open\" ;;\n"
+        "  *) printf 'Status: open\\nBranch: pr/test\\n' ;;\n"
         "esac\n",
         encoding="utf-8")
     fake.chmod(0o755)
     view = tmp_path / "pr.json"
-    return SimpleNamespace(repo=repo, bindir=bindir, view=view,
+    return SimpleNamespace(repo=repo, bindir=bindir, view=view, tip=tip,
                            venv=Path(sys.executable).parent.parent)
 
 
@@ -343,41 +473,124 @@ def run_merge(made: SimpleNamespace, view: dict) -> subprocess.CompletedProcess:
 
 
 def test_the_merge_route_refuses_a_self_authored_verdict(merge_route):
-    refused = run_merge(merge_route, a_view(AUTHOR, a_comment(AUTHOR, "Verdict: approved")))
+    refused = run_merge(merge_route, a_view(AUTHOR, an_approval(AUTHOR, tip=merge_route.tip)))
 
     assert refused.returncode == 9, refused.stdout + refused.stderr
     assert "REFUSED" in refused.stdout
     assert "different npub" in refused.stdout
 
 
-def test_the_merge_route_lets_a_second_party_verdict_through(merge_route):
+def test_the_merge_route_refuses_a_verdict_from_outside_the_allowlist(merge_route):
+    """The script's allowlist is the config's, and the refusal says whose key it refused."""
+    refused = run_merge(merge_route, a_view(AUTHOR, an_approval(STRANGER,
+                                                                 tip=merge_route.tip)))
+
+    assert refused.returncode == 9, refused.stdout + refused.stderr
+    assert "REFUSED" in refused.stdout
+    assert STRANGER.public_key().to_bech32() in refused.stdout
+    assert "not a configured reviewer" in refused.stdout
+
+
+def test_the_merge_route_refuses_an_approval_of_an_earlier_tip(merge_route):
+    refused = run_merge(merge_route, a_view(AUTHOR, an_approval(REVIEWER, tip=EARLIER)))
+
+    assert refused.returncode == 9, refused.stdout + refused.stderr
+    assert "the approval covers tip" in refused.stdout
+    assert merge_route.tip[:8] in refused.stdout
+
+
+def test_the_merge_route_lets_a_permitted_approval_of_the_current_tip_through(merge_route):
     """Past the guard it reaches the apply step -- which the fake fails, as a marker."""
-    past = run_merge(merge_route, a_view(AUTHOR, a_comment(REVIEWER, "Verdict: approved")))
+    past = run_merge(merge_route, a_view(AUTHOR, an_approval(REVIEWER, tip=merge_route.tip)))
 
     assert "REFUSED" not in past.stdout
     assert past.returncode == 1 and "CONFLICT" in past.stdout
 
 
-def test_the_check_exits_three_when_the_pr_cannot_be_read(merge_route, monkeypatch):
+def guard_env(monkeypatch, reviewers=(REVIEWER,)) -> None:
+    """The check's two external reads: the config, and the allowlist resolved from it."""
+    monkeypatch.setattr("hermes_nostr_gateway.cli.load_config", lambda path=None: {})
+    monkeypatch.setattr(verdicts, "permitted_reviewers",
+                        lambda config: tuple(key(who) for who in reviewers))
+
+
+def test_the_check_exits_three_when_the_pr_cannot_be_read(monkeypatch, capsys):
+    guard_env(monkeypatch)
+
     def unreadable(*args, **kwargs):
         raise verdicts.VerdictError("ngit pr view abababab failed: relay unreachable")
 
     monkeypatch.setattr(verdicts, "read_view", unreadable)
+    assert verdicts.main([PR, "--tip", TIP]) == verdicts.EXIT_UNREADABLE
+    assert "relay unreachable" in capsys.readouterr().err
+
+
+def test_the_check_exits_three_when_the_config_cannot_be_read(monkeypatch, capsys):
+    def missing(path=None):
+        raise SystemExit("no config found: pass --config or create config.yaml")
+
+    monkeypatch.setattr("hermes_nostr_gateway.cli.load_config", missing)
+    assert verdicts.main([PR, "--tip", TIP]) == verdicts.EXIT_UNREADABLE
+    assert "no config found" in capsys.readouterr().err
+
+
+def test_the_check_exits_three_when_there_is_no_tip_to_compare_against(monkeypatch, capsys):
+    """A guard that cannot run is 3, not 9: nobody is being asked for a re-review."""
+    guard_env(monkeypatch)
     assert verdicts.main([PR]) == verdicts.EXIT_UNREADABLE
+    assert "--tip" in capsys.readouterr().err
 
 
-def test_the_check_exits_zero_for_a_second_party_verdict(monkeypatch, capsys):
+def test_the_check_exits_zero_for_a_permitted_approval_of_the_tip(monkeypatch, capsys):
+    guard_env(monkeypatch)
     monkeypatch.setattr(verdicts, "read_view",
-                        lambda pr: a_view(AUTHOR, a_comment(REVIEWER, "Verdict: approved")))
-    assert verdicts.main([PR]) == 0
-    assert "OK" in capsys.readouterr().out
+                        lambda pr: a_view(AUTHOR, an_approval(REVIEWER)))
+    assert verdicts.main([PR, "--tip", TIP]) == 0
+    out = capsys.readouterr().out
+    assert "OK" in out and REVIEWER.public_key().to_bech32() in out
 
 
 def test_the_check_exits_nine_for_a_self_review(monkeypatch, capsys):
+    guard_env(monkeypatch)
     monkeypatch.setattr(verdicts, "read_view",
-                        lambda pr: a_view(AUTHOR, a_comment(AUTHOR, "Verdict: approved")))
-    assert verdicts.main([PR]) == verdicts.EXIT_REFUSED
+                        lambda pr: a_view(AUTHOR, an_approval(AUTHOR, tip=TIP)))
+    assert verdicts.main([PR, "--tip", TIP]) == verdicts.EXIT_REFUSED
     assert "REFUSED" in capsys.readouterr().err
+
+
+def test_the_check_exits_nine_for_an_unpermitted_reviewer(monkeypatch, capsys):
+    guard_env(monkeypatch)
+    monkeypatch.setattr(verdicts, "read_view",
+                        lambda pr: a_view(AUTHOR, an_approval(STRANGER, tip=TIP)))
+    assert verdicts.main([PR, "--tip", TIP]) == verdicts.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert STRANGER.public_key().to_bech32() in err and "ngit.reviewers" in err
+
+
+def test_the_merge_guard_reads_the_allowlist_the_label_pass_reads(monkeypatch, tmp_path):
+    """One allowlist, one place: the guard resolves `ngit.reviewers` through `cli.reviewer_keys`.
+
+    That function is what `cmd_ngit_sync` puts into `BridgeConfig.reviewers` before `Sync` is
+    built, so the list the label pass filters verdicts with and the list the merge route
+    checks them against cannot be two different answers.
+    """
+    from hermes_nostr_gateway import cli, ngit
+
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"secret_key_hex": sdk.Keys.generate().secret_key().to_hex()}),
+                        encoding="utf-8")
+    keyfile = tmp_path / "review.hex"
+    keyfile.write_text(REVIEWER.secret_key().to_hex() + "\n", encoding="utf-8")
+    config = {"identity": {"secret_file": str(identity)},
+              "ngit": {"review_secret_file": str(keyfile)}}
+
+    guard = verdicts.permitted_reviewers(config)
+    labels = cli.reviewer_keys(ngit.BridgeConfig.from_config(config["ngit"]))
+
+    assert guard == labels == (key(REVIEWER),)
+    # And that resolved list is exactly what the label pass is constructed from.
+    bridged = ngit.BridgeConfig(reviewers=labels)
+    assert {as_hex(who) for who in bridged.reviewers} == {key(REVIEWER)}
 
 
 # -- the configured review identity --------------------------------------------

@@ -219,6 +219,7 @@ case "${1:-} ${2:-}" in
       fi
     else
       printf 'Status:   %s\\n' "${FAKE_PR_STATUS:-open}"
+      printf 'Branch:   %s\\n' "${FAKE_PR_BRANCH:-pr/test}"
     fi
     ;;
   "pr list")
@@ -274,6 +275,8 @@ def make_bridge(tmp_path: Path, repo: Path, *, cards: dict[str, str],
     config = tmp_path / "config.yaml"
     config.write_text(
         f"store: {tmp_path / 'gateway.db'}\n"
+        "ngit:\n"
+        f"  reviewers: [{'2' * 64}]\n"
         "concord:\n"
         "  projects:\n"
         f"    - channel: {'c' * 64}\n"
@@ -295,6 +298,10 @@ def make_repo(tmp_path: Path) -> SimpleNamespace:
     git(repo, "remote", "add", "origin", str(origin))
     commit(repo, "a.txt")
     git(repo, "push", "-q", "origin", "HEAD:refs/heads/master")
+    # The proposal's branch and its tip: the merge route reads the head from the remote, and
+    # the approved verdict has to name that sha for the guard to let the merge through.
+    tip = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "push", "-q", "origin", "HEAD:refs/heads/pr/test")
 
     scripts = repo / "scripts"
     scripts.mkdir()
@@ -305,12 +312,13 @@ def make_repo(tmp_path: Path) -> SimpleNamespace:
     bindir.mkdir()
     (bindir / "ngit").write_text(FAKE_NGIT, encoding="utf-8")
     (bindir / "ngit").chmod(0o755)
-    #: The PR's thread as the authorship check reads it: one verdict, from somebody other than
-    #: the PR's author, so the merge route is past that check and on to what a test is about.
+    #: The PR's thread as the approval check reads it: one verdict, from a key the config's
+    #: `ngit.reviewers` names, covering the branch head -- so the merge route is past that
+    #: check and on to what a test is about.
     (bindir / "pr.json").write_text(json.dumps({
         "author": "1" * 64,
         "comments": [{"id": "c" * 64, "author": "2" * 64,
-                      "body": "Verdict: approved", "created_at": 1}],
+                      "body": f"Verdict: approved\n\nTip: {tip}", "created_at": 1}],
     }), encoding="utf-8")
 
     # The gate is not this test's subject: a ruff that passes, and a pytest that says so --
@@ -330,7 +338,6 @@ def make_repo(tmp_path: Path) -> SimpleNamespace:
 
     messages = tmp_path / "pr-messages"
     messages.mkdir()
-    tip = git(repo, "rev-parse", "HEAD").stdout.strip()
     return SimpleNamespace(origin=origin, repo=repo, scripts=scripts, bindir=bindir,
                            venv=venv, messages=messages, base=tip)
 
@@ -539,7 +546,7 @@ def test_a_rebased_proposal_names_the_successor_that_replaced_it(tmp_path: Path)
         "id": PR, "branch": "pr/duplicate(2207969b)", "status": "open",
         "subject": "the stale proposal",
         "comments": [{"id": "c" * 64, "author": "2" * 64,
-                      "body": "Verdict: approved", "created_at": 1}],}), encoding="utf-8")
+                      "body": f"Verdict: approved\n\nTip: {made.base}", "created_at": 1}],}), encoding="utf-8")
     (jsondir / f"{successor}.json").write_text(json.dumps({
         "id": successor, "branch": "pr/duplicate(bbbbbbbb)", "status": "open",
         "subject": "the proposal that survived",
@@ -571,7 +578,7 @@ def test_a_rebased_proposal_with_no_sibling_still_asks_for_a_named_successor(
     (jsondir / f"{PR}.json").write_text(json.dumps({
         "id": PR, "branch": "pr/only(2207969b)", "status": "open",
         "comments": [{"id": "c" * 64, "author": "2" * 64,
-                      "body": "Verdict: approved", "created_at": 1}]}), encoding="utf-8")
+                      "body": f"Verdict: approved\n\nTip: {made.base}", "created_at": 1}]}), encoding="utf-8")
     prlist = tmp_path / "pr-list.json"
     prlist.write_text(json.dumps([
         {"id": PR, "branch": "pr/only(2207969b)", "status": "open"},
