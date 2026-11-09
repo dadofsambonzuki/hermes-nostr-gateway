@@ -29,6 +29,7 @@ the CLI, the tests and a ``kill -9`` recovery script keep their simple behaviour
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -308,6 +309,16 @@ _RUMOR_COLUMNS = {
     #: A row from before the prefixes existed asked for nothing: `normal` is the truth, and
     #: NOT NULL means a reader never has to distinguish "no mode" from "normal".
     "mode": "TEXT NOT NULL DEFAULT 'normal'",
+    #: The id of the newer message in the same plane and conversation that took this
+    #: row's place in a shaped replay. Empty when the row was aged out instead (there is
+    #: no single newer message then). The marker is durable: a shaped row must not become
+    #: a turn merely because the row that superseded it was acked first.
+    "superseded_by": "TEXT",
+    #: Why a delivery ended without a turn: `superseded` when the adapter filed a shaped
+    #: replay row as context and acked it. Deliberately not `blocked_reason`: that means
+    #: policy refused the message and feeds `drops`; a superseded message was accepted,
+    #: is still in `history`, and must not read as a refusal.
+    "settled_reason": "TEXT",
 }
 
 #: The states an invite can be in. `held` is the default, and the truth for every row
@@ -355,6 +366,136 @@ def _json_or_none(raw: Any) -> Any:
         return json.loads(raw)
     except (TypeError, ValueError):
         return None
+
+
+#: Why a replay row was settled without a turn (`settled_reason`). Closed on purpose:
+#: a crash, a policy refusal and a digest each have their own lifecycle and must not
+#: borrow this name.
+SETTLED_SUPERSEDED = "superseded"
+SETTLED_REASONS = frozenset({SETTLED_SUPERSEDED})
+
+#: A typed answer to an approval gate. Never superseded: a gate answered by a message
+#: filed as context is a lost decision. The boundary keeps `/approvals` (Hermes' listing
+#: command) from reading as an answer.
+_APPROVAL_REPLY = re.compile(r"^/(approve|deny)(?:\s|$)", re.IGNORECASE)
+
+
+def is_approval_reply(text: str | None) -> bool:
+    """True when *text* is a typed `/approve` or `/deny` answer, not ordinary chat."""
+    return bool(_APPROVAL_REPLY.match((text or "").strip()))
+
+
+def _replay_group(row: dict[str, Any]) -> tuple[str, str]:
+    """The unit shaping may collapse: one conversation on one plane.
+
+    Planes never supersede each other — the same peer on NIP-17 and NIP-04 is two
+    transports, not one message replacing another — and a row with no conversation is
+    its own group rather than sharing an empty key with every other sender-less row.
+    """
+    plane = str(row.get("plane") or "")
+    conversation = str(row.get("conversation") or "")
+    if conversation:
+        return (plane, conversation)
+    return (plane, f"id:{row.get('id') or ''}")
+
+
+def _media_keys(row: dict[str, Any]) -> set[str]:
+    """The attachments a row carries, by digest (or url when it claims no digest)."""
+    keys: set[str] = set()
+    for item in row.get("attachments") or []:
+        if not isinstance(item, dict):
+            continue
+        digest = str(item.get("sha256") or "").strip().lower()
+        if digest:
+            keys.add("sha256:" + digest)
+        elif item.get("url"):
+            keys.add("url:" + str(item["url"]))
+    return keys
+
+
+def shape_replay(rows: list[dict[str, Any]], *, max_messages: int = 5,
+                 max_age_secs: int = 600, now: int | None = None) -> list[dict[str, Any]]:
+    """Decide which replayed rows become turns, and which are context.
+
+    A reconnect is not a history lesson: a peer who wrote six lines into a dead stream
+    should cost one turn, not six. Working newest-first over the batch (the caller
+    supplies arrival order, oldest first), a row is marked ``superseded`` when a newer
+    *deliverable* row exists in the same plane and conversation, when it is older than
+    ``max_age_secs``, or when ``max_messages`` deliverable turns are already kept in
+    this batch. Superseded rows are never deleted: their content stays in the store and
+    `history` shows it; the adapter acks them as context instead of turning them into a
+    run.
+
+    Three exceptions protect work the batch must not silently swallow:
+
+    * a reaction (kind 7) and a typed ``/approve``/``/deny`` reply are a decision, not a
+      turn to save — they are always deliverable and never count against the cap;
+    * a row carrying media is never superseded unless a newer deliverable row carries
+      the same media, so a photo cannot be replaced by a later caption that lacks it;
+      such a row is delivered even past the cap, because losing the picture is worse
+      than one extra turn;
+    * a row already marked in the store as superseded stays that way. The marker is
+      written by `Store.replay_batch` so a failed ack cannot resurrect an old message as
+      a turn once the newer row has been acked and left the batch.
+
+    ``0`` disables a bound: ``max_messages=0`` keeps every deliverable row (the old
+    behaviour apart from the age horizon), ``max_age_secs=0`` removes the horizon.
+    Both at ``0`` is exactly the pre-shaping replay.
+    """
+    if not rows:
+        return rows
+    stamp = int(time.time() if now is None else now)
+    cap = max(0, int(max_messages))
+    horizon = max(0, int(max_age_secs))
+    cutoff = stamp - horizon if horizon else None
+
+    newest: dict[tuple[str, str], str] = {}
+    covered: dict[tuple[str, str], set[str]] = {}
+    kept = 0
+
+    def mark(row: dict[str, Any], by: str | None) -> None:
+        row["superseded"] = True
+        # Keep the first decision: a row already marked in the store must not be
+        # re-pointed at whichever newer row happens to be left in this batch.
+        existing = row.get("superseded_by")
+        row["superseded_by"] = existing if isinstance(existing, str) else (by or "")
+
+    def deliver(row: dict[str, Any], group: tuple[str, str]) -> None:
+        nonlocal kept
+        kept += 1
+        newest[group] = str(row.get("id") or "")
+        covered.setdefault(group, set()).update(_media_keys(row))
+
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        group = _replay_group(row)
+        if row.get("kind") == 7 or is_approval_reply(row.get("content")):
+            # A decision, not chat: it must reach the adapter even if everything around
+            # it is collapsed, and it does not cost one of the replay's turns. It is
+            # also not a *newer message* that can supersede an older one — an old line
+            # of text must not lose its turn to a 👍 — so it does not become the group's
+            # newest deliverable.
+            continue
+        if cutoff is not None and int(row.get("received_at") or 0) < cutoff:
+            mark(row, newest.get(group))
+            continue
+        if row.get("superseded_by") is not None:
+            mark(row, row.get("superseded_by") if isinstance(row.get("superseded_by"), str)
+                 else "")
+            continue
+        newer = newest.get(group)
+        if newer is not None:
+            if not (_media_keys(row) - covered.get(group, set())):
+                mark(row, newer)
+                continue
+            # Else: media the newer deliverable row does not carry. Fall through and
+            # deliver it — that is the one thing a replay must not lose.
+        elif cap and kept >= cap:
+            if not (_media_keys(row) - covered.get(group, set())):
+                mark(row, "")
+                continue
+        deliver(row, group)
+    return rows
 
 
 @dataclass
@@ -944,7 +1085,7 @@ class Store:
             (self.identity, rule, interval_s, window_start),
         )
 
-    def mark_delivered(self, ids: list[str]) -> None:
+    def mark_delivered(self, ids: list[str], *, reason: str | None = None) -> None:
         """Mark individual rumors delivered, and whole digest batches when the id is one.
 
         An adapter that knows only ``type: message`` acks ``id``; for a digest frame
@@ -952,18 +1093,25 @@ class Store:
         closed only once every ``batched`` rumor in it is delivered — a partial id-level
         ack leaves it open, so replay can still offer what is left. A second ack is a
         no-op: ``COALESCE`` keeps the first timestamp.
+
+        ``reason`` records a delivery that ended without a turn (`superseded`, when the
+        adapter filed a shaped replay row as context). It is a closed vocabulary and is
+        kept apart from ``blocked_reason``: a superseded message was accepted and remains
+        in `history`, so it must not appear in `drops` as a refusal.
         """
         ids = [i for i in ids if i]
         if not ids:
             return
+        settled = str(reason) if reason in SETTLED_REASONS else None
         now = int(time.time())
         whole: set[str] = set()
         touched: set[str] = set()
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany(
-                "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?) WHERE id = ?",
-                [(now, i) for i in ids],
+                "UPDATE rumors SET delivered_at = COALESCE(delivered_at, ?),"
+                " settled_reason = COALESCE(settled_reason, ?) WHERE id = ?",
+                [(now, settled, i) for i in ids],
             )
             for start in range(0, len(ids), 200):
                 chunk = ids[start:start + 200]
@@ -1010,6 +1158,28 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def _replay_rows(self, limit: int, max_age_minutes: int, *,
+                     newest_first: bool = False,
+                     now: int | None = None) -> list[dict[str, Any]]:
+        """Undelivered immediate rows inside the replay window, in replay order.
+
+        One query for both answers. `pending_immediate` wants the oldest page, which is
+        the order a replay has always promised; `replay_batch` wants the newest page and
+        reverses it, because shaping must collapse a backlog to its recent end rather
+        than spend the batch cap on its oldest messages.
+        """
+        stamp = int(time.time() if now is None else now)
+        cutoff = stamp - max(int(max_age_minutes), 0) * 60
+        order = "received_at DESC, rowid DESC" if newest_first else "received_at, rowid"
+        rows = self.db.execute(
+            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate'"
+            " AND authority != 'self' AND blocked_reason IS NULL"
+            " AND received_at >= ? AND received_at >= ?"
+            f" ORDER BY {order} LIMIT ?",
+            (cutoff, self.replay_floor(), limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def pending_immediate(self, limit: int = 20, max_age_minutes: int = 120) -> list[dict[str, Any]]:
         """Messages that never reached an adapter (refused, or crashed mid-delivery).
 
@@ -1021,18 +1191,55 @@ class Store:
         arrival and then insertion: `received_at` has second resolution, and a replay
         has to keep the order the frames first appeared in or a cursor-taking consumer
         would see it jump backwards.
+
+        This is the raw query: it says what is undelivered, not what should be a turn.
+        `replay_batch` is the shaped answer a `subscribe` actually offers.
         """
-        cutoff = int(time.time()) - max(int(max_age_minutes), 0) * 60
-        rows = self.db.execute(
-            "SELECT * FROM rumors WHERE delivered_at IS NULL AND reach = 'immediate'"
-            " AND authority != 'self' AND blocked_reason IS NULL"
-            " AND received_at >= ? AND received_at >= ?"
-            " ORDER BY received_at, rowid LIMIT ?",
-            (cutoff, self.replay_floor(), limit),
-        ).fetchall()
-        items = [dict(r) for r in rows]
+        items = self._replay_rows(limit, max_age_minutes)
         self._with_attachments(items)
         return items
+
+    def replay_batch(self, limit: int = 20, max_age_minutes: int = 120, *,
+                     max_messages: int = 5, max_age_secs: int = 600,
+                     now: int | None = None) -> list[dict[str, Any]]:
+        """The rows a `subscribe` may replay, shaped so a batch costs few turns.
+
+        `pending_immediate` answers "which rows are undelivered"; this answers "which of
+        them should become a turn". It takes the *newest* `limit` rows inside the replay
+        window and returns them oldest-first, because a backlog larger than the window
+        must collapse to its recent end, not to its oldest page. `shape_replay` marks the
+        ones a newer message, the age horizon or the batch cap leaves as context.
+
+        A superseded decision is written to the row (`superseded_by`) in the same call.
+        The decision, not the batch, is durable: if the adapter acks the newer row and
+        then loses the ack of an older one, the older row is still context on the next
+        `subscribe` instead of becoming a stale turn out of order.
+        """
+        stamp = int(time.time() if now is None else now)
+        items = list(reversed(self._replay_rows(
+            limit, max_age_minutes, newest_first=True, now=stamp)))
+        self._with_attachments(items)
+        shape_replay(items, max_messages=max_messages, max_age_secs=max_age_secs, now=stamp)
+        self._record_superseded(items)
+        return items
+
+    def _record_superseded(self, rows: list[dict[str, Any]]) -> None:
+        """Persist the shaping decision so it survives an ack order or a reconnect."""
+        writes = [(str(row.get("superseded_by") or ""), str(row["id"]))
+                  for row in rows
+                  if row.get("superseded") and row.get("superseded_by") is not None]
+        if not writes:
+            return
+        self._begin()
+        try:
+            self.db.executemany(
+                "UPDATE rumors SET superseded_by = COALESCE(superseded_by, ?) WHERE id = ?",
+                writes,
+            )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     def skip_pending(self) -> int:
         """Declare the current backlog already answered, at a handover or an import.

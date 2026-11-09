@@ -558,10 +558,15 @@ class Gateway:
         #: conversation each mapped channel has) are known.
         self.ngit_watch_cfg = NgitWatchConfig.from_config(cfg)
         self.ngit_watch: NgitWatcher | None = None
-        # Replay is for "crashed mid-delivery", not "history": minutes, and a floor.
+        # Replay is for "crashed mid-delivery", not "history": minutes, and a floor. The
+        # shaping bounds are read once here: a change needs a restart, because the batch
+        # they govern is built from this object on every `subscribe`. `max_messages=0`
+        # and `max_age_secs=0` each disable their bound; both at 0 is the old replay.
         replay = cfg.get("replay") or {}
         self.replay_limit = int(replay.get("limit", 20))
         self.replay_max_age_minutes = int(replay.get("max_age_minutes", 120))
+        self.replay_max_messages = max(0, int(replay.get("max_messages", 5)))
+        self.replay_max_age_secs = max(0, int(replay.get("max_age_secs", 600)))
         # Retry TTL: age bounds a dead relay's backlog, not the per-row attempt cap —
         # that only helps rows that get a turn. Expired rows are kept (not deleted) so
         # an operator can still see what was given up on.
@@ -1960,6 +1965,8 @@ class Gateway:
             },
             "replay": {"limit": self.replay_limit,
                        "max_age_minutes": self.replay_max_age_minutes,
+                       "max_messages": self.replay_max_messages,
+                       "max_age_secs": self.replay_max_age_secs,
                        "floor": self.store.replay_floor()},
             # How the store is being written: a queue that keeps growing, or a flush
             # time that keeps climbing, is the first sign the disk cannot keep up.
@@ -2150,10 +2157,17 @@ class Gateway:
         A replay is the same frame the first delivery would have been, profile included: a
         crash between the store write and the ack must not turn a routed message into a turn
         under the default profile.
+
+        The batch is *shaped* (`Store.replay_batch`): one conversation's older messages are
+        marked `superseded` and carry no turn. The adapter files such a frame as context and
+        acks it, so the text stays in `history` without costing an agent run. `final` keeps
+        its existing meaning — it is a `blocked`-frame field and is not set here.
         """
         frames = []
-        for row in self.store.pending_immediate(limit or self.replay_limit,
-                                                self.replay_max_age_minutes):
+        for row in self.store.replay_batch(limit or self.replay_limit,
+                                           self.replay_max_age_minutes,
+                                           max_messages=self.replay_max_messages,
+                                           max_age_secs=self.replay_max_age_secs):
             frame = {
                 "type": "message", "plane": row["plane"], "id": row["id"],
                 "sender": row["sender"], "conversation": row["conversation"],
@@ -2166,6 +2180,13 @@ class Gateway:
                 "mode": addressing.canonical(row["mode"]),
                 "replay": True,
             }
+            # A shaped-away row is context, not a turn. Its text is in the store and
+            # `history` shows it; `superseded_by` names the newer message that replaced it
+            # (absent when the age horizon is what aged it out).
+            if row.get("superseded"):
+                frame["superseded"] = True
+                if row.get("superseded_by"):
+                    frame["superseded_by"] = row["superseded_by"]
             # A replay has to carry the same attachments as the original frame, or the
             # adapter sees a photo it can no longer ask for.
             if row.get("attachments"):
@@ -2188,10 +2209,10 @@ class Gateway:
         return {"skipped": skipped, "replay_floor": self.store.replay_floor()}
 
     def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
-            frame: int | None = None) -> dict[str, Any]:
+            frame: int | None = None, reason: str | None = None) -> dict[str, Any]:
         if rule is not None and frame is not None:
             return self.store.ack_digest(rule, int(frame))
-        self.store.mark_delivered(ids or [])
+        self.store.mark_delivered(ids or [], reason=reason)
         return {"acked": ids or []}
 
     # -- media (spec §4b) ------------------------------------------------

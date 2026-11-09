@@ -69,8 +69,11 @@ Every refusal is a word, and the word decides what to do.
   waiting.
 - **pending vs delivered**: `pending` is a stored inbound row no adapter has taken yet
   (replay will deliver it) and, in the bridge, a PR notice that is queued but not yet
-  confirmed. `sent`/`signalled` mean the daemon took it. A pass exits 0 when every notice is
-  delivered *or queued*; only `failed` and `errors` are delivery failures.
+  confirmed. `sent`/`signalled` mean the daemon took it. A reconnect replay is shaped: only
+  the newest message per plane and conversation is a turn, and older ones are acked as
+  context (`settled_reason: superseded`) — they stay in `history` and are *not* `drops`. A
+  pass exits 0 when every notice is delivered *or queued*; only `failed` and `errors` are
+  delivery failures.
 - **waiting vs ready**: an issue becomes a card only when a trusted npub
   (`control.trusted_npubs` unioned with the concord plane's list) publishes the `ready`
   label on it (`ngit.ready_label`). Until then its link state is `waiting`: no task, no

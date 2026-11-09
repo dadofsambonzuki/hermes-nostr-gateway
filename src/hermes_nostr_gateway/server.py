@@ -92,7 +92,7 @@ class Handler(Protocol):
               since: int | None, limit: int) -> dict[str, Any]: ...
     def peers(self) -> dict[str, Any]: ...
     def ack(self, ids: list[str] | None = None, *, rule: str | None = None,
-            frame: int | None = None) -> dict[str, Any]: ...
+            frame: int | None = None, reason: str | None = None) -> dict[str, Any]: ...
     def replay_digests(self, since_frame: int = 0) -> list[dict[str, Any]]: ...
     def mark_read(self, ids: list[str]) -> dict[str, Any]: ...
     def replay_pending(self, limit: int = 20) -> list[dict[str, Any]]: ...
@@ -262,7 +262,13 @@ class SocketServer:
                                 rule=req.get("rule"), frame=req.get("frame")
                             )
                         else:
-                            result = self.handler.ack(req.get("ids", []))
+                            # `reason` records a delivery that ended without a turn: the
+                            # adapter acks a shaped-away replay as `superseded` so the row
+                            # is terminal (not stuck) while `history` keeps the message.
+                            # Only forwarded when sent: a message-only consumer predates it.
+                            extra = ({"reason": req.get("reason")}
+                                     if "reason" in req else {})
+                            result = self.handler.ack(req.get("ids", []), **extra)
                         await self._send(writer, {"type": "ok", **result})
                     elif op == "mark_read":
                         await self._send(writer, {"type": "ok",

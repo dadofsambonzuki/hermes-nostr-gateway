@@ -194,6 +194,39 @@ this is meant to prevent. The refusal path keeps `success=True` for the same rea
 Hermes' "decided, do not retry" outcome, while `success=False` puts the text back into the
 delivery ledger's retry sweeps, which is the loop being closed — and the refusal is remembered
 for the window so a recovery replay of it is not attempted again.
+
+## A replay is shaped before delivery: superseded rows are context, not turns
+
+A reconnect re-offers undelivered messages, but not as a page of history. In one plane and one
+conversation only the newest deliverable message is a turn. The rows a later message, the age
+horizon (`replay.max_age_secs`, default 600) or the batch cap (`replay.max_messages`, default 5)
+leaves behind are marked `superseded` on the frame, with `superseded_by` naming the newer row
+when there is one. The adapter files such a frame as context and acks it with `reason:
+superseded`; the daemon records `delivered_at` and `settled_reason`, and the text stays in
+`history`. `settled_reason` is deliberately a separate column from `blocked_reason`: `drops`
+lists refusals, and a superseded message was accepted, not refused.
+
+Why: a peer who writes six lines into a dead stream costs six agent turns today, because
+Hermes' busy-mode `interrupt` only queues the later ones — it does not collapse them. The text
+is already in the store; re-running it to understand it is the cost this removes. The decision
+is written onto the row (`superseded_by`), not held only in the batch: if the newer row's ack
+lands and the older row's does not, the older row must stay context rather than become a stale
+turn out of order on the next reconnect. A shaped row is not un-shaped by a config change, for
+the same reason — the turn it lost is context now.
+
+The batch must not swallow a decision. A reaction (kind 7) and a typed `/approve`/`/deny`
+answer are never superseded and do not count against the cap: a gate answered by a superseded
+message is a lost decision. (A prompt itself is an outbound row — `authority: self` — which the
+replay query never offers; the typed answer is the half that can be pending.) A message carrying
+media is never superseded unless a newer deliverable message carries the same media, and such a
+row is delivered even past the cap: losing the picture is worse than one extra turn. Shaping is
+per plane as well as per conversation — the same peer on NIP-17 and NIP-04 is two transports —
+and digest frames are batches with their own replay, never shaped. A superseded frame is
+settled, not held: it is acked, so it never enters the adapter's hold/reconnect path, and
+`final` keeps its existing meaning on `blocked` frames. The bounds are read once at worker
+construction, so a change needs a restart; `0` disables a bound, and both at `0` is the old
+replay.
+
 ## An issue is a dedupe key, not an identity
 
 The ngit bridge keys a task on the issue's event id (`ngit:issue:<id>`) so a re-poll cannot

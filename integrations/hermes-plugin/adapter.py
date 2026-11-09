@@ -1293,7 +1293,8 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                      ident[:12] or "(no id)", code or type(exc).__name__, exc, exc_info=exc)
         return FrameOutcome.SKIP
 
-    async def _ack(self, message_id: str, attempts: int = 3) -> bool:
+    async def _ack(self, message_id: str, attempts: int = 3, *,
+                   reason: str | None = None) -> bool:
         """Acknowledge a delivered message, retrying without killing the subscription.
 
         The ack is a separate short-lived socket request, so it can fail while the
@@ -1302,11 +1303,19 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         failure becomes a duplicate-delivery loop. A failed ack is therefore logged and
         swallowed: the row stays pending, and the replay path plus `_delivered_ids`
         make the retry idempotent.
+
+        `reason` is the daemon's record of a delivery that ended without a turn — the
+        only one today is `superseded`, for a shaped-away replay. It rides the same ack,
+        so the row is terminal (`hng health` does not call it stuck) while `history`
+        still shows the message.
         """
         delay = 0.5
+        payload: dict[str, Any] = {"op": "ack", "ids": [message_id]}
+        if reason:
+            payload["reason"] = reason
         for attempt in range(1, attempts + 1):
             try:
-                await self._request({"op": "ack", "ids": [message_id]})
+                await self._request(payload)
                 return True
             except Exception as exc:  # noqa: BLE001 - a lost ack must not kill the reader
                 if attempt == attempts:
@@ -1329,6 +1338,18 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         disconnected.
         """
         message_id = frame.get("id") or ""
+        if frame.get("superseded"):
+            # The daemon shaped a reconnect batch: a newer message in the same conversation
+            # is the turn, and this one is transcript. Its text is already in the store and
+            # `history` shows it, so there is nothing for the agent to run here — ack it so
+            # `subscribe` does not offer it again, and record why on the row. A frame from a
+            # daemon too old to shape never says this, which is exactly today's behaviour.
+            logger.info("nostr replay %s from %s superseded by a newer message; filed as "
+                        "context", (message_id or "(no id)")[:12],
+                        _short(str(frame.get("sender") or "")))
+            if message_id:
+                await self._ack(message_id, reason="superseded")
+            return None
         if is_reaction_frame(frame):
             # A kind-7 rumor rides the NIP-17 plane's ordinary message frame, but it is an
             # answer to a prompt, not something a person said: it must never start a turn.

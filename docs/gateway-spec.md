@@ -382,6 +382,20 @@ A refusal is part of the contract, not an error to swallow: the adapter passes t
 the agent (Hermes adds `[attachment not delivered: <code>]` to the message text), because an
 attachment the agent cannot see must not read as a message that never had one.
 
+**A reconnect batch is shaped before it is offered.** `Gateway.replay_pending` takes the newest
+rows inside the replay window and marks each one a newer deliverable message in the same plane
+and conversation, the age horizon (`replay.max_age_secs`, default 600) or the batch cap
+(`replay.max_messages`, default 5) leaves behind as `superseded`; `superseded_by` names the
+newer row when there is one. The adapter MUST NOT call `handle_message` for such a frame: its
+text is transcript, already in the store and visible through `history`. It acks with `reason:
+superseded`, which the daemon records as `settled_reason` beside `delivered_at` — kept apart
+from `blocked_reason`, because nothing was refused and `drops` must not list it. A row is never
+superseded across planes, a reaction or a typed `/approve`/`/deny` answer is never superseded,
+and a frame carrying media is only superseded when a newer deliverable frame carries the same
+media. Digest frames are batches with their own replay and are never shaped. An adapter older
+than the flag delivers the batch as it always did, which is the pre-shaping behaviour. The two
+bounds are read at daemon startup; `0` disables a bound, and both at `0` is the old replay.
+
 **Holding and steering are Hermes' own.** A `message` frame carries `mode` — `normal`, `queue`
 or `steer`, the same words Hermes' commands use. The gateway has already read and stripped the
 prefix — `/queue` or `/q` for `queue`, `/steer` or `/s` for `steer` — and decided the sender may

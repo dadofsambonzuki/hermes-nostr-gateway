@@ -664,6 +664,7 @@ class GatewayDaemon:
         self.subscriptions = 0
         self.replays: list[int] = []
         self.acks: list[str] = []
+        self.reasons: list[str | None] = []
 
     def replay_pending(self, limit=20):
         self.subscriptions += 1
@@ -672,10 +673,11 @@ class GatewayDaemon:
             self.on_replay(self.subscriptions)
         return self.gateway.replay_pending()
 
-    def ack(self, ids=None, *, rule=None, frame=None):
+    def ack(self, ids=None, *, rule=None, frame=None, reason=None):
         ids = list(ids or [])
         self.acks.extend(ids)
-        return self.gateway.ack(ids)
+        self.reasons.append(reason)
+        return self.gateway.ack(ids, reason=reason)
 
     async def status(self):
         return {}
@@ -1054,4 +1056,62 @@ async def test_a_settled_blocked_frame_does_not_cost_a_resubscribe(tmp_path, mon
         "a refusal whose row is retired has no replay to wait for: replacing the connection "
         "for it pays the backoff for a frame the daemon cannot offer again"
     )
+
+
+async def test_a_shaped_replay_costs_one_turn_and_acks_the_rest_as_context(tmp_path, monkeypatch):
+    """The daemon's shaping, honoured by the real reader loop.
+
+    Three messages from one peer in one conversation: the newest is the turn, the two
+    older are acked as `superseded` without `handle_message`, and the store records both
+    dispositions — one delivered by a turn, two delivered as context. An adapter that
+    ignored the flag would show three turns here; one that acked the context as an
+    ordinary delivery would leave `settled_reason` empty, which is the difference `hng
+    health` and `history` read.
+    """
+    monkeypatch.setattr(Gateway, "_load_follows", lambda self: ())
+    gateway = _gateway(tmp_path)
+    gateway.store.set_replay_floor(0)
+    now = int(time.time())
+    ids = ["a1" * 32, "b2" * 32, "c3" * 32]
+    for index, ident in enumerate(ids):
+        gateway.store.add(_inbound(ident, PEER_HEX, "nip17", f"message {index + 1}"))
+        gateway.store.db.execute("UPDATE rumors SET received_at = ? WHERE id = ?",
+                                 (now - 3 + index, ident))
+
+    daemon = GatewayDaemon(gateway)
+    server = SocketServer(tmp_path / "shaped.sock", daemon)
+    await server.start()
+
+    inst = _reader_adapter(tmp_path / "shaped.sock")
+    turns = []
+
+    async def handle_message(event):
+        turns.append(event.message_id)
+
+    inst.handle_message = handle_message
+    task = asyncio.create_task(inst._reader_loop())
+    try:
+        await _until(lambda: len(daemon.acks) == 3,
+                     "the shaped replay was never fully acked")
+        await asyncio.sleep(0.1)
+    finally:
+        inst._closing = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await server.stop()
+
+    rows = {r["id"]: r for r in gateway.store.recent(5)}
+    gateway.store.close()
+
+    assert turns == [ids[2]], "only the newest message in the conversation is a turn"
+    assert daemon.acks == ids, "every frame is settled, in replay order"
+    assert daemon.reasons == ["superseded", "superseded", None], (
+        "the context acks say why; the turn's ack is an ordinary delivery"
+    )
+    assert rows[ids[0]]["settled_reason"] == "superseded"
+    assert rows[ids[1]]["settled_reason"] == "superseded"
+    assert rows[ids[2]]["settled_reason"] is None
+    assert rows[ids[0]]["content"] == "message 1", "context keeps its text in `history`"
+
 

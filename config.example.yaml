@@ -140,9 +140,20 @@ feeds:
 # adapter restart. The window is minutes and nothing older than the store's replay
 # floor is offered (stamped when the store is created, or by `hng replay-skip` when an
 # adapter handover means the backlog was already answered).
+#
+# A reconnect also *shapes* its batch, so six messages sent into a dead stream cost one
+# agent turn rather than six: only the newest deliverable message per conversation is a
+# turn, and the older ones are acked as context (`superseded`) with their text kept in
+# the store and `history`. `max_messages` caps the turns in one batch; `max_age_secs`
+# files anything older as context instead of waking the agent late. Media a newer
+# message does not carry, reactions, and typed `/approve` or `/deny` answers are never
+# superseded. Set either bound to 0 to disable it; both at 0 is the old replay. Read at
+# startup, so changing these needs a restart.
 replay:
   limit: 20
   max_age_minutes: 120
+  max_messages: 5
+  max_age_secs: 600
 
 # Outbound retry. A wrap that failed at one relay is republished from storage as the
 # same signed event (never re-wrapped) in small batches. Age, not attempts, bounds the

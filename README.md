@@ -67,7 +67,9 @@ Under them:
   outbound replay guard, so a reply Hermes redelivers is not published twice.
 - **Durability.** A message is stored before it is delivered, replayed if the adapter never
   acknowledged it, and retried per relay by republishing the same signed event — never a re-wrap,
-  which would change its id and show the peer a duplicate.
+  which would change its id and show the peer a duplicate. A reconnect batch is shaped: only the
+  newest message per plane and conversation is a turn, and older ones are acked as context
+  (`superseded`) so a burst written into a dead stream costs one turn, not six.
 - **Coverage that is measured.** Reads span `relays.read` plus the kind-10050 inbox relays of
   every peer in `groups`; per-relay counts and last errors are in `hng status`, because "we read
   all relays" is a claim a status line should be able to prove.
@@ -83,7 +85,10 @@ envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, 
 `route_key_missing`, `route_unresolved`) and never looks like chat. It also carries `final`, the
 row's fate rather than the reason's: `true` when the row is retired (a policy refusal, never
 replayed) and `false` while the daemon is still offering it, so a consumer settles a finished
-refusal and holds a replayable one instead of guessing from the reason string.
+refusal and holds a replayable one instead of guessing from the reason string. A replayed
+`message` carries `replay: true`; one that a newer message in the same conversation has made
+context also carries `superseded: true` (with `superseded_by` naming the newer row), and the
+adapter acks it without a turn.
 
 ### The slash menu a client can see (`advertise`)
 
