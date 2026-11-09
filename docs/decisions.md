@@ -661,4 +661,6 @@ wider read cannot invent work or move a card.
 **Unbounded by the cursor, on purpose.** A status that landed behind the PR cursor is exactly
 the one the `#a` read has stopped looking for. The status read asks about open links only —
 applied and closed are final for the board — and it is re-asked every pass until the link
-finishes, so a late status heals on its own.
+finishes, so a late status heals on its own. The watcher is unchanged: it still wakes a pass
+from the repository's `#a` subscription, so an `e`-only status is picked up by the next
+scheduled pass rather than in seconds.
