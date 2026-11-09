@@ -63,9 +63,9 @@ NGIT_PASS_UNIT = "hermes-nostr-gateway-ngit"
 #: a config carrying it is told it is not read. The example config is a subset by test.
 READ_KEYS: frozenset[str] = frozenset({
     "adapter", "advertise", "bots", "concord", "control", "defaults", "deps", "drops",
-    "feeds", "groups", "identity", "marmot", "media", "ngit", "policies", "profiles",
-    "rate_limit", "relays", "replay", "retry", "routing", "socket", "store", "store_write",
-    "whitenoise",
+    "feeds", "groups", "hermes_config", "identity", "marmot", "media", "ngit", "policies",
+    "profiles", "rate_limit", "relays", "replay", "retry", "routing", "socket", "store",
+    "store_write", "whitenoise",
 })
 
 #: Keys deliberately tolerated without being read, and the reason the advisory repeats: a

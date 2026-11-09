@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from git_sandbox import commit, git, make_clone
-from hermes_nostr_gateway import cli, doctor
+from hermes_nostr_gateway import cli, doctor, profiles
 from hermes_nostr_gateway.ngit import NGIT_FLOOR, NgitError, resolve_target
 
 COMMUNITY = "ab" * 32
@@ -288,6 +288,14 @@ def test_the_shipped_example_config_has_no_unread_keys():
 def test_a_key_the_code_reads_is_not_reported_even_absent_from_the_example():
     """Residue is judged against the code, not the example: `socket:` is read but undocumented."""
     assert doctor.unread_config_keys({"socket": "/run/hng.sock", "routing": {}}) == []
+
+
+def test_hermes_config_is_read_top_level_so_it_is_never_called_residue(tmp_path):
+    """`hermes_config` steers the profiles router on `hng serve`; calling it residue would lie."""
+    configured = tmp_path / "hermes" / "config.yaml"
+    assert profiles.hermes_config_path({"hermes_config": str(configured)}) == configured
+    assert doctor.unread_config_keys(
+        {"hermes_config": str(configured), "socket": "/run/hng.sock"}) == []
 
 
 def test_a_checkout_parked_on_a_proposal_branch_is_a_failed_check(good, monkeypatch, capsys,
