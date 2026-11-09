@@ -1351,3 +1351,20 @@ asks: a still-open PR whose link records a tip newer than its card's completion 
 its branch, whether or not the revision was noticed. That is the state an older version left
 behind — it wrote the tip and had no re-open — and the state a missed event leaves. Comparing
 costs one row per PR and cannot loop; waiting for the event again would wait forever.
+
+## One review is one verdict comment, and the bridge is its only writer
+
+The review card's brief told a reviewer that the bridge publishes its comment; the review skill
+told it to publish by hand as well, and claimed the bridge would not then re-publish. Both fired.
+The bridge treats an existing comment as its own only when the text is byte-identical, and a card
+comment carrying a readback note or a gates summary never is -- so one review left two kind-1111
+verdicts on the PR, and 22 of the 61 PRs carrying verdicts had that pair. PR 4e6493f7 got three
+in 2m38s, the third from a second review card.
+
+**The reviewer writes the comment; the bridge publishes it.** The brief says so, the skill says
+so, and a hand publish is reserved for the cards the bridge cannot reach: a hand-made card with
+no `ngit:pr:` key, a review older than the bridge, or a root the link row already marks `closed`
+because a revision superseded it.
+
+Why: the verdict is the record, and a record with two authors is not a record -- the label pass
+and the merge guard both read the newest comment, so a duplicate is a second opinion nobody gave.
