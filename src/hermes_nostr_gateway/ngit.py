@@ -4303,8 +4303,8 @@ class Sync:
         """Finish the review card on an approval, or open the fix it asks for.
 
         The verdict is the review's end. `approved` completes the card -- the merge is still
-        a person's, and the merge route reads the approval's tip from the link
-        (`verdict_tip`) before it applies anything. `changes-requested` **queues the fix**:
+        a person's, and the merge route reads the tip the verdict names before it applies
+        anything. `changes-requested` **queues the fix**:
         one card per verdict event, carrying the findings, on the implementer's desk. The
         review card itself is left where the reviewer parked it -- it is still the PR's
         review, and a revision reopens it for the tip the fix leaves -- because `done` on an
