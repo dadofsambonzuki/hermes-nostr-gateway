@@ -1142,3 +1142,20 @@ interpreter — and the daemon kept serving on 3.11 throughout, so nothing here 
 
 Consequence: a contributor on 3.11 gets a resolver refusal that names the floor, not a hung test
 run; and the tested range is the declared range, so the next floor change has to move CI with it.
+
+## An unread config key is an advisory, never a refusal
+
+`hng doctor` names the top-level config keys this build does not read in one advisory line: the
+entry is marked `advisory`, renders as `note` rather than `ok`/`FAIL`, is counted separately from
+the checks ("12/12 check(s) passed; 1 advisory"), and cannot decide the exit code. A key that is
+deliberately ignored keeps its reason in the same line — `transport`, whose `nak` publisher is
+deleted, so an older config still boots.
+
+Why: config keys are set ahead of merges on purpose (a block the running build does not know must
+not stop it), and the same silence that permits that is what lets residue accumulate across
+upgrades. Refusing a start over a key would break the first case; saying nothing breaks the
+second. The preflight can say "this build does not read it" without taking a side, and the
+allowlist keeps the line from re-teaching the same exception: tolerated-but-ignored is a decision
+with a reason, not an unknown. The set of read keys lives beside the doctor and is checked against
+the shipped example, so a key added to the example without the merge that reads it is a red test
+rather than a fresh install that ships with an advisory.

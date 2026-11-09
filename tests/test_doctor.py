@@ -26,6 +26,9 @@ MAINTAINER = "ef" * 32
 IDENTIFIER = "example-repo"
 CONVERSATION = f"concord:{COMMUNITY}:{CHANNEL_ID}"
 
+#: The file a fresh install copies, read the way the preflight reads a live config.
+EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.yaml"
+
 #: A stand-in `ngit` that answers the two calls this repo makes and nothing else.
 NGIT_STUB = """#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -235,8 +238,56 @@ def test_a_correct_config_exits_zero(good, monkeypatch, capsys):
     assert run_doctor(monkeypatch, tmp_path, config) == 0
     checks = checks_by_name(capsys)
     assert all(check["ok"] for check in checks.values()), checks
+    assert "config-keys" not in checks, "a config of read keys has nothing to advise"
     assert checks["ngit"]["detail"].startswith(NGIT_FLOOR)
     assert "behind master" in checks["checkout"]["detail"]
+
+
+def test_unread_config_keys_are_one_advisory_line_and_never_fail_the_run(good, monkeypatch,
+                                                                       capsys):
+    """Residue is named, with the tolerated key's own reason, and the exit code ignores it."""
+    tmp_path, home, checkout, config = good
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    cfg["digest"] = {"interval_minutes": 15, "max_items": 20}
+    cfg["transport"] = {"legacy": False}
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    check = checks_by_name(capsys)["config-keys"]
+    assert check["ok"] and check["advisory"]
+    assert not check["fix"], "an advisory names no fix"
+    assert "digest" in check["detail"] and "transport" in check["detail"]
+    assert "no transport switch" in check["detail"], "the allowlist keeps its reason"
+
+
+def test_the_advisory_renders_as_one_note_line(good, monkeypatch, capsys):
+    """One line naming both, marked `note`, and the summary counts it separately."""
+    tmp_path, home, checkout, config = good
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    cfg["digest"] = {"interval_minutes": 15}
+    cfg["transport"] = {"legacy": False}
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert cli.main(["--config", str(config), "doctor"]) == 0
+    out = capsys.readouterr().out
+    named = [line for line in out.splitlines() if "digest" in line]
+    assert len(named) == 1, named
+    assert named[0].lstrip().startswith("note")
+    assert "transport" in named[0]
+    assert "check(s) passed; 1 advisory" in out
+    assert "FAIL" not in out
+
+
+def test_the_shipped_example_config_has_no_unread_keys():
+    """What a fresh install copies never produces the advisory."""
+    cfg = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    assert doctor.unread_config_keys(cfg) == []
+
+
+def test_a_key_the_code_reads_is_not_reported_even_absent_from_the_example():
+    """Residue is judged against the code, not the example: `socket:` is read but undocumented."""
+    assert doctor.unread_config_keys({"socket": "/run/hng.sock", "routing": {}}) == []
 
 
 def test_a_checkout_parked_on_a_proposal_branch_is_a_failed_check(good, monkeypatch, capsys,

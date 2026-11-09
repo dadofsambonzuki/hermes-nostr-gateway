@@ -279,7 +279,10 @@ warning naming the restart when the gateway process started before that copy was
 board exists and is bound, a timer instance or crontab line carries a pass for every channel that
 queues work, and the watcher reports its state.
 Every failing check names its fix; `--json` is the same shape for a script, and the exit code is 1
-when anything failed.
+when anything failed. A top-level config key this build does not read is named once as an
+**advisory** line (`note`) instead: a config may be set ahead of the merge that reads a block, and
+residue from an older one should be visible without failing the host. Keys tolerated on purpose
+keep their reason in that line (`transport`, whose `nak` publisher is deleted).
 
 `hng skill install` copies the repository's own generic skill — `skills/nostr-gateway/SKILL.md`,
 the verbs, the failure vocabulary and the traps — into `$HERMES_HOME/skills/nostr-gateway/`, so an

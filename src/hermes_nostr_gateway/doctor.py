@@ -58,6 +58,24 @@ SYSTEMD_UNIT_DIRS: tuple[Path, ...] = (
 #: name is the channel -- which is also the one string a channel id alone can be named by.
 NGIT_PASS_UNIT = "hermes-nostr-gateway-ngit"
 
+#: Top-level config keys this build reads. The preflight uses it to tell a live key from
+#: residue, so a key has to be added here with the merge that starts reading it -- otherwise
+#: a config carrying it is told it is not read. The example config is a subset by test.
+READ_KEYS: frozenset[str] = frozenset({
+    "adapter", "advertise", "bots", "concord", "control", "defaults", "deps", "drops",
+    "feeds", "groups", "identity", "marmot", "media", "ngit", "policies", "profiles",
+    "rate_limit", "relays", "replay", "retry", "routing", "socket", "store", "store_write",
+    "whitenoise",
+})
+
+#: Keys deliberately tolerated without being read, and the reason the advisory repeats: a
+#: config set before a merge must still boot, and an operator should not have to re-learn
+#: which leftovers are on purpose.
+TOLERATED_KEYS: dict[str, str] = {
+    "transport": "ignored on purpose: there is no transport switch, so an older config still "
+                 "boots",
+}
+
 
 @dataclass(frozen=True)
 class Check:
@@ -67,9 +85,13 @@ class Check:
     ok: bool
     detail: str
     fix: str = ""
+    #: An advisory is reported, never counted: unknown config keys are residue (or a block set
+    #: ahead of a merge), not a reason to refuse the host.
+    advisory: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail, "fix": self.fix}
+        return {"name": self.name, "ok": self.ok, "detail": self.detail, "fix": self.fix,
+                "advisory": self.advisory}
 
 
 @dataclass(frozen=True)
@@ -81,7 +103,7 @@ class Report:
 
     @property
     def failed(self) -> list[Check]:
-        return [check for check in self.checks if not check.ok]
+        return [check for check in self.checks if not check.ok and not check.advisory]
 
     @property
     def ok(self) -> bool:
@@ -95,17 +117,49 @@ class Report:
         width = max((len(check.name) for check in self.checks), default=4)
         out: list[str] = []
         for check in self.checks:
-            out.append(f"  {'ok  ' if check.ok else 'FAIL'}  {check.name:<{width}}  "
-                       f"{check.detail}")
-            if not check.ok and check.fix:
+            if check.advisory:
+                label = "note"
+            else:
+                label = "ok  " if check.ok else "FAIL"
+            out.append(f"  {label}  {check.name:<{width}}  {check.detail}")
+            if not check.ok and not check.advisory and check.fix:
                 out.append(f"        {'':<{width}}  fix: {check.fix}")
-        passed = len(self.checks) - len(self.failed)
-        out.append(f"{passed}/{len(self.checks)} check(s) passed"
-                   + ("" if self.ok else f"; {len(self.failed)} need attention"))
+        counted = [check for check in self.checks if not check.advisory]
+        advisories = len(self.checks) - len(counted)
+        passed = len(counted) - len(self.failed)
+        summary = f"{passed}/{len(counted)} check(s) passed"
+        if advisories:
+            summary += f"; {advisories} advisory"
+        if self.failed:
+            summary += f"; {len(self.failed)} need attention"
+        out.append(summary)
         return out
 
 
 # -- the checks --------------------------------------------------------------
+
+def unread_config_keys(cfg: dict[str, Any]) -> list[str]:
+    """Top-level keys this build does not read, in the order the file carries them.
+
+    A key can be set ahead of a merge on purpose, so this answers "does this build read it",
+    not "is it wrong" -- which is why it becomes an advisory and never a failing check.
+    """
+    return [key for key in cfg if key not in READ_KEYS]
+
+
+def _config_keys_check(cfg: dict[str, Any]) -> Check | None:
+    """Unread top-level keys as one advisory line; tolerated leftovers keep their reason."""
+    unread = unread_config_keys(cfg)
+    if not unread:
+        return None
+    parts: list[str] = []
+    for key in unread:
+        reason = TOLERATED_KEYS.get(key)
+        parts.append(f"{key} ({reason or 'no code reads it: stale, or set ahead of a merge'})")
+    return Check("config-keys", True,
+                 "config carries key(s) this build does not read: " + "; ".join(parts),
+                 advisory=True)
+
 
 def credential_sources(name: str) -> list[tuple[str, Path]]:
     """Installed units that load `name`, as (unit name, source file) pairs.
@@ -660,8 +714,11 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
     # each mapping problem said once, not once per question asked about it.
     mapping = ProjectMap.from_config(cfg.get("concord") or {})
     projects_check, boards_check = _registry_checks(mapping)
-    checks = (
-        Check("config", True, f"{config_path} parses"),
+    checks: list[Check] = [Check("config", True, f"{config_path} parses")]
+    keys_check = _config_keys_check(cfg)
+    if keys_check is not None:
+        checks.append(keys_check)
+    checks.extend([
         _identity_check(cfg),
         _store_check(cfg),
         _socket_check(path, reply, problem),
@@ -674,5 +731,5 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
         boards_check,
         _schedule_check(mapping),
         _watcher_check(cfg, reply, problem),
-    )
-    return Report(config=str(config_path), checks=checks)
+    ])
+    return Report(config=str(config_path), checks=tuple(checks))
