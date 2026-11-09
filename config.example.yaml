@@ -291,6 +291,12 @@ defaults:
 #   reviews: true                # a PR also gets a review task on the board (never a merge)
 #   review_assignee: review      # profile that review task is dispatched to; a bot role's own
 #                                # identity + profile (see "Bot identities and profiles")
+#   review_fix_assignee: fixer   # profile a changes-requested verdict's fix card is dispatched
+#                                # to; default: assignee
+#   owns:                        # the npubs this instance speaks for: a fix card is queued
+#     - npub1...                 # only for a PR whose author is one of them, so two instances
+#                                # watching one repository do not both queue the same fix.
+#                                # Default: this gateway's own identity
 #   relays:                      # where 1618/1631 events are read; default: relays.read
 #     - wss://relay.example
 #   lookback_hours: 168          # the first poll's floor (0 = everything the relay gives)

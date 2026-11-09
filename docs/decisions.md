@@ -808,6 +808,9 @@ the card being `done` says the review is over, and the bridge records the review
 link (`verdict_tip`) so the merge route refuses a tip the approval does not cover. The label is
 a public copy of the state, not the gate.
 
+*Partly superseded — see "A changes-requested verdict queues a fix card" below: `approved` still
+completes the card, and `changes-requested` queues a fix card instead of re-queuing this one.*
+
 **Why the bridge and not the reviewer.** The reviewer cannot complete the card (the guard
 refuses a completion on an open PR, and it must: a worker's word is not a review), and it cannot
 call `kanban_request_changes` (not a review-lane claim). Making the reviewer do it would mean
@@ -827,6 +830,55 @@ the same tip again and publish the same verdict for ever. The fix worker pushes 
 `Revision: <tip>`; the push usually lands first, so the park is the news, and the card goes back
 to the review queue with the review brief for the tip the PR carries.
 
+*Superseded — see "A changes-requested verdict queues a fix card" below. The review card keeps
+the review brief now, and the fix is its own card.*
+
+## A changes-requested verdict queues a fix card
+
+The rule above made one card carry three jobs: review this tip, fix what the review found, then
+review the fixed tip. The card's identity changed with the verdict, the next claim had to be told
+which of the three it was doing, and the per-verdict idempotency lived in a `changes_requested`
+event on the card — the last one, so two rounds of findings on one PR could not both be
+remembered. The fix also competed with the review for the card's status: `done` on an open PR is
+what the guard exists to refuse, so a card mid-fix could not be finished and a card mid-review
+could not be handed to a fixer without rewriting what it was.
+
+**A verdict is a statement, and the work it asks for is its own unit.** So a changes-requested
+verdict now **opens a fix card**, keyed on the verdict event:
+`ngit:pr:<pr root>:changes:<verdict event id>` (`Board.fix_key`). The idempotency is the
+statement: a re-read of one verdict finds its card by the key, and a second review of the same PR
+— the fix pushed, reviewed again, changes asked for again — is a second statement and earns a
+second card. The card carries the verdict's own words, not a summary, plus the PR id, the tip
+the verdict covered, and the push recipe; it is dispatched to `ngit.assignee`, or
+`ngit.review_fix_assignee` when an operator names one.
+
+**The review card stays the PR's.** It remains parked on the verdict it answered (`Verdict:` in
+the reason), and a revision reopens it for the tip the fix leaves — so the PR still has one
+review card for its life, and the next claim still reviews. It is not re-queued to the
+implementer any more: two cards for one fix is the duplication this is written to avoid. The
+review card is therefore still `blocked` while the fix is outstanding, which is the truthful
+state — the review is over, the PR is not approved, and nothing may complete it (`done` requires
+`applied`).
+
+**The one-card rule is scoped, not repealed.** One PR root has one *review* card. A fix card is a
+strict extension of the same key prefix, so `Board.review_task` and `Board.pr_cards` exclude it:
+answering a verdict against the fix card, or completing it with the PR, would put a second writer
+on one card. A fix card carries no `done requires applied` guard — its work is a pushed revision,
+not a landing — and a merge finishes one that is still queued, because a fix for a PR that landed
+is work nobody should claim.
+
+**Ownership decides whose queue it is.** `ngit.owns` (default: the gateway's own identity) names
+the npubs this instance speaks for. A fix belongs to the queue that can push to the PR's branch,
+so a PR authored outside that list opens nothing here: the label is still published — it is the
+public half, and every instance derives it — and the pass says once, per verdict, that it skipped
+the card. Two instances watching one repository therefore do not both hand the same fix to their
+own implementer, and an external author's PR stays theirs. An approval is not gated: it finishes
+the review and queues no work.
+
+**Nothing here merges.** The strongest thing a verdict's consequence can do is put work in a
+queue. The merge route still decides whether the PR lands, and it reads the verdict and the tip
+it covers from the PR, not from either card.
+
 ## A verdict behind the cursor is reconciled on demand
 
 The verdict rule above only reaches verdicts the poll carries. It cannot reach one that is
@@ -838,17 +890,21 @@ got no event at all, because their verdicts had been consumed before the rule ex
 **The heal is a command, not a pass.** `hng ngit reconcile --channel <id>` walks the PR links
 whose card is `blocked` with the `Verdict:` marker, reads each PR root's newest verdict again,
 and applies the same rule the label pass uses: `approved` completes the card, `changes-requested`
-returns it to its implementer, and a verdict a newer tip has superseded puts the card back in the
-review queue for the tip the PR carries — finishing on a superseded verdict, or re-requesting a
-fix already pushed, are both wrong. It is on demand because the condition is not a state the pass
-could detect: "a verdict exists that nothing will read" is only true of cards parked before a
-rule, and a schedule that re-read every parked card for ever would be a poll dressed as a repair.
+queues the fix card its verdict asks for, and a verdict a newer tip has superseded puts the card
+back in the review queue for the tip the PR carries — finishing on a superseded verdict, or
+re-requesting a fix already pushed, are both wrong. It is on demand because the condition is not
+a state the pass could detect: "a verdict exists that nothing will read" is only true of cards
+parked before a rule, and a schedule that re-read every parked card for ever would be a poll
+dressed as a repair.
 
-**Idempotent by construction, and marker-gated.** Every outcome is `done` or `ready`, and neither
-is a candidate on a later run, so the second run moves nothing. The marker test — not the reason's
-wording — decides what is a candidate: a card blocked on a person's question matches no marker,
-so it is not listed by `--dry-run` and not moved by the real run. `--dry-run` prints the blast
-radius first, because a repair an operator cannot preview is a repair an operator cannot trust.
+**Idempotent by construction, and marker-gated.** An approval leaves `done` and a superseded
+verdict leaves `ready`; neither is a candidate on a later run, so the second run moves nothing. A
+changes-requested card stays `blocked` on its verdict, so the guard against a second run is the
+fix card's key instead: the first run queues it and a later one finds it and says so. The marker
+test — not the reason's wording — decides what is a candidate: a card blocked on a person's
+question matches no marker, so it is not listed by `--dry-run` and not moved by the real run.
+`--dry-run` prints the blast radius first, because a repair an operator cannot preview is a
+repair an operator cannot trust.
 
 ## A close names the successor
 

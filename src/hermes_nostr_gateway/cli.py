@@ -1533,10 +1533,11 @@ def cmd_ngit_reconcile(cfg: dict[str, Any], args) -> int:
     The heal for cards parked before the bridge applied verdicts: the pass that reads a
     verdict only sees what the poll carries, so a verdict already consumed is never read
     again. This reads it from the PR root by the card, decides the same transition the pass
-    would have, and writes it -- `approved` finishes the card, `changes-requested` returns
-    it to its implementer, and a verdict a newer tip has superseded puts the card back in
-    the review queue. Idempotent: every outcome is `done` or `ready`, neither of which is a
-    candidate next time. `--dry-run` names every card it would move, and why, writing nothing.
+    would have, and writes it -- `approved` finishes the card, `changes-requested` queues the
+    fix card its verdict asks for, and a verdict a newer tip has superseded puts the card back
+    in the review queue. Idempotent: an approval leaves `done`, a superseded verdict leaves
+    `ready`, and a changes request leaves the card parked on a fix card the next run finds.
+    `--dry-run` names every card it would move, and why, writing nothing.
     """
     if args.dry_run:
         return _ngit_command(cfg, args, lambda sync: sync.reconcile(dry_run=True))
@@ -2208,7 +2209,8 @@ def main(argv: list[str] | None = None) -> int:
                                   help="board slug override (default: the mapping's board)")
     p_ngit_reconcile.add_argument(
         "--assignee", default=None,
-        help="profile a changes-requested card returns to (default: ngit.assignee)")
+        help="profile a changes-requested fix card is dispatched to (default:"
+             " ngit.review_fix_assignee, else ngit.assignee)")
     p_ngit_reconcile.add_argument("--dry-run", action="store_true",
                                   help="name every card that would move, and why; write nothing")
     p_ngit_reconcile.add_argument("--json", action="store_true")

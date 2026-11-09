@@ -53,8 +53,16 @@ only until the bridge acts on the verdict or the fix, which it does on its next 
 ### One card per PR root
 
 The kind-1618 event that opened the PR is its key (`ngit:pr:<root>`), and one PR root has one
-card for the life of the PR. A re-poll, a retry after a failed send, a re-push a client
-published as a second proposal, and a revision all land on that card.
+**review** card for the life of the PR. A re-poll, a retry after a failed send, a re-push a
+client published as a second proposal, and a revision all land on that card.
+
+**A changes-requested verdict adds one fix card per verdict event** —
+`ngit:pr:<root>:changes:<verdict event>` (`Board.fix_key`) — because the work a verdict asks for
+is its own unit, with its own findings and its own key. That key is a strict extension of the
+review key, so every query that means "the PR's review card" excludes it (`Board.review_task`,
+`Board.pr_cards`), and a fix never receives a verdict's consequence. The review card itself stays
+parked on the verdict until a revision reopens it. See `docs/decisions.md`, "A changes-requested
+verdict queues a fix card".
 
 - **A second proposal for the same branch is a revision.** The oldest proposal is the root
   (same author, same source branch); a later 1618 for that branch, or one that names the root
@@ -99,8 +107,9 @@ then read the board again — the code is right, the deployment was not.
 **Check:** `hng ngit sync --channel <id> --dry-run --json` counts a new tip under
 `prs.revisions` and the reopen it would cause under `prs.would_reopen`; `prs.reopened` moves
 only on a real pass. And
-`sqlite3 <board>/kanban.db "select idempotency_key from tasks where idempotency_key like 'ngit:pr:%'"`
-has one row per PR root.
+`sqlite3 <board>/kanban.db "select idempotency_key from tasks where idempotency_key like 'ngit:pr:%' and idempotency_key not like '%:changes:%'"`
+has one row per PR root — the fix cards are the `%:changes:%` half, one per changes-requested
+verdict.
 
 ### `done` requires applied
 
@@ -318,22 +327,24 @@ triage -> todo|ready          a person, or the specifier profile
 todo -> ready                 every parent card is done (the kernel's gate)
 ready -> running              the dispatcher claims it
 running -> review             the worker's last act on the card: kanban_request_review
-review -> ready -> running    a new revision, or a changes-requested verdict
+review -> ready -> running    a new revision
 review -> blocked             the PR was closed without a merge; a person decides
 review -> done                a merge, or a reviewer's approving verdict
 done -> ready                 a revision on a PR that never merged (the repair path)
-blocked -> ready              a fix that was pushed, a revision on a verdict-parked card,
-                              or a changes-requested verdict
+blocked -> ready              a fix that was pushed, or a revision on a verdict-parked card
 blocked -> done               the approving verdict on a review card the reviewer parked
+new card (ready)              a changes-requested verdict: ngit:pr:<root>:changes:<event>
 any -> archived               out of the board
 ```
 
 `review -> running` has two triggers, and neither is silent. A **new revision** reopens the
 card by itself, because the tip the verdict covered is no longer the tip on the PR. A
 **verdict** ends the review: the bridge reads it from the PR root and applies it — `approved`
-completes the card with the verdict as its result (the merge stays the operator's), and
-`changes-requested` puts it back on the implementer's desk as `ready` with the findings, which
-is the transition `kanban_request_changes` writes for a card the kernel handed to a reviewer.
+completes the review card with the verdict as its result (the merge stays the operator's), and
+`changes-requested` queues a **fix card** for the implementer, carrying the findings verbatim and
+keyed on the verdict event. The review card does not move: it stays parked on the verdict it
+answered, and the revision that follows the fix reopens it. Two rounds of findings are two cards,
+and a re-read of one verdict is no card at all.
 
 A **blocked** card is released by an event only when the bridge parked it: `Verdict:` or
 `Revision:` as the first word of the reason says the next event is what it waits for, and a

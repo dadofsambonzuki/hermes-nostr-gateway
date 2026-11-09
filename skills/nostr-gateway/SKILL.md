@@ -106,10 +106,13 @@ Every refusal is a word, and the word decides what to do.
   repeated poll must not repeat the notice, and a silent block reads exactly like work that never
   started, which is how a board stalls with every health check green.
 - **A verdict finishes the card.** Approve or changes-requested is published on the PR (a
-  kind-1111 comment plus a label) and the bridge applies it to the PR's card on its next pass:
-  `approved` completes the card with the verdict as its result (the merge is still the
-  operator's), and `changes-requested` returns it to the implementer as `ready` with the
-  findings. Neither leaves the card parked, so the board and the PR say the same thing.
+  kind-1111 comment plus a label) and the bridge applies it on its next pass: `approved`
+  completes the review card with the verdict as its result (the merge is still the operator's),
+  and `changes-requested` opens a **fix card** for the implementer — the findings verbatim, the
+  PR, the tip the verdict covered and the push recipe — keyed on the verdict event, so a second
+  round of findings is a second card and a re-read of one verdict opens none. The review card
+  stays parked on the verdict; a revision reopens it for the fixed tip. A PR whose author is not
+  in `ngit.owns` gets no fix card here, and the pass says it skipped it.
 - **A merged PR's card finishes itself, and the refusal says why.** `ngit pr apply` replays the
   patches as new commits, so the bridge does not trust ancestry or a status event alone: it
   compares patch ids against the base branch too. A refusal that names what it compared (`no

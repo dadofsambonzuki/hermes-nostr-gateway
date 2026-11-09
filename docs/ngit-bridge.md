@@ -317,9 +317,9 @@ same branch and a revision all land on that one card; none of them makes a secon
 - A **revision** is an event, not an observation: kind 1619 (`E` names the PR, `c` the new
   tip), or a republished proposal carrying the same `E`/`P`/`c` tags. It reopens the PR's one
   card — `review`/`done` -> `ready` — with one comment naming the new tip and the event that
-  moved it, and with the review brief rewritten for that tip (a fix round left the fix brief
-  behind). A card already `ready` or `running` only gets the comment and the brief (the
-  queue, or the worker reading it, now knows which tip is current); a `blocked` card is
+  moved it, and with the review brief rewritten for that tip. A card already `ready` or
+  `running` only gets the comment and the brief (the queue, or the worker reading it, now knows
+  which tip is current); a `blocked` card is
   waiting for a person unless the bridge itself parked it (`Verdict:`/`Revision:` in the
   reason), in which case the revision reopens it; an `archived` one is left alone.
   A branch that moved without an event changes nothing: the tip the bridge knows is the tip
@@ -400,16 +400,26 @@ same branch and a revision all land on that one card; none of them makes a secon
   `Verdict: changes-requested` and the tip it covers. That park is a hand-off, not a
   question: the bridge reads the newest verdict from the PR root and applies it to the card
   the verdict covers — `approved` **completes** it with the verdict as the result (the merge
-  is still a person's), and `changes-requested` puts it back on the implementer's desk as
-  `ready` with the fix brief and the findings. The same pass publishes the label, so the
-  board and the PR cannot disagree about which verdict they answered. A card blocked on a
-  real question is never finished or re-queued by a verdict: only one the bridge parked (a
-  `Verdict:`/`Revision:` reason) or a card in the `review` lane is touched.
-- **The fix round ends the same way.** The fix brief tells the implementer to push the fix
-  and park the card with `Revision: <tip>`. The push usually lands first, so the park is the
-  news: the bridge reopens the card for review with the review brief for the tip the PR
-  carries. `Revision:` is the only marker that does that, and a card blocked on a person's
-  question is left where it is.
+  is still a person's), and `changes-requested` **opens a fix card** for the implementer,
+  carrying the findings verbatim and keyed on the verdict event (`ngit:pr:<root>:changes:<event>`).
+  The review card itself stays parked on the verdict it answered; a revision reopens it for the
+  tip the fix leaves. The same pass publishes the label, so the board and the PR cannot disagree
+  about which verdict they answered. A card blocked on a real question is never finished or
+  re-queued by a verdict: only one the bridge parked (a `Verdict:`/`Revision:` reason) or a card
+  in the `review` lane is touched.
+- **The fix is its own card, and the push ends it.** A fix card carries the verdict's words, the
+  PR, the tip the verdict covered and the push recipe; `ngit.review_fix_assignee` routes it
+  (`ngit.assignee` by default). The worker fixes on the PR's own branch, gates, publishes a
+  revision — the full patch set, never a delta — and completes the card with the new tip. A
+  worker that parks with `Revision: <tip>` instead is finished by the bridge, which reads the
+  same news, and the review card goes back to the review queue with the review brief for the tip
+  the PR carries. A fix card carries no `done requires applied` guard (its work is a pushed
+  revision, not a landing) and a merge finishes one that is still queued.
+- **Only for the PRs this instance owns.** `ngit.owns` names the npubs an instance speaks for —
+  the gateway's own identity by default. A changes-requested verdict on a PR authored outside
+  that list opens nothing: the fix belongs to the queue that can push to the branch, so two
+  instances watching one repository do not both queue it. The pass says once, per verdict, that
+  it skipped the card; the label is still published, because it is the public half.
 - **A verdict the pass has already gone past is reconciled on demand.** The pass reads a
   verdict only for a PR the poll carried, so a verdict that arrived while the bridge was down
   — or before it applied verdicts at all — sits behind the cursor and is never read again.
@@ -533,12 +543,13 @@ publishing a state the PR itself does not carry.
 **The same read finishes the card.** The verdict a label is derived from is the review's end,
 so the pass applies it to the PR's card in the same step: `approved` completes the card with
 the verdict as its result (the merge stays the operator's, and the `approved` label is what
-the merge route reads), and `changes-requested` returns the card to the implementer as `ready`
-with the fix brief and the findings. One rule decides both — a verdict covers the tip it was
-given for — so a revision that moves the tip leaves the label at `review-required` and the
-card untouched until a reviewer reads the new tip. Only a card the bridge parked, or one in
-the `review` lane, is acted on: a card blocked on a person's question is never finished or
-re-queued by a verdict, however green it is.
+the merge route reads), and `changes-requested` opens the fix card the verdict asks for — one
+card per verdict event, with the findings, on the implementer's desk — while the review card
+stays parked on the verdict until a revision reopens it. One rule decides both — a verdict
+covers the tip it was given for — so a revision that moves the tip leaves the label at
+`review-required` and the card untouched until a reviewer reads the new tip. Only a card the
+bridge parked, or one in the `review` lane, is acted on: a card blocked on a person's question
+is never finished or re-queued by a verdict, however green it is.
 
 **One writer.** The label pass — the sync that walks `ngit_links` — is the only thing that
 writes a label. It reads each open PR's verdict comments and the label events the PR currently
@@ -609,18 +620,20 @@ written for are exactly the ones the pass will never see.
 
 - It walks the PR links whose card is `blocked` with the bridge's own `Verdict:` hand-off, reads
   each PR root's newest verdict again, and applies the rule above: `approved` completes the card
-  with the verdict as its result, `changes-requested` returns it to its implementer with the
-  findings and the fix brief, and a verdict a newer tip has superseded puts the card back in the
-  review queue for the tip the PR carries — the transition a revision writes. Finishing a card on
-  a superseded verdict, or re-requesting a fix the implementer already pushed, would both be
-  wrong.
+  with the verdict as its result, `changes-requested` queues the fix card its verdict asks for
+  (and says so once when that card already exists), and a verdict a newer tip has superseded puts
+  the card back in the review queue for the tip the PR carries — the transition a revision writes.
+  Finishing a card on a superseded verdict, or re-requesting a fix the implementer already pushed,
+  would both be wrong.
 - A card blocked on a person's question matches no marker: it is not listed by `--dry-run` and
   not moved by the real run. A closed or applied PR is skipped for the same reason it is final.
 - `--dry-run` prints one row per card — `<card>  PR <short>  blocked -> <status> (<profile>):
-  why` — and writes nothing: no status, no comment, no link note. The blast radius is read
+  why` (a changes request reads `blocked -> fix card (<profile>)`) — and writes nothing: no
+  status, no comment, no link note. The blast radius is read
   before it lands.
-- It is idempotent by construction: every outcome is `done` or `ready`, and neither is a
-  candidate next time, so a second run moves nothing.
+- It is idempotent by construction: an approval leaves `done`, a superseded verdict leaves
+  `ready`, and neither is a candidate next time; a changes request leaves the card parked on the
+  verdict, so its fix card's key is what makes the second run a no-op and a note.
 - The label is not this pass's to write. It applies the card, records the verdict anchor on the
   link, and the next `ngit sync` publishes the label that verdict earns.
 

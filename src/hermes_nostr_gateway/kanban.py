@@ -75,6 +75,22 @@ def branch_name(slug: str, task_id: str, title: str = "") -> str:
     return f"{base}-{tail}" if tail else base
 
 
+#: What makes a key a *fix* card's: the PR root, then the verdict that asked for the fix.
+#: It is a strict extension of `ngit:pr:<root>`, which is why every query that means "the
+#: PR's review card" excludes it -- a fix card talks about a PR without being its review.
+FIX_KEY_INFIX = ":changes:"
+
+
+def fix_key(pr_id: str, verdict_event: str) -> str:
+    """The idempotency key of the card a changes-requested verdict queues.
+
+    Keyed on the verdict event, not on the PR: a second review of the same PR is a second
+    statement about it and earns a second card, while a re-read of one verdict lands on the
+    card it already has. That is the whole of the idempotency -- no flag, no event marker.
+    """
+    return f"ngit:pr:{str(pr_id or '')}{FIX_KEY_INFIX}{str(verdict_event or '')}"
+
+
 @dataclass(frozen=True)
 class Anchor:
     """What a project-bound board gives a task: a repository, a branch, a project id."""
@@ -149,6 +165,10 @@ class Board:
         title of `Review PR <first 8>: ...` and the PR's event id somewhere in the body,
         which is the one line the brief cannot leave out.
 
+        A fix card is a strict extension of the same prefix and is excluded on purpose: it
+        is the work a verdict queued, not the PR's review, and answering a verdict against
+        it would put a second writer on one card.
+
         Newest first, because a verdict covers the revision it was given for: a later card
         is a later review of the same PR, and its verdict is the one in force.
         """
@@ -157,10 +177,11 @@ class Board:
             return None
         row = self.db.execute(
             "SELECT * FROM tasks WHERE status != 'archived'"
-            " AND (idempotency_key = ? OR idempotency_key LIKE ?"
+            " AND ((idempotency_key = ?"
+            "       OR (idempotency_key LIKE ? AND idempotency_key NOT LIKE ?))"
             "      OR (title LIKE ? AND body LIKE ?))"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%",
+            (f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%", f"%{FIX_KEY_INFIX}%",
              f"Review PR {pr_id[:8]}:%", f"%{pr_id}%"),
         ).fetchone()
         return dict(row) if row is not None else None
@@ -176,14 +197,17 @@ class Board:
         The identities are the ones `review_task` already trusts: the bridge's idempotency
         key (bare or per-tip), or the review brief's title with the PR's event id / nevent in
         the body. A bare mention of the PR elsewhere is deliberately not a match -- a card
-        that talks about a PR is not necessarily finished when that PR lands.
+        that talks about a PR is not necessarily finished when that PR lands. A fix card is
+        excluded for the same reason it is not a review card: it is the work a verdict
+        queued, and the merge that finishes the PR finishes the review, not the fix.
         """
         pr_id = str(pr_id or "")
         if not pr_id:
             return []
-        clauses = ["idempotency_key = ?", "idempotency_key LIKE ?",
+        clauses = ["idempotency_key = ?",
+                   "(idempotency_key LIKE ? AND idempotency_key NOT LIKE ?)",
                    "(title LIKE ? AND body LIKE ?)"]
-        params: list[Any] = [f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%",
+        params: list[Any] = [f"ngit:pr:{pr_id}", f"ngit:pr:{pr_id}:%", f"%{FIX_KEY_INFIX}%",
                              f"Review PR {pr_id[:8]}:%", f"%{pr_id}%"]
         if nevent:
             clauses.append("(title LIKE ? AND body LIKE ?)")
@@ -192,6 +216,23 @@ class Board:
             "SELECT * FROM tasks WHERE status != 'archived' AND ("
             + " OR ".join(clauses) + ") ORDER BY created_at, rowid",
             tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fix_cards(self, pr_id: str) -> list[dict[str, Any]]:
+        """Every live card a changes-requested verdict queued for this PR, oldest first.
+
+        Not the PR's review card, and not found by `pr_cards`: a fix is keyed on the verdict
+        event that asked for it, so one PR can have several over its life and each is its
+        own unit of work. The bridge finishes them when the PR lands -- a fix queued for a
+        merged PR is work nobody should claim -- and nothing else here reads them.
+        """
+        pr_id = str(pr_id or "")
+        if not pr_id:
+            return []
+        rows = self.db.execute(
+            "SELECT * FROM tasks WHERE status != 'archived' AND idempotency_key LIKE ?"
+            " ORDER BY created_at, rowid", (f"ngit:pr:{pr_id}{FIX_KEY_INFIX}%",),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -515,86 +556,12 @@ class Board:
         head = reason.strip().lower()
         return next((mark for mark in PARK_MARKERS if head.startswith(mark)), "")
 
-    def request_changes(self, task_id: str, *, reason: str, implementer: str = "",
-                        reviewer: str = "ngit", body: str = "", verdict: str = "") -> bool:
-        """`* -> ready` on the implementer's desk, with the findings on the card.
-
-        The kernel's `request_changes` is the shape, not a call: it refuses a card whose run
-        was not claimed from `review`, and the bridge's review card is claimed from `ready`
-        (it is made for one PR, not handed over by an implementer). So the rows the kernel
-        would have written are written here, against the card the bridge owns: the status,
-        the router (`assignee`), an ended run, and one `changes_requested` event naming the
-        verdict it answers and the implementer it went to.
-
-        `body` replaces the review brief with the fix brief: the card is the queue, and a
-        worker claiming it must be told to fix this tip rather than review it again. Empty
-        leaves the body alone, which is what a card the bridge did not write needs.
-
-        Idempotent on the verdict event: a second pass over the same verdict writes nothing.
-        False when the card is finished or archived (a merged PR is final), or when this
-        verdict's consequence is already recorded.
-        """
-        now = int(time.time())
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            row = self.db.execute(
-                "SELECT status FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
-            if row is None or str(row["status"]) in (DONE, "archived"):
-                self.db.execute("ROLLBACK")
-                return False
-            prior = str(row["status"])
-            if verdict and self._answers_verdict(task_id, verdict):
-                self.db.execute("ROLLBACK")
-                return False
-            sets = ("status = ?, completed_at = NULL, claim_lock = NULL,"
-                    " claim_expires = NULL, current_run_id = NULL, worker_pid = NULL,"
-                    " block_kind = NULL, block_recurrences = 0, last_failure_error = NULL")
-            params: list[Any] = [READY]
-            if implementer:
-                sets += ", assignee = ?"
-                params.append(str(implementer))
-            if body:
-                sets += ", body = ?"
-                params.append(str(body))
-            self.db.execute(f"UPDATE tasks SET {sets} WHERE id = ?",
-                            (*params, str(task_id)))
-            if reason:
-                self.db.execute(
-                    "INSERT INTO task_comments (task_id, author, body, created_at)"
-                    " VALUES (?,?,?,?)", (str(task_id), reviewer or "ngit", reason, now))
-            self.db.execute(
-                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
-                " VALUES (?,?,?,?,?)",
-                (str(task_id), None, "changes_requested",
-                 json.dumps({"status": READY, "from": prior, "reason": reason,
-                             "implementer": implementer or None,
-                             "reviewer": reviewer or "ngit", "verdict": verdict or None},
-                            separators=(",", ":")), now),
-            )
-            self.db.execute("COMMIT")
-            return True
-        except sqlite3.Error:
-            self.db.execute("ROLLBACK")
-            raise
-
-    def _answers_verdict(self, task_id: str, verdict: str) -> bool:
-        """Whether this verdict event's consequence is already on the card."""
-        row = self.db.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested'"
-            " ORDER BY id DESC LIMIT 1", (str(task_id),)).fetchone()
-        if row is None:
-            return False
-        try:
-            return str((json.loads(row["payload"] or "{}") or {}).get("verdict") or "") == verdict
-        except ValueError:
-            return False
-
     def set_body(self, task_id: str, body: str) -> bool:
         """Replace the card's brief. False for a card that is gone or archived.
 
         The body is the instruction the dispatcher hands the next worker, so it is rewritten
-        whenever the same card is queued for different work (a fix round, then a fresh
-        review of the new tip). It is not a status: nothing reads it back.
+        when the same card is queued for a fresh review of a new tip. It is not a status:
+        nothing reads it back.
         """
         if not body:
             return False

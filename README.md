@@ -167,8 +167,15 @@ aimed at the bot. `ready_label: ""` restores the older rule (a trusted author's 
 A verdict the pass has already gone past — one that arrived while the bridge was down, or before
 the bridge applied verdicts to cards — is read again by `hng ngit reconcile --channel
 <conversation>`, which applies it to the card parked on it: `approved` finishes the card,
-`changes-requested` returns it to its implementer. `--dry-run` names every card and the
+`changes-requested` queues the fix card its verdict asks for. `--dry-run` names every card and the
 transition first, and a second run moves nothing.
+
+A changes-requested verdict opens a **fix card** for the implementer — the reviewer's findings
+verbatim, the PR, the tip the verdict covered and the push recipe — keyed on the verdict event, so
+a second round of findings is a second card and a re-read of one verdict opens none. The PR's
+review card stays parked on the verdict and a revision reopens it for the fixed tip. Only the PRs
+this instance speaks for are queued (`ngit.owns`, default: its own identity), and
+`ngit.review_fix_assignee` picks the profile that fixes them instead of `ngit.assignee`.
 
 A PR's review task ends in a verdict — the reviewer writes it once, on the task, and the bridge
 publishes it on the PR itself as a kind-1111 comment signed by the review identity, with one line
