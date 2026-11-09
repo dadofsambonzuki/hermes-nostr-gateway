@@ -1374,10 +1374,12 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
                    "PRs are not announced"
         else:
             prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
-    # One reader serves three jobs -- PR labels, issue labels and comment mentions -- so it
-    # is built whenever any of them needs a relay, not only when PRs are announced.
+    # One reader serves four jobs -- PR labels, a reconcile's verdict, issue labels and
+    # comment mentions -- so it is built whenever any of them needs a relay, not only when
+    # PRs are announced. `reader` is the reconcile path: it reads a verdict to apply one
+    # even when this deployment publishes no labels at all.
     if target.address and relays and (ngit_cfg.labels or ngit_cfg.mentions
-                                      or ngit_cfg.ready_label):
+                                      or ngit_cfg.ready_label or reader):
         state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
         if ngit_cfg.labels:
             # One reader, one writer, the same relay set: the pass reads the verdict
