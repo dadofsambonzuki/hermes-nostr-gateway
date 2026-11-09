@@ -66,24 +66,27 @@ published as a second proposal, and a revision all land on that card.
   reason), in which case the revision reopens it; an `applied` PR is final, so a late
   revision cannot revive it.
 
-**Enforced in** `_fold_repeats` and `_revisions` in `src/hermes_nostr_gateway/ngit.py`, the
-`ngit:pr:<root>` idempotency key on the card, and `Board.reopen` in
-`src/hermes_nostr_gateway/kanban.py`. `tests/test_ngit.py` pins one card across two passes, a
-republished proposal and a revision of a `done` card — and, since the queue grew a duplicate
-review card for a re-push, the two real kind-1618 roots it published (same `branch-name`, two
-tips, the second one based on the first).
+**Enforced in** `_fold_repeats`/`_fold_root` and `_revisions` in
+`src/hermes_nostr_gateway/ngit.py`, the `ngit:pr:<root>` idempotency key on the card, and
+`Board.reopen` in `src/hermes_nostr_gateway/kanban.py`. `tests/test_ngit.py` pins one card
+across two passes, a republished proposal and a revision of a `done` card — and, since the
+queue grew a duplicate review card for a re-push, the two real kind-1618 roots it published
+(same `branch-name`, two tips, the second one based on the first).
 
-**The branch it compares is the one on the wire.** `branch-name` is the author's branch, cut
-by ngit to 60 characters. `ngit pr view --json` prints `pr/<branch>-(<8 hex>)`: a local ref
-name, adding the short PR id so two roots of one branch stay apart on screen. That ref does
-reach the tag through one path — a push made from the branch `ngit pr checkout` created —
-where ngit strips the `pr/` and then cuts the rest to 60. For a branch of 49 characters or
-fewer the whole `-(<8 hex>)` survives and is published; from 50 to 60 the cut leaves a
-partial suffix (`-(12345678`, `-(`, `-`) or nothing, which no rule can match back to the
-branch. The incident's own branch was 74 characters, so its two roots carry one name and
-fold. `tests/test_ngit.py` pins both the real pair and the decorated one; a `(<pr-id>)`
-mismatch matters only for the short branch, and any normalisation merges names that could
-be genuinely distinct.
+**The branch it compares is the one on the wire**, with one normalisation. `branch-name` is
+the author's branch, cut by ngit to 60 characters. `ngit pr view --json` prints
+`pr/<branch>-(<8 hex>)`: a local ref name, adding the short PR id so two roots of one branch
+stay apart on screen. That ref does reach the tag through one path — a push made from the
+branch `ngit pr checkout` created — where ngit strips the `pr/` and then cuts the rest to 60.
+For a branch of 49 characters or fewer the whole `-(<8 hex>)` survives and is published;
+from 50 to 60 the cut leaves a partial suffix (`-(12345678`, `-(`, `-`) or nothing, which no
+rule can match back to the branch. `_fold_root` strips a trailing `-(<8 hex>)` only when that
+hex is the first eight of the root's event id, which is exactly what `ngit pr checkout`
+appends: the decorated re-push folds onto its root, while a branch genuinely named
+`topic-(deadbeef)` stays a different branch unless `deadbeef` opens the root of `topic`. The
+incident's own branch was 74 characters, so its two roots carry one name and fold without the
+normalisation. `tests/test_ngit.py` pins both shapes, a first poll that carries both, and the
+two negatives — a lookalike suffix that names no root, and another author's decorated name.
 
 **So a second card for one branch means the pass that made it had no fold.** Check the
 checkout before the comparison: `hng status` prints `checkout: <branch> @ <sha> (<n> behind

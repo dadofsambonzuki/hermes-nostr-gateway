@@ -3133,13 +3133,13 @@ class Sync:
         is the record. A proposal with no tip names no revision and is left as a PR.
 
         The key is the branch **as published**: the 1618's `branch-name`, cut by ngit to 60
-        characters. `ngit pr view --json` prints `pr/<branch>-(<8 hex>)`, a local ref name;
-        that ref reaches the tag when a push is made from the branch `ngit pr checkout`
-        created, and survives the cut only for a source branch of 49 characters or fewer.
-        The incident's branch was 74, so its roots carry one name and fold; a short branch
-        publishes the suffix and does not, which
-        `test_a_repush_from_the_checked_out_branch_makes_one_card` pins. Folding it means
-        deciding whether two names that differ only by that suffix are one branch.
+        characters. A push made from the branch `ngit pr checkout` created publishes
+        `<branch>-(<8 hex root id>)` when the source branch is 49 characters or fewer. That
+        suffix is stripped, but only when the hex is the event id of the root the branch
+        names -- the decoration ngit itself writes -- so a branch genuinely called
+        `<branch>-(deadbeef)` stays distinct. The incident's branch was 74 characters, so the
+        cut removed its suffix and its two roots carry one name; the short one is pinned by
+        `test_a_repush_from_the_checked_out_branch_makes_one_card`.
         """
         closed = closed or set()
         known: dict[tuple[str, str], str] = {}
@@ -3163,7 +3163,8 @@ class Sync:
         fresh: list[PullRequest] = []
         repeats: list[Revision] = []
         for pr in prs:
-            root = known.get((pr.author, pr.branch)) if pr.branch and pr.commit else None
+            root = (_fold_root(known, pr.author, pr.branch, pr_id=pr.id)
+                    if pr.branch and pr.commit else None)
             if root and root != pr.id:
                 repeats.append(Revision(pr_id=root, commit=pr.commit,
                                         created_at=pr.created_at, event_id=pr.id,
@@ -4237,6 +4238,34 @@ def _detail(link: dict[str, Any]) -> dict[str, Any]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# `ngit pr checkout <root>` checks out `pr/<branch>-(<root event id, first 8 hex>)`; a push
+# from that branch publishes the name with the `pr/` stripped, so the suffix reaches the
+# 1618's `branch-name` whenever the whole string fits the writer's 60-character cut.
+_PR_CHECKOUT_SUFFIX = re.compile(r"-\(([0-9a-f]{8})\)$")
+
+
+def _fold_root(known: Mapping[tuple[str, str], str], author: str, branch: str, *,
+               pr_id: str = "") -> str | None:
+    """The root a proposal belongs to: the exact (author, branch), or its checkout name.
+
+    A decorated name folds only when its hex is the event id of the root it names -- what
+    `ngit pr checkout` appends -- so a branch genuinely called `topic-(deadbeef)` is a
+    different branch unless `deadbeef` happens to open the root of `topic`. `pr_id` is the
+    proposal itself, which the caller has already seeded into `known`: an exact match on it
+    names no root, so the decorated lookup still has to run.
+    """
+    root = known.get((author, branch))
+    if root is not None and root != pr_id:
+        return root
+    match = _PR_CHECKOUT_SUFFIX.search(branch)
+    if match is None:
+        return None
+    candidate = known.get((author, branch[:match.start()]))
+    if candidate is None or candidate == pr_id:
+        return None
+    return candidate if candidate.startswith(match.group(1)) else None
 
 
 def _guard_covers_tip(held: Mapping[str, Any], tip: str) -> bool:

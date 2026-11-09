@@ -2,8 +2,9 @@
   "what": [
     "One source branch pushed twice, the SECOND push made from the branch `ngit pr checkout`",
     "creates: two kind-1618 roots whose `branch-name` tags differ only by the client's",
-    "`-(<root event id, first 8 hex>)` suffix. `_fold_repeats` keys on `(author, branch)`,",
-    "so this pair does not fold and the bridge makes two review cards for one branch.",
+    "`-(<root event id, first 8 hex>)` suffix. Before `_fold_root`, `_fold_repeats` keyed",
+    "on the raw `(author, branch)`, so this pair did not fold and the bridge made two review",
+    "cards for one branch; the fixture pins the wire shape the fold now normalises.",
     "",
     "These events are hand-built, not captured. The real incident's events are in",
     "`ngit-repush-two-roots.json` and carry identical names: that branch was 74 characters,",

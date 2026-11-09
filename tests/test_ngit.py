@@ -4566,9 +4566,11 @@ def test_the_two_roots_of_one_repush_make_one_card(harness):
 # `ngit pr checkout <root>` creates `pr/<branch>-(<root event id, first 8 hex>)`, and a push
 # made from that branch publishes the checked-out name as `branch-name` (ngit strips one
 # leading `pr/` and cuts the rest to 60 characters). A branch of 49 characters or fewer
-# therefore publishes `<branch>-(<8 hex>)` on a re-push, and `_fold_repeats` keys on the raw
-# name: two roots, two cards. The incident's own branch was 74 characters, so the 60-character
-# cut removed the suffix -- which is why its two events (the fixture above) carry one name.
+# therefore publishes `<branch>-(<8 hex>)` on a re-push. `_fold_root` strips that suffix when
+# -- and only when -- the hex is the event id of the root the name claims, so this folds onto
+# the first root while a branch that merely looks decorated stays a different branch. The
+# incident's own branch was 74 characters, so the 60-character cut removed the suffix -- which
+# is why its two events (the fixture above) carry one name.
 
 SUFFIX_FIXTURE = Path(__file__).parent / "fixtures" / "ngit-suffixed-branch-repush.json"
 
@@ -4588,8 +4590,6 @@ def test_the_suffixed_fixture_is_one_branch_the_client_decorated():
     assert feed.revisions == []
 
 
-@pytest.mark.xfail(strict=True,
-                  reason="t_e15d80e2: _fold_repeats compares the decorated branch name")
 def test_a_repush_from_the_checked_out_branch_makes_one_card(harness):
     """Two names, one branch: one root, one card and one revision, as the docs promise."""
     events = suffixed_repush_events()
@@ -4606,3 +4606,50 @@ def test_a_repush_from_the_checked_out_branch_makes_one_card(harness):
     assert len(pr_links(harness)) == 1
     assert report.prs["reopened"] == 1 and report.prs["tasks"] == 0
     assert harness.task(task_id)["status"] == "ready"
+
+
+def test_one_poll_carrying_both_checked_out_names_still_makes_one_card(harness):
+    """The first poll may carry the re-push too; the oldest proposal is still the only card."""
+    events = suffixed_repush_events()
+    harness.prs_data = repush_feed(events)
+    report = harness.sync()
+
+    tasks = review_tasks(harness)
+    assert len(tasks) == 1 and len(pr_links(harness)) == 1
+    assert tasks[0]["idempotency_key"] == f"ngit:pr:{events[0]['id']}"
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 1
+    assert len(harness.messages) == 1
+
+
+def test_a_branch_that_only_looks_decorated_is_a_new_pr(harness):
+    """The suffix folds only when its hex opens the root it names, not on shape alone."""
+    pr = make_pr("f3", commit="a" * 40, branch="pr/widget")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    set_review_status(harness, review_tasks(harness)[0]["id"], "review")
+
+    # Exactly eight lowercase hex in parens at the end -- ngit's shape -- but `deadbeef` does
+    # not open this root, so it names a different branch, not the checked-out one.
+    lookalike = make_pr("f4", commit="b" * 40, branch="pr/widget-(deadbeef)",
+                        created_at=2000)
+    harness.prs_data = ([lookalike], [])
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 2 and len(pr_links(harness)) == 2
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
+
+
+def test_a_decorated_branch_from_another_author_is_a_new_pr(harness):
+    """The suffix names a root, not a branch: the author is still half the fold key."""
+    pr = make_pr("f3", commit="a" * 40, branch="pr/widget")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    set_review_status(harness, review_tasks(harness)[0]["id"], "review")
+
+    other = make_pr("f4", author=STRANGER_HEX, commit="b" * 40,
+                    branch=f"pr/widget-({pr.id[:8]})", created_at=2000)
+    harness.prs_data = ([other], [])
+    report = harness.sync()
+
+    assert len(harness.tasks()) == 2 and len(pr_links(harness)) == 2
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
