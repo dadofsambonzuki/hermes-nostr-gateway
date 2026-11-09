@@ -102,6 +102,12 @@ master)`, and a bridge serving a stale tree makes one card per root while every 
 green (`hng doctor` passes a checkout that is behind by design). Pull, restart the daemon,
 then read the board again — the code is right, the deployment was not.
 
+**A `[new branch]` push the host provoked is not the fold's problem.** When `grasp.day.ag`
+answers a `pr/*` ref update with 404, the client cannot see the branch it already proposed
+and pushes it again: one branch, two kind-1618 roots 108 seconds apart — the second based on
+the first — and two review cards. The 404 is a host fault; the fold decides only that the
+second root lands on the first card, and nothing on this side stops the push.
+
 **In this tree:** yes — all three are on `master`.
 
 **Check:** `hng ngit sync --channel <id> --dry-run --json` counts a new tip under
