@@ -136,7 +136,8 @@ board card. The plugin does not retire on a promise.
 - Remove `platforms.marmot` from `~/.hermes/config.yaml` and the `marmot` entry from
   `plugins.enabled`; a disabled-but-installed plugin is one `hermes config set` away from
   coming back, which is the drift this decision exists to stop.
-- Update the README and `docs/ops-notes.md` to describe the gateway as the only reader.
+- Update the README (and the host's own infrastructure notes, where relay gates and key
+  handling live) to describe the gateway as the only reader.
 - Keep `marmot.hermes_platform` in the guard. It costs nothing, and it catches a reinstall
   or a copied config on a second host — the two ways the second reader comes back.
 

@@ -69,16 +69,36 @@ relays:
     - wss://relay.example.com/chat
     - wss://nos.lol
     - wss://relay.primal.net
+  # White Noise relays — the Marmot plane's relay set, carried by wn-agent, never part of
+  # the DM or feed read set: they reject public kinds and are not a general NIP-17 inbox.
+  # Both spellings are accepted and merged: this one, and the top-level `whitenoise:` list
+  # below, which is what an older config carries. Naming a relay does not subscribe to it —
+  # it is what keeps the relay out of the DM read set when a peer advertises it in their
+  # kind-10050 inbox list.
+  # whitenoise:
+  #   - wss://relay.eu.whitenoise.chat
 
 # White Noise relays belong to the Marmot plane only (wn-agent), never the DM/feed
 # read set: they reject public kinds and are not a general NIP-17 inbox. They are
 # `kept`, with the Marmot plane as their purpose: `hng status` lists them apart from
 # the read set and they never colour a relay verdict.
+# Also accepted under `relays:` as `relays.whitenoise`; both places are merged.
 whitenoise:
   - wss://relay.eu.whitenoise.chat
   - wss://relay.us.whitenoise.chat
 
 store: ~/.local/state/hermes-nostr-gateway/gateway.db
+
+# The control socket: NDJSON over a 0600 Unix socket, no network listener. Every client
+# (`hng status`, the Hermes plugin) must expand this path exactly as the daemon does.
+# Default: $XDG_RUNTIME_DIR/hermes-nostr-gateway.sock, or
+# ~/.local/state/hermes-nostr-gateway/gateway.sock when XDG_RUNTIME_DIR is unset. Set it
+# when the default does not fit: an AF_UNIX name is capped at 107 bytes (108 with the
+# terminator), so a long $HOME makes `hng serve` fail at startup with `OSError: AF_UNIX
+# path too long` — a short path here is the fix. The Hermes plugin reads
+# NOSTR_GATEWAY_SOCKET or its own `socket_path` setting instead, so point both at one
+# path. This is this daemon's socket, not `marmot.socket` below (wn-agent's).
+# socket: ~/.local/state/hermes-nostr-gateway/gateway.sock
 
 # Writes leave the event loop: a message is queued (with its dedupe decided against the
 # database, read-only) and committed in batches on a dedicated thread. See

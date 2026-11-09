@@ -19,8 +19,10 @@ Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 # config.yaml names it:
 #     identity:
 #       secret_credential: nostr_secret
-# The source must exist before the first start, or the unit fails to start. Creating it
-# is documented in docs/ops-notes.md, "Key handling".
+# The source must exist before the first start, or the unit fails to start: a JSON file
+# holding {"secret_key_hex": "..."} (or the key on its own), root-owned and mode 0600.
+# Host-side operations -- key handling among them -- are kept with the host's own
+# infrastructure notes, not in this repository (README, "Docs").
 LoadCredential=nostr_secret:/etc/hermes-nostr-gateway/identity.json
 ExecStartPre=/usr/bin/install -d -m 0755 /home/ubuntu/.local/state/hermes-nostr-gateway/ngit-cache
 ExecStart=/home/ubuntu/Projects/hermes-nostr-gateway/.venv/bin/hng serve

@@ -300,8 +300,12 @@ Install `requirements.txt` before the editable install: it is the only path that
 `nip44_v2_conversation_key`, which Concord derives its channel keys from, so a resolver that
 picks the release up by name fails only at runtime.
 
-The Hermes plugin finds the socket through `NOSTR_GATEWAY_SOCKET` or its `socket_path` setting;
-the daemon's default is `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`.
+The daemon and the Hermes plugin have to agree on the socket path, and the daemon's `socket:`
+setting is the source. Unset, it takes `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`, or
+`~/.local/state/hermes-nostr-gateway/gateway.sock` when `XDG_RUNTIME_DIR` is unset. An AF_UNIX
+name is capped at 107 bytes, so on a long `$HOME` that fallback cannot bind and `hng serve` dies
+at startup with a bare `AF_UNIX path too long` — `socket:` set to a short path is the fix. The
+plugin reads `NOSTR_GATEWAY_SOCKET` or its `socket_path` setting, so point both at one path.
 
 The work half queues onto a **kanban board**, so the install is not finished until Hermes has the
 plugin that renders it. `plugins.enabled` in `~/.hermes/config.yaml` must include `kanban`; a
@@ -332,9 +336,14 @@ the board and appears on the PR, so a reader of either one sees the same thing.
 `config.example.yaml` carries the comments; this is the map.
 
 - **`relays`** — the read set, the publish floor, and `peer_inbox` coverage of peers' own inbox
-  relays.
+  relays. `whitenoise` (top level or under `relays`) is the set the Marmot plane owns: it is
+  never read here, only kept out of the DM read set when a peer advertises one.
 - **`identity`** — `secret_file`, or `secret_credential` under systemd so the key is never a file
   the service user can open.
+- **`socket`** — the control socket. Default `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`, or
+  `~/.local/state/hermes-nostr-gateway/gateway.sock` when `XDG_RUNTIME_DIR` is unset; set it when
+  the default is too long for an AF_UNIX name (107 bytes). Not `marmot.socket`, which is
+  `wn-agent`'s.
 - **Policy** — `groups`, `policies` (match on group, kind, DM or mention; decide `reach` and
   `authority`) and `defaults`, plus the bounded exceptions `rate_limit` and `bots`.
 - **`control`** — where a confirmation is asked (`control.concord`, `control.nip17`,
