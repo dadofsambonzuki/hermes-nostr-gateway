@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -204,7 +205,8 @@ class Harness:
                  assignee: str = "default", anchor: Anchor | None = None,
                  notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
                  applied: FakeApplied | None = None, sweep=None, verdicts=None,
-                 owns: tuple[str, ...] = (TRUSTED_HEX,)):
+                 owns: tuple[str, ...] = (TRUSTED_HEX,),
+                 now: Callable[[], float] = time.time):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -243,6 +245,9 @@ class Harness:
         self.verdict_publisher = verdicts or self._publish_verdict
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
+        #: The pass's clock. Pinned by the tests whose fixtures sit inside a time window,
+        #: so the assertion is about the window, not about the day the suite ran.
+        self.now = now
         self.config = bridge_config(assignee=assignee, lookback_hours=0,
                                     reply_secret_file="/etc/example/reply.json",
                                     owns=owns)
@@ -394,7 +399,7 @@ class Harness:
             prs=self.prs, statuses=self.statuses, sweep=self.sweep,
             notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state, applied=self.applied,
-            self_npub=self.self_npub, verdicts=self.verdict_publisher)
+            self_npub=self.self_npub, verdicts=self.verdict_publisher, now=self.now)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -1085,18 +1090,19 @@ def test_a_pending_link_with_no_notice_is_requeued(home, store):
 
 def test_a_deleted_cursor_starts_from_now_not_from_the_lookback(home, store):
     """A reset must not replay a week of PRs into the channel."""
-    made = Harness(home, store, prs=([make_pr("d8", created_at=5000)], ()))
+    now = 1_800_000_000
+    made = Harness(home, store, prs=([make_pr("d8", created_at=5000)], ()),
+                   now=lambda: now)
     made.config = bridge_config(assignee="default", lookback_hours=168)
     try:
         made.sync()
-        before = int(time.time())
-        assert before - 168 * 3600 - 2 <= made.since_seen[0] <= before - 168 * 3600 + 2
+        assert made.since_seen[0] == now - 168 * 3600
 
         made.store.db.execute("DELETE FROM ngit_cursors WHERE repo = ? AND stream = 'prs'",
                               (ADDRESS,))
         made.prs_data = ([], ())
         made.sync()
-        assert before - ngit.CURSOR_OVERLAP_S - 2 <= made.since_seen[-1] <= before + 2
+        assert made.since_seen[-1] == now - ngit.CURSOR_OVERLAP_S
     finally:
         made.close()
 
@@ -1120,11 +1126,12 @@ def test_since_can_be_given_explicitly(harness):
 
 
 def test_the_first_poll_has_a_lookback_floor(harness):
+    now = 1_800_000_000
+    harness.now = lambda: now
     harness.config = bridge_config(assignee="default", lookback_hours=24)
     harness.prs_data = ([], [])
-    before = int(time.time())
     harness.sync()
-    assert before - 24 * 3600 - 2 <= harness.since_seen[0] <= before - 24 * 3600 + 2
+    assert harness.since_seen[0] == now - 24 * 3600
 
 
 # -- the notifier: what a busy daemon looks like from here --------------------
@@ -1981,19 +1988,26 @@ def test_a_status_returned_by_both_reads_is_counted_once():
 # re-read it, the link stayed `signalled`, and the board kept obeying an open PR. The sweep
 # re-reads the two status kinds over a trailing window, every pass, and is the only reader
 # that can still see that close.
+#
+# The clock is pinned, not read off the wall: the floor is `now - 24h`, so an ambient clock
+# walked past this fixture's fixed close at 15:42 UTC on 2026-11-09 and the test failed for
+# every run after that instant. These epochs keep the incident's shape relative to the
+# pinned clock: the close six hours behind the poll cursor, the cursor three hours before
+# "now".
+SWEEP_NOW = 1794185210                                       # 2026-11-09 00:46:50Z
+
 
 def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
     """Acceptance (1): the sweep sees a close the incremental poll has moved past.
 
-    Both ends of the gap are measured from the clock at run time, because the window they
-    are measured against is: `now - sweep_hours`. A literal date here asserts fine until the
-    window's floor has rolled past it and then fails on master for everyone, whatever the
-    code does -- which is what happened to the 2026-11-08 fixtures. The close sits deep in
-    the default window so that shortening the window still breaks this test: that is the
-    property it pins.
+    Both ends of the gap are measured from the pinned clock, because the window they
+    are measured against is: `now - sweep_hours`. The close sits deep in the default
+    window so that shortening the window still breaks this test: that is the property
+    it pins, and the pin is why the fixture cannot rot with the run date.
     """
+    now = SWEEP_NOW
+    harness.now = lambda: now
     pr, task_id = pr_with_review_task(harness)
-    now = int(time.time())
     stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64,
                           created_at=now - 20 * 3600)        # deep inside the 24h window
     reached = now - 2 * 3600                                 # the poll has read past the close
@@ -2009,7 +2023,9 @@ def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
     assert row["status"] == "blocked" and row["block_kind"] == "dependency"
     assert any("9" * 64 in comment["body"] for comment in harness.comments(task_id))
     assert report.prs["blocked"] == 1 and report.prs["swept"] == 1
-    # The sweep read a window that reaches back past the close ...
+    # The sweep read a window that reaches back past the close: its floor is exactly the
+    # pinned clock minus the window, which is what makes this independent of the run date.
+    assert harness.sweep_since[-1] == SWEEP_NOW - ngit.DEFAULT_SWEEP_HOURS * 3600
     assert harness.sweep_since[-1] <= stopped.created_at
     # ... because the window is (nearly) the whole default day, not a sliver of it: this is
     # the line a shortened `sweep_hours` breaks, and the reason the close above is 20h old.
@@ -2178,13 +2194,13 @@ def test_a_failing_sweep_is_a_report_line_not_a_lost_pass(harness):
 
 def test_the_sweep_window_extends_over_the_gap_since_the_last_sweep(harness):
     """A pass that was down for longer than the window still covers what it missed."""
+    harness.now = lambda: SWEEP_NOW
     harness.store.ngit_set_cursor(ADDRESS, ngit.SWEEP_CURSOR, 1794000000)
-    before = int(time.time())
 
     harness.sync()
 
     assert harness.sweep_since[0] == 1794000000
-    assert int(harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR)) >= before
+    assert int(harness.store.ngit_cursor(ADDRESS, ngit.SWEEP_CURSOR)) == SWEEP_NOW
 
 
 def test_sweep_hours_zero_turns_the_sweep_off(harness):
