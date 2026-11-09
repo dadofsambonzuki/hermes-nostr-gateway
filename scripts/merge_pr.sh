@@ -7,7 +7,8 @@
 # Exit: 0 applied (or would), 1 conflict, 2 gate failure, 3 usage/state error,
 #       4 a card workspace (not the operator's), 5 the live checkout moved,
 #       6 a commit does not say which card wrote it, 7 the card is not in review or done,
-#       8 merged, but the applied record (kind-1631) did not publish.
+#       8 merged, but the applied record (kind-1631) did not publish,
+#       9 no verdict from a different npub.
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -111,13 +112,17 @@ fi
 # verdict is the NIP-22 kind-1111 comment on the PR root that the bridge publishes from the
 # review card and the label pass reads -- one event, two readers -- so a self-authored PR
 # merges only with a second party's signature. It reads the same `ngit pr view` the status
-# above does, and refuses before anything is applied.
+# above does, and refuses before anything is applied. Exit 9 is its own code -- 5 is the live
+# checkout moving, 7 the card, 8 the applied record -- so a caller can tell which refusal it
+# got. (5, then 6 and 7, then 8 were each taken by master while this refusal was in review.)
 verdict_check=$(PYTHONPATH="${PYTHONPATH:-$REPO/src}" "$PYTHON" \
   -m hermes_nostr_gateway.ngit_verdict "$pr" 2>&1)
 case $? in
   0) ;;
-  3|127) echo "$verdict_check"; exit 3 ;;
-  *) echo "$verdict_check"; exit 5 ;;
+  9) echo "$verdict_check"; exit 9 ;;
+  # Anything else is the check failing to run, not a verdict: a missing interpreter or an
+  # import error must not read as "ask a reviewer".
+  *) echo "$verdict_check"; exit 3 ;;
 esac
 
 wt=$(mktemp -d "${TMPDIR:-/tmp}/merge-pr.XXXXXX")

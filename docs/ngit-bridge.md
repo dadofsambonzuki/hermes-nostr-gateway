@@ -554,6 +554,13 @@ one-pass correction rather than a manual cleanup. The link row only remembers wh
 published, so a poll with no news publishes nothing. A merge leaves the last verdict in place:
 it is the verdict the merge was decided on.
 
+**The label says what the PR says; the merge guard decides who signed it.** The label pass does
+not look at the author of a verdict comment — the label reports the newest verdict on the PR
+root, whoever signed it, because that is what a reader of the PR can see. So a verdict the PR's
+own author published by hand puts `approved` on the column while `scripts/merge_pr.sh` still
+refuses the merge (exit 9). That is the intended split: the label is the state, the guard is the
+safety, and the guard is the authority when the two disagree.
+
 **A verdict that cannot be read does not fall back.** If the newest comment states a verdict in
 words the bridge does not recognise, the label is left untouched and the pass records the event
 id and the relay: publishing an older approval over a verdict nobody parsed is the wrong

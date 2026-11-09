@@ -345,7 +345,7 @@ def run_merge(made: SimpleNamespace, view: dict) -> subprocess.CompletedProcess:
 def test_the_merge_route_refuses_a_self_authored_verdict(merge_route):
     refused = run_merge(merge_route, a_view(AUTHOR, a_comment(AUTHOR, "Verdict: approved")))
 
-    assert refused.returncode == 5, refused.stdout + refused.stderr
+    assert refused.returncode == 9, refused.stdout + refused.stderr
     assert "REFUSED" in refused.stdout
     assert "different npub" in refused.stdout
 
@@ -373,7 +373,7 @@ def test_the_check_exits_zero_for_a_second_party_verdict(monkeypatch, capsys):
     assert "OK" in capsys.readouterr().out
 
 
-def test_the_check_exits_five_for_a_self_review(monkeypatch, capsys):
+def test_the_check_exits_nine_for_a_self_review(monkeypatch, capsys):
     monkeypatch.setattr(verdicts, "read_view",
                         lambda pr: a_view(AUTHOR, a_comment(AUTHOR, "Verdict: approved")))
     assert verdicts.main([PR]) == verdicts.EXIT_REFUSED

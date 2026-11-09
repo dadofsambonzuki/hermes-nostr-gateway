@@ -293,7 +293,7 @@ self-authored change lands only with a second party's signature on it.
 
 **Enforced in** `scripts/worker_push_guard.sh` (the `pre-push` hook; installed once per clone
 into the hooks directory every worktree shares), `scripts/merge_pr.sh` (exit 4 in a card
-workspace, exit 5 with no verdict from a different npub), and
+workspace, exit 9 with no verdict from a different npub), and
 `src/hermes_nostr_gateway/ngit_verdict.py` (the authorship check the merge route calls).
 
 **In this tree:** yes — the hook and `merge_pr.sh`'s exit-4 refusal are on `master` (PR
@@ -301,7 +301,7 @@ workspace, exit 5 with no verdict from a different npub), and
 `merge_pr.sh` against a fake `ngit` to pin both the refusal and the pass-through.
 
 **Check:** `scripts/worker_push_guard.sh status` reports whether the hook is installed and
-whether this shell is a card workspace; `bash scripts/merge_pr.sh <pr> --check` exits 5 for a
+whether this shell is a card workspace; `bash scripts/merge_pr.sh <pr> --check` exits 9 for a
 self-authored verdict before it applies anything.
 
 ## Transitions

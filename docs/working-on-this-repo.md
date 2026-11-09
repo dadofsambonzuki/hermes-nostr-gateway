@@ -13,10 +13,13 @@ scripts/merge_pr.sh <pr-id|nevent> --check    # apply and gate only
 Exit codes: 0 applied (or would), 1 conflict, 2 gate failure or a refused push, 3 usage or state
 error, 4 a card workspace (not the operator's), 5 the live checkout moved mid-run, 6 a commit
 carries no card trailer (none at all, or one that names something that is not a card), 7 the card
-is not in `review` or `done`, 8 merged but the applied record (kind-1631) did not publish. 6 and
-7 are the authorship route:
-[every commit says which card wrote it](#every-commit-says-which-card-wrote-it) and
-[a merge needs the card finished](#a-merge-needs-the-card-in-review-or-done).
+is not in `review` or `done`, 8 merged but the applied record (kind-1631) did not publish, 9 no
+verdict from a different npub. One code, one meaning: 5 says the checkout moved and the operator
+backs it out, 8 says the content is in `master` and the record is missing, and 6, 7 and 9 are the
+authorship route refusing — each names the part it refused:
+[the commit trailer](#every-commit-says-which-card-wrote-it),
+[the card](#a-merge-needs-the-card-in-review-or-done),
+[the signature](#a-merge-needs-a-second-signature).
 
 **A merge is for the tip a reviewer approved.** The check reads the bridge's `verdict_tip` for
 the PR and refuses when the tip differs — `merge_pr.sh` reads the branch's current tip from
@@ -143,7 +146,7 @@ hermes_nostr_gateway.ngit_merge`).
 ## A merge needs a second signature
 
 Before it applies anything `scripts/merge_pr.sh` refuses a PR whose newest kind-1111 verdict is
-its own author's (exit 5): a self-authored change lands only with a second party's signature on
+its own author's (exit 9): a self-authored change lands only with a second party's signature on
 it, never on "the author looked at it". The verdict is the comment the review card publishes on
 the PR (see [ngit-bridge](ngit-bridge.md), "The verdict on the PR"); there is no second place to
 record one.

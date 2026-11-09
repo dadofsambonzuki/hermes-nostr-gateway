@@ -65,8 +65,13 @@ READ_LIMIT = 50
 NGIT_TIMEOUT_S = 120.0
 
 #: Exit codes of `python -m hermes_nostr_gateway.ngit_verdict` (documented in merge_pr.sh).
+#: 9, not 5: `scripts/merge_pr.sh` answers 5 for "the live checkout moved", 6 for a commit with
+#: no card trailer, 7 for a card that is not in review or done, and 8 for a merge whose applied
+#: record did not publish. A shared code would make "ask a reviewer" indistinguishable from any
+#: of them. The number has moved twice while this PR was in review (master took 6 and 7, then
+#: 8): the next free code is the one to take, and `merge_pr.sh` names them all in its header.
 EXIT_UNREADABLE = 3
-EXIT_REFUSED = 5
+EXIT_REFUSED = 9
 
 
 class VerdictError(RuntimeError):
@@ -414,11 +419,13 @@ def read_view(pr: str, *, runner: Callable[..., Any] = subprocess.run) -> Mappin
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """The merge route's check: exit 0 when the verdict is somebody else's, 5 when it is not.
+    """The merge route's check: exit 0 when the verdict is somebody else's, 9 when it is not.
 
     `scripts/merge_pr.sh` calls this before it applies anything. 3 is "could not read", which
-    is a state error like the rest of that script's refusals; 5 is the authorship refusal, so
-    a caller can tell "ask a reviewer" from "the relay is down".
+    is a state error like the rest of that script's refusals; 9 is the authorship refusal, so
+    a caller can tell "ask a reviewer" from "the relay is down". 9 and not 5 because the merge
+    route already spends 5 on the live checkout, 6 and 7 on the card checks and 8 on a missing
+    applied record: one code, one meaning, or the caller cannot tell which refusal it got.
     """
     parser = argparse.ArgumentParser(
         prog="python -m hermes_nostr_gateway.ngit_verdict",
