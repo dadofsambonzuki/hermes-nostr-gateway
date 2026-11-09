@@ -19,8 +19,10 @@ import nostr_sdk as sdk
 import pytest
 import websockets
 
+from hermes_nostr_gateway import publisher as publisher_module
 from hermes_nostr_gateway.gateway import Gateway
 from hermes_nostr_gateway.publisher import (
+    CLOSE_SETTLE,
     BindingsPublisher,
     Outcome,
     classify,
@@ -228,6 +230,37 @@ async def test_a_relay_rejection_is_not_retried(relay_factory, no_subprocess):
     assert not ok
     assert "blocked" in (error or "")
     assert len(strict.frames) == 1, "a rejection was retried"
+
+
+async def test_closing_the_publisher_settles_before_the_loop_goes(monkeypatch):
+    """The client is released while the loop is alive, after its workers get a turn.
+
+    This build aborts at interpreter shutdown — SIGABRT, "panic in a function that
+    cannot unwind" from async-compat/tokio — when the client's background tasks are
+    still live as the loop closes. A one-shot `hng ngit applied` hit it on roughly one
+    process in five, which reads as a failed merge to any caller that checks the exit
+    code. `shutdown()` only *asks* those tasks to stop, so the settle is what makes the
+    teardown a shutdown rather than a race; it must not be dropped as a delay.
+    """
+    order: list[str] = []
+    real_sleep = asyncio.sleep
+
+    async def record(delay, *args, **kwargs) -> None:
+        order.append(f"settle {delay}")
+        await real_sleep(0)
+
+    class Client:
+        async def shutdown(self) -> None:
+            order.append("shutdown")
+
+    monkeypatch.setattr(publisher_module.asyncio, "sleep", record)
+    held = BindingsPublisher("11" * 32)
+    held._client = Client()
+    await held.aclose()
+
+    assert order[0] == "shutdown"
+    assert order[1].startswith("settle") and float(order[1].split()[1]) >= CLOSE_SETTLE, order
+    assert held._client is None, "the client is still held after a close"
 
 
 async def test_a_rate_limited_relay_is_retried_with_the_same_bytes(relay_factory, no_subprocess):

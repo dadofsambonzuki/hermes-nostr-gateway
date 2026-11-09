@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import enum
+import gc
 import json
 import logging
 from typing import Any, Iterable, Protocol
@@ -60,6 +61,14 @@ _TRANSIENT = ("rate-limit", "rate limited", "error:", "unavailable", "busy",
 #: The relay already stores this exact event id (NIP-01 `duplicate:`): an idempotent
 #: success, not a failure -- the event is there, which is all the caller wanted.
 _HELD = ("duplicate", "already have", "already exists")
+
+#: How long `aclose` lets the client's workers finish after `shutdown` before the loop is
+#: allowed to close. The bindings' `shutdown` only *asks* its background tasks to stop;
+#: dropping the client with them still live aborts the process (`panic in a function that
+#: cannot unwind`, SIGABRT) once the Rust runtime goes. A one-shot `hng ngit applied` hit
+#: that on roughly one process in five, which reads as a failed merge to a caller checking
+#: the exit code. There is no join to call, so this is the settle.
+CLOSE_SETTLE = 0.1
 
 
 def _norm(relay: str) -> str:
@@ -307,6 +316,11 @@ class BindingsPublisher:
             self._client = None
             self._urls.clear()
             self._last_used.clear()
+            # Let the client's tasks notice `shutdown` while the loop is still alive, then
+            # release it: dropped after the Rust runtime is gone, this build aborts at
+            # interpreter shutdown (SIGABRT). See CLOSE_SETTLE and `Pool.stop`.
+            await asyncio.sleep(CLOSE_SETTLE)
+            gc.collect()
 
 
 def make_publisher(cfg: dict[str, Any], secret: str | None) -> Publisher:
