@@ -16,6 +16,7 @@ uid that connected — before a single frame is read.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -28,6 +29,46 @@ log = logging.getLogger("hng.socket")
 
 #: `struct ucred` as SO_PEERCRED returns it: pid, uid, gid (Linux).
 _PEERCRED = struct.Struct("3i")
+
+#: `sockaddr_un.sun_path` is a fixed 108-byte field on Linux, the terminating NUL
+#: included — so a path may be 107 bytes. The kernel counts bytes, not characters,
+#: which is why the check encodes first. See `socket_path_problem`.
+UNIX_SOCKET_PATH_MAX = 108
+
+#: The two ways out of a too-long path, said once so serve, doctor and the tests agree.
+SOCKET_PATH_FIX = (
+    "Set `socket:` in the config (or pass `--socket`) to a shorter path, for example "
+    "/run/hermes-nostr-gateway/gateway.sock; or set XDG_RUNTIME_DIR so the default socket "
+    "is $XDG_RUNTIME_DIR/hermes-nostr-gateway.sock"
+)
+
+
+def socket_path_problem(path: str | Path) -> str | None:
+    """Why `path` cannot be bound as an AF_UNIX socket, or None when it fits.
+
+    A `$HOME`-derived default is the usual victim: with no `XDG_RUNTIME_DIR`, the
+    default is `$HOME/.local/state/hermes-nostr-gateway/gateway.sock`, and a long
+    `$HOME` silently exceeds the kernel's address field. Naming the size, the limit
+    and the fix here is what turns a traceback into a configuration error.
+    """
+    size = len(os.fsencode(str(path)))
+    if size < UNIX_SOCKET_PATH_MAX:
+        return None
+    return (
+        f"the control socket path is {size} bytes; the kernel's AF_UNIX limit is "
+        f"{UNIX_SOCKET_PATH_MAX} bytes including the terminating NUL ({path})"
+    )
+
+
+class SocketPathError(RuntimeError):
+    """The control-socket path does not fit the kernel's AF_UNIX address field."""
+
+    def __init__(self, path: str | Path):
+        self.path = str(path)
+        self.size = len(os.fsencode(self.path))
+        problem = socket_path_problem(path) or (
+            f"the control socket path is too long for an AF_UNIX socket: {self.path}")
+        super().__init__(f"{problem}. {SOCKET_PATH_FIX}")
 
 
 def peer_uid(sock: Any) -> int | None:
@@ -113,10 +154,20 @@ class SocketServer:
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        problem = socket_path_problem(self.path)
+        if problem is not None:
+            raise SocketPathError(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             self.path.unlink()
-        self._server = await asyncio.start_unix_server(self._handle, path=str(self.path))
+        try:
+            self._server = await asyncio.start_unix_server(self._handle, path=str(self.path))
+        except OSError as exc:
+            if exc.errno == errno.ENAMETOOLONG:
+                # The check above states the rule; this is the kernel stating it, kept so a
+                # platform whose field is smaller still gets a named error, not a traceback.
+                raise SocketPathError(self.path) from exc
+            raise
         os.chmod(self.path, 0o600)
         log.info("socket listening at %s", self.path)
 

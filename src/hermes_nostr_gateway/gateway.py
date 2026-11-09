@@ -80,7 +80,7 @@ from .profiles import hermes_config_path, require_profiles
 from .projects import ProjectMap, project_for_conversation
 from .publisher import Publisher, make_publisher
 from .routing import Resolution, load_router, reported_route
-from .server import SocketServer
+from .server import SocketPathError, SocketServer, socket_path_problem
 from .store import (
     MAX_FUTURE_S,
     MAX_MESSAGE_AGE_S,
@@ -541,6 +541,11 @@ class Gateway:
         self.socket_path = Path(socket_path) if socket_path else Path(
             os.path.expanduser(cfg.get("socket") or default_socket_path())
         )
+        # A path the kernel cannot bind is a configuration error, not a crash: refuse it
+        # here, where `hng serve` already turns config errors into one line and exit 2.
+        # The bind site repeats the check for a SocketServer used on its own.
+        if socket_path_problem(self.socket_path) is not None:
+            raise SocketPathError(self.socket_path)
         #: What this identity advertises to clients: its kind-0 profile (so a client's
         #: `bot: true` discovery step finds it) and the kind-10304 command manifest Armada
         #: renders the slash menu from. Off unless `advertise.publish` asks for it, and a

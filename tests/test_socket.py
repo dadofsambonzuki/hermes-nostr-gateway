@@ -270,6 +270,81 @@ async def test_subscribe_replays_digest_and_ack_uses_frame(tmp_path):
         await srv.stop()
 
 
+def _path_of_size(tmp_path, size: int):
+    """A path whose encoding is exactly `size` bytes, under `tmp_path`.
+
+    The kernel's limit is bytes, not characters, so the tests that sit either side of it
+    are built from the encoded length rather than a guessed string of 'x's.
+    """
+    name_size = size - len(os.fsencode(str(tmp_path))) - 1  # the separator
+    if name_size < 6:
+        pytest.skip(f"tmp_path leaves no room for a {size}-byte path")
+    return tmp_path / ("x" * (name_size - 5) + ".sock")
+
+
+async def test_a_socket_path_at_the_kernel_limit_still_binds(tmp_path):
+    """107 bytes is the most the kernel's 108-byte field allows room for; it must bind."""
+    path = _path_of_size(tmp_path, socket_server.UNIX_SOCKET_PATH_MAX - 1)
+    assert len(os.fsencode(str(path))) == socket_server.UNIX_SOCKET_PATH_MAX - 1
+
+    srv = SocketServer(path, FakeHandler())
+    await srv.start()
+    try:
+        (frame,) = await call(path, {"op": "ping"})
+        assert frame["type"] == "pong"
+    finally:
+        await srv.stop()
+
+
+async def test_a_socket_path_over_the_kernel_limit_is_a_named_config_error(tmp_path):
+    """The fresh-install failure: a long `$HOME` default is a config error, not OSError.
+
+    The kernel answers `OSError: AF_UNIX path too long` from inside asyncio, which names
+    neither the path, the limit, nor the fix. `SocketServer.start` must say all three and
+    must do it with its own error type.
+    """
+    limit = socket_server.UNIX_SOCKET_PATH_MAX
+    path = _path_of_size(tmp_path, limit)
+    assert len(os.fsencode(str(path))) == limit
+
+    with pytest.raises(socket_server.SocketPathError) as raised:
+        await SocketServer(path, FakeHandler()).start()
+
+    message = str(raised.value)
+    assert f"is {limit} bytes" in message
+    assert f"limit is {limit} bytes including the terminating NUL" in message
+    assert f"({path})" in message
+    assert "socket:" in message and "XDG_RUNTIME_DIR" in message
+    assert not isinstance(raised.value, OSError), "the bare OSError is what this replaces"
+
+
+def test_hng_serve_refuses_a_socket_path_over_the_kernel_limit(tmp_path, capsys):
+    """`hng serve` exits 2 with the named error, instead of printing a traceback."""
+    import yaml
+    from nostr_sdk import Keys
+
+    from hermes_nostr_gateway import cli
+
+    secret_file = tmp_path / "secret.json"
+    secret_file.write_text(json.dumps(
+        {"secret_key_hex": Keys.generate().secret_key().to_hex()}))
+    path = _path_of_size(tmp_path, socket_server.UNIX_SOCKET_PATH_MAX)
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "identity": {"secret_file": str(secret_file)},
+        "relays": {"read": [], "publish": []},
+        "store": str(tmp_path / "gateway.db"),
+        "socket": str(path),
+    }))
+
+    assert cli.main(["--config", str(config), "serve"]) == 2
+    said = capsys.readouterr().err
+    assert said.startswith("refusing to start: socket:")
+    assert f"{len(os.fsencode(str(path)))} bytes" in said
+    assert "108" in said and "XDG_RUNTIME_DIR" in said
+    assert "Traceback" not in said
+
+
 async def test_message_only_adapter_acks_a_digest_by_frame_id_and_reconnect_replays_nothing(
         tmp_path):
     """Done-condition for the digest contract: an adapter that knows only

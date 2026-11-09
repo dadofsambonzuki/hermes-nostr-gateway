@@ -41,6 +41,7 @@ from .projects import (
     hermes_home,
     load_registry,
 )
+from .server import SOCKET_PATH_FIX, socket_path_problem
 
 #: How long the daemon gets to answer `status` before the socket check calls it absent.
 DAEMON_TIMEOUT_S = 3.0
@@ -233,6 +234,11 @@ def probe_daemon(path: Path, *, timeout: float = DAEMON_TIMEOUT_S) -> tuple[dict
 
 
 def _socket_check(path: Path, reply: dict | None, problem: str) -> Check:
+    too_long = socket_path_problem(path)
+    if too_long is not None:
+        # Before the daemon-down branch: "start the daemon" is the wrong remedy for a
+        # path the kernel will refuse every time, and the length is knowable without it.
+        return Check("socket", False, too_long, SOCKET_PATH_FIX)
     if reply is None:
         return Check("socket", False, f"{path}: {problem}",
                      f"start the daemon: `hng --config <config> serve` (it binds {path}); "

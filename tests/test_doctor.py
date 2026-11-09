@@ -737,6 +737,22 @@ def test_a_relay_both_read_and_kept_fails_the_preflight(good, monkeypatch, capsy
     assert relays["fix"]
 
 
+def test_a_socket_path_over_the_kernel_limit_names_the_limit_and_the_fix(
+        good, monkeypatch, capsys, tmp_path):
+    """Doctor is the first thing an operator runs: "start the daemon" is not the fix
+    for a path the kernel refuses every time, so the length is checked before the probe."""
+    tmp_path, home, checkout, config = good
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    cfg["socket"] = str(tmp_path / ("d" * 100) / "gateway.sock")
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    check = checks_by_name(capsys)["socket"]
+    assert not check["ok"]
+    assert "108" in check["detail"] and "bytes" in check["detail"]
+    assert "socket:" in check["fix"] and "XDG_RUNTIME_DIR" in check["fix"]
+
+
 def test_unparsable_config_exits_one_and_says_so(tmp_path, monkeypatch, capsys):
     path = tmp_path / "config.yaml"
     path.write_text("identity: [unclosed\n")

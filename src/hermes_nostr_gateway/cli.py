@@ -2064,6 +2064,7 @@ def cmd_serve(args) -> int:
     from .advertise import AdvertiseError
     from .gateway import Gateway, MarmotOwnershipError
     from .routing import RoutingConfigError
+    from .server import SocketPathError
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -2092,6 +2093,11 @@ def cmd_serve(args) -> int:
         # `advertise.publish` names something this daemon cannot advertise. Publishing
         # nothing while the config says otherwise is the one outcome a menu must not have.
         print(f"refusing to start: profile: {exc}", file=sys.stderr)
+        return 2
+    except SocketPathError as exc:
+        # Too long for the kernel's AF_UNIX field: the fix is a config edit, so say that
+        # instead of letting asyncio turn it into `OSError: AF_UNIX path too long`.
+        print(f"refusing to start: socket: {exc}", file=sys.stderr)
         return 2
 
     async def run() -> None:
