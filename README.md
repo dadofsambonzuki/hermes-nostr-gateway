@@ -160,6 +160,12 @@ An issue from a trusted npub (`control.trusted_npubs`, or the concord plane's ow
 which a trusted npub answers with `hng ngit answer <task-id|nevent> --yes|--no --by <npub>` — the
 author of an issue does not thereby authorise it.
 
+A verdict the pass has already gone past — one that arrived while the bridge was down, or before
+the bridge applied verdicts to cards — is read again by `hng ngit reconcile --channel
+<conversation>`, which applies it to the card parked on it: `approved` finishes the card,
+`changes-requested` returns it to its implementer. `--dry-run` names every card and the
+transition first, and a second run moves nothing.
+
 A PR's review task ends in a verdict and a comment on the task; it never merges, and the merge
 event closes it. The bridge chooses no model for it: the board's default, then the assignee
 profile's own model, decides, and one task can be moved with `hermes kanban set-model`. A bot

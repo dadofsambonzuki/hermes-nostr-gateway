@@ -53,6 +53,11 @@ PARK_MARKERS = ("verdict:", "revision:")
 #: The one marker a fix worker writes: "the fix is pushed, at this tip". The bridge reopens
 #: the card for review on its own, because the push usually lands before the worker parks.
 FIXED_MARK = "revision:"
+#: The one marker a review worker writes: "the verdict is on the PR, at this tip". It is what
+#: `hng ngit reconcile` looks for: a card parked this way is waiting for the bridge to read a
+#: verdict, not for a person, so a verdict the pass's cursor has already gone past can still
+#: be applied to it.
+VERDICT_MARK = "verdict:"
 
 
 class BoardError(RuntimeError):

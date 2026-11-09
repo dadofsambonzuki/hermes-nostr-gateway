@@ -36,13 +36,16 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `config`, `checkout`, `project`, `board`; exit 1 on any gap. Plain `hng projects --json` lists the map only. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
 | What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{d seen,created,ready,held,existing,comments,deleted,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
+| Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
 | What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
 | One preflight of all of the above | `hng doctor --json` | `ok` and `checks[]` of `{name, ok, detail, fix}`; exit 1 when any check fails. |
 
 Read-only questions are safe to run at any time: `status`, `health`, `drops`, `recent`,
-`projects`, `route`, `profile`, `doctor` and `ngit sync --dry-run` write nothing. `hng profile
-publish` publishes the advertisement, and `ngit sync` without `--dry-run` writes tasks,
-comments, notices and cursors — it is what the scheduled pass runs.
+`projects`, `route`, `profile`, `doctor`, `ngit sync --dry-run` and `ngit reconcile --dry-run`
+write nothing. `hng profile publish` publishes the advertisement, `ngit sync` without
+`--dry-run` writes tasks, comments, notices and cursors — it is what the scheduled pass runs —
+and `ngit reconcile` without `--dry-run` moves the cards parked on a verdict (never a card
+blocked on a person's question).
 
 ## Failure vocabulary
 

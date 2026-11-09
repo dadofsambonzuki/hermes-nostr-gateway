@@ -162,3 +162,20 @@ def test_send_keeps_a_failed_wrap_for_the_retry_loop(tmp_path, monkeypatch):
     # The stored event is the signed wrap, so a retry republishes the same id (spec §7).
     assert json.loads(pending[0]["event"])["kind"] == 1059
     store.close()
+
+
+def test_ngit_reconcile_parses_and_refuses_an_unmapped_channel(tmp_path, capsys):
+    """The subcommand exists and its wiring refuses before touching a relay or a board.
+
+    A full reconcile needs a checkout, an `ngit` binary and relays; what this pins is that
+    `hng ngit reconcile --channel ...` reaches the same preflight `ngit sync` does, with the
+    same exit code -- the one thing a cron line or an operator's habit can get wrong.
+    """
+    path, _ = make_config(tmp_path)
+    cfg = yaml.safe_load(open(path))
+    cfg["ngit"] = {"assignee": "default"}
+    open(path, "w").write(yaml.safe_dump(cfg))
+
+    assert cli.main(["--config", path, "ngit", "reconcile",
+                     "--channel", f"concord:{'0' * 64}:{'1' * 64}", "--dry-run"]) == 2
+    assert "no concord.projects entry maps" in capsys.readouterr().err

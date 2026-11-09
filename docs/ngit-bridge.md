@@ -322,6 +322,12 @@ same branch and a revision all land on that one card; none of them makes a secon
   news: the bridge reopens the card for review with the review brief for the tip the PR
   carries. `Revision:` is the only marker that does that, and a card blocked on a person's
   question is left where it is.
+- **A verdict the pass has already gone past is reconciled on demand.** The pass reads a
+  verdict only for a PR the poll carried, so a verdict that arrived while the bridge was down
+  — or before it applied verdicts at all — sits behind the cursor and is never read again.
+  `hng ngit reconcile --channel <id>` reads those PR roots again and applies the same rule;
+  `--dry-run` first, and a second run moves nothing. See "A verdict the pass has already gone
+  past" under the label section.
 - A kind-1632 **closed** status is not a merge and never completes a card. The PR's cards are
   blocked with `block_kind=dependency`, a comment naming the closing event, and a guard that
   refuses completion — a person decides whether the work is re-filed, re-proposed or dropped.
@@ -426,6 +432,33 @@ carries, and an old PR still open is labelled when a revision puts it back in th
 Publishing a label onto every PR the bridge ever announced would be a burst of events nobody
 asked for, and a merge is left as it is — its link is closed, and the label a merged PR
 carries is whatever it was decided on.
+
+### A verdict the pass has already gone past
+
+The pass reads a verdict only for a PR the poll carried (or one its row already labels), so a
+verdict that arrived while the bridge was down — or before it applied verdicts to cards at all —
+sits behind the cursor and is never read again. A card parked on such a verdict is then
+unhealable by any later pass, and so is every later fix to this path: the cards a fix is
+written for are exactly the ones the pass will never see.
+
+`hng ngit reconcile --channel <id>` is that heal, run on demand:
+
+- It walks the PR links whose card is `blocked` with the bridge's own `Verdict:` hand-off, reads
+  each PR root's newest verdict again, and applies the rule above: `approved` completes the card
+  with the verdict as its result, `changes-requested` returns it to its implementer with the
+  findings and the fix brief, and a verdict a newer tip has superseded puts the card back in the
+  review queue for the tip the PR carries — the transition a revision writes. Finishing a card on
+  a superseded verdict, or re-requesting a fix the implementer already pushed, would both be
+  wrong.
+- A card blocked on a person's question matches no marker: it is not listed by `--dry-run` and
+  not moved by the real run. A closed or applied PR is skipped for the same reason it is final.
+- `--dry-run` prints one row per card — `<card>  PR <short>  blocked -> <status> (<profile>):
+  why` — and writes nothing: no status, no comment, no link note. The blast radius is read
+  before it lands.
+- It is idempotent by construction: every outcome is `done` or `ready`, and neither is a
+  candidate next time, so a second run moves nothing.
+- The label is not this pass's to write. It applies the card, records the verdict anchor on the
+  link, and the next `ngit sync` publishes the label that verdict earns.
 
 ## Bot identities and profiles
 
@@ -550,6 +583,9 @@ Recovery:
   moved past the PR would leave it stuck.
 - **A relay read fails**: PRs are reported as an error and issues still import; the queue is
   still drained, so a notice already decided on is not held back by the relay.
+- **A verdict is behind the cursor** — it arrived during downtime, or before the bridge applied
+  verdicts — so no ordinary pass will ever read it again: `hng ngit reconcile --channel <id>`
+  (with `--dry-run` first) applies it to the card parked on it, and a second run is a no-op.
 - **Catch-up after downtime**: the cursor is where the last successful poll ended, so the next
   poll reads the gap; events already linked are not reported again, and notices already queued
   are delivered from the queue.

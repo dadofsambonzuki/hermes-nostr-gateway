@@ -1259,12 +1259,14 @@ def _read_relays(cfg: dict[str, Any]) -> list[str]:
 
 
 def cmd_ngit(args) -> int:
-    """The ngit bridge: one sync pass, one answer to a held issue, or a merge's card check."""
+    """The ngit bridge: one sync pass, one verdict reconcile, one answer, one merge check."""
     cfg = load_config(args.config)
     if args.ngit_cmd == "answer":
         return cmd_ngit_answer(cfg, args)
     if args.ngit_cmd == "merge-check":
         return cmd_ngit_merge(cfg, args)
+    if args.ngit_cmd == "reconcile":
+        return cmd_ngit_reconcile(cfg, args)
     return cmd_ngit_sync(cfg, args)
 
 
@@ -1280,12 +1282,26 @@ def cmd_ngit_merge(cfg: dict[str, Any], args) -> int:
                           board=args.board or "", as_json=args.json)
 
 
-def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
-    """One pass over a channel's repo: issues become work, PR news goes to the channel.
+class _PassRefused(Exception):
+    """A bridge command cannot start: the reason to print, and the exit code to print it with."""
 
-    Everything that identifies this box comes from configuration: the conversation names
-    the channel, `concord.projects` resolves it to a checkout and a board, `ngit.assignee`
-    says who a ready task is dispatched to, and the control pane says whose issue is work.
+    def __init__(self, message: str, code: int = 2):
+        super().__init__(message)
+        self.code = code
+
+
+def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
+    """Wire one bridge command: the board, the `Sync`, and what could not be announced.
+
+    `ngit sync` and `ngit reconcile` start here, so one configuration decides the target,
+    the board and the relay set for both. Everything that identifies this box comes from
+    configuration: the conversation names the channel, `concord.projects` resolves it to a
+    checkout and a board, `ngit.assignee` says who a ready task is dispatched to, and the
+    control pane says whose issue is work.
+
+    `reader` wires the verdict reader even when the deployment publishes no labels:
+    `reconcile` exists to read a verdict, so it needs one where a sync would not. Raising
+    `_PassRefused` rather than printing keeps the refusal in one place per command.
     """
     from dataclasses import replace
 
@@ -1301,21 +1317,18 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
     assignee = str(args.assignee or ngit_cfg.assignee or "").strip()
     if not assignee:
-        print("ngit: set ngit.assignee (the profile a ready task is dispatched to) "
-              "or pass --assignee", file=sys.stderr)
-        return 2
+        raise _PassRefused("set ngit.assignee (the profile a ready task is dispatched to) "
+                           "or pass --assignee")
     try:
         target = bridge.resolve_target(cfg, channel=args.channel, repo=args.repo,
                                        board=args.board)
     except bridge.NgitError as exc:
-        print(f"ngit: {exc}", file=sys.stderr)
-        return 2
+        raise _PassRefused(str(exc)) from exc
     home = hermes_home()
     try:
         board = Board(bridge.board_path(target.board, home=home))
     except BoardError as exc:
-        print(f"ngit: {exc}", file=sys.stderr)
-        return 2
+        raise _PassRefused(str(exc)) from exc
 
     # The dependency, once the configuration is known to be usable: a missing or old
     # `ngit` is a preflight failure with a version to install, not a surprise in a cron
@@ -1323,16 +1336,20 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
     try:
         bridge.require_ngit()
     except bridge.NgitError as exc:
-        print(f"ngit: {exc}", file=sys.stderr)
-        return 2
+        board.close()
+        raise _PassRefused(str(exc)) from exc
 
-    checkout = bridge.Ngit(target.repo)
-    repository = checkout.repository()
-    target = replace(target, address=repository.address,
-                     default_branch=bridge.default_branch(target.repo))
+    try:
+        checkout = bridge.Ngit(target.repo)
+        repository = checkout.repository()
+        target = replace(target, address=repository.address,
+                         default_branch=bridge.default_branch(target.repo))
 
-    anchor = Anchor.for_board(home, target.board)
-    crypto, store, _policy, _plane = build(cfg)
+        anchor = Anchor.for_board(home, target.board)
+        crypto, store, _policy, _plane = build(cfg)
+    except Exception:
+        board.close()
+        raise
     ngit_cfg = replace(ngit_cfg, assignee=assignee)
     prs = None
     labeler = None
@@ -1352,22 +1369,36 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
                        "PRs are not announced"
             else:
                 prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
+                # The reader is not the writer: a verdict is read to be applied, and a
+                # command that applies one asks for the reader even when nothing is labelled.
+                if ngit_cfg.labels or reader:
+                    state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
                 if ngit_cfg.labels:
                     # One reader, one writer, the same relay set: the pass reads the verdict
                     # and the live labels from where it publishes them, so a retraction and
                     # the state it corrects cannot come from different views of the repo.
                     labeler = labels.LabelPublisher(relays, secret=secret_from(cfg))
-                    state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
     notifier = bridge.DaemonNotifier(
-        os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path())))
+        os.path.expanduser(str(getattr(args, "socket", None) or cfg.get("socket")
+                              or default_socket_path())))
     sync = bridge.Sync(
         store=store, board=board, control=ControlConfig.from_config(cfg.get("control")),
         config=ngit_cfg, target=target,
         issues=checkout.issues, detail=checkout.detail,
         prs=prs.events if prs is not None else None, notify=notifier, anchor=anchor,
         labels=labeler, state=state)
+    return board, sync, note
+
+
+def _ngit_command(cfg: dict[str, Any], args, work) -> int:
+    """Run one wired bridge command and print what it did; exit 1 on any error it reported."""
     try:
-        report = sync.run(since=args.since, recreate=args.recreate, dry_run=args.dry_run)
+        board, sync, note = _ngit_pass(cfg, args, reader=args.ngit_cmd == "reconcile")
+    except _PassRefused as exc:
+        print(f"ngit: {exc}", file=sys.stderr)
+        return exc.code
+    try:
+        report = work(sync)
     finally:
         board.close()
     if note:
@@ -1378,6 +1409,31 @@ def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
         for line in report.lines():
             print(line)
     return 1 if report.errors else 0
+
+
+def cmd_ngit_sync(cfg: dict[str, Any], args) -> int:
+    """One pass over a channel's repo: issues become work, PR news goes to the channel."""
+
+    def work(sync):
+        return sync.run(since=args.since, recreate=args.recreate, dry_run=args.dry_run)
+
+    return _ngit_command(cfg, args, work)
+
+
+def cmd_ngit_reconcile(cfg: dict[str, Any], args) -> int:
+    """Apply a verdict the pass's cursor has gone past to the card parked on it.
+
+    The heal for cards parked before the bridge applied verdicts: the pass that reads a
+    verdict only sees what the poll carries, so a verdict already consumed is never read
+    again. This reads it from the PR root by the card, decides the same transition the pass
+    would have, and writes it -- `approved` finishes the card, `changes-requested` returns
+    it to its implementer, and a verdict a newer tip has superseded puts the card back in
+    the review queue. Idempotent: every outcome is `done` or `ready`, neither of which is a
+    candidate next time. `--dry-run` names every card it would move, and why, writing nothing.
+    """
+    if args.dry_run:
+        return _ngit_command(cfg, args, lambda sync: sync.reconcile(dry_run=True))
+    return _ngit_command(cfg, args, lambda sync: sync.reconcile())
 
 
 def cmd_ngit_answer(cfg: dict[str, Any], args) -> int:
@@ -1875,6 +1931,23 @@ def main(argv: list[str] | None = None) -> int:
     p_ngit_sync.add_argument("--socket", default=None, help="daemon socket override")
     p_ngit_sync.add_argument("--json", action="store_true")
     p_ngit_sync.set_defaults(func=cmd_ngit)
+
+    p_ngit_reconcile = ngit_sub.add_parser(
+        "reconcile",
+        help="apply a verdict the pass's cursor has gone past to the card parked on it")
+    p_ngit_reconcile.add_argument("--channel", required=True,
+                                  help="the channel's conversation, concord:<community>:<channel>")
+    p_ngit_reconcile.add_argument("--repo", default=None,
+                                  help="checkout override (default: the mapping's path)")
+    p_ngit_reconcile.add_argument("--board", default=None,
+                                  help="board slug override (default: the mapping's board)")
+    p_ngit_reconcile.add_argument(
+        "--assignee", default=None,
+        help="profile a changes-requested card returns to (default: ngit.assignee)")
+    p_ngit_reconcile.add_argument("--dry-run", action="store_true",
+                                  help="name every card that would move, and why; write nothing")
+    p_ngit_reconcile.add_argument("--json", action="store_true")
+    p_ngit_reconcile.set_defaults(func=cmd_ngit)
 
     p_ngit_answer = ngit_sub.add_parser(
         "answer", help="yes or no for an issue held for a human")

@@ -196,13 +196,18 @@ class Harness:
         return ngit_labels.LabelResult(ok=True, events=(event,), retracted=True, relays=2)
 
     def sync(self, **kwargs):
-        sync = ngit.Sync(
+        return self._sync().run(**kwargs)
+
+    def reconcile(self, **kwargs):
+        return self._sync().reconcile(**kwargs)
+
+    def _sync(self):
+        return ngit.Sync(
             store=self.store, board=self.board, control=self.control,
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
             prs=self.prs, notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state)
-        return sync.run(**kwargs)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -2282,6 +2287,171 @@ def test_a_pushed_fix_puts_the_card_back_in_the_review_queue(harness):
     # The claim reviews the tip the PR carries, not the fix that already happened.
     assert "Review this PR" in row["body"] and "b" * 40 in row["body"]
     assert any("Fix pushed" in c["body"] for c in harness.comments(task_id))
+
+
+# -- reconcile: a verdict behind the pass's cursor ----------------------------
+#
+# The pass that reads a verdict walks what the poll carried, so a verdict already consumed
+# is never read again — which made every card parked before the bridge applied verdicts
+# unhealable, and every later fix to that path unhealable in production too.
+# `hng ngit reconcile` asks the PR root again, for the cards parked on a verdict and only
+# those: a person's block matches no marker and is never listed, let alone moved.
+
+def record_tip(harness, pr_id: str, tip: str, *, at: int) -> None:
+    """The link's note as a revision that landed would have left it (the event was consumed)."""
+    link = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr_id)
+    detail = json.loads(link["detail"] or "{}")
+    detail["tip"], detail["tip_at"] = tip, at
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr_id,
+                                 state=str(link["state"]), detail=detail)
+
+
+def test_reconcile_finishes_a_card_parked_on_a_verdict_the_pass_never_saw(harness):
+    """The card the fix was written for: approved, and the poll no longer carries the verdict."""
+    pr, task_id = pr_with_review_task(harness)
+    event = review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64,
+                           created_at=2000)
+    park_with_verdict(harness, task_id, "approved")
+    harness.prs_data = ([], [])
+    label_calls = len(harness.label_calls)
+
+    report = harness.reconcile()
+
+    row = harness.task(task_id)
+    assert row["status"] == "done"
+    assert "Verdict: approved" in str(row["result"]) and event in str(row["result"])
+    assert [(card.task_id, card.to) for card in report.cards] == [(task_id, "done")]
+    assert report.errors == []
+    # Finished is not merged, and the label stays the next sync's to write.
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] != "merged"
+    assert len(harness.label_calls) == label_calls
+    # The anchor records which verdict the card answered.
+    assert label_detail(harness, pr.id)["verdict_event"] == event
+
+
+def test_a_reconcile_dry_run_names_the_card_and_writes_nothing(harness):
+    """The blast radius, before it lands: the card, the transition, and not one byte written."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000)
+    park_with_verdict(harness, task_id, "approved")
+    harness.prs_data = ([], [])
+    comments = len(harness.comments(task_id))
+    detail = dict(label_detail(harness, pr.id))
+
+    report = harness.reconcile(dry_run=True)
+
+    assert [(card.task_id, card.status, card.to) for card in report.cards] == [
+        (task_id, "blocked", "done")]
+    assert report.cards[0].verdict == "approved" and report.cards[0].verdict_event == "a" * 64
+    assert harness.task(task_id)["status"] == "blocked"
+    assert len(harness.comments(task_id)) == comments
+    assert task_events(harness, task_id, "completed") == []
+    assert label_detail(harness, pr.id) == detail
+    printed = "\n".join(report.lines())
+    assert task_id in printed and pr.id[:8] in printed and "would move" in printed
+
+
+def test_a_second_reconcile_changes_nothing(harness):
+    """Idempotent by construction: the first run leaves a `ready` card, which is no candidate."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64,
+                   created_at=2000)
+    park_with_verdict(harness, task_id, "changes-requested")
+    harness.prs_data = ([], [])
+    harness.reconcile()
+    comments = len(harness.comments(task_id))
+    changes = len(task_events(harness, task_id, "changes_requested"))
+
+    report = harness.reconcile()
+
+    assert report.cards == []
+    assert any("no card is parked on a verdict" in note for note in report.notes)
+    assert harness.task(task_id)["status"] == "ready"
+    assert len(harness.comments(task_id)) == comments
+    assert len(task_events(harness, task_id, "changes_requested")) == changes
+
+
+def test_reconcile_returns_a_changes_requested_card_to_its_implementer(harness):
+    """The other half of the four: back on the implementer's desk with the findings."""
+    pr, task_id = pr_with_review_task(harness)
+    event = review_verdict(
+        harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64, created_at=2000,
+        body="Verdict: changes-requested\n\nThe second claim is not what the code does.")
+    park_with_verdict(harness, task_id, "changes-requested")
+    harness.prs_data = ([], [])
+
+    report = harness.reconcile()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready" and row["assignee"] == "default"
+    assert row["block_kind"] is None
+    # The brief is the fix brief: the next claim fixes the tip, it does not review it again.
+    assert "The second claim is not what the code does." in row["body"]
+    assert "changes-requested" in row["body"]
+    assert [(card.task_id, card.to, card.who) for card in report.cards] == [
+        (task_id, "ready", "default")]
+    changes = task_events(harness, task_id, "changes_requested")
+    assert len(changes) == 1 and changes[0]["payload"]["verdict"] == event
+
+
+def test_reconcile_leaves_a_card_blocked_on_a_question_alone(harness):
+    """A person's question is not a verdict's to settle, however green the verdict is."""
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000)
+    assert harness.board.block(
+        task_id, kind="needs_input", author="holly",
+        comment="Which of the two incompatible claims is intended? A person decides.")
+
+    report = harness.reconcile()
+
+    assert report.cards == []
+    assert harness.task(task_id)["status"] == "blocked"
+    assert task_events(harness, task_id, "completed") == []
+    assert any("no card is parked on a verdict" in note for note in report.notes)
+
+
+def test_reconcile_leaves_a_card_parked_on_a_verdict_it_cannot_read(harness):
+    """Nothing to apply is not a reason to guess: the card stays where the reviewer left it."""
+    _pr, task_id = pr_with_review_task(harness)
+    park_with_verdict(harness, task_id, "approved")
+    harness.prs_data = ([], [])
+
+    report = harness.reconcile()
+
+    assert report.cards == []
+    assert harness.task(task_id)["status"] == "blocked"
+    assert any("no verdict" in note for note in report.notes)
+
+
+def test_a_verdict_a_newer_tip_has_superseded_returns_the_card_to_review(harness):
+    """Finishing on a superseded verdict, or re-requesting a fix already pushed, are both wrong.
+
+    The revision that moved the tip was consumed too, so the card is still parked on a
+    verdict that covers the tip before it. The card goes back to the review queue for the
+    tip the PR carries — the transition a revision writes.
+    """
+    pr, task_id = pr_with_review_task(harness)
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64,
+                   created_at=2000)
+    park_with_verdict(harness, task_id, "changes-requested")
+    record_tip(harness, pr.id, "b" * 40, at=3000)
+    # The review role's own profile, as a deployment with a separate review bot has it: the
+    # card must go back to that desk, not to the implementer's.
+    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
+                                       review_assignee="review")
+    harness.board.db.execute("UPDATE tasks SET assignee = 'review' WHERE id = ?", (task_id,))
+
+    report = harness.reconcile()
+
+    row = harness.task(task_id)
+    assert row["status"] == "ready" and row["assignee"] == "review"
+    assert "Review this PR" in row["body"] and "b" * 40 in row["body"]
+    assert [(card.task_id, card.to, card.who) for card in report.cards] == [
+        (task_id, "ready", "review")]
+    assert "earlier tip" in report.cards[0].why and "b" * 12 in report.cards[0].why
+    assert task_events(harness, task_id, "completed") == []
+    assert len(task_events(harness, task_id, "review_reopened")) == 1
+    assert any("back in the review queue" in c["body"] for c in harness.comments(task_id))
 
 
 def test_a_done_card_on_a_pr_that_never_merged_reopens(harness):

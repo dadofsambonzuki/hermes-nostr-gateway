@@ -618,3 +618,27 @@ opening a second one, and its body becomes the fix brief — otherwise the next 
 the same tip again and publish the same verdict for ever. The fix worker pushes and parks with
 `Revision: <tip>`; the push usually lands first, so the park is the news, and the card goes back
 to the review queue with the review brief for the tip the PR carries.
+
+## A verdict behind the cursor is reconciled on demand
+
+The verdict rule above only reaches verdicts the poll carries. It cannot reach one that is
+already behind the cursor — and those are exactly the cards a fix to this path is written for,
+which made every such fix unhealable in production. Measured after the verdict rule deployed:
+three changes-requested cards and one approved card stayed `blocked` with a `Verdict:` reason and
+got no event at all, because their verdicts had been consumed before the rule existed.
+
+**The heal is a command, not a pass.** `hng ngit reconcile --channel <id>` walks the PR links
+whose card is `blocked` with the `Verdict:` marker, reads each PR root's newest verdict again,
+and applies the same rule the label pass uses: `approved` completes the card, `changes-requested`
+returns it to its implementer, and a verdict a newer tip has superseded puts the card back in the
+review queue for the tip the PR carries — finishing on a superseded verdict, or re-requesting a
+fix already pushed, are both wrong. It is on demand because the condition is not a state the pass
+could detect: "a verdict exists that nothing will read" is only true of cards parked before a
+rule, and a schedule that re-read every parked card for ever would be a poll dressed as a repair.
+
+**Idempotent by construction, and marker-gated.** Every outcome is `done` or `ready`, and neither
+is a candidate on a later run, so the second run moves nothing. The marker test — not the reason's
+wording — decides what is a candidate: a card blocked on a person's question matches no marker,
+so it is not listed by `--dry-run` and not moved by the real run. `--dry-run` prints the blast
+radius first, because a repair an operator cannot preview is a repair an operator cannot trust.
+

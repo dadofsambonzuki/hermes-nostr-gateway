@@ -246,6 +246,12 @@ A **blocked** card is released by an event only when the bridge parked it: `Verd
 `Revision:` as the first word of the reason says the next event is what it waits for, and a
 person's question matches neither.
 
+**Behind the cursor, the repair is a command.** A verdict (or revision) that arrived while the
+bridge was down, or before the rule above existed, is never read again by a pass — the poll only
+carries what is newer than its cursor. `hng ngit reconcile --channel <id>` reads those PR roots
+again for the cards parked on a `Verdict:` reason and applies the same transition; `--dry-run`
+prints the cards and their destinations first, and a second run moves nothing.
+
 `review -> done` for a card with **no** PR link is the ordinary `kanban_complete`; the guard
 binds only cards that review a PR.
 
