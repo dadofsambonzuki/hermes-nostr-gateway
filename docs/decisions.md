@@ -800,7 +800,8 @@ ones a human had not read yet. The authorised-author rule also conflated two dif
 the contributor asking for something, and the maintainer deciding it is wanted.
 
 So the authorisation moved to a label: an issue becomes a card when a trusted npub has published
-`ready` (NIP-32 kind 1985, targeting the issue) — `ngit.ready_label`, `""` to restore the author
+`ready` (NIP-32 kind 1985, targeting the issue; any namespace, because the namespace is a display
+convention and the question is who said it) — `ngit.ready_label`, `""` to restore the author
 rule. Three consequences are deliberate:
 
 - **The decision is public and durable.** It is written on the issue, where the contributor and

@@ -1397,6 +1397,48 @@ class RelayLabels:
     #: The pass calls the reader; `read` is the name a caller that has the object uses.
     __call__ = read
 
+    def issue_labels(self, ids: Sequence[str]) -> dict[str, tuple[Label, ...]]:
+        """Every label each issue carries, whichever NIP-32 namespace wrote it.
+
+        `read` folds labels through `live_label`, which keeps only the `#t` namespace the
+        review column displays. The issue gate asks a different question — does this issue
+        carry a label called `ready`, and who published it — and the editor a maintainer
+        uses is not necessarily the review writer, so no namespace is assumed. The target
+        scopes it: an `e` tag naming *this* issue, plus this repository's `a` when the event
+        carries one at all.
+        """
+        wanted = [str(root) for root in ids if str(root or "").strip()]
+        if not wanted:
+            return {}
+        if not self.relays:
+            raise NgitError("no relays configured: labels cannot be read")
+        events = self._fetch(relays=self.relays, kinds=[KIND_LABEL], tag="e",
+                             values=wanted, limit=READ_AHEAD,
+                             a_tag=self.address or None, secret=self.secret)
+        found: dict[str, list[Label]] = {root: [] for root in wanted}
+        seen: set[tuple[str, str]] = set()
+        for _relay, event in events or ():
+            root = _tag_value(event, "e")
+            if root not in found:
+                continue
+            addresses = _tags(event, "a")
+            if self.address and addresses and self.address not in addresses:
+                continue
+            event_id = str(event.get("id") or "")
+            for tag in event.get("tags") or ():
+                if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "l":
+                    continue
+                value = str(tag[1] or "").strip()
+                if not value or (root, f"{event_id}:{value}") in seen:
+                    continue
+                seen.add((root, f"{event_id}:{value}"))
+                found[root].append(Label(
+                    value=value, event_id=event_id,
+                    created_at=int(event.get("created_at") or 0),
+                    relay=str(event.get("relay") or ""),
+                    author=npub_of(str(event.get("pubkey") or ""))))
+        return {root: tuple(labels) for root, labels in found.items()}
+
     def comments(self, ids: Sequence[str]) -> tuple[dict[str, list[dict[str, Any]]],
                                                     tuple[str, ...]]:
         """Raw kind-1111 comments per root, and the relays that answered any of them.
@@ -2249,14 +2291,19 @@ class Sync:
                 "ready label: no relays to read labels from (ngit.relays or relays.read)")
             return False
         try:
-            read = self.state([issue.hex])
+            reader = getattr(self.state, "issue_labels", None)
+            if callable(reader):
+                labels = reader([issue.hex]).get(issue.hex, ())
+            else:  # a reader that only answers verdicts: use the `#t` labels it does carry
+                read = self.state([issue.hex])
+                for error in read.errors:
+                    report.errors.append(f"issue {issue.id[:12]}: {error}")
+                labels = read.prs.get(issue.hex, PrRead()).labels
         except Exception as exc:  # noqa: BLE001 - a read failure is a report line
             report.errors.append(f"issue {issue.id[:12]}: labels unreadable ({exc})"[:200])
             return False
-        for error in read.errors:
-            report.errors.append(f"issue {issue.id[:12]}: {error}")
         wanted = self.config.ready_label
-        for carried in read.prs.get(issue.hex, PrRead()).labels:
+        for carried in labels:
             if carried.value != wanted:
                 continue
             if self.control.is_trusted(carried.author, TRUSTED_PLANE):

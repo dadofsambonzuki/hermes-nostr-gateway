@@ -181,6 +181,9 @@ class _Reader:
     def read(self, ids):
         return self.harness._read(ids)
 
+    def issue_labels(self, ids):
+        return self.harness._issue_labels(ids)
+
     def comments(self, ids):
         return self.harness._comments(ids)
 
@@ -222,6 +225,7 @@ class Harness:
         #: Raw comments per root: what a mention pass reads.
         self.comments_by_root: dict[str, list[dict]] = {}
         self.comment_reads: list[tuple[str, ...]] = []
+        self.issue_label_reads: list[tuple[str, ...]] = []
         self.state = state or _Reader(self)
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
@@ -255,8 +259,18 @@ class Harness:
             raise self.sweep_data
         return self.sweep_data
 
-    def _issue_hexes(self) -> set[str]:
-        return {issue.hex for issue in self.issues} | set(self.details)
+    def _issue_labels(self, ids):
+        """What a label read returns for issues: the default trusted `ready`, or a test's set."""
+        out = {}
+        for issue_id in ids:
+            labels = self.ready_labels.get(issue_id)
+            if labels is None and issue_id not in self.unready:
+                labels = (ngit_labels.Label(
+                    value=self.config.ready_label or "ready", event_id="c" * 64,
+                    author=TRUSTED_HEX),)
+            out[issue_id] = labels or ()
+        self.issue_label_reads.append(tuple(ids))
+        return out
 
     def _read(self, pr_ids):
         """The relay read: whatever the test put in `verdicts`, `carried` and `readings`.
@@ -267,16 +281,13 @@ class Harness:
         the wrong reason.
         """
         self.read_calls.append(tuple(pr_ids))
-        issues = self._issue_hexes()
+        issue_ids = {issue.hex for issue in self.issues} | set(self.details)
+        issues = self._issue_labels([pr for pr in pr_ids if pr in issue_ids])
         prs = {}
         for pr in pr_ids:
             labels = self.carried.get(pr)
             if labels is None and pr in issues:
-                labels = self.ready_labels.get(pr)
-                if labels is None and pr not in self.unready:
-                    labels = (ngit_labels.Label(
-                        value=self.config.ready_label or "ready", event_id="c" * 64,
-                        author=TRUSTED_HEX),)
+                labels = issues[pr]
             prs[pr] = ngit.PrRead(verdict=self.verdicts.get(pr),
                                   labels=labels or (),
                                   readings=self.readings.get(pr, ()))
@@ -4055,3 +4066,38 @@ def test_a_mention_on_a_pull_request_uses_the_pr_command(harness):
     reply = [task for task in harness.tasks() if task["idempotency_key"].startswith(
         "ngit:mention:")][0]
     assert "on PR" in reply["title"] and "ngit pr comment" in reply["body"]
+
+
+def test_issue_labels_accepts_any_namespace_and_keeps_the_author():
+    """The issue gate asks "who said ready", not which display namespace wrote it."""
+    issue_id = "f" * 64
+
+    def fetch(**kwargs):
+        return [("wss://a.example", {
+            "id": "a" * 64, "kind": ngit_labels.KIND_LABEL, "pubkey": TRUSTED_HEX,
+            "created_at": 10,
+            "tags": [["L", "ngit.tools"], ["l", "ready", "ngit.tools"],
+                     ["a", ADDRESS], ["e", issue_id]],
+            "content": "ok",
+        })]
+
+    labels = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch).issue_labels(
+        [issue_id])
+    assert [(label.value, label.author) for label in labels[issue_id]] == [
+        ("ready", npub(TRUSTED_HEX))]
+
+
+def test_issue_labels_ignores_a_label_for_another_repository():
+    issue_id = "e" * 64
+
+    def fetch(**kwargs):
+        return [("wss://a.example", {
+            "id": "b" * 64, "kind": ngit_labels.KIND_LABEL, "pubkey": TRUSTED_HEX,
+            "created_at": 10,
+            "tags": [["l", "ready"], ["a", "30617:" + "99" * 32 + ":other"],
+                     ["e", issue_id]],
+        })]
+
+    labels = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch).issue_labels(
+        [issue_id])
+    assert labels[issue_id] == ()

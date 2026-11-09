@@ -225,14 +225,16 @@ Two operational notes:
   release ever wrote 1622.
 - **An issue is queued only when a trusted npub labels it `ready`, not when its author is
   trusted.** A label is kind 1985, targets the issue (`e`) and is published by someone in the
-  control pane's trusted set for the concord plane. Until one exists the issue is recorded as
-  `waiting` — no task, no worker — and the channel gets one line naming the issue and the
-  missing label; the link's own state is what stops that line repeating on every poll. When
-  the label appears, the card is created `ready` and the usual notice follows. The issue's
-  own author is not consulted at that point: a trusted person reading the issue and saying
-  "work on this" *is* the authorisation, and it is published where the contributor can see it
-  rather than in a channel they cannot. `ready_label: ""` restores the old rule (a trusted
-  author's issue is created on sight; anyone else's is held and asked about).
+  control pane's trusted set for the concord plane. Any NIP-32 namespace counts — the gate reads
+  the `l` tags directly rather than the `#t` rule the PR review column uses, so whichever editor
+  a maintainer labels with (`ngit issue label`, a client) is honoured. Until one exists the
+  issue is recorded as `waiting` — no task, no worker — and the channel gets one line naming the
+  issue and the missing label; the link's own state is what stops that line repeating on every
+  poll. When the label appears, the card is created `ready` and the usual notice follows. The
+  issue's own author is not consulted at that point: a trusted person reading the issue and
+  saying "work on this" *is* the authorisation, and it is published where the contributor can
+  see it rather than in a channel they cannot. `ready_label: ""` restores the old rule (a
+  trusted author's issue is created on sight; anyone else's is held and asked about).
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming
