@@ -26,8 +26,10 @@ from hermes_nostr_gateway.health import (
     OK,
     WARN,
     Verdict,
+    counts_text,
     health_report,
     plane_health,
+    relay_counts,
     render_health,
 )
 from hermes_nostr_gateway.server import SocketServer
@@ -165,6 +167,65 @@ def test_a_warning_relay_is_counted_without_degrading_the_gateway():
     assert report["verdict"] == "ok"
     assert report["relays"]["warn"] == 1 and report["relays"]["bad"] == 0
     assert report["relays"]["warnings"] == [f"{OTHER}: quiet"]
+
+
+def test_a_refused_relay_is_counted_apart_and_does_not_degrade_the_gateway():
+    """A relay's policy is not the gateway's fault: `refused` is its own state.
+
+    Before this, one relay that would not serve our filter made `health` read degraded
+    on every call — the same output as a broken read path, so nobody could tell them
+    apart. The read set is what is wrong, and `refused` says so once.
+    """
+    refused = verdict(OTHER, WARN, "refused",
+                      detail="auth-required after NIP-42 (7x), last 34m ago")
+    report = health_report(
+        planes=["nip17"],
+        plane_rows=[row("nip17", events=2, last_event_at=NOW - 60)],
+        verdicts=[verdict(), refused],
+        now=NOW,
+    )
+
+    assert report["verdict"] == "ok" and report["degraded"] is False
+    assert report["relays"]["refused"] == 1
+    assert report["relays"]["bad"] == 0
+    assert report["relays"]["unhealthy"] == []
+    assert report["relays"]["counts"]["states"] == {"connected": 1, "refused": 1}
+    assert "1 refused" in report["summary"], "the refusal is still visible in the summary"
+    assert report["relays"]["refused_relays"][0]["relay"] == OTHER
+
+
+def test_a_refusal_is_reported_once_with_its_reason():
+    refused = verdict(OTHER, WARN, "refused",
+                      detail="auth-required after NIP-42 (7x), last 34m ago")
+    report = health_report(planes=["nip17"], verdicts=[verdict(), refused], now=NOW)
+
+    lines = render_health(report)
+
+    assert any("1 refused" in line for line in lines), "the count must be visible"
+    named = [line for line in lines if "! refused" in line]
+    assert len(named) == 1, f"a refusal must be said once, not per plane: {lines}"
+    assert OTHER in named[0] and "auth-required after NIP-42" in named[0]
+
+
+def test_counts_text_names_each_state_in_reading_order():
+    counts = relay_counts([verdict(),
+                           verdict(OTHER, WARN, "quiet"),
+                           verdict("wss://r3.example", WARN, "refused"),
+                           verdict("wss://r4.example", BAD, "down")])
+    assert counts_text(counts) == (
+        "4 read relay(s): 1 connected, 1 quiet, 1 refused, 1 down")
+
+
+def test_every_relay_refused_still_reads_as_no_transport():
+    """Refused is not a fault per relay, but an all-refused read set delivers nothing."""
+    report = health_report(
+        planes=["nip17"],
+        plane_rows=[row("nip17", events=3, last_event_at=NOW - 60)],
+        verdicts=[verdict(RELAY, WARN, "refused"), verdict(OTHER, WARN, "refused")],
+        now=NOW,
+    )
+    assert report["verdict"] == "degraded"
+    assert "no read relay is delivering" in report["planes"]["nip17"]["reasons"]
 
 
 def test_render_health_shows_each_plane_and_the_reasons():

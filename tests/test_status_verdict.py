@@ -105,22 +105,29 @@ def test_a_fresh_auth_notice_is_authenticating_and_expires():
     assert stale.state == "connected", "an old auth notice must not pin a healthy relay"
 
 
-def test_a_relay_that_refuses_every_kind_is_refusing():
+def test_a_relay_that_refuses_every_kind_is_refused_not_down():
+    """`refused` is its own state: the relay answered, it just will not serve us.
+
+    It used to be BAD, which made one relay's policy read as a gateway fault and turned
+    `health` degraded on every call. The read set is the thing that is wrong, and the
+    card fixes it by moving the relay to `relays.keep`.
+    """
     verdict = verdict_for(worker(kinds=[], refused_kinds=[1059, 4], alive=False,
                                  last_error=CONNECT_FAILED))
 
-    assert verdict.state == "refusing"
-    assert verdict.severity == BAD
+    assert verdict.state == "refused"
+    assert verdict.severity == WARN
     assert "nothing left to read" in verdict.detail
     assert "4, 1059" in verdict.detail
+    assert "refused" in render([verdict])[0]
 
 
-def test_a_relay_that_authenticates_and_still_refuses_is_named_not_authenticating():
+def test_a_relay_that_authenticates_and_still_refuses_is_refused_with_its_reason():
     """The reported stuck state: `authenticating` for ever, because every retry auths.
 
     A relay that answers AUTH and closes the filter anyway has decided something about
     this key. Reporting it as a handshake in progress hides the blind spot behind a WARN
-    that never expires; it is a refusal and it is BAD.
+    that never expires; it is a refusal, named once with the reason.
     """
     verdict = verdict_for(worker(
         events=0, last_event_at=None, connected_at=NOW - 600, alive=False,
@@ -128,9 +135,9 @@ def test_a_relay_that_authenticates_and_still_refuses_is_named_not_authenticatin
         auth_refusals=4, auth_refused_at=NOW - 5,
         last_error="auth-required after authenticating (4x): requested filter ..."))
 
-    assert verdict.state == "refusing", "a permanent auth refusal read as a handshake"
-    assert verdict.severity == BAD
-    assert "answered NIP-42" in verdict.detail
+    assert verdict.state == "refused", "a permanent auth refusal read as a handshake"
+    assert verdict.severity == WARN, "a relay's policy must not degrade the gateway"
+    assert "auth-required after NIP-42" in verdict.detail
     assert "4x" in verdict.detail
     line = render([verdict])[0]
     assert "authenticating" not in line
@@ -141,7 +148,7 @@ def test_a_relay_that_delivered_then_refuses_auth_is_not_called_a_refusal():
     verdict = verdict_for(worker(events=9, auth_refusals=3, auth_refused_at=NOW - 5,
                                  auth_at=NOW - 5))
 
-    assert verdict.state != "refusing"
+    assert verdict.state != "refused"
 
 
 def test_a_partial_refusal_stays_connected_and_says_what_is_still_read():
@@ -273,11 +280,15 @@ class StubDaemon(threading.Thread):
         self.join(timeout=5)
 
 
-def make_config(tmp_path, relays: list[str], socket_path) -> str:
+def make_config(tmp_path, relays: list[str], socket_path, *,
+                keep: list | None = None) -> str:
     (tmp_path / "secret.json").write_text(json.dumps({"secret_key_hex": "11" * 32}))
+    relay_cfg: dict = {"read": relays, "publish": relays[:1]}
+    if keep is not None:
+        relay_cfg["keep"] = keep
     cfg = {
         "identity": {"secret_file": str(tmp_path / "secret.json")},
-        "relays": {"read": relays, "publish": relays[:1]},
+        "relays": relay_cfg,
         "store": str(tmp_path / "status.db"),
         "socket": str(socket_path),
         "groups": {}, "policies": [], "defaults": {},
@@ -341,19 +352,82 @@ def test_check_exits_non_zero_when_the_daemon_is_unreachable(tmp_path, capsys):
     capsys.readouterr()
 
 
-def test_check_exits_non_zero_for_a_refusing_relay_but_plain_status_does_not(tmp_path, capsys):
+def test_check_exits_zero_for_a_refused_relay_and_non_zero_for_a_down_one(tmp_path, capsys):
+    """A refusal is the read set's problem, not the gateway's: plain status and `--check`
+    both stay successful. A dead worker is still the fault `--check` exists to catch."""
     path = make_config(tmp_path, [RELAY], tmp_path / "gw.sock")
-    reply = {"type": "status", "identity": "me", "relay_stats": [],
-             "relays_read": [RELAY],
-             "workers": [worker(kinds=[], refused_kinds=[1059, 4], alive=False)]}
+    refused_reply = {"type": "status", "identity": "me", "relay_stats": [],
+                     "relays_read": [RELAY],
+                     "workers": [worker(kinds=[], refused_kinds=[1059, 4], alive=False)]}
+
+    with StubDaemon(tmp_path / "gw.sock", refused_reply):
+        assert cli.main(["--config", path, "status"]) == 0
+    assert "refused" in capsys.readouterr().out
+
+    with StubDaemon(tmp_path / "gw.sock", refused_reply):
+        assert cli.main(["--config", path, "status", "--check"]) == 0
+    capsys.readouterr()
+
+    down_reply = {"type": "status", "identity": "me", "relay_stats": [],
+                  "relays_read": [RELAY],
+                  "workers": [worker(alive=False)]}
+    with StubDaemon(tmp_path / "gw.sock", down_reply):
+        assert cli.main(["--config", path, "status", "--check"]) == 1
+    capsys.readouterr()
+
+
+def test_status_lists_kept_relays_apart_and_never_calls_them_history(tmp_path, capsys):
+    """A relay kept for another purpose is config, not a store row nobody removed.
+
+    It must not appear among the read verdicts (no worker, no colour) and must not be
+    counted as "not in config (history only)" either — the operator put it there.
+    """
+    kept = [{"url": OTHER, "why": "refuses our filters; kept for web-of-trust checks"}]
+    path = make_config(tmp_path, [RELAY], tmp_path / "gw.sock", keep=kept)
+    seed_store(tmp_path, (OTHER, {"events": 4}))
+    reply = {"type": "status", "identity": "me",
+             "relay_stats": [{"relay": OTHER, "events": 4, "last_event": NOW - 3600}],
+             "relays_read": [RELAY], "workers": [worker()]}
+
+    with StubDaemon(tmp_path / "gw.sock", reply):
+        assert cli.main(["--config", path, "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [row["relay"] for row in payload["relays"]] == [RELAY]
+    assert payload["kept"] == [
+        {"relay": OTHER, "why": "refuses our filters; kept for web-of-trust checks",
+         "purpose": "keep"}]
+    assert payload["not_in_config"] == [], "a kept relay is not a stale store row"
+    assert payload["relays_counts"]["total"] == 1
 
     with StubDaemon(tmp_path / "gw.sock", reply):
         assert cli.main(["--config", path, "status"]) == 0
-    assert "refusing" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "read set: 1 read relay(s): 1 connected" in out
+    head, _, tail = out.partition("kept (not read, for another purpose):")
+    assert OTHER in tail, "a kept relay must be listed with its reason"
+    assert "refuses our filters" in tail
+    assert OTHER not in head, "a kept relay must not be in the verdict table"
+    assert "not in config" not in out
+
+
+def test_status_shows_the_whitenoise_list_as_kept_for_the_marmot_plane(tmp_path, capsys):
+    """`relays.whitenoise` was reading as a stale store row; it is a deliberate keep."""
+    path = make_config(tmp_path, [RELAY], tmp_path / "gw.sock")
+    config_path = tmp_path / "config.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    cfg["whitenoise"] = [REMOVED]
+    config_path.write_text(yaml.safe_dump(cfg))
+    reply = {"type": "status", "identity": "me", "relay_stats": [],
+             "relays_read": [RELAY], "workers": [worker()]}
 
     with StubDaemon(tmp_path / "gw.sock", reply):
-        assert cli.main(["--config", path, "status", "--check"]) == 1
-    capsys.readouterr()
+        assert cli.main(["--config", path, "status"]) == 0
+
+    out = capsys.readouterr().out
+    tail = out.partition("kept (not read, for another purpose):")[2]
+    assert REMOVED in tail and "Marmot plane only" in tail
+    assert "not in config" not in out
 
 
 def test_status_json_carries_the_verdicts_and_the_stale_rows(tmp_path, capsys):

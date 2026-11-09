@@ -20,7 +20,12 @@ import nostr_sdk as sdk
 import pytest
 
 from hermes_nostr_gateway import gateway as gateway_mod
-from hermes_nostr_gateway.gateway import Gateway, relay_read_plan, restricted_relay
+from hermes_nostr_gateway.gateway import (
+    Gateway,
+    kept_relays,
+    relay_read_plan,
+    restricted_relay,
+)
 from hermes_nostr_gateway.relay import refused_kinds
 from hermes_nostr_gateway.store import Store
 
@@ -45,6 +50,61 @@ def test_read_entry_without_a_url_is_an_error_not_a_silent_skip():
         relay_read_plan({"relays": {"read": [{"kinds": [1059]}]}})
     with pytest.raises(ValueError):
         relay_read_plan({"relays": {"read": [{"url": "wss://relay.example", "kinds": []}]}})
+
+
+def test_kept_relays_are_parsed_with_their_reason_and_never_read():
+    """`relays.keep` is the other half of the read-set decision: retained, not asked."""
+    cfg = {"relays": {
+        "read": ["wss://relay.example.com/chat"],
+        "keep": [
+            {"url": "wss://relay.example.com/archive", "why": "history only"},
+            "wss://relay.example.com/old",
+        ],
+    }}
+
+    urls, _ = relay_read_plan(cfg)
+
+    assert urls == ["wss://relay.example.com/chat"]
+    assert [(entry.url, entry.why, entry.purpose) for entry in kept_relays(cfg)] == [
+        ("wss://relay.example.com/archive", "history only", "keep"),
+        ("wss://relay.example.com/old", "", "keep"),
+    ]
+
+
+def test_a_relay_cannot_be_both_read_and_kept():
+    """One decision, one place: a relay is asked our filters or kept for another purpose."""
+    cfg = {"relays": {"read": ["wss://relay.example.com/chat"],
+                      "keep": ["wss://relay.example.com/chat/"]}}
+
+    with pytest.raises(ValueError, match="both read and kept"):
+        relay_read_plan(cfg)
+
+
+def test_white_noise_relays_are_kept_with_the_marmot_plane_as_their_purpose():
+    cfg = {"relays": {"read": ["wss://relay.example.com/chat"]},
+           "whitenoise": ["wss://relay.eu.whitenoise.chat"]}
+
+    kept = kept_relays(cfg)
+
+    assert [(entry.url, entry.purpose, entry.why) for entry in kept] == [
+        ("wss://relay.eu.whitenoise.chat", "whitenoise",
+         "Marmot plane only (relays.whitenoise)")]
+    with pytest.raises(ValueError, match="both read and kept"):
+        relay_read_plan({"relays": {"read": ["wss://relay.eu.whitenoise.chat"]},
+                         "whitenoise": ["wss://relay.eu.whitenoise.chat"]})
+
+
+def test_a_kept_entry_without_a_url_is_an_error_not_a_silent_skip():
+    with pytest.raises(ValueError):
+        kept_relays({"relays": {"keep": [{"why": "no relay named"}]}})
+
+
+def test_a_peers_inbox_cannot_drag_a_kept_relay_back_into_the_read_set():
+    """A peer's 10050 says where their inbox is; it does not overrule this host's config."""
+    cfg = {"relays": {"keep": [{"url": "wss://relay.example.com/old",
+                                "why": "refuses our filters"}]}}
+
+    assert gateway_mod._peer_exclusions(cfg) == ("wss://relay.example.com/old",)
 
 
 @pytest.mark.parametrize("relay,expected", [

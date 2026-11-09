@@ -78,6 +78,14 @@ expected.
 - A relay being down or empty is invisible: `relay.damus.io` answered 503 for a whole day
   (0 events) and the operator's own relay held **zero** wrappers. Log **per-relay event counts**
   and surface a relay that has delivered nothing while others have.
+- **A read set is what can serve the filter.** `relays.read` is the set the daemon asks its
+  filters of, and a relay that will not serve them belongs in `relays.keep` (or, for the Marmot
+  plane's group relays, `relays.whitenoise`) with a `why` — retained for web-of-trust checks or
+  as history, no worker, no verdict. A refusal is a state of its own: reported once with the
+  reason, counted apart from `down`, and it does not degrade `health` — the read set is wrong,
+  not the gateway. A relay named in both blocks is a config error. A peer's kind-10050 list is
+  not authoritative over the kept set: it cannot re-add a relay this host has decided not to
+  read.
 - The 3-day `since` is not slack, it is a correctness requirement: NIP-59 randomises gift-wrap
   `created_at` up to two days into the past. Watermark on the **inner rumor** time, not the
   wrapper's.

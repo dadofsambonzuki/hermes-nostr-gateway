@@ -242,7 +242,9 @@ $EDITOR config.yaml                     # identity.secret_file, relays, policies
 
 `hng doctor` is the one preflight, and it replaces six commands run in a remembered order: the
 config parses, the identity key reads, the store is writable, the configured socket path expands
-and the daemon answers, `ngit` is on `PATH` at or above its floor, the checkout the daemon runs
+and the daemon answers, the read set is legible in one line (`N read relay(s): … ok, … refused`,
+refusals counted apart from dead relays and a refused relay named as a config decision rather than
+a fault), `ngit` is on `PATH` at or above its floor, the checkout the daemon runs
 from has `master`'s code (HEAD is a commit that exists on `origin/master`, so a clone left on a
 proposal branch fails), the live Hermes plugin copy is this build's `adapter.py` by SHA-256 (with a
 warning naming the restart when the gateway process started before that copy was written), every
@@ -333,13 +335,18 @@ Two runtimes, and each has its own health.
 (`deploy/hermes-nostr-gateway.service`), which reads the identity key from a credential rather
 than a file the service user can open. `hng status` is about relays: for each relay in
 `relays.read` it asks the running daemon what that worker is doing and prints one verdict —
-`connected`, `authenticating`, `refusing`, `down`, `no worker`, `no events for 47m`, or `unknown`
-when the daemon is not running. `hng health` is about traffic: per plane it reports the last event
-and its age, the undelivered backlog, the policy blocks, and whether the plane is degraded and
-why. It degrades on a fault — a stale backlog, an outbound retry whose TTL expired, every read
-relay down — not on a quiet night and not on `blocked`, because a blocked message is the policy
-working. `--json` gives either as a frame for a script, `--check` exits non-zero on an unhealthy
-relay, an unreachable daemon or a degraded plane, and `--quiet-minutes` sets the silence window.
+`connected`, `authenticating`, `refused`, `down`, `no worker`, `no events for 47m`, or `unknown`
+when the daemon is not running. Relays in `relays.keep` and `relays.whitenoise` are listed apart
+as **kept, not read**, with the reason they are kept: they get no worker, so they have no verdict
+to colour, and a peer's kind-10050 list cannot drag one back into the read set. A relay that will
+not serve the filters we ask is `refused (<reason>)` — a fact about the read set, counted apart
+from `down` and not a degraded verdict. `hng health` is about traffic: per plane it reports the
+last event and its age, the undelivered backlog, the policy blocks, and whether the plane is
+degraded and why. It degrades on a fault — a stale backlog, an outbound retry whose TTL expired,
+every read relay dead or refused, which means nothing is delivering — not on a quiet night, not on
+`blocked` (a blocked message is the policy working), and not on a relay that will not serve us.
+`--json` gives either as a frame for a script, `--check` exits non-zero on a down relay, an
+unreachable daemon or a degraded plane, and `--quiet-minutes` sets the silence window.
 
 **The bridge** is a systemd timer pass per channel (`deploy/hermes-nostr-gateway-ngit@.timer`),
 staggered so two passes do not reach for the same board at the same moment. The two units ship as

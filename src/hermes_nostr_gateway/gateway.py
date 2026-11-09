@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
@@ -123,6 +124,69 @@ def store_write_options(raw: Any) -> dict[str, Any]:
     return options
 
 
+@dataclass(frozen=True)
+class KeptRelay:
+    """A relay deliberately outside the read set, and why this host keeps it."""
+
+    url: str
+    why: str = ""
+    #: Which block named it: `keep` (the operator's note) or `whitenoise` (the
+    #: Marmot plane, whose relays are never a general DM/feed read set).
+    purpose: str = "keep"
+
+    def as_dict(self) -> dict[str, str]:
+        return {"relay": self.url, "why": self.why, "purpose": self.purpose}
+
+
+def kept_relays(cfg: dict[str, Any]) -> list[KeptRelay]:
+    """Relays this host keeps but does not read, with the reason it keeps them.
+
+    `relays.keep` is for a relay retained for web-of-trust checks or as history: it
+    never becomes a worker, never appears in a relay verdict and never colours
+    `health`. A relay that cannot serve the filters we ask belongs there, not in
+    `relays.read` — a refusal is a fact about the relay, not a fault in the gateway.
+
+    `relays.whitenoise` is the same shape with a known purpose: those relays carry the
+    Marmot plane's groups and are never part of the DM or feed read set (see
+    `docs/decisions.md`, "White Noise relays are Marmot-only").
+
+    An entry is a URL, or `{url, why}` where `why` is the sentence `hng status` prints.
+    """
+    relays = cfg.get("relays") or {}
+    if not isinstance(relays, dict):
+        raise ValueError("relays must be a mapping")
+    found: list[KeptRelay] = []
+    for purpose, block in (("keep", relays.get("keep")),
+                           ("whitenoise", [*(cfg.get("whitenoise") or []),
+                                           *(relays.get("whitenoise") or [])])):
+        for entry in block or []:
+            if isinstance(entry, str):
+                url, why = entry.strip(), ""
+            elif isinstance(entry, dict):
+                url = str(entry.get("url") or entry.get("relay") or "").strip()
+                why = str(entry.get("why") or "").strip()
+            else:
+                raise ValueError(f"relays.{purpose} entry must be a URL or a mapping: {entry!r}")
+            if not url:
+                raise ValueError(f"relays.{purpose} entry has no url: {entry!r}")
+            if purpose == "whitenoise" and not why:
+                # The purpose is not the operator's note to make: the decision is already
+                # written down, and `hng status` should say it without a config comment.
+                why = "Marmot plane only (relays.whitenoise)"
+            found.append(KeptRelay(url=url, why=why, purpose=purpose))
+    # Dedupe on the comparison form, keeping the first spelling: a relay repeated in
+    # both blocks is one kept relay, and `keep`'s note is the more specific one.
+    seen: set[str] = set()
+    unique: list[KeptRelay] = []
+    for entry in found:
+        key = normalise_relay(entry.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    return unique
+
+
 def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int, ...]]]:
     """The read set, plus any per-relay kind set the config pins.
 
@@ -131,6 +195,10 @@ def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int
     closes the whole subscription when it appears in the same REQ, so its 1059 DMs
     would otherwise go down with it (spec §3: those relays carry DMs that exist
     nowhere else).
+
+    A relay named both here and in `relays.keep` is a config error, not a preference:
+    the read set is what the daemon asks its filters of, and "kept, not read" is the
+    other side of that decision.
     """
     urls: list[str] = []
     declared: dict[str, tuple[int, ...]] = {}
@@ -149,6 +217,14 @@ def relay_read_plan(cfg: dict[str, Any]) -> tuple[list[str], dict[str, tuple[int
             if not kinds:
                 raise ValueError(f"relays.read entry has an empty kind set: {entry!r}")
             declared[url] = kinds
+    kept = {normalise_relay(entry.url) for entry in kept_relays(cfg)}
+    clash = [url for url in urls if normalise_relay(url) in kept]
+    if clash:
+        raise ValueError(
+            "a relay cannot be both read and kept: "
+            + ", ".join(clash)
+            + " (relays.read asks its filters; relays.keep and relays.whitenoise say "
+              "it is not read)")
     return urls, declared
 
 
@@ -158,10 +234,11 @@ def _peer_exclusions(cfg: dict[str, Any]) -> tuple[str, ...]:
     White Noise relays carry the Marmot plane's groups, refuse public kinds and are not
     a general NIP-17 inbox (docs/gateway-spec.md §3 "Relay policy"; docs/decisions.md,
     "White Noise relays are Marmot-only"). A peer listing one is saying where their own
-    inbox is, not asking us to subscribe to a group relay.
+    inbox is, not asking us to subscribe to a group relay. `relays.keep` is the same
+    answer for a relay this host has already decided not to read: a peer's 10050 must
+    not silently undo an operator's config.
     """
-    relays = cfg.get("relays") or {}
-    values = [*(cfg.get("whitenoise") or []), *(relays.get("whitenoise") or [])]
+    values = [entry.url for entry in kept_relays(cfg)]
     return tuple(str(value) for value in values if str(value).strip())
 
 

@@ -1,11 +1,12 @@
 """`hng doctor`: one preflight over everything the other verbs assume.
 
 The knowledge used to live in six commands run in a remembered order: is the config there,
-does the key read, can the store be written, does the daemon answer, is `ngit` new enough,
-is the checkout the daemon serves on `master`, is the live Hermes plugin copy the `adapter.py`
-this build ships, does every mapped checkout carry a NIP-34 address, are the project and board
-really there, is a pass scheduled for each channel, and what is the watcher doing? Each check
-here is one of those questions, reports the answer, and names what to change when it fails.
+does the key read, can the store be written, does the daemon answer, is the read set legible
+(how many relays, how many ok, how many refused), is `ngit` new enough, is the checkout the
+daemon serves on `master`, is the live Hermes plugin copy the `adapter.py` this build ships,
+does every mapped checkout carry a NIP-34 address, are the project and board really there, is a
+pass scheduled for each channel, and what is the watcher doing? Each check here is one of those
+questions, reports the answer, and names what to change when it fails.
 
 `run` never raises for a bad host: a broken config, a missing key or a missing `ngit` is a
 failing check with a fix, which is what `--json` carries and what makes the exit code
@@ -238,6 +239,45 @@ def _socket_check(path: Path, reply: dict | None, problem: str) -> Check:
                      "run it under the same user that owns the store")
     workers = len(reply.get("workers") or [])
     return Check("socket", True, f"daemon answers at {path} ({workers} worker(s))")
+
+
+def _relays_check(cfg: dict[str, Any], reply: dict | None, problem: str) -> Check:
+    """The read set in one line: how many, how many ok, and how many refused.
+
+    A relay that will not serve our filters is `refused`: counted apart from `down`,
+    because it is a fact about the read set rather than a transport fault, and it does
+    not fail this check. A relay with no worker or a dead child does, because then the
+    gateway is not reading something it says it reads.
+    """
+    from .gateway import kept_relays, relay_read_plan
+    from .health import BAD, counts_text, relay_counts, relay_verdicts
+
+    try:
+        read, _ = relay_read_plan(cfg)
+        kept = kept_relays(cfg)
+    except ValueError as exc:
+        return Check("relays", False, str(exc),
+                     "fix `relays.read` / `relays.keep` (see config.example.yaml)")
+
+    if reply is None:
+        return Check("relays", True,
+                     f"not checked: the daemon did not answer ({problem}); "
+                     "the socket check carries this")
+    verdicts = relay_verdicts(reply, relays=read)
+    counts = relay_counts(verdicts)
+    detail = counts_text(counts)
+    if kept:
+        detail += f"; {len(kept)} kept for another purpose"
+    if counts["refused"]:
+        detail += ("; a refused relay is not a read relay: move it to `relays.keep` "
+                   "with a why")
+    bad = [row for row in verdicts if row.severity == BAD]
+    if bad:
+        return Check("relays", False,
+                     detail + f"; not reading: {', '.join(row.relay for row in bad)}",
+                     "check reachability and restart the daemon; remove a relay that is "
+                     "gone, or move a relay that refuses us to `relays.keep` with a why")
+    return Check("relays", True, detail)
 
 
 def _ngit_check(status: NgitStatus) -> Check:
@@ -619,6 +659,7 @@ def run(cfg: dict[str, Any], *, config_path: str | Path, socket: str | Path | No
         _identity_check(cfg),
         _store_check(cfg),
         _socket_check(path, reply, problem),
+        _relays_check(cfg, reply, problem),
         _ngit_check(status),
         _checkout_check(),
         _adapter_check(cfg),

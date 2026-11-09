@@ -12,12 +12,15 @@ per-worker timestamps were added) when an event last arrived. The verdicts below
 pure functions over that frame plus the configured read set, so they are testable
 without a relay, a clock or a daemon.
 
-Two rules keep them honest:
+Three rules keep them honest:
 
 * A missing fact is "unknown", never "healthy". A daemon that cannot say leaves the
   verdict saying so.
 * The store's per-relay row is history. It is shown only as history, never as the
   reason a relay is or is not working.
+* A refusal is a state, not a fault. `refused` is counted apart from `down`, because a
+  relay that will not serve our filters says the read set is wrong, not that the
+  gateway is, and one such policy must not make every health call read degraded.
 
 Why "worker alive" is evidence of a connection: `nak req --stream` exits within a
 second when it cannot reach the relay (`failed to connect to any of the given
@@ -165,12 +168,14 @@ def _verdict(relay: str, workers: list[dict[str, Any]], *, now: float,
     age_s = int(now - last_event_at) if last_event_at else None
 
     # A relay that refused every kind we asked for cannot deliver on that filter; that
-    # is a configuration/negotiation fault, not a transport blip.
+    # is a configuration/negotiation fault, not a transport blip. It is `refused`, not
+    # `down`: the relay is answering, it just will not serve us, and that is a fact about
+    # the read set rather than a fault the whole gateway inherits.
     if not active and refused:
-        return Verdict(relay, "refusing", "refusing",
-                       f"refused kind(s) {_kind_list(refused)}; nothing left to read",
+        return Verdict(relay, "refused", "refused",
+                       f"kind(s) {_kind_list(refused)} not allowed; nothing left to read",
                        events=events, last_event_at=_stamp(last_event_at), age_s=age_s,
-                       severity=BAD)
+                       severity=WARN)
 
     # A relay that answered AUTH and closed the filter anyway is deciding something
     # about this key, not finishing a handshake. "authenticating" would be a permanent
@@ -184,11 +189,11 @@ def _verdict(relay: str, workers: list[dict[str, Any]], *, now: float,
         count = max(_count(worker, "auth_refusals") for worker in auth_refused)
         stamps = [_float(worker.get("auth_refused_at")) for worker in auth_refused]
         newest = max([stamp for stamp in stamps if stamp is not None], default=None)
-        detail = f"answered NIP-42 and still refused the filter ({count}x)"
+        detail = f"auth-required after NIP-42 ({count}x)"
         if newest is not None:
             detail += f", last {human_age(now - newest)} ago"
-        return Verdict(relay, "refusing", "refusing", detail,
-                       events=events, severity=BAD)
+        return Verdict(relay, "refused", "refused", detail,
+                       events=events, severity=WARN)
 
     if not alive:
         # Deliberately no stderr text here: a child's last words are diagnostics, not a
@@ -269,6 +274,46 @@ def relay_verdicts(status: dict[str, Any] | None, *, relays: Iterable[str] | Non
     return [_verdict(relay, workers.get(relay) or [], now=now,
                      quiet_minutes=quiet_minutes, daemon_up=status is not None)
             for relay in wanted]
+
+
+def relay_counts(verdicts: Iterable[Verdict]) -> dict[str, Any]:
+    """How the read set divides up, by state and by severity.
+
+    `refused` and `down` are counted apart on purpose: "8 relays, 4 refused" says the
+    read set is wrong for this host, while "8 relays, 4 down" says the transport is. The
+    two want different fixes, so they must not share a number.
+    """
+    rows = list(verdicts)
+    states: dict[str, int] = {}
+    for row in rows:
+        states[row.state] = states.get(row.state, 0) + 1
+    return {
+        "total": len(rows),
+        "ok": sum(1 for row in rows if row.severity == OK),
+        "warn": sum(1 for row in rows if row.severity == WARN),
+        "bad": sum(1 for row in rows if row.severity == BAD),
+        "refused": states.get("refused", 0),
+        "down": states.get("down", 0),
+        "states": states,
+    }
+
+
+#: The order a counts line reads in: what is working, then what is not, then what is
+#: unknown. Anything new sorts after these rather than inventing a position.
+STATE_ORDER = ("connected", "quiet", "connecting", "authenticating",
+               "refused", "down", "no-worker", "unknown")
+
+
+def counts_text(counts: dict[str, Any]) -> str:
+    """`8 read relay(s): 2 connected, 5 quiet, 1 refused` — the one-line read set."""
+    total = int(counts.get("total") or 0)
+    if not total:
+        return "no read relay(s)"
+    states = counts.get("states") or {}
+    order = list(STATE_ORDER) + sorted(set(states) - set(STATE_ORDER))
+    parts = [f"{states[state]} {state.replace('-', ' ')}"
+             for state in order if states.get(state)]
+    return f"{total} read relay(s): " + ", ".join(parts)
 
 
 def reports_event_times(status: dict[str, Any] | None) -> bool:
@@ -461,9 +506,11 @@ def health_report(*, planes: Iterable[str], plane_rows: Iterable[dict[str, Any]]
     """
     now = time.time() if now is None else float(now)
     verdicts = list(verdicts)
+    counts = relay_counts(verdicts)
     bad = [verdict for verdict in verdicts if verdict.severity == BAD]
     warned = [verdict for verdict in verdicts if verdict.severity == WARN]
     ok_relays = [verdict for verdict in verdicts if verdict.severity == OK]
+    refused = [verdict for verdict in verdicts if verdict.state == "refused"]
 
     # Every relay refused or died: the planes are silent for a reason that belongs to
     # the transport, not to them. Saying it per plane stops four identical mysteries.
@@ -496,7 +543,7 @@ def health_report(*, planes: Iterable[str], plane_rows: Iterable[dict[str, Any]]
         "verdict": verdict,
         "degraded": bool(reasons),
         "reasons": reasons,
-        "summary": _summary(verdict, planes_report, verdicts, ok_relays,
+        "summary": _summary(verdict, planes_report, counts, ok_relays,
                             pending_total, blocked_total, uptime_s),
         "identity": identity,
         "socket": socket_path,
@@ -512,15 +559,20 @@ def health_report(*, planes: Iterable[str], plane_rows: Iterable[dict[str, Any]]
             "ok": len(ok_relays),
             "warn": len(warned),
             "bad": len(bad),
+            # A refused relay is its own count, not a bad one: it is not delivering, but
+            # the gateway is not failing, the read set is wrong for this host.
+            "refused": len(refused),
+            "refused_relays": [verdict.as_dict() for verdict in refused],
             "unhealthy": [verdict.relay for verdict in bad],
             "warnings": [f"{verdict.relay}: {verdict.label}" for verdict in warned],
+            "counts": counts,
             "list": [verdict.as_dict() for verdict in verdicts],
         },
         "notes": list(notes),
     }
 
 
-def _summary(verdict: str, planes_report: list[PlaneHealth], verdicts: list[Verdict],
+def _summary(verdict: str, planes_report: list[PlaneHealth], counts: dict[str, Any],
              ok_relays: list[Verdict], pending: int, blocked: int,
              uptime_s: float | None) -> str:
     """One sentence, built from the same numbers — never a second reading of them."""
@@ -536,8 +588,10 @@ def _summary(verdict: str, planes_report: list[PlaneHealth], verdicts: list[Verd
         bits.append("no events in the store")
     bits.append(f"{pending} pending")
     bits.append(f"{blocked} blocked")
-    if verdicts:
-        bits.append(f"{len(ok_relays)}/{len(verdicts)} relay(s) ok")
+    if counts.get("total"):
+        bits.append(f"{len(ok_relays)}/{counts['total']} relay(s) ok")
+        if counts.get("refused"):
+            bits.append(f"{counts['refused']} refused")
     return ", ".join(bits)
 
 
@@ -563,9 +617,17 @@ def render_health(report: dict[str, Any], *, indent: str = "  ") -> list[str]:
                          f"  blocked={plane.get('blocked', 0)}")
     relays = report.get("relays") or {}
     if relays.get("total"):
-        lines.append(f"{indent}relays: {relays.get('ok', 0)}/{relays['total']} ok"
-                     + (f", unhealthy: {', '.join(relays.get('unhealthy') or [])}"
-                        if relays.get("unhealthy") else ""))
+        line = (f"{indent}relays: {relays.get('ok', 0)}/{relays['total']} ok")
+        if relays.get("refused"):
+            line += f", {relays['refused']} refused"
+        if relays.get("unhealthy"):
+            line += f", unhealthy: {', '.join(relays.get('unhealthy') or [])}"
+        lines.append(line)
+        # A refusal is reported once, with the reason, here — not as four warnings on the
+        # per-plane lines and not as a degraded verdict the whole gateway inherits.
+        for row in relays.get("refused_relays") or []:
+            lines.append(f"{indent}! refused {row.get('relay')} — "
+                         f"{row.get('detail') or 'no reason given'}")
     for reason in reasons[1:]:
         lines.append(f"{indent}! {reason}")
     for note in report.get("notes") or []:

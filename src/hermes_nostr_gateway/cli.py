@@ -21,9 +21,11 @@ from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret, pubkey_fr
 from .fetch import fetch_many_blocking, stream_events
 from .health import (
     BAD,
+    counts_text,
     default_planes,
     health_report,
     human_age,
+    relay_counts,
     relay_verdicts,
     render,
     render_health,
@@ -426,7 +428,7 @@ def cmd_send(args) -> int:
 def cmd_status(args) -> int:
     from dataclasses import replace
 
-    from .gateway import default_socket_path, relay_read_plan
+    from .gateway import default_socket_path, kept_relays, relay_read_plan
     from .server import request
 
     cfg = load_config(args.config)
@@ -440,6 +442,9 @@ def cmd_status(args) -> int:
     drops = {**store.drop_counts(drops_ttl), "ttl_hours": drops_ttl / 3600}
     now = time.time()
     relays, _ = relay_read_plan(cfg)
+    # Kept, not read: retained for web-of-trust checks or as history. Listed apart from
+    # the read set, never given a worker and never allowed to colour a verdict.
+    kept = kept_relays(cfg)
     publish = [str(relay) for relay in (cfg.get("relays") or {}).get("publish") or []]
     socket_path = Path(os.path.expanduser(
         os.path.expanduser(str(args.socket or cfg.get("socket") or default_socket_path()))))
@@ -471,8 +476,10 @@ def cmd_status(args) -> int:
             for v in verdicts
         ]
 
-    stale = stale_rows({"relay_stats": stats["relays"]}, set(relays) | set(publish))
+    stale = stale_rows({"relay_stats": stats["relays"]},
+                       set(relays) | set(publish) | {entry.url for entry in kept})
     menu = _menu_status(cfg, socket_path)
+    counts = relay_counts(verdicts)
 
     if args.json:
         print(json.dumps({
@@ -492,6 +499,9 @@ def cmd_status(args) -> int:
             "wraps": store.wrap_counts(),
             "menu": menu,
             "relays": [verdict.as_dict() for verdict in verdicts],
+            "relays_counts": counts,
+            # Deliberately not part of `relays`: kept for another purpose, never read.
+            "kept": [entry.as_dict() for entry in kept],
             "not_in_config": stale,
             # The daemon's watcher, as it reports itself: absent from an older daemon, which
             # is why this is read from the frame rather than from config.
@@ -537,8 +547,14 @@ def cmd_status(args) -> int:
                   + (f", {len(due)} wake(s) due" if due else ""))
         elif watch.get("reason"):
             print(f"ngit:     not watching ({watch['reason']})")
+    print(f"read set: {counts_text(counts)}")
     for line in render(verdicts):
         print(line)
+    if kept:
+        print("kept (not read, for another purpose):")
+        width = max(len(entry.url) for entry in kept)
+        for entry in kept:
+            print(f"  {entry.url:<{width}}  {entry.why or 'kept, not read'}")
     if frame is not None and not reports_event_times(frame):
         print("note:     this daemon reports no per-worker event times "
               "(restart it for \"no events for Nm\" verdicts)")

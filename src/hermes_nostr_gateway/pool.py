@@ -245,7 +245,7 @@ class PoolWorker:
 
         A relay that answers the challenge and still refuses the filter is deciding
         something about this key, not asking for another attempt. Counting it lets the
-        backoff escalate; stamping it lets `health` say "refusing" rather than
+        backoff escalate; stamping it lets `health` say "refused" rather than
         "authenticating" — which is what a permanent refusal used to look like, because
         every retry produced a fresh challenge and refreshed `auth_at`.
         """

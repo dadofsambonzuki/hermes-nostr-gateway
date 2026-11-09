@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -87,15 +88,17 @@ def hermes_home(tmp_path: Path, *, registry: bool = True, board: bool = True,
 def write_config(tmp_path: Path, home: Path, checkout: Path, *,
                  identity: Path | dict | None = None,
                  projects: list[dict] | None = None, ngit: dict | None = None,
-                 store: Path | None = None) -> Path:
+                 store: Path | None = None,
+                 relays: dict | None = None) -> Path:
     ident = identity if isinstance(identity, dict) else {
         "secret_file": str(identity or make_secret(tmp_path))}
     cfg = {
         "identity": ident,
         "store": str(store or tmp_path / "gateway.db"),
         "socket": str(tmp_path / "gateway.sock"),
-        "relays": {"read": ["wss://relay.example"],
-                   "publish": ["wss://relay.example"]},
+        "relays": relays if relays is not None else {
+            "read": ["wss://relay.example"],
+            "publish": ["wss://relay.example"]},
         "concord": {"projects": projects if projects is not None else [{
             "channel": CHANNEL_ID, "community": COMMUNITY, "path": str(checkout),
             "project": PROJECT, "board": BOARD}]},
@@ -121,8 +124,14 @@ def fake_ngit(tmp_path: Path, monkeypatch, *, version: str = NGIT_FLOOR) -> Path
 
 
 def live_daemon(*, alive: bool = True) -> dict:
+    now = int(time.time())
     return {
-        "type": "status", "workers": [],
+        "type": "status",
+        "workers": [{
+            "relay": "wss://relay.example", "purpose": "dm", "kinds": [1059, 4],
+            "refused_kinds": [], "events": 3, "alive": True, "auth_refusals": 0,
+            "connected_at": now - 600, "last_event_at": now - 60,
+        }],
         "ngit_watch": {"enabled": True, "alive": alive,
                        "targets": [{"channel": CONVERSATION}],
                        "relays": ["wss://relay.example"]},
@@ -664,6 +673,68 @@ def test_daemon_down_fails_the_socket_and_names_the_fix(good, monkeypatch, capsy
     assert "serve" in checks["socket"]["fix"]
     assert not checks["watcher"]["ok"]
     assert checks["watcher"]["fix"]
+    assert checks["relays"]["ok"], "no daemon is the socket check's failure, not the relays'"
+    assert "not checked" in checks["relays"]["detail"]
+
+
+def test_the_relays_check_counts_refused_apart_from_down(good, monkeypatch, capsys):
+    """`8 relays: 4 refused` is one line, and it does not fail the preflight.
+
+    A relay refusing our filters is a fact about the read set; four of them used to read
+    as four warnings and a degraded verdict nobody could act on. A relay with no worker
+    is still a failure: the gateway claims to read it and is not.
+    """
+    tmp_path, home, checkout, config = good
+    config = write_config(tmp_path, home, checkout, relays={
+        "read": ["wss://relay.example", "wss://relay.example/refused"],
+        "publish": ["wss://relay.example"],
+        "keep": [{"url": "wss://relay.example/archive", "why": "history only"}],
+    })
+    reply = live_daemon()
+    reply["workers"].append({
+        "relay": "wss://relay.example/refused", "purpose": "dm", "kinds": [],
+        "refused_kinds": [1059, 4], "events": 0, "alive": False, "auth_refusals": 0,
+    })
+    stub_daemon(monkeypatch, reply)
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 0
+    relays = checks_by_name(capsys)["relays"]
+    assert relays["ok"]
+    assert "2 read relay(s)" in relays["detail"]
+    assert "1 connected, 1 refused" in relays["detail"]
+    assert "1 kept for another purpose" in relays["detail"]
+    assert "move it to `relays.keep`" in relays["detail"]
+
+
+def test_the_relays_check_fails_when_a_read_relay_has_no_worker(good, monkeypatch, capsys):
+    tmp_path, home, checkout, config = good
+    config = write_config(tmp_path, home, checkout, relays={
+        "read": ["wss://relay.example", "wss://relay.example/gone"],
+        "publish": ["wss://relay.example"],
+    })
+    stub_daemon(monkeypatch, live_daemon())
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    relays = checks_by_name(capsys)["relays"]
+    assert not relays["ok"]
+    assert "wss://relay.example/gone" in relays["detail"]
+    assert relays["fix"]
+
+
+def test_a_relay_both_read_and_kept_fails_the_preflight(good, monkeypatch, capsys):
+    """The read set and the kept set are one decision; naming both is a config error."""
+    tmp_path, home, checkout, config = good
+    config = write_config(tmp_path, home, checkout, relays={
+        "read": ["wss://relay.example"],
+        "publish": ["wss://relay.example"],
+        "keep": [{"url": "wss://relay.example/", "why": "wants it both ways"}],
+    })
+
+    assert run_doctor(monkeypatch, tmp_path, config) == 1
+    relays = checks_by_name(capsys)["relays"]
+    assert not relays["ok"]
+    assert "both read and kept" in relays["detail"]
+    assert relays["fix"]
 
 
 def test_unparsable_config_exits_one_and_says_so(tmp_path, monkeypatch, capsys):

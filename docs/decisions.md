@@ -927,4 +927,28 @@ The worker writes the reply; the bridge only routes it and supplies the spelling
 step, which is where a model left to guess would put the comment in the wrong thread or sign it
 as the wrong npub.
 
+## A relay that refuses our filters is not a read relay
 
+The read set stood at eight relays and four of them contributed nothing: two answered nothing at
+all, one answered `auth-required` even after NIP-42 and kept refusing the key, and one group relay
+had held nothing for a fortnight. None of that is a fault in the gateway, and all of it was
+reported as one — `health` read `degraded` on every call, which is the same as making it
+unreadable.
+
+**A read set is defined by what it can serve, so the config says which set is which.**
+`relays.read` is the relays whose filters are the gateway's business. `relays.keep` is a relay
+retained for web-of-trust checks or as history, with a `why`; `relays.whitenoise` is the same
+thing with the Marmot plane as its purpose. A kept relay gets no worker, no verdict and no say in
+the gateway's health — and a relay named in both lists is a config error, because the choice has
+one place to live. A peer's kind-10050 list cannot re-add a kept relay: this host's decision about
+what it reads outranks a peer's inbox advertisement.
+
+**`refused` is a state, not a fault.** A relay that will not serve the filter is reported once, as
+`refused (<reason>)`, and counted apart from `down` — "8 relays, 4 refused" is a sentence about the
+read set while "8 relays, 4 down" is a sentence about the transport, and they want different fixes.
+A refusal does not degrade `health` either; only a read set with nothing delivering on it does.
+`hng doctor` carries the counts in one line, so the read set can be wrong out loud without turning
+every other verdict red.
+
+Why: a signal that is always amber is a signal nobody reads, and the cost of a relay whose policy
+is not ours is one config line, not a degraded gateway.

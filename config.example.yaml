@@ -37,7 +37,8 @@ relays:
   # Read set = our 10050 inbox relays PLUS the sender's app relays. Reading only the
   # first list misses DMs that exist nowhere else, silently (spec §3).
   # An entry is a URL, or {url, kinds} when that relay's filter must be narrower than
-  # subscription when it appears in the same REQ — its wraps would go with it.
+  # DM_KINDS: a relay that refuses kind 4 closes the whole subscription when it appears
+  # in the same REQ — its wraps would go with it.
   read:
     - wss://relay.example.com/chat
     - wss://relay.example.com/inbox
@@ -45,6 +46,14 @@ relays:
     - wss://relay.primal.net
     - wss://relay.ditto.pub
     - {url: wss://relay.dreamith.to, kinds: [1059]}
+  # Kept, not read: relays retained for web-of-trust checks or as history. They get no
+  # worker, never appear in a relay verdict and never make `health` degraded. A relay
+  # that will not serve the filters we ask belongs here, with the reason, not in `read`:
+  # a refusal is a fact about the relay, not a fault in the gateway. An entry is a URL
+  # or {url, why}, and why is the sentence `hng status` prints beside it.
+  keep:
+    - url: wss://relay.example.com/archive
+      why: "web-of-trust lookups only; refuses our read filters"
   # Read coverage beyond that list (spec §3). A peer who publishes only into their own
   # kind-10050 inbox relays is invisible to a fixed read list, silently. So the inbox
   # relays of every pubkey in `groups` are resolved at startup and on a refresh, then
@@ -62,7 +71,9 @@ relays:
     - wss://relay.primal.net
 
 # White Noise relays belong to the Marmot plane only (wn-agent), never the DM/feed
-# read set: they reject public kinds and are not a general NIP-17 inbox.
+# read set: they reject public kinds and are not a general NIP-17 inbox. They are
+# `kept`, with the Marmot plane as their purpose: `hng status` lists them apart from
+# the read set and they never colour a relay verdict.
 whitenoise:
   - wss://relay.eu.whitenoise.chat
   - wss://relay.us.whitenoise.chat
