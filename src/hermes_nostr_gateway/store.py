@@ -191,6 +191,18 @@ CREATE TABLE IF NOT EXISTS ngit_comments (
     PRIMARY KEY (repo, source_id, comment_id)
 );
 
+-- One row per comment that mentioned this gateway, so a re-poll cannot file the same reply
+-- twice. `task_id` is empty when the mention was seen and deliberately not answered (an
+-- untrusted author), which is a decision worth remembering: a later pass must not re-decide it.
+CREATE TABLE IF NOT EXISTS ngit_mentions (
+    repo       TEXT NOT NULL,
+    comment_id TEXT NOT NULL,
+    task_id    TEXT,
+    detail     TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, comment_id)
+);
+
 -- Per repo and stream, the last event time a poll reached: a poll asks only for what is
 -- newer, and a catch-up after downtime does not re-read a week of history.
 CREATE TABLE IF NOT EXISTS ngit_cursors (
@@ -1517,6 +1529,25 @@ class Store:
             (str(repo), 1621, 1618),
         ).fetchall()
         return tuple(str(row[0]) for row in rows if row and row[0])
+
+    def ngit_mention(self, repo: str, comment_id: str) -> dict[str, Any] | None:
+        """What this gateway has already decided about one comment that mentioned it."""
+        row = self.db.execute(
+            "SELECT * FROM ngit_mentions WHERE repo = ? AND comment_id = ?",
+            (str(repo), str(comment_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def ngit_mention_save(self, repo: str, comment_id: str, *, task_id: str = "",
+                          detail: Any = None) -> bool:
+        """Remember one mention. `task_id` empty records a mention deliberately not answered."""
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO ngit_mentions (repo, comment_id, task_id, detail,"
+            " created_at) VALUES (?,?,?,?,?)",
+            (str(repo), str(comment_id), str(task_id or ""),
+             json.dumps(detail or {}, sort_keys=True), int(time.time())),
+        )
+        return cur.rowcount > 0
 
     def ngit_comment_seen(self, repo: str, source_id: str, comment_id: str) -> bool:
         row = self.db.execute(

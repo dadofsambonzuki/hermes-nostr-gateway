@@ -150,15 +150,19 @@ supplies the checkout and the board:
 
 | event | becomes |
 |---|---|
-| kind-1621 issue | a task on the channel's board |
+| kind-1621 issue | a task on the channel's board, once a trusted npub labels it `ready` |
 | kind-1111 comment | a comment on that task, in `created_at` order, once |
+| kind-1111 @mention | one reply task, naming the thread and the command that answers in it |
 | kind-1618 PR | one notice in the channel, and one review task on the board |
 | kind-1631 applied | a `merged as <commit>` follow-up; it completes the review task |
 
-An issue from a trusted npub (`control.trusted_npubs`, or the concord plane's own list) is created
-`ready` for the dispatcher. Anyone else's is created `blocked` and the channel gets one question,
-which a trusted npub answers with `hng ngit answer <task-id|nevent> --yes|--no --by <npub>` — the
-author of an issue does not thereby authorise it.
+An issue is queued when a trusted npub (`control.trusted_npubs`, or the concord plane's own list)
+publishes the `ready` label on it (`ngit.ready_label`). Until then it is recorded as waiting — no
+task, no worker — and the channel gets one line saying so. A mention of the gateway's own npub in
+an issue or PR comment becomes a reply task, because being named is the one request in a repo
+aimed at the bot. `ready_label: ""` restores the older rule (a trusted author's issue is created
+`ready` on sight; anyone else's is `blocked` and asked about, answered with
+`hng ngit answer <task-id|nevent> --yes|--no --by <npub>`).
 
 A verdict the pass has already gone past — one that arrived while the bridge was down, or before
 the bridge applied verdicts to cards — is read again by `hng ngit reconcile --channel
@@ -316,7 +320,8 @@ the board and appears on the PR, so a reader of either one sees the same thing.
   another; a board without a project is a config error, because nothing anchors the worktree.
 - **`ngit`** — the bridge, a sibling block rather than a corner of Concord: `assignee`, `reviews`,
   `review_assignee`, `relays`, `lookback_hours`, `sweep_hours`, `issues`, `prs`, `priority`,
-  `max_new`, `max_prs`.
+  `max_new`, `max_prs`, `labels`, `ready_label`, `mentions`, `mention_assignee`,
+  `reply_secret_file`.
 
 ## Operations
 

@@ -32,14 +32,20 @@ ngit:
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
   labels: true             # publish each PR's review state as a NIP-34 label (see below)
+  ready_label: ready       # an issue is queued only when a trusted npub labels it this
+  mentions: true           # an @mention in an issue/PR comment becomes a reply task
+  mention_assignee: default  # profile a mention reply task is dispatched to
+  reply_secret_file: /path/to/reply.json  # key a reply is signed with; default identity.secret_file
   watch: true              # the daemon wakes a pass on a mapped repo's event (see below);
                            # default on once `assignee` is set, `false` is the timer alone
   watch_debounce_s: 30     # coalesce a channel's events this long before the pass
 ```
 
 Trusted authors are the control pane's (`control.trusted_npubs` unioned with
-`control.planes.concord.trusted_npubs`). With no trusted npubs configured every issue is held,
-which is the safe default: a person is asked, not guessed.
+`control.planes.concord.trusted_npubs`). They are who may authorise an issue (by labelling it
+`ready`), whose mentions become reply tasks, and — with `ready_label: ""` — whose issues are
+queued on sight. With no trusted npubs configured nothing is queued automatically, and nothing
+is guessed.
 
 The repository address is read from the checkout itself (`ngit repo --json`, the kind-30617
 coordinate). Nothing about a particular box is compiled in.
@@ -217,15 +223,44 @@ Two operational notes:
   comment id). A comment added later is appended; nothing is rewritten. The kind is 1111
   because that is what `ngit issue comment` and `ngit pr comment` publish on 3.0.5 — no ngit
   release ever wrote 1622.
+- **An issue is queued only when a trusted npub labels it `ready`, not when its author is
+  trusted.** A label is kind 1985, targets the issue (`e`) and is published by someone in the
+  control pane's trusted set for the concord plane. Until one exists the issue is recorded as
+  `waiting` — no task, no worker — and the channel gets one line naming the issue and the
+  missing label; the link's own state is what stops that line repeating on every poll. When
+  the label appears, the card is created `ready` and the usual notice follows. The issue's
+  own author is not consulted at that point: a trusted person reading the issue and saying
+  "work on this" *is* the authorisation, and it is published where the contributor can see it
+  rather than in a channel they cannot. `ready_label: ""` restores the old rule (a trusted
+  author's issue is created on sight; anyone else's is held and asked about).
 - A trusted author's issue is created `ready` and the channel gets one notice,
   `issue <nevent> -> <task id>`.
 - Any other author's issue is created `blocked` and the channel gets exactly one question naming
   the issue, the author, the nevent, the task and what a `yes` would do. The question is queued
   and the link stays `held` until the daemon takes it, so it is asked once when the channel is
   reachable and retried when it was not — and the idempotency key stops a retry becoming a
-  second question.
+  second question. This path is what `ready_label: ""` (and every link written before the
+  gate existed) uses.
 - `max_new` bounds how many tasks one poll creates; the rest are counted as deferred and picked
   up by the next poll. A backlog or a spam run cannot fill the board and the channel at once.
+
+## Mentions: answering one in the thread
+
+An @mention of the gateway in an issue or PR comment becomes one reply task
+(`mention_assignee`, else `assignee`), and nothing else in the repo does. The detection is the
+NIP-27 `p` tag naming the gateway's own key on a kind-1111 comment whose root the bridge has
+linked; a `nostr:npub…` reference in the words counts too, for a client that dropped the tag.
+Only a trusted npub's mention becomes a task: a stranger can already file an issue, and a
+mention must not be a second way to spend a worker turn. Refused mentions are recorded with no
+task, so the decision is made once.
+
+The task carries the comment, the root nevent and the comment id, and the exact command that
+publishes the reply in the thread — `ngit issue comment … --reply-to <comment> --nsec-file
+<key>`, or the `pr` form — signed with `reply_secret_file` (default `identity.secret_file`,
+the gateway's own identity). The wording is the worker's; the bridge does not answer for it.
+`mentions: false` turns the feature off, and a deployment whose identity is a systemd
+credential rather than a file leaves `reply_secret_file` empty, in which case the task says
+the reply cannot be published and why.
 
 ## Answering a held issue
 

@@ -790,3 +790,41 @@ applied and closed are final for the board — and it is re-asked every pass unt
 finishes, so a late status heals on its own. The watcher is unchanged: it still wakes a pass
 from the repository's `#a` subscription, so an `e`-only status is picked up by the next
 scheduled pass rather than in seconds.
+
+## An issue is queued by a trusted label, not by its author
+
+The bridge used to decide from the author: a trusted npub's issue became a card on sight, anyone
+else's was held and asked about in the channel. That made "who wrote this" stand in for "do we
+want this work", and it spent a card (and a question) on every issue anyone filed — including the
+ones a human had not read yet. The authorised-author rule also conflated two different people:
+the contributor asking for something, and the maintainer deciding it is wanted.
+
+So the authorisation moved to a label: an issue becomes a card when a trusted npub has published
+`ready` (NIP-32 kind 1985, targeting the issue) — `ngit.ready_label`, `""` to restore the author
+rule. Three consequences are deliberate:
+
+- **The decision is public and durable.** It is written on the issue, where the contributor and
+  every other reader can see it, instead of in a channel the contributor may not be in. Taking
+  the label off does not retract a card that already exists — a card is work in flight, and the
+  board is not a mirror.
+- **A waiting issue is a link, not a card.** `ngit_links.state = waiting` records that it was
+  seen and is not queued. That row is what makes the one channel line repeatable-free, and what
+  lets a later pass notice the label without re-reading the whole issue list.
+- **The author stops mattering at the card.** Once a trusted person has authorised the work, the
+  issue is queued `ready` whoever filed it. The old `held`/`asked`/`answer` path is kept for
+  links written before the gate and for `ready_label: ""`; it is not the default.
+
+## A mention is the one thing in a repo addressed to the bot
+
+Every other event in a repository is addressed to the repository: an issue is a request for the
+project, a PR is a proposed change, a comment is part of a thread. An @mention with the
+gateway's `p` tag is addressed to the agent, and it is the one case where "the bot should answer
+here" is what the person asked for. It becomes one reply task (`mentions: true`), carrying the
+comment, the thread's nevent and the exact `ngit issue|pr comment --reply-to … --nsec-file …`
+command, signed with `reply_secret_file` — the gateway identity, because a reply in the bot's
+voice has to come from the bot's key.
+
+Trust is the control pane's, as everywhere else: a stranger's mention is recorded with no task.
+The worker writes the reply; the bridge only routes it and supplies the spelling of the publish
+step, which is where a model left to guess would put the comment in the wrong thread or sign it
+as the wrong npub.

@@ -43,12 +43,14 @@ dispatched to, and stops there. The model is the board's to decide -- the board'
 then the assignee profile's own model -- so reviewing on a different model is the operator's
 call (`hermes kanban set-model`), not a second knob in this config.
 
-Authorisation is the control pane's. An issue from a trusted npub (`control.trusted_npubs`
-or the concord plane's own list) is queued `ready`; any other author is held `blocked` and
-asked about in the channel, so a stranger cannot put work in the queue by filing an issue
-and nobody's issue is silently worked. The question is durable state -- a task comment plus
-the `ngit_links` row -- not a live turn's memory, so a restart does not forget it and a
-re-poll does not ask twice.
+Authorisation is the control pane's, and it is expressed on the repository. An issue is queued
+only when a trusted npub (`control.trusted_npubs` or the concord plane's own list) has published
+the configured `ready` label on it: until then the issue is recorded `waiting`, with no card and
+one line in the channel, so filing is not the same thing as asking for work. The label is
+published where the contributor can see it, which a channel question is not. `ready_label: ""`
+restores the author-keyed rule (a trusted author's issue is queued on sight; anyone else's is
+held `blocked` and asked about once). A comment that @mentions this gateway is the other thing
+addressed to the bot rather than the repo, and becomes one reply task for a trusted author.
 
 State (the `ngit_*` tables in `store.py`): one link per issue and per PR root, carrying the
 task id and the lifecycle the bridge reached, plus a per-repo high-water mark so a poll asks
@@ -154,7 +156,8 @@ TRUSTED_PLANE = "concord"
 #: States a link can hold. `held` means the question has not reached the channel yet (a
 #: retry is correct); `asked` means it did (asking again is not). For a PR, `pending` is the
 #: same idea: it is known, and its notice is either queued or posted but not yet confirmed.
-ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted"})
+ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted",
+                          "waiting"})
 PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
 
 #: Seconds of overlap on a relay cursor. Relays apply `since` inclusively and clocks drift;
@@ -192,6 +195,11 @@ NOTIFY_TIMEOUT_S = 20.0
 #: pass. Long enough that a PR revision and its status event coalesce, short enough that
 #: "within a minute" holds. See docs/ngit-bridge.md, "Waking the pass".
 DEFAULT_WATCH_DEBOUNCE_S = 30.0
+
+#: Roots one mention pass may ask a relay for. One REQ per relay for the batch, so this is
+#: the size of a filter set rather than of a message: a repository with thousands of linked
+#: PRs would otherwise build a REQ no relay will answer.
+MAX_MENTION_ROOTS = 200
 
 #: The oldest `ngit` the bridge will drive. Pinned because the bridge parses `--json`
 #: documents and reads the `merge-commit-id` tag, and a missing or older binary must fail at
@@ -601,6 +609,20 @@ class BridgeConfig:
     #: default -- the LABELS column is what a reader looks at -- and off for a deployment
     #: that does not want the extra events on its repository's relays.
     labels: bool = True
+    #: The label that queues an issue, published by a trusted npub. Empty turns the gate off
+    #: (a trusted author's issue becomes a task on sight, the old behaviour). A label is the
+    #: authorisation: the issue's own author is not consulted once a trusted person has said
+    #: "work on this", which is what keeps a roadside issue from becoming a card.
+    ready_label: str = "ready"
+    #: Whether an @mention of this gateway in an issue or PR comment becomes a reply task.
+    #: On by default: being mentioned is the one request in a repo that is aimed at the bot.
+    mentions: bool = True
+    #: The profile a mention reply task is dispatched to. Empty means `assignee`.
+    mention_assignee: str = ""
+    #: The nsec/hex file a mention reply is signed with, so the reply is the bot's own words
+    #: in its own voice (the gateway identity). Empty means the deployment cannot publish a
+    #: reply and the task says so.
+    reply_secret_file: str = ""
 
     @classmethod
     def from_config(cls, raw: Any) -> "BridgeConfig":
@@ -649,6 +671,10 @@ class BridgeConfig:
             watch=None if watch is None else bool(watch),
             watch_debounce_s=debounce,
             labels=bool(block.get("labels", True)),
+            ready_label=str(block.get("ready_label", "ready") or "").strip(),
+            mentions=bool(block.get("mentions", True)),
+            mention_assignee=str(block.get("mention_assignee") or "").strip(),
+            reply_secret_file=str(block.get("reply_secret_file") or "").strip(),
         )
 
 
@@ -669,7 +695,10 @@ class Report:
     issues: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "ready": 0, "held": 0, "existing": 0,
         "comments": 0, "deleted": 0, "deferred": 0, "would_create": 0,
-        "would_post": 0})
+        "waiting": 0, "would_wait": 0, "would_post": 0})
+    mentions: dict[str, int] = field(default_factory=lambda: {
+        "seen": 0, "created": 0, "existing": 0, "ignored": 0, "deferred": 0,
+        "would_create": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
@@ -701,7 +730,7 @@ class Report:
         return {"channel": self.channel, "repo": self.repo, "board": self.board,
                 "assignee": self.assignee, "repo_address": self.address,
                 "dry_run": self.dry_run, "issues": dict(self.issues), "prs": dict(self.prs),
-                "sweep_hours": self.sweep_hours,
+                "mentions": dict(self.mentions), "sweep_hours": self.sweep_hours,
                 "posted": self.posted, "failed": self.failed,
                 "errors": list(self.errors), "notes": list(self.notes)}
 
@@ -712,9 +741,20 @@ class Report:
         i, p = self.issues, self.prs
         out.append(f"issues:  {i['seen']} seen, {i['created']} created ({i['ready']} ready,"
                    f" {i['held']} held), {i['existing']} known, {i['comments']} comment(s)"
+                   + (f", {i['waiting']} waiting for a ready label" if i["waiting"] else "")
                    + (f", {i['deleted']} deleted by hand" if i["deleted"] else "")
                    + (f", {i['deferred']} waiting for the next poll" if i["deferred"] else "")
+                   + (f", {i['would_wait']} would wait for a ready label"
+                      if self.dry_run and i["would_wait"] else "")
                    + (f", {i['would_create']} would be created" if self.dry_run else ""))
+        m = self.mentions
+        if any(m.values()):
+            out.append(f"mentions: {m['seen']} seen, {m['created']} reply task(s)"
+                       + (f", {m['existing']} known" if m["existing"] else "")
+                       + (f", {m['ignored']} from an untrusted author" if m["ignored"] else "")
+                       + (f", {m['deferred']} waiting for the next poll" if m["deferred"] else "")
+                       + (f", {m['would_create']} would create a task"
+                          if self.dry_run and m["would_create"] else ""))
         out.append(f"prs:     {p['seen']} seen, {p['signalled']} signalled,"
                    f" {p['merged']} merged, {p['existing']} known"
                    + (f", {p['closed']} closed" if p["closed"] else "")
@@ -1357,6 +1397,35 @@ class RelayLabels:
     #: The pass calls the reader; `read` is the name a caller that has the object uses.
     __call__ = read
 
+    def comments(self, ids: Sequence[str]) -> tuple[dict[str, list[dict[str, Any]]],
+                                                    tuple[str, ...]]:
+        """Raw kind-1111 comments per root, and the relays that answered any of them.
+
+        `read` keeps only what a verdict needs, and a verdict does not need the `p` tags. A
+        mention *is* those tags (NIP-27: a mentioned pubkey is `p`), so the mention pass
+        reads the same events without folding them first. One REQ per relay for the whole
+        batch, as `read` does.
+        """
+        wanted = [str(root) for root in ids if str(root or "").strip()]
+        if not wanted:
+            return {}, ()
+        if not self.relays:
+            raise NgitError("no relays configured: comments cannot be read")
+        events = self._fetch(relays=self.relays, kinds=[KIND_COMMENT], tag="E",
+                             values=wanted, limit=READ_AHEAD, secret=self.secret)
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        seen: set[str] = set()
+        for _relay, event in events or ():
+            event_id = str(event.get("id") or "")
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+            root = _tag_value(event, "E")
+            if root in wanted:
+                grouped.setdefault(root, []).append(event)
+        answered = tuple(dict.fromkeys(str(relay) for relay, _ in events or ()))
+        return grouped, answered
+
 
 # -- posting into the channel -------------------------------------------------
 
@@ -1432,6 +1501,72 @@ def question_message(issue: Issue, task_id: str, target: Target, assignee: str) 
         f"task: {task_id} (held, not queued)",
         "",
         f"Reply yes to queue it on board {target.board} for {assignee}, or no to leave it out.",
+    ])
+
+
+def waiting_message(issue: Issue, label: str) -> str:
+    """The one line an issue gets while it waits for a trusted `ready` label.
+
+    It names no task on purpose: there is none, and saying so is what stops a reader
+    wondering whether the bridge lost it. The label is the authorisation, and the repo is
+    where it is written, so the message points at the issue rather than at a reply here.
+    """
+    return "\n".join([
+        f'issue "{issue.subject}" by {issue.author}',
+        issue.id,
+        f"no task yet: a trusted author adds the `{label}` label to queue it",
+    ])
+
+
+def mention_title(kind: str, root_subject: str, author: str) -> str:
+    """A reply task's title: short, and unambiguous about which thread it answers."""
+    subject = (root_subject or "(no subject)").strip()
+    if len(subject) > 80:
+        subject = subject[:77].rstrip() + "..."
+    return f"Reply to {author[:14]}'s mention on {kind} \"{subject}\""
+
+
+def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, Any],
+                 target: Target, secret_file: str) -> str:
+    """What a reply needs: the words, the thread, and the exact command that publishes it.
+
+    The wording is the worker's to write -- this is a person asking the bot a question in
+    public, and a canned paragraph is worse than no reply. The command is not: `--reply-to`
+    keeps the answer in the thread, and the key file is the only identity whose reply reads
+    as the bot's own. Writing it here means the worker does not have to rediscover ngit's
+    spelling of either.
+    """
+    body = str(comment.get("content") or "").strip() or "(the comment has no words)"
+    author = npub_of(str(comment.get("pubkey") or ""))
+    comment_id = str(comment.get("id") or "")
+    command = "pr" if kind == "PR" else "issue"
+    if secret_file:
+        publish = (f"ngit {command} comment {root_nevent} --body-file <path to your reply> "
+                   f"--reply-to {comment_id} --nsec-file {secret_file}")
+    else:
+        publish = ("no reply key is configured (`ngit.reply_secret_file`): answer in the "
+                   "channel instead and say why")
+    return "\n".join([
+        f"{author} mentioned this gateway on a {kind} in {target.address or target.repo}.",
+        "",
+        "Their comment:",
+        "",
+        *[f"> {line}" for line in body.splitlines()],
+        "",
+        "---",
+        f"Root: {root}",
+        f"Root nevent: {root_nevent}",
+        f"Comment: {comment_id}",
+        f"Author: {author}",
+        "",
+        "Write one reply as this gateway (its own voice, not a summary of the repo) and publish",
+        "it in the thread:",
+        "",
+        f"  {publish}",
+        "",
+        "Then add a one-line comment on this task naming what you posted, and complete it.",
+        "Do not change code, labels, or the issue/PR state, and do not reply with anything the",
+        "comment did not ask for.",
     ])
 
 
@@ -1745,7 +1880,14 @@ def notice_state(kind: int, notice: str) -> str:
         if notice == "closed":
             return "closed"
         return "signalled"
-    return "asked" if notice == "question" else "ready"
+    if notice == "question":
+        return "asked"
+    if notice == "waiting":
+        # The issue is still not authorised: the channel has been told, and the link must
+        # keep saying `waiting` so the next pass re-reads the label instead of assuming a
+        # question was asked (or that a hand-deleted task was decided).
+        return "waiting"
+    return "ready"
 
 
 class Sync:
@@ -1763,7 +1905,7 @@ class Sync:
                  statuses: StatusSource | None = None, sweep: PrSource | None = None,
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
-                 applied: Optional[AppliedSource] = None,
+                 applied: Optional[AppliedSource] = None, self_npub: str = "",
                  now: Callable[[], float] = time.time):
         self.store = store
         self.board = board
@@ -1787,6 +1929,9 @@ class Sync:
         # `ngit pr apply` merge publishes no status of its own) and what it compares instead.
         self.applied: Optional[AppliedSource] = applied or AppliedCheckout(
             target.repo, target.default_branch or "master")
+        #: This gateway's own key, hex: a mention is a `p` tag naming it, and a comment that
+        #: carries it is the one thing in a repo addressed to the bot rather than the repo.
+        self.self_npub = str(self_npub or "").lower()
         self._now = now
 
     # -- entry point -----------------------------------------------------
@@ -1806,6 +1951,13 @@ class Sync:
                 self._read_prs(report, since=since, dry_run=dry_run)
             except NgitError as exc:
                 report.errors.append(f"prs: {exc}")
+        # Mentions last: the roots it reads are the links the two passes above have just
+        # written, so a comment on an issue first seen this pass is already attributable.
+        if self.config.mentions:
+            try:
+                self._mentions(report, dry_run=dry_run)
+            except NgitError as exc:
+                report.errors.append(f"mentions: {exc}")
         # Delivery is its own step, after both directions have decided what to say: what is
         # in the queue is what gets sent, whether it was decided this pass or three passes
         # ago, and the relay being down cannot hold a queued notice back.
@@ -1992,8 +2144,12 @@ class Sync:
         link = self.store.ngit_link(key, KIND_ISSUE, ref.hex)
         task = self.board.task(link["task_id"]) if link and link.get("task_id") else None
         recreated = False
+        # A waiting link is a decision, not a lost task: the issue was seen and no trusted
+        # `ready` label was on it. It must fall through to the label check, not to the
+        # deleted-by-hand branch.
+        waiting = bool(link is not None and task is None and link.get("state") == "waiting")
 
-        if link is not None and task is None:
+        if link is not None and task is None and not waiting:
             if not recreate:
                 if link["state"] != "deleted":
                     self.store.ngit_link_state(key, KIND_ISSUE, ref.hex, "deleted")
@@ -2014,6 +2170,34 @@ class Sync:
 
         issue = self.detail(ref)
         trusted = self.control.is_trusted(issue.author, TRUSTED_PLANE)
+        # -- the ready gate -------------------------------------------------
+        # A card is created when a trusted npub has labelled the issue `ready`, not when the
+        # issue's own author is trusted. The label is the authorisation even for a trusted
+        # author's issue: filing is not asking for work, and "add it to the board" is a thing
+        # a person says once, in the repo, where the contributor can see it.
+        if self.config.ready_label:
+            if not self._ready(issue, report, dry_run=dry_run):
+                if waiting:
+                    report.issues["existing"] += 1
+                    return "waiting"
+                if not allow_create:
+                    report.issues["deferred"] += 1
+                    return "deferred"
+                if dry_run:
+                    report.issues["would_wait"] += 1
+                    return "would_wait"
+                # The link, not a task: this row is how the next pass remembers the issue has
+                # been seen and is waiting, so the channel is told once and not every ten
+                # minutes. Its comments are copied when (if) the card is created.
+                self.store.ngit_link_save(
+                    key, KIND_ISSUE, issue.hex, board=self.target.board, state="waiting",
+                    detail={"nevent": issue.id, "subject": issue.subject,
+                            "author": issue.author})
+                self._enqueue(KIND_ISSUE, issue.hex, "waiting",
+                              waiting_message(issue, self.config.ready_label))
+                report.issues["waiting"] += 1
+                return "waiting"
+            trusted = True
         status = "ready" if trusted else "blocked"
         if not allow_create:
             # A backlog is spread over polls rather than filling the board and the channel
@@ -2052,6 +2236,33 @@ class Sync:
             self._ask(issue, task_id, report, dry_run=dry_run)
         return "created"
 
+    def _ready(self, issue: Issue, report: Report, *, dry_run: bool) -> bool:
+        """Whether a trusted npub has labelled this issue with `ngit.ready_label`.
+
+        The label is read from the repo's relays, not from `ngit issue view`: the CLI shows a
+        label's value and not who wrote it, and "who" is the whole question. A relay that
+        could not be read is a `no` with an error line -- queueing on a read that did not
+        happen would be the one failure this gate cannot recover from.
+        """
+        if self.state is None:
+            report.errors.append(
+                "ready label: no relays to read labels from (ngit.relays or relays.read)")
+            return False
+        try:
+            read = self.state([issue.hex])
+        except Exception as exc:  # noqa: BLE001 - a read failure is a report line
+            report.errors.append(f"issue {issue.id[:12]}: labels unreadable ({exc})"[:200])
+            return False
+        for error in read.errors:
+            report.errors.append(f"issue {issue.id[:12]}: {error}")
+        wanted = self.config.ready_label
+        for carried in read.prs.get(issue.hex, PrRead()).labels:
+            if carried.value != wanted:
+                continue
+            if self.control.is_trusted(carried.author, TRUSTED_PLANE):
+                return True
+        return False
+
     def _ask(self, issue: Issue, task_id: str, report: Report, *, dry_run: bool) -> bool:
         """Queue the question and leave the link `held` until the daemon takes it.
 
@@ -2087,6 +2298,98 @@ class Sync:
                 continue
             self.store.ngit_note_comment(key, ref.hex, comment.hex, task_id)
             report.issues["comments"] += 1
+
+    # -- mentions --------------------------------------------------------
+
+    def _mentions(self, report: Report, *, dry_run: bool) -> None:
+        """Turn a comment that names this gateway into one reply task.
+
+        A mention is a NIP-27 `p` tag naming this key on a kind-1111 comment whose root is an
+        issue or PR the bridge has linked -- the same read `read` uses for verdicts, kept
+        unfolded because the `p` tags are the whole signal. Only a trusted npub's mention
+        becomes work: a stranger can already file an issue, and a stranger's mention must not
+        be a second way to spend a worker turn. Every mention is remembered, refused ones
+        included, so the decision is made once and a re-poll cannot re-litigate it.
+        """
+        key = self.target.key
+        info: dict[str, tuple[str, dict[str, Any]]] = {}
+        for row in self.store.ngit_links(key, KIND_ISSUE):
+            info[str(row["source_id"])] = ("issue", _detail(row))
+        for row in self.store.ngit_links(key, KIND_PR):
+            info[str(row["source_id"])] = ("PR", _detail(row))
+        roots = list(info)[:MAX_MENTION_ROOTS]
+        if not roots or not self.self_npub:
+            return
+        if self.state is None:
+            report.notes.append("mentions: no relays to read comments from")
+            return
+        read_comments = getattr(self.state, "comments", None)
+        if not callable(read_comments):
+            report.notes.append("mentions: this reader cannot supply raw comments")
+            return
+        try:
+            grouped, _relays = read_comments(roots)
+        except Exception as exc:  # noqa: BLE001 - a read failure is a report line
+            report.errors.append(f"mentions: {type(exc).__name__}: {exc}"[:200])
+            return
+        budget = max(1, int(self.config.max_new or 1))
+        me = npub_of(self.self_npub)
+        for root, events in grouped.items():
+            kind, note = info.get(root, ("issue", {}))
+            for event in sorted(events, key=lambda e: (int(e.get("created_at") or 0),
+                                                       str(e.get("id") or ""))):
+                comment_id = str(event.get("id") or "")
+                if not comment_id or not self._mentions_me(event):
+                    continue
+                report.mentions["seen"] += 1
+                author = npub_of(str(event.get("pubkey") or ""))
+                if not author or author == me:
+                    continue                    # our own comment is not a mention to answer
+                if self.store.ngit_mention(key, comment_id) is not None:
+                    report.mentions["existing"] += 1
+                    continue
+                if not self.control.is_trusted(author, TRUSTED_PLANE):
+                    if not dry_run:
+                        self.store.ngit_mention_save(key, comment_id,
+                                                     detail={"author": author, "root": root,
+                                                             "why": "untrusted author"})
+                    report.mentions["ignored"] += 1
+                    continue
+                if budget <= 0:
+                    report.mentions["deferred"] += 1
+                    continue
+                if dry_run:
+                    report.mentions["would_create"] += 1
+                    continue
+                task_id = self.board.create(
+                    title=mention_title(kind, str(note.get("subject") or ""), author),
+                    body=mention_body(kind=kind, root=root,
+                                      root_nevent=str(note.get("nevent") or root),
+                                      comment=event, target=self.target,
+                                      secret_file=self.config.reply_secret_file),
+                    assignee=self.config.mention_assignee or self.config.assignee,
+                    status="ready", idempotency_key=f"ngit:mention:{comment_id}",
+                    anchor=self.anchor, priority=self.config.priority)
+                self.store.ngit_mention_save(key, comment_id, task_id=task_id,
+                                             detail={"author": author, "root": root,
+                                                     "kind": kind})
+                budget -= 1
+                report.mentions["created"] += 1
+
+    def _mentions_me(self, event: Mapping[str, Any]) -> bool:
+        """True when a comment names this gateway: a `p` tag, or its key in the words.
+
+        The tag is the NIP-27 spelling and what gitworkshop writes for an `@npub` mention.
+        The text fallback exists because a client that dropped the tag still leaves the
+        `nostr:npub…` reference in the body, and answering a person's question matters more
+        than insisting on their client's correctness.
+        """
+        for tag in event.get("tags") or ():
+            if (isinstance(tag, (list, tuple)) and len(tag) >= 2 and str(tag[0]) == "p"
+                    and str(tag[1]).lower() == self.self_npub):
+                return True
+        body = str(event.get("content") or "").lower()
+        return bool(body) and (self.self_npub in body or npub_of(self.self_npub) in body)
 
     # -- pull requests ---------------------------------------------------
 

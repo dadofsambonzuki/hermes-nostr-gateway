@@ -115,12 +115,15 @@ class Verdict:
 
 @dataclass(frozen=True)
 class Label:
-    """One live kind-1985 label event on a PR, as a relay served it."""
+    """One live kind-1985 label event, as a relay served it."""
 
     value: str
     event_id: str
     created_at: int = 0
     relay: str = ""
+    #: Who published it. The bridge's issue gate needs this: a label is only an authorisation
+    #: when a trusted npub wrote it, and the value alone cannot say that.
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -219,7 +222,8 @@ def live_label(event: Mapping[str, Any]) -> Optional[Label]:
         return None
     return Label(value=value, event_id=str(event.get("id") or ""),
                  created_at=int(event.get("created_at") or 0),
-                 relay=str(event.get("relay") or ""))
+                 relay=str(event.get("relay") or ""),
+                 author=str(event.get("pubkey") or ""))
 
 
 # -- the state ----------------------------------------------------------------

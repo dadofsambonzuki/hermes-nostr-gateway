@@ -1359,29 +1359,48 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
     labeler = None
     state = None
     note = ""
+    relays: tuple[str, ...] = ()
+    if target.address:
+        # An explicit `ngit.relays` is the operator's choice; otherwise the repository
+        # announcement's own relay hints, then the gateway's read set, which is where a
+        # repo that predates the hints still publishes.
+        relays = ngit_cfg.relays or tuple(dict.fromkeys(
+            (*repository.relays, *_read_relays(cfg))))[:8]
     if ngit_cfg.prs:
         if not target.address:
             note = "this checkout has no NIP-34 address: PRs are not announced"
+        elif not relays:
+            note = "no relays to read PRs from (ngit.relays or relays.read): " \
+                   "PRs are not announced"
         else:
-            # An explicit `ngit.relays` is the operator's choice; otherwise the repository
-            # announcement's own relay hints, then the gateway's read set, which is where a
-            # repo that predates the hints still publishes.
-            relays = ngit_cfg.relays or tuple(dict.fromkeys(
-                (*repository.relays, *_read_relays(cfg))))[:8]
-            if not relays:
-                note = "no relays to read PRs from (ngit.relays or relays.read): " \
-                       "PRs are not announced"
-            else:
-                prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
-                # The reader is not the writer: a verdict is read to be applied, and a
-                # command that applies one asks for the reader even when nothing is labelled.
-                if ngit_cfg.labels or reader:
-                    state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
-                if ngit_cfg.labels:
-                    # One reader, one writer, the same relay set: the pass reads the verdict
-                    # and the live labels from where it publishes them, so a retraction and
-                    # the state it corrects cannot come from different views of the repo.
-                    labeler = labels.LabelPublisher(relays, secret=secret_from(cfg))
+            prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
+    # One reader serves three jobs -- PR labels, issue labels and comment mentions -- so it
+    # is built whenever any of them needs a relay, not only when PRs are announced.
+    if target.address and relays and (ngit_cfg.labels or ngit_cfg.mentions
+                                      or ngit_cfg.ready_label):
+        state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
+        if ngit_cfg.labels:
+            # One reader, one writer, the same relay set: the pass reads the verdict
+            # and the live labels from where it publishes them, so a retraction and
+            # the state it corrects cannot come from different views of the repo.
+            labeler = labels.LabelPublisher(relays, secret=secret_from(cfg))
+    if ngit_cfg.ready_label and state is None:
+        note = "; ".join(filter(None, [note,
+                                       f"no relays to read the `{ngit_cfg.ready_label}` label "
+                                       "from: issues will not be queued"]))
+    if ngit_cfg.mentions and state is None:
+        note = "; ".join(filter(None, [note,
+                                       "no relays to read comments from: mentions are not "
+                                       "answered"]))
+    # A reply is published by the worker that writes it, as the gateway's own identity: the
+    # absolute path travels in the task body so a worktree's shell reads the same file.
+    reply_secret = ngit_cfg.reply_secret_file
+    if not reply_secret:
+        identity = cfg.get("identity") if isinstance(cfg.get("identity"), dict) else {}
+        reply_secret = str(identity.get("secret_file") or "").strip()
+    if reply_secret:
+        reply_secret = os.path.abspath(os.path.expanduser(reply_secret))
+    ngit_cfg = replace(ngit_cfg, reply_secret_file=reply_secret)
     notifier = bridge.DaemonNotifier(
         os.path.expanduser(str(getattr(args, "socket", None) or cfg.get("socket")
                               or default_socket_path())))
@@ -1392,7 +1411,8 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         prs=prs.events if prs is not None else None,
         statuses=prs.statuses if prs is not None else None,
         sweep=prs.sweep if prs is not None else None,
-        notify=notifier, anchor=anchor, labels=labeler, state=state)
+        notify=notifier, anchor=anchor, labels=labeler, state=state,
+        self_npub=crypto.our_pubkey())
     return board, sync, note
 
 

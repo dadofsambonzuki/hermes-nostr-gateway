@@ -291,9 +291,11 @@ defaults:
 #   priority: 0                  # task priority for anything the bridge creates
 #   max_new: 20                  # new tasks per poll; the rest wait for the next one
 #   max_prs: 10                  # notices decided on, and handed to the daemon, per poll
-#   labels: true                 # publish each PR's review state (review-required,
-#                                # changes-requested, approved) as one NIP-34 label on the
-#                                # PR; false publishes no extra events
+#   labels: true                 # publish each PR's review state as one NIP-34 label on the PR
+#   ready_label: ready           # an issue is queued only when a trusted npub labels it "ready"
+#   mentions: true               # an @mention in an issue/PR comment becomes a reply task
+#   mention_assignee: default    # profile a mention reply task is dispatched to
+#   reply_secret_file: /path/to/reply.json   # key a mention reply is signed with (default: identity.secret_file)
 #   watch: true                  # the daemon wakes a pass when a mapped repo's issue/PR
 #                                # event arrives; default on once `assignee` is set, and
 #                                # `false` is exactly the cron-only behaviour (cron stays

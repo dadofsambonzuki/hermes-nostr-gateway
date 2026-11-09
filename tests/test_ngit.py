@@ -33,6 +33,7 @@ PROJECT = "example-project"
 TRUSTED_HEX = "11" * 32
 STRANGER_HEX = "22" * 32
 OTHER_HEX = "33" * 32
+SELF_HEX = "44" * 32
 CHANNEL_ID = "cd" * 32
 
 
@@ -164,6 +165,25 @@ class FakeApplied:
             tip, Evidence(False, "no commit on master carries its patch"
                                  " (1 compared against 2 since 9b52622)"))
 
+class _Reader:
+    """The relay read the way production supplies it: callable, and able to serve comments.
+
+    `RelayLabels` is both (`__call__` = `read`, plus `comments` for the raw events a mention
+    needs). One object here keeps the harness honest about that shape.
+    """
+
+    def __init__(self, harness: "Harness"):
+        self.harness = harness
+
+    def __call__(self, ids):
+        return self.harness._read(ids)
+
+    def read(self, ids):
+        return self.harness._read(ids)
+
+    def comments(self, ids):
+        return self.harness._comments(ids)
+
 
 class Harness:
     """A sync with every external collaborator replaced by something a test can see."""
@@ -196,11 +216,19 @@ class Harness:
         self.carried: dict[str, tuple[ngit_labels.Label, ...]] = {}
         self.readings: dict[str, tuple[tuple[str, str, int], ...]] = {}
         self.read_calls: list[tuple[str, ...]] = []
-        self.state = state or self._state
+        #: Issues with no trusted `ready` label, and issues whose label set is spelled out.
+        self.unready: set[str] = set()
+        self.ready_labels: dict[str, tuple[ngit_labels.Label, ...]] = {}
+        #: Raw comments per root: what a mention pass reads.
+        self.comments_by_root: dict[str, list[dict]] = {}
+        self.comment_reads: list[tuple[str, ...]] = []
+        self.state = state or _Reader(self)
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
-        self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0)
+        self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0,
+                                        reply_secret_file="/etc/example/reply.json")
         self.anchor = anchor
+        self.self_npub = SELF_HEX
         self.notifier = notifier or (lambda who, text, key="": self.messages.append((who, text)))
         self.repo = home.parent / "checkout"
         self.repo.mkdir(exist_ok=True)
@@ -227,15 +255,39 @@ class Harness:
             raise self.sweep_data
         return self.sweep_data
 
-    def _state(self, pr_ids):
-        """The relay read: whatever the test put in `verdicts`, `carried` and `readings`."""
+    def _issue_hexes(self) -> set[str]:
+        return {issue.hex for issue in self.issues} | set(self.details)
+
+    def _read(self, pr_ids):
+        """The relay read: whatever the test put in `verdicts`, `carried` and `readings`.
+
+        An issue reads as carrying a `ready` label from the trusted npub unless the test says
+        otherwise (`unready`, or an explicit `ready_labels` entry): the gate is the default
+        behaviour, and a harness that had to opt in to it would make every old test pass for
+        the wrong reason.
+        """
         self.read_calls.append(tuple(pr_ids))
-        return ngit.ReadState(
-            prs={pr: ngit.PrRead(verdict=self.verdicts.get(pr),
-                                 labels=self.carried.get(pr, ()),
-                                 readings=self.readings.get(pr, ()))
-                 for pr in pr_ids},
-            relays=("wss://relay.example",))
+        issues = self._issue_hexes()
+        prs = {}
+        for pr in pr_ids:
+            labels = self.carried.get(pr)
+            if labels is None and pr in issues:
+                labels = self.ready_labels.get(pr)
+                if labels is None and pr not in self.unready:
+                    labels = (ngit_labels.Label(
+                        value=self.config.ready_label or "ready", event_id="c" * 64,
+                        author=TRUSTED_HEX),)
+            prs[pr] = ngit.PrRead(verdict=self.verdicts.get(pr),
+                                  labels=labels or (),
+                                  readings=self.readings.get(pr, ()))
+        return ngit.ReadState(prs=prs, relays=("wss://relay.example",))
+
+    def _comments(self, ids):
+        """Raw kind-1111 comments per root, as `RelayLabels.comments` returns them."""
+        self.comment_reads.append(tuple(ids))
+        grouped = {root: list(self.comments_by_root.get(root, ())) for root in ids
+                   if self.comments_by_root.get(root)}
+        return grouped, ("wss://relay.example",)
 
     def _label(self, pr_id: str, address: str, add, retract=()):
         """Record what the sync asked to publish, apply it to the fake relays, and land it.
@@ -257,6 +309,12 @@ class Harness:
         self.carried[pr_id] = tuple(held)
         return ngit_labels.LabelResult(ok=True, events=tuple(events), retracted=True, relays=2)
 
+    def no_gate(self) -> None:
+        """Turn the ready-label gate off, for the `held`/`asked` lifecycle it replaced."""
+        self.config = ngit.BridgeConfig(assignee=self.config.assignee,
+                                        lookback_hours=self.config.lookback_hours,
+                                        ready_label="")
+
     def sync(self, **kwargs):
         return self._sync().run(**kwargs)
 
@@ -270,7 +328,8 @@ class Harness:
             issues=lambda: list(self.issues), detail=self.detail,
             prs=self.prs, statuses=self.statuses, sweep=self.sweep,
             notify=self.notifier, anchor=self.anchor,
-            labels=self.labeler, state=self.state, applied=self.applied)
+            labels=self.labeler, state=self.state, applied=self.applied,
+            self_npub=self.self_npub)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -321,6 +380,7 @@ def test_trusted_author_creates_a_ready_task(harness):
 
 
 def test_unrecognised_author_is_held_and_asked_exactly_once(harness):
+    harness.no_gate()
     issue = make_issue("b2", author=STRANGER_HEX, subject="Do my bidding",
                        body="Please build this.")
     harness.issues = [issue]
@@ -358,6 +418,7 @@ def test_question_is_retried_when_the_channel_was_unreachable(home, store):
             raise ngit.NotifyError("the daemon is not running")
 
     made = Harness(home, store, issues=[issue], notifier=flaky)
+    made.no_gate()
     made.details = {issue.hex: issue}
     try:
         first = made.sync()
@@ -378,6 +439,7 @@ def test_a_held_question_survives_a_restart(home, tmp_path):
 
     first_store = Store(store_path, identity="test")
     first = Harness(home, first_store, issues=[issue])
+    first.no_gate()
     first.details = {issue.hex: issue}
     try:
         first.sync()
@@ -388,6 +450,7 @@ def test_a_held_question_survives_a_restart(home, tmp_path):
 
     second_store = Store(store_path, identity="test")
     second = Harness(home, second_store, issues=[issue])
+    second.no_gate()
     second.details = {issue.hex: issue}
     try:
         report = second.sync()
@@ -403,6 +466,7 @@ def test_a_held_question_survives_a_restart(home, tmp_path):
 def test_yes_promotes_with_an_audit_comment(home, store):
     issue = make_issue("c4", author=STRANGER_HEX, subject="Worth doing")
     made = Harness(home, store, issues=[issue])
+    made.no_gate()
     made.details = {issue.hex: issue}
     try:
         made.sync()
@@ -428,6 +492,7 @@ def test_yes_promotes_with_an_audit_comment(home, store):
 def test_no_leaves_it_blocked_with_the_reason(home, store):
     issue = make_issue("d5", author=STRANGER_HEX)
     made = Harness(home, store, issues=[issue])
+    made.no_gate()
     made.details = {issue.hex: issue}
     try:
         made.sync()
@@ -450,6 +515,7 @@ def test_no_leaves_it_blocked_with_the_reason(home, store):
 def test_an_untrusted_npub_cannot_answer(home, store):
     issue = make_issue("d6", author=STRANGER_HEX)
     made = Harness(home, store, issues=[issue])
+    made.no_gate()
     made.details = {issue.hex: issue}
     try:
         made.sync()
@@ -463,15 +529,19 @@ def test_an_untrusted_npub_cannot_answer(home, store):
 
 
 def test_a_plane_only_trust_is_not_a_concord_trust(home, store):
+    """A `ready` label only authorises when its publisher is trusted in the concord plane."""
     issue = make_issue("d7", author=OTHER_HEX)
     control = ControlConfig.from_config(
         {"planes": {"nip17": {"trusted_npubs": [npub(OTHER_HEX)]}}})
     made = Harness(home, store, issues=[issue], trusted=())
     made.control = control
     made.details = {issue.hex: issue}
+    made.ready_labels[issue.hex] = (ngit_labels.Label(
+        value="ready", event_id="d" * 64, author=OTHER_HEX),)
     try:
-        made.sync()
-        assert made.tasks()[0]["status"] == "blocked"
+        report = made.sync()
+        assert made.tasks() == []
+        assert report.issues["waiting"] == 1
     finally:
         made.close()
 
@@ -482,6 +552,8 @@ def test_concord_plane_trust_is_enough(home, store):
     made.control = ControlConfig.from_config(
         {"planes": {"concord": {"trusted_npubs": [npub(OTHER_HEX)]}}})
     made.details = {issue.hex: issue}
+    made.ready_labels[issue.hex] = (ngit_labels.Label(
+        value="ready", event_id="e" * 64, author=OTHER_HEX),)
     try:
         made.sync()
         assert made.tasks()[0]["status"] == "ready"
@@ -3824,3 +3896,162 @@ def test_a_reader_that_raises_is_an_error_not_an_exception():
     assert read.prs == {}
     assert any("OSError" in problem for problem in read.errors)
 
+
+
+# -- the ready-label gate -----------------------------------------------------
+
+def test_an_issue_waits_until_a_trusted_ready_label_is_added(harness):
+    """Filing is not asking for work: the card appears when a trusted npub says so."""
+    issue = make_issue("f1", subject="Add a flag")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.unready.add(issue.hex)
+
+    first = harness.sync()
+
+    assert harness.tasks() == []
+    assert first.issues["waiting"] == 1 and first.issues["created"] == 0
+    assert harness.store.ngit_link(ADDRESS, ngit.KIND_ISSUE, issue.hex)["state"] == "waiting"
+    assert len(harness.messages) == 1
+    assert "ready" in harness.messages[0][1] and issue.id in harness.messages[0][1]
+
+    # The same issue on the next poll says nothing new: the link is the memory.
+    again = harness.sync()
+    assert again.issues["existing"] == 1 and len(harness.messages) == 1
+
+    # A trusted author labels it ready: now the card is made, with the usual notice.
+    harness.unready.discard(issue.hex)
+    third = harness.sync()
+
+    tasks = harness.tasks()
+    assert len(tasks) == 1 and tasks[0]["status"] == "ready"
+    assert tasks[0]["idempotency_key"] == f"ngit:issue:{issue.hex}"
+    assert third.issues["created"] == 1 and third.issues["ready"] == 1
+    assert len(harness.messages) == 2
+    assert tasks[0]["id"] in harness.messages[1][1]
+
+
+def test_a_ready_label_from_an_untrusted_npub_does_not_queue(home, store):
+    issue = make_issue("f2")
+    made = Harness(home, store, issues=[issue], trusted=())
+    made.details = {issue.hex: issue}
+    made.ready_labels[issue.hex] = (ngit_labels.Label(
+        value="ready", event_id="a" * 64, author=STRANGER_HEX),)
+    try:
+        report = made.sync()
+        assert made.tasks() == []
+        assert report.issues["waiting"] == 1
+    finally:
+        made.close()
+
+
+def test_the_gate_can_be_turned_off(harness):
+    harness.no_gate()
+    issue = make_issue("f3", author=STRANGER_HEX)
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+
+    report = harness.sync()
+
+    assert harness.tasks()[0]["status"] == "blocked"
+    assert report.issues["held"] == 1
+
+
+# -- mentions ----------------------------------------------------------------
+
+def mention_event(seed: str, *, author: str = TRUSTED_HEX, root: str,
+                  content: str = "what does this do?", tags: list | None = None) -> dict:
+    """A NIP-22 comment, the way gitworkshop writes an @npub mention."""
+    return {
+        "id": event_id(seed),
+        "pubkey": author,
+        "kind": ngit_labels.KIND_COMMENT,
+        "created_at": 100,
+        "content": content,
+        "tags": tags if tags is not None else [
+            ["E", root, "", REPO_OWNER], ["K", "1621"], ["P", REPO_OWNER],
+            ["e", root, "", REPO_OWNER], ["k", "1621"], ["p", SELF_HEX],
+        ],
+    }
+
+
+def test_a_comment_that_mentions_the_gateway_becomes_one_reply_task(harness):
+    issue = make_issue("a1", subject="How do I configure this?")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.comments_by_root[issue.hex] = [mention_event("a2", root=issue.hex)]
+
+    report = harness.sync()
+
+    assert report.mentions["created"] == 1 and report.mentions["seen"] == 1
+    reply = [task for task in harness.tasks() if task["idempotency_key"].startswith(
+        "ngit:mention:")][0]
+    assert reply["status"] == "ready" and reply["assignee"] == "default"
+    assert "mentioned this gateway" in reply["body"]
+    assert issue.id in reply["body"]              # the thread, as the nevent people use
+    assert "ngit issue comment" in reply["body"] and "--reply-to" in reply["body"]
+    assert harness.store.ngit_mention(ADDRESS, event_id("a2"))["task_id"] == reply["id"]
+
+    # A re-poll reads the same comment and files nothing again.
+    again = harness.sync()
+    assert again.mentions["created"] == 0 and again.mentions["existing"] == 1
+    assert len([task for task in harness.tasks()
+                if task["idempotency_key"].startswith("ngit:mention:")]) == 1
+
+
+def test_a_mention_from_an_untrusted_npub_is_remembered_and_ignored(harness):
+    issue = make_issue("b1")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.comments_by_root[issue.hex] = [
+        mention_event("b2", author=STRANGER_HEX, root=issue.hex)]
+
+    report = harness.sync()
+
+    assert report.mentions["ignored"] == 1 and report.mentions["created"] == 0
+    assert not [task for task in harness.tasks()
+                if task["idempotency_key"].startswith("ngit:mention:")]
+    row = harness.store.ngit_mention(ADDRESS, event_id("b2"))
+    assert row is not None and not row["task_id"]
+
+
+def test_a_comment_that_names_somebody_else_is_not_a_mention(harness):
+    issue = make_issue("c1")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.comments_by_root[issue.hex] = [
+        mention_event("c2", root=issue.hex, content="just a thought",
+                      tags=[["E", issue.hex], ["K", "1621"], ["p", OTHER_HEX]])]
+
+    report = harness.sync()
+
+    assert report.mentions["seen"] == 0 and report.mentions["created"] == 0
+
+
+def test_the_npub_in_the_words_counts_when_the_tag_is_missing(harness):
+    """A client that drops the `p` tag still leaves the reference in the body."""
+    issue = make_issue("d1")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.comments_by_root[issue.hex] = [
+        mention_event("d2", root=issue.hex,
+                      content=f"nostr:{npub(SELF_HEX)} can you look?",
+                      tags=[["E", issue.hex], ["K", "1621"]])]
+
+    report = harness.sync()
+
+    assert report.mentions["created"] == 1
+
+
+def test_a_mention_on_a_pull_request_uses_the_pr_command(harness):
+    pr = make_pr("e1", subject="Add a widget")
+    harness.prs_data = ngit.PrFeed(prs=(pr,), merges=(), revisions=(), closed=())
+    harness.comments_by_root[pr.id] = [mention_event(
+        "e2", root=pr.id, content="why this approach?",
+        tags=[["E", pr.id], ["K", "1618"], ["p", SELF_HEX]])]
+
+    harness.sync()
+
+    reply = [task for task in harness.tasks() if task["idempotency_key"].startswith(
+        "ngit:mention:")][0]
+    assert "on PR" in reply["title"] and "ngit pr comment" in reply["body"]
