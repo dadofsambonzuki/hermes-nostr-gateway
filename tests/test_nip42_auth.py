@@ -204,10 +204,23 @@ async def test_no_one_shot_moves_the_binding_once_the_pump_has_a_home(auth_relay
         assert found is None, "the stub served an event it does not have"
 
         # And the daemon's own subscription is still working afterwards.
-        assert worker.alive and sdkloop.current() is home
+        #
+        # The binding is this test's subject, so it is read before any further await: the
+        # pump re-asserts its own loop before every await (`sdkloop.ensure`), so a re-point
+        # that landed during the one-shot would be papered over by the time a wait returns.
+        assert sdkloop.current() is home, "the one-shot left the bindings on another loop"
         assert recorded == [], (
             "a one-shot re-pointed the bindings' loop: "
             f"{[(id(loop), getattr(loop, 'is_closed', lambda: None)()) for loop in recorded]}")
+
+        # Liveness is waited for, not sampled. The relay challenges on connect, so the first
+        # REQ can go out before the AUTH completes and be closed `auth-required`; the worker
+        # is then not `alive` until it re-REQs, which is the pump working, not one that
+        # stopped. The relay's own record is the proof that matters: it only sends EOSE for
+        # a REQ it has an AUTH for, so a served subscription id is one it accepted.
+        await wait_for(
+            lambda: worker.alive and worker.subscription_id in relay.served,
+            why="the pump never re-subscribed and got served after the one-shot")
     finally:
         worker.stop()
         await asyncio.wait_for(task, timeout=10)
