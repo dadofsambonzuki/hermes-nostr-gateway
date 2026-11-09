@@ -518,7 +518,10 @@ Three properties the pass keeps:
   key and left alone, as long as it is at least as new as the tip it has to cover. (A
   hand-published comment that names no `Tip:` is published once more with the marker added:
   the words are already on the thread, but an approval the merge route cannot match to a
-  revision is not one it can act on.)
+  revision is not one it can act on.) When the hand comment is the newer of the two, it is the
+  one `newest_verdict` reads, so the PR can show `approved` in its label column while the merge
+  still refuses it: the refusal is correct, and the answer is a re-review of the tip that is
+  there.
 - **Read back before it is recorded.** A relay's OK is not the thread: the pass fetches the
   PR's comments again and records the verdict only when the event is on the PR. A failure is
   reported as an error and retried on the next poll; it never holds the cursor.

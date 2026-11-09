@@ -25,7 +25,11 @@ already holds (`duplicate:` is success), and a store that lost its row republish
 new. The link row remembers only "this card's comment was published as this event", so a quiet
 poll does no work; and before publishing, the PR's own thread is read once for the same text
 from the same key -- a verdict the reviewer published by hand is left alone rather than
-duplicated.
+duplicated. "The same text" includes the `Tip:` marker: a hand comment that names none is
+published once more with the marker added, because the words being on the thread does not make
+an approval one the merge can match to a revision. If that hand comment is the newer of the
+two, `newest_verdict` reads it, so the label can show `approved` while the merge keeps refusing
+it -- the refusal is correct, and a re-review of the tip that is there is the answer.
 
 The merge guard uses the other half of the same read: `check_authorship` takes
 `ngit pr view <pr> --json --comments` and answers with the same rules the label pass applies

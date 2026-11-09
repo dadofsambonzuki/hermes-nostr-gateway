@@ -609,6 +609,28 @@ def test_the_merge_guard_reads_the_allowlist_the_label_pass_reads(monkeypatch, t
     assert {as_hex(who) for who in bridged.reviewers} == {key(REVIEWER)}
 
 
+def test_a_review_key_that_cannot_be_read_is_an_empty_allowlist_and_a_named_reason(
+        capsys, tmp_path):
+    """An unreadable key file refuses every verdict, and says which file it could not read.
+
+    Empty is the safe direction and it is deliberate: a guard that guessed the key would accept
+    a signature it cannot identify. The warning is what keeps it diagnosable -- the merge route
+    answers this state with exit 9 ("no reviewer is configured"), which reads as "ask a
+    reviewer" about a box that in fact cannot read its own config, so the line naming the file
+    is the only thing that tells the two apart.
+    """
+    from hermes_nostr_gateway import cli, ngit
+
+    missing = tmp_path / "review-absent.hex"
+
+    resolved = cli.reviewer_keys(ngit.BridgeConfig(review_secret_file=str(missing)))
+
+    assert resolved == ()
+    err = capsys.readouterr().err
+    assert "reviewers unavailable" in err
+    assert str(missing) in err
+
+
 # -- the configured review identity --------------------------------------------
 
 def a_review_config(tmp_path: Path, *, gateway: str, review: str) -> tuple[dict, object]:
