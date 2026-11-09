@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -2303,16 +2304,74 @@ def test_a_pass_with_no_news_still_holds_an_open_guard(harness):
     assert "open at c0ffee" in str(refused.value)
 
 
+# -- the acceptance command runs on a host, and the host may not be ready ----------
+#
+# The test below runs the real `hermes kanban complete` against the harness board, so it is
+# an integration test with an installed CLI. `shutil.which` only answers "a binary exists":
+# with an empty `$HOME` the binary is there and every verb first provisions a dependency
+# environment for that data root -- minutes of installer work, and nothing to do with the
+# guard. Setting `HERMES_HOME` to the harness home does not help; a root with no committed
+# environment is precisely what makes the launcher build one. So the child is told not to
+# install anything (`HERMES_DISABLE_LAZY_INSTALLS`, the launcher's own switch), which leaves
+# an unready host refusing in milliseconds with the reason instead of provisioning, and the
+# CLI is asked one cheap question first (`list`: the same bootstrap, no mutation) on a
+# deadline for the case where it does not answer at all.
+
+CLI_PROBE_SECONDS = 20
+
+
+def cli_not_ready(hermes: str, env: dict) -> str | None:
+    """Why the `hermes` CLI cannot be driven on this host, or None when it answers.
+
+    The probe's own session is what makes the deadline honest: a launcher that starts
+    work has children, and killing only the process we can see would leave that work
+    running after the skip.
+    """
+    try:
+        probe = subprocess.Popen(
+            [hermes, "kanban", "--board", BOARD, "list"], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+    except OSError as exc:
+        return f"the hermes CLI could not be started: {exc}"
+    try:
+        out, err = probe.communicate(timeout=CLI_PROBE_SECONDS)
+    except subprocess.TimeoutExpired:
+        os.killpg(probe.pid, signal.SIGKILL)
+        try:
+            probe.communicate(timeout=10)
+        except subprocess.TimeoutExpired:  # something it spawned left the session
+            probe.kill()
+            probe.communicate()
+        return (f"`hermes kanban list` did not answer in {CLI_PROBE_SECONDS}s on this host, "
+                f"so the acceptance command would time out rather than be refused")
+    if probe.returncode != 0:
+        said = " ".join((err or out or "").split())
+        return (f"`hermes kanban list` exited {probe.returncode} on this host"
+                + (f": {said[:200]}" if said else ""))
+    return None
+
+
 def test_the_cli_refuses_an_open_pr_card(harness):
-    """The acceptance command, run for real against the harness board."""
-    hermes = shutil.which("hermes")
+    """The acceptance command, run for real against the harness board.
+
+    The host is not the subject, so a CLI that cannot answer is skipped for: its silence
+    would be an environmental failure wearing a red test's clothes.
+    """
+    hermes = shutil.which("hermes") or ""
     if not hermes:
         pytest.skip("the hermes CLI is not installed on this host")
-    pr, task_id = pr_with_review_task(harness)
     env = {key: value for key, value in os.environ.items()
            if key not in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK",
                           "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME")}
     env["HERMES_KANBAN_HOME"] = str(harness.home)
+    # A test may read the host; it may not install a runtime on it. With lazy installs
+    # refused, a data root that has no environment answers `hermes pm repair` instead of
+    # spending a minute building one inside the suite.
+    env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+    not_ready = cli_not_ready(hermes, env)
+    if not_ready:
+        pytest.skip(not_ready)
+    pr, task_id = pr_with_review_task(harness)
 
     done = subprocess.run(
         [hermes, "kanban", "--board", BOARD, "complete", task_id, "--summary", "probe"],
