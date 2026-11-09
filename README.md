@@ -310,6 +310,12 @@ name is capped at 107 bytes, so on a long `$HOME` that fallback cannot bind and 
 at startup with a bare `AF_UNIX path too long` — `socket:` set to a short path is the fix. The
 plugin reads `NOSTR_GATEWAY_SOCKET` or its `socket_path` setting, so point both at one path.
 
+Out-of-process sends work without the gateway in the calling process: the plugin registers a
+**standalone sender** that dials the same socket, so `hermes send --to nostr:<hex>` and a cron
+job with `deliver=nostr` reach the daemon from any shell. The daemon still owns the identity,
+relays and policy; the sender carries no second allowlist, is text-only, and drops Hermes'
+control notices exactly as the live adapter does. `NOSTR_HOME_CHANNEL` is the cron home target.
+
 The work half queues onto a **kanban board**, so the install is not finished until Hermes has the
 plugin that renders it. `plugins.enabled` in `~/.hermes/config.yaml` must include `kanban`; a
 `hermes` install without it queues work nobody can see — the cards exist, the bridge behaves, and

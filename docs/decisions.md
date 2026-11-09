@@ -1193,3 +1193,48 @@ daemon's copy as the source of truth. The `nostr-sdk` uniffi binding declares no
 all, so there is no third-party logger here to filter; if one appears, the root handler already
 covers anything that propagates, and a binding that prints straight to stderr is outside the
 logging tree and would need its own boundary.
+
+## A standalone send is one socket request, not a second transport
+
+Hermes can deliver from two processes: the gateway, which holds the platform adapter, and a
+fresh `hermes send` or cron process, which holds only the plugin. The second one used to fail
+with "No live adapter" because the plugin registered no `standalone_sender_fn`; every job and
+note then named `hng send` instead. The gateway's socket already carries a `send` op, so the
+fix is one request over it — no HTTP layer, no sidecar, no second daemon.
+
+**No replay ledger.** The adapter's `_SendLedger` exists because Hermes re-sends a reply it
+cannot prove landed; the daemon's `outbound_wraps` rows are the durable record of what was
+published. A standalone caller has no recovery loop to suppress: a duplicate from a scheduled
+job is a job configuration error, not a transport replay. Each call therefore carries a fresh
+`id` and is published as asked. The daemon still keys on that id, so a caller that does retry
+with the same id gets the message it already published rather than a second copy.
+
+**The live path's bound, and the path in the error.** The daemon publishes before it answers,
+and a recipient relay list that has to be fetched plus a relay that has to time out are both
+part of that answer; a short request timeout would report failure for a message that lands.
+So the standalone bound is the live send's 180s, and a caller with its own tighter bound (cron's
+`standalone_send_timeout_seconds` defaults to 60) still owns that decision. A daemon that is not
+running fails at connect, immediately. Every failure of this path says `the nostr gateway daemon
+did not answer at <socket path>` — the first question an operator asks is which file was dialled,
+and "No live adapter" answered a different one.
+
+**`deliver=nostr` needs nothing else.** Cron resolves a bare platform through
+`PlatformEntry.cron_deliver_env_var`, which the plugin already sets to `NOSTR_HOME_CHANNEL`;
+with the sender registered, that destination has a transport. A missing home names the env var:
+`hermes send --to nostr` asks for `NOSTR_HOME_CHANNEL` by name (Host's own home-channel error),
+and the sender repeats it if it is ever called with no destination.
+
+**A pubkey is target syntax, not a channel name.** Registration also adds
+`parse_target_ref_fn`: without it a plugin platform has no native syntax, so
+`hermes send --to nostr:<hex>` fails in target resolution before the sender is reached ("The
+plugin parser did not recognize it"). The parser accepts exactly the forms the daemon addresses
+itself — a 64-hex pubkey, an npub, `concord:<community>:<channel>`, `marmot:<group>` — and
+leaves everything else to Hermes' own resolution. It says which strings this platform owns; the
+daemon still validates the destination on the `send` op.
+
+**Control text still stops at the adapter.** The standalone path uses the same
+`is_control_text()` as the live `send()`, returns success so Hermes does not retry, and writes
+no frame; only a destination explicitly named in `NOSTR_CONTROL_CHANNEL` is exempt. Text only:
+attachments are refused, never silently dropped. The daemon's policy remains the one allowlist
+— this adapter sets `enforces_own_access_policy`, and a second list here would be the drift that
+flag exists to prevent.

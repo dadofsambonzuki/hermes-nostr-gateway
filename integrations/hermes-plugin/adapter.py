@@ -49,6 +49,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -77,6 +78,12 @@ PLATFORM_NAME = "nostr"
 DEFAULT_SOCKET = "~/.local/state/hermes-nostr-gateway/gateway.sock"
 SEND_TIMEOUT_S = 180.0
 CONNECT_TIMEOUT_S = 15.0
+#: A standalone send is one socket request, and the daemon publishes before it answers: a
+#: recipient relay list that has to be fetched and a relay that has to time out are both
+#: part of that answer. The bound is therefore the live path's, not a short request's; a
+#: daemon that is not running fails at connect, immediately. A caller with a tighter bound
+#: of its own (cron's ``standalone_send_timeout_seconds`` defaults to 60) still owns it.
+STANDALONE_TIMEOUT_S = SEND_TIMEOUT_S
 #: One `media.get` may download the gateway's whole per-blob cap (25 MiB by default), so it
 #: gets a longer bound than an ordinary request.
 MEDIA_TIMEOUT_S = 30.0
@@ -236,6 +243,72 @@ def env_setting(name: str, default: str = "") -> str:
 def socket_path(config: Any) -> Path:
     configured = env_setting("NOSTR_GATEWAY_SOCKET") or _extra(config).get("socket_path")
     return Path(os.path.expanduser(configured or DEFAULT_SOCKET))
+
+
+#: A Nostr target is a pubkey (hex or bech32), or a conversation the daemon addresses itself
+#: (`concord:<community>:<channel>`, `marmot:<group>`). Anything else is not this platform's
+#: target syntax and must fall through Hermes' own resolution rather than be sent somewhere.
+_PUBKEY_HEX = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def parse_target_ref(target_ref: str) -> Optional[tuple[str, Optional[str]]]:
+    """Hermes' ``parse_target_ref_fn``: recognise a nostr conversation id as written.
+
+    Without this a plugin platform has no native target syntax, so ``hermes send --to
+    nostr:<hex>`` fails in target resolution before the standalone sender is ever called
+    ("The plugin parser did not recognize it"). The daemon still validates the destination
+    on the ``send`` op -- this only says which strings are addressed to this platform.
+    """
+    ref = (target_ref or "").strip()
+    if not ref:
+        return None
+    if _PUBKEY_HEX.fullmatch(ref):
+        return ref.lower(), None
+    if ref.startswith("npub1") and len(ref) > len("npub1"):
+        return ref, None
+    if ref.lower().startswith("concord:") and len(ref.split(":")) >= 3:
+        return ref, None
+    if ref.lower().startswith("marmot:") and ref.split(":", 1)[1].strip():
+        return ref, None
+    return None
+
+
+def _as_hex(value: str) -> str:
+    """*value* as a lower-cased hex pubkey: an npub is decoded, anything else is returned as-is.
+
+    An npub that cannot be decoded is no destination at all: ``""`` rather than the npub, so a
+    comparison never accidentally matches the un-decoded spelling.
+    """
+    value = (value or "").strip()
+    if not value.startswith("npub"):
+        return value.lower()
+    try:
+        import subprocess
+        out = subprocess.run(["nak", "decode", value], capture_output=True, text=True,
+                             timeout=10, env=_nak_env())
+        return (out.stdout or "").strip().lower()
+    except Exception:  # noqa: BLE001 - an undecodable npub is an unusable destination
+        return ""
+
+
+def control_allowed(chat_id: str, config: Any) -> bool:
+    """Whether *chat_id* is an explicitly nominated control destination.
+
+    ``NOSTR_CONTROL_CHANNEL`` (or the plugin's ``control_channel`` setting) is the one
+    deliberate exception to dropping control text; it is a comma-separated list, and the first
+    entry is also accepted as hex when it is written as an npub. Nothing else is: the home
+    channel is for conversation, never for status lines.
+    """
+    raw = (env_setting("NOSTR_CONTROL_CHANNEL")
+           or _extra(config).get("control_channel") or "").strip()
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    target = (chat_id or "").strip().lower()
+    if not target:
+        return False
+    allowed = {part.lower() for part in parts}
+    if parts:
+        allowed.add(_as_hex(parts[0]))
+    return target in allowed
 
 
 def profile_missing(name: str) -> bool:
@@ -921,13 +994,8 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         cached = getattr(self, "_home_hex", "")
         if cached:
             return cached
-        try:  # a bad home channel must not fail a send that would otherwise work
-            import subprocess
-            out = subprocess.run(["nak", "decode", raw], capture_output=True, text=True,
-                                 timeout=10, env=_nak_env())
-            self._home_hex = (out.stdout or "").strip().lower()
-        except Exception:  # noqa: BLE001
-            self._home_hex = ""
+        # A bad home channel must not fail a send that would otherwise work.
+        self._home_hex = _as_hex(raw)
         return self._home_hex
 
     def _may_address(self, chat_id: str) -> bool:
@@ -963,22 +1031,11 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         cached = getattr(self, "_control_hex", "")
         if cached:
             return cached
-        try:
-            import subprocess
-            out = subprocess.run(["nak", "decode", first], capture_output=True, text=True,
-                                 timeout=10, env=_nak_env())
-            self._control_hex = (out.stdout or "").strip().lower()
-        except Exception:  # noqa: BLE001
-            self._control_hex = ""
+        self._control_hex = _as_hex(first)
         return self._control_hex
 
     def _control_allowed(self, chat_id: str) -> bool:
-        target = (chat_id or "").strip().lower()
-        allowed = {p.strip().lower() for p in
-                   (env_setting("NOSTR_CONTROL_CHANNEL")
-                    or _extra(getattr(self, "_config", None)).get("control_channel") or "").split(",")
-                   if p.strip()}
-        return bool(target) and target in allowed | {self._control_chat()}
+        return control_allowed(chat_id, getattr(self, "_config", None))
 
     # -- approval reactions ---------------------------------------------
     def _approvals(self) -> OrderedDict[str, tuple[str, str, str]]:
@@ -1993,6 +2050,103 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         return json.loads(raw)
 
 
+async def standalone_send(pconfig: Any, chat_id: str, message: str, *,
+                           thread_id: Optional[str] = None,
+                           media_files: Optional[list[Any]] = None,
+                           force_document: bool = False,
+                           **kwargs: Any) -> dict[str, Any]:
+    """Send one text message from a process that is not the gateway.
+
+    This is the ``standalone_sender_fn`` Hermes uses for ``deliver=<platform>`` cron jobs and
+    for ``hermes send`` when no live adapter is in the calling process. The gateway's socket is
+    the whole transport: one connection, one ``send`` op, one reply -- no identity, no relay
+    connection and no subscription are opened here. The daemon owns those, and its policy is
+    authoritative (this adapter sets ``enforces_own_access_policy`` for exactly that reason); a
+    second allowlist in this path would be the drift that flag exists to prevent.
+
+    **No replay ledger.** The adapter's ``_SendLedger`` exists because Hermes re-sends a reply
+    it could not prove landed. A standalone caller has no such recovery loop: the daemon's
+    ``outbound_wraps`` rows are the record, and a duplicate from a scheduled job is a job
+    configuration error, not a transport replay. Every call therefore carries a fresh ``id``
+    and is published as asked.
+
+    Control notices are dropped and reported as success, exactly as ``NostrGatewayAdapter.send``
+    does: a cron placeholder or shutdown line must never reach a peer, and reporting failure
+    would make Hermes retry it. Only a nominated control destination is exempt.
+
+    Text only: a caller with attachments gets a refusal naming them, never a silent drop.
+    """
+    target = str(chat_id or "").strip()
+    if not target:
+        return {
+            "success": False,
+            "error": ("nostr standalone send needs an explicit destination: pass "
+                      "'--to nostr:<pubkey>' or set NOSTR_HOME_CHANNEL"),
+        }
+    if media_files:
+        return {
+            "success": False,
+            "error": (f"nostr standalone send is text-only; {len(media_files)} attachment(s) "
+                      "were not sent"),
+        }
+    if is_control_text(message) and not control_allowed(target, pconfig):
+        logger.debug("nostr standalone send skipped: Hermes control notice, not a message")
+        return {"success": True, "skipped": "control_notice", "delivered": False}
+
+    path = socket_path(pconfig)
+    payload = {"op": "send", "to": target, "text": message, "id": uuid.uuid4().hex}
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(path))
+    except OSError as exc:
+        return {"success": False,
+                "error": f"the nostr gateway daemon did not answer at {path}: {exc}"}
+    try:
+        writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        await writer.drain()
+        try:
+            raw = await asyncio.wait_for(reader.readline(), STANDALONE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return {"success": False,
+                    "error": (f"the nostr gateway daemon did not answer at {path} "
+                              f"within {STANDALONE_TIMEOUT_S:.0f}s")}
+    except OSError as exc:
+        return {"success": False,
+                "error": f"the nostr gateway daemon did not answer at {path}: {exc}"}
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+
+    if not raw:
+        return {"success": False,
+                "error": (f"the nostr gateway daemon did not answer at {path}: "
+                          "it closed the connection without a reply")}
+    try:
+        frame = json.loads(raw)
+    except (TypeError, ValueError):
+        frame = None
+    if not isinstance(frame, dict):
+        return {"success": False,
+                "error": f"the nostr gateway daemon at {path} sent a reply that was not a frame"}
+    if frame.get("type") == "error":
+        reason = str(frame.get("error") or frame.get("code") or "refused")[:300]
+        return {"success": False, "error": f"the nostr gateway refused the send: {reason}"}
+    if not frame.get("ok"):
+        if frame.get("error"):
+            reason = str(frame["error"])
+        else:
+            errors = frame.get("errors")
+            reason = (json.dumps(errors, separators=(",", ":")) if isinstance(errors, dict)
+                      else str(errors or ""))
+        return {"success": False,
+                "error": ("the nostr gateway could not deliver the message: "
+                          f"{reason[:300] or 'no relay accepted it'}")}
+    return {"success": True, "platform": PLATFORM_NAME, "chat_id": target,
+            "message_id": frame.get("message_id")}
+
+
 #: The daemon deliberately does not import Hermes (its `profiles.py` copies Hermes'
 #: profile grammar for the same reason), so the host's gateway-dispatchable commands cross
 #: the boundary as a file beside the gateway socket. This module *does* run inside Hermes:
@@ -2114,6 +2268,8 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=validate_config,
         cron_deliver_env_var="NOSTR_HOME_CHANNEL",
+        standalone_sender_fn=standalone_send,
+        parse_target_ref_fn=parse_target_ref,
         allowed_users_env="NOSTR_ALLOWED_USERS",
         allow_all_env="NOSTR_ALLOW_ALL_USERS",
         max_message_length=0,
