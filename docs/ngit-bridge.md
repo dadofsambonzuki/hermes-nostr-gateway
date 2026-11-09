@@ -720,8 +720,12 @@ Rules that keep the pairing honest:
   a role: its work becomes unattributable.
 - **The verdict goes on the PR.** The bridge publishes the review card's verdict as a NIP-34
   comment signed as the review role's own identity, from `ngit.review_secret_file` (see "The
-  verdict on the PR"). The manual route is still there for a card that is gone, or a review
-  that predates the bridge:
+  verdict on the PR"). The manual route is for a card that is gone, or a review that predates
+  the bridge -- not a second publisher. A reviewer that publishes by hand *and* leaves a verdict
+  on the card puts two kind-1111 comments on the PR: the bridge treats an existing comment as its
+  own only when the text is byte-identical, and a card comment that carries readback notes or a
+  gates summary never is. One review, one comment: write it on the card and let the bridge
+  publish it.
 
   ```bash
   ngit pr comment <id|nevent> --body "<verdict>" --nsec-file <path to the review key>
