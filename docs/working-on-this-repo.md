@@ -66,9 +66,10 @@ can resolve, and the failure looks like a PR that never applied.
 
 **Closing a proposal** is `hng ngit closed <id|nevent> --reason "<why>"`, not `ngit pr close`.
 `ngit pr close` writes a 1632 with `e`/`alt`/`p` and no `a` tag; a repository's feed is filtered
-by that coordinate, so the bridge and every other repository reader never see the close. And say
-why: `closed` on its own reads as "rejected", which is a lie about a proposal whose content is
-already in master.
+by that coordinate, so the bridge and every other repository reader never see the close. A close
+is for a proposal that will not land — a duplicate, or a rebase that applies no commits — and its
+reason names the successor it left behind. Merged work is not closed: the proposal whose own
+content landed takes the applied record above, naming the commit.
 
 ## Every commit says which card wrote it
 
