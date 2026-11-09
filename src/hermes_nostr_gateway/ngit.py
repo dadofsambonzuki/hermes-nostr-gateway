@@ -1557,8 +1557,15 @@ class RelayLabels:
 
     Comments are matched by their NIP-22 root (`E` = the PR), which is what "the verdict on
     the PR root" means; a reply inside the thread carries the same root and counts too, in
-    the order it was published. Labels are matched by `e` (the PR) and the repository's `a`,
-    so another repository's label on the same event id cannot be mistaken for this one's.
+    the order it was published.
+
+    Labels are read by `e` (the PR) **alone**, because `#e` and `#a` in one filter are a
+    conjunction: a label event that names the PR and carries no repository `a` at all --
+    the shape `ngit pr label` writes -- would never come back, and a label the pass cannot
+    read is one it cannot retract. The repository check is applied afterwards instead, with
+    `issue_labels`' tolerance: this repository's `a` when the event carries one at all. So
+    another repository's label on the same event id is still not mistaken for this one's,
+    and every shape that states this PR's review state reaches `reconcile_labels`.
     """
 
     def __init__(self, relays: Sequence[str], address: str = "", *,
@@ -1585,8 +1592,7 @@ class RelayLabels:
                                    values=ids, limit=READ_AHEAD, secret=self.secret,
                                    authors=self.reviewers) if self.reviewers else []
             carried = self._fetch(relays=self.relays, kinds=[KIND_LABEL], tag="e",
-                                  values=ids, limit=READ_AHEAD, a_tag=self.address,
-                                  secret=self.secret)
+                                  values=ids, limit=READ_AHEAD, secret=self.secret)
         except Exception as exc:  # noqa: BLE001 - a read that failed is a report line
             return ReadState(errors=(f"relay read failed: {type(exc).__name__}: {exc}"[:200],))
 
@@ -1601,6 +1607,12 @@ class RelayLabels:
             label = live_label(event)
             root = _tag_value(event, "e")
             if label is None or root not in labels:
+                continue
+            # The read is by `e` alone, so this is where the repository scopes it: an event
+            # carrying another repository's `a` is not this PR's state, and one carrying no
+            # `a` at all is -- the same tolerance `issue_labels` applies to the issue gate.
+            addresses = _tags(event, "a")
+            if self.address and addresses and self.address not in addresses:
                 continue
             if (root, label.event_id) in seen:
                 continue

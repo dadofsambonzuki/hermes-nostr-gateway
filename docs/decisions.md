@@ -755,6 +755,15 @@ survivor first (the row's own event when the relays still serve it, otherwise th
 one) and retracts the rest. That is what makes a leftover a one-pass fix; a writer that only
 retracted events it remembered would leave the column with a history nobody could trust.
 
+**The read is by `e` alone.** NIP-01 filters conjoin, so asking for `#e` *and* the repository
+`#a` in one filter only ever returns the shape this bridge writes — while `ngit pr label`
+publishes a label with `e` and `p` and no `a`. That event is visible to every reader and
+invisible to a filtered pass, so it counts in the column and can never be retracted. The
+repository scopes the read afterwards instead, on the events: this repository's `a` when one is
+carried, and an event with no `a` at all is this PR's. The same tolerance the issue-label gate
+applies, for the same reason. The kind-5 limit is unchanged: a retraction only removes events
+from our own key, so another key's label can be ignored by a reader but not deleted by one.
+
 **Unknown is not stale.** A newest verdict the parser cannot read leaves the label untouched
 and records the event and relay; so does a relay read that failed, and a PR the pass has
 labelled but cannot read a verdict for. Falling back to an older approval is the one direction

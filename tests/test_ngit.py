@@ -2663,6 +2663,46 @@ def test_a_second_live_label_with_the_same_value_is_retracted(harness):
     assert any("retracted 1 other live label event" in note for note in report.notes)
 
 
+@pytest.mark.parametrize("wanted_shape", ["with-a", "without-a"])
+def test_the_pass_leaves_one_label_when_a_pr_carries_both_shapes(harness, wanted_shape):
+    """Two live labels on one PR: one carries the repository's `a`, one carries none.
+
+    The `a`-less event is the shape `ngit pr label` writes. A read filtered on `#a` is a
+    conjunction, so it never saw that event -- the pass could neither adopt it as the label
+    that belongs nor retract it as the leftover, and the PR kept two review states. Read by
+    `e` alone, whichever shape carries the desired word survives and the other is retracted.
+    """
+    pr = make_pr("e7")
+    harness.prs_data = ([pr], [])
+    addresses = {"with-a": ADDRESS, "without-a": ""}
+    other_shape = "without-a" if wanted_shape == "with-a" else "with-a"
+    wanted_event, leftover_event = "w" * 64, "l" * 64
+    # `review-required` is what a new PR with a review card should carry; the `approved` is
+    # a leftover from an earlier writer whichever shape holds it.
+    carried = {wanted_shape: ("review-required", wanted_event),
+               other_shape: ("approved", leftover_event)}
+    events = [relay_label("wss://a.example", value=value, event_id=event_id, pr_id=pr.id,
+                          address=addresses[shape])
+              for shape, (value, event_id) in carried.items()]
+
+    def fetch(**kwargs):
+        return [] if kwargs["kinds"] == [ngit.KIND_COMMENT] \
+            else relay_answer(events, kwargs.get("a_tag") or "")
+
+    harness.state = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch)
+    report = harness.sync()
+
+    assert len(harness.label_calls) == 1
+    pr_id, address, add, retract = harness.label_calls[0]
+    # No publish: the label that belongs is already live, in one of the two shapes.
+    assert (pr_id, address, add) == (pr.id, ADDRESS, ())
+    assert retract == (leftover_event,)
+    detail = label_detail(harness, pr.id)
+    assert detail["label"] == ["review-required"]
+    assert detail["label_events"] == [wanted_event]
+    assert report.prs["labels"] == 0
+
+
 def test_a_duplicate_neither_the_row_nor_the_relay_names_keeps_the_newest(harness):
     """The row names an event that is gone; two live duplicates remain. Newest survives."""
     pr, _task = pr_with_review_task(harness)
@@ -4577,10 +4617,24 @@ def relay_comment(relay: str, *, event_id: str, body: str, created_at: int,
 
 
 def relay_label(relay: str, *, value: str, event_id: str, pr_id: str = LABEL_PR,
-                namespace: str = "#t") -> tuple[str, dict]:
+                namespace: str = "#t", address: str = "") -> tuple[str, dict]:
+    """One kind-1985 label off a relay. `address` empty is the shape `ngit pr label` writes."""
+    tags = [["L", namespace], ["l", value, namespace]]
+    if address:
+        tags.append(["a", address])
+    tags.append(["e", pr_id])
     return (relay, {"id": event_id, "kind": ngit_labels.KIND_LABEL, "content": "",
                     "created_at": 1000, "relay": relay,
-                    "tags": [["L", namespace], ["l", value, namespace], ["e", pr_id]]})
+                    "tags": tags})
+
+
+def relay_answer(events: list[tuple[str, dict]], a_tag: str = "") -> list[tuple[str, dict]]:
+    """What a relay returns for one filter: `#a` is a conjunction, so it drops what lacks it."""
+    if not a_tag:
+        return list(events)
+    return [(relay, event) for relay, event in events
+            if any(str(tag[0]) == "a" and str(tag[1]) == a_tag
+                   for tag in event.get("tags") or ())]
 
 
 def test_the_relay_read_takes_the_newest_verdict_and_keeps_each_relay_s_answer():
@@ -4606,7 +4660,9 @@ def test_the_relay_read_takes_the_newest_verdict_and_keeps_each_relay_s_answer()
     assert "wss://a.example" in read.disagreement()
     # One filter per PR, one request per relay per kind: the relay that answered is kept.
     assert calls[0]["tag"] == "E" and calls[0]["values"] == [LABEL_PR]
-    assert calls[1]["tag"] == "e" and calls[1]["a_tag"] == ADDRESS
+    # The label read asks by `e` alone: a `#a` in the same filter is a conjunction and would
+    # hide a label written without one. The repository is checked on the events instead.
+    assert calls[1]["tag"] == "e" and calls[1].get("a_tag") is None
 
 
 def test_a_label_for_another_pr_or_another_namespace_is_not_this_pr_s():
@@ -4622,6 +4678,31 @@ def test_a_label_for_another_pr_or_another_namespace_is_not_this_pr_s():
     read = reader.read([LABEL_PR]).prs[LABEL_PR]
 
     assert read.labels == ()
+
+
+def test_the_label_read_sees_a_label_that_carries_no_repository_tag():
+    """`ngit pr label` writes `e` and `p` and no `a`; a filter on the repository never sees it.
+
+    Both shapes are live on the same PR, so both have to come back: a label the read cannot
+    see is one the pass can never retract. An event carrying *another* repository's `a` is
+    still dropped -- the tolerance is "this repository or none", not "any".
+    """
+    def fetch(**kwargs):
+        if kwargs["kinds"] == [ngit.KIND_COMMENT]:
+            return []
+        return relay_answer([
+            relay_label("wss://a.example", value="approved", event_id="a" * 64,
+                        address=ADDRESS),
+            relay_label("wss://a.example", value="review-required", event_id="r" * 64),
+            relay_label("wss://a.example", value="in-review", event_id="o" * 64,
+                        address="30617:" + "99" * 32 + ":other"),
+        ], kwargs.get("a_tag") or "")
+
+    reader = ngit.RelayLabels(["wss://a.example"], ADDRESS, fetcher=fetch)
+    read = reader.read([LABEL_PR]).prs[LABEL_PR]
+
+    assert [(label.value, label.event_id) for label in read.labels] == [
+        ("approved", "a" * 64), ("review-required", "r" * 64)]
 
 
 def test_a_read_with_no_relays_is_an_error_not_an_empty_answer():
