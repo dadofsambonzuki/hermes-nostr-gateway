@@ -149,6 +149,15 @@ PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
 #: the link table, not the cursor, is what stops a replayed event being reported twice.
 CURSOR_OVERLAP_S = 300
 
+#: How many linked PRs one `#e` status read asks about. A status cannot change anything for
+#: a PR the board has already finished, so the set is the open links; the cap bounds a board
+#: that never closed anything, and the newest links are the ones news is about.
+MAX_STATUS_PRS = 50
+
+#: How many status events one PR's filter keeps. A PR has one applied or one closed status;
+#: twenty is deep enough for a relay that also replays retried publishes.
+STATUS_READ_AHEAD = 20
+
 #: How long one notice waits for the daemon. A turn can hold the daemon for longer than a
 #: socket round trip takes, so the timeout is generous -- but it still has to end: the notice
 #: is queued, and giving up on it is what lets the poll finish and the next one retry.
@@ -357,6 +366,8 @@ class Merge:
     pr_id: str         # hex of the root PR event
     commit: str = ""
     created_at: int = 0
+    #: The status event itself, so two reads of one relay count it once.
+    event_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -427,6 +438,60 @@ def newest_revisions(revisions: Sequence[Revision]) -> list[Revision]:
         if seen is None or revision.created_at >= seen.created_at:
             newest[revision.pr_id] = revision
     return list(newest.values())
+
+
+def _newer_merge(candidate: Merge, current: Merge) -> bool:
+    """Whether one status should stand over another for the same PR.
+
+    A status that names a commit is the evidence a card can be finished on, so it outranks
+    one that names none; between two of the same shape the newer event wins.
+    """
+    return (bool(candidate.commit), candidate.created_at) >= (
+        bool(current.commit), current.created_at)
+
+
+def merge_feeds(*feeds: PrFeed) -> PrFeed:
+    """Fold several reads of the same relays into one feed, each event counted once.
+
+    A status can arrive through both reads -- the repository's `#a` filter and the per-PR
+    `#e` one -- and a relay can replay an event across passes. The fold is by event id, and
+    for a PR that more than one status names, the newest record wins: a replayed older
+    status must not turn the clock back on a merge or a close the board has moved past.
+    """
+    prs: dict[str, PullRequest] = {}
+    revisions: dict[str, Revision] = {}
+    merges: dict[str, Merge] = {}
+    closed: dict[str, Closed] = {}
+    seen: set[str] = set()
+    for feed in feeds:
+        for pr in feed.prs:
+            if pr.id not in seen:
+                seen.add(pr.id)
+                prs[pr.id] = pr
+        for revision in feed.revisions:
+            key = revision.event_id or (f"{revision.pr_id}:{revision.commit}:"
+                                        f"{revision.created_at}")
+            if key not in seen:
+                seen.add(key)
+                revisions[key] = revision
+        for merge in feed.merges:
+            key = merge.event_id or f"{merge.pr_id}:{merge.commit}:{merge.created_at}"
+            if key in seen:
+                continue
+            seen.add(key)
+            current = merges.get(merge.pr_id)
+            if current is None or _newer_merge(merge, current):
+                merges[merge.pr_id] = merge
+        for stopped in feed.closed:
+            key = stopped.event_id or f"{stopped.pr_id}:{stopped.created_at}"
+            if key in seen:
+                continue
+            seen.add(key)
+            current_closed = closed.get(stopped.pr_id)
+            if current_closed is None or stopped.created_at >= current_closed.created_at:
+                closed[stopped.pr_id] = stopped
+    return PrFeed(prs=list(prs.values()), merges=list(merges.values()),
+                  revisions=list(revisions.values()), closed=list(closed.values()))
 
 
 @dataclass(frozen=True)
@@ -820,7 +885,8 @@ def merge_from_event(event: dict[str, Any]) -> Optional[Merge]:
         applied = _tags(event, APPLIED_COMMIT_TAG)
         commit = applied[0] if applied else ""
     return Merge(pr_id=event_hex(pr_id), commit=commit,
-                 created_at=int(event.get("created_at") or 0))
+                 created_at=int(event.get("created_at") or 0),
+                 event_id=str(event.get("id") or ""))
 
 
 def closed_from_event(event: dict[str, Any]) -> Optional[Closed]:
@@ -966,14 +1032,26 @@ class Ngit:
 
 
 class RelayPrs:
-    """Kind-1618 and kind-1631 events for one repository address, read from relays."""
+    """PR events for one repository address, read from relays.
+
+    Two reads, because NIP-34 spells a status twice over. Kinds 1618/1619/1631/1632 are
+    fetched under the repository's `#a` filter -- a proposal with no `a` cannot be
+    attributed to a repository, so attributing one would mean reading every ngit repo's
+    PRs. Kinds 1631/1632 alone are also fetched by `#e` over the PR ids the caller already
+    knows, because `ngit pr close` publishes a status with `e`/`alt`/`p` and no `a`: the
+    `#a` read can never return it, and the relay's `e` index can. Attribution of a status
+    is by id already (`merge_from_event`/`closed_from_event` resolve the root the caller
+    asks about), so the wider read cannot act on a PR the board does not link.
+    """
 
     def __init__(self, relays: Sequence[str], address: str, *,
                  fetcher: Callable[..., list[dict[str, Any]]] = fetch_many_blocking,
+                 status_fetcher: Callable[..., list[Any]] = fetch_tagged_blocking,
                  secret: str | None = None):
         self.relays = tuple(str(url) for url in relays if url)
         self.address = address
         self._fetch = fetcher
+        self._fetch_statuses = status_fetcher
         self.secret = secret
 
     def events(self, since: int) -> PrFeed:
@@ -986,6 +1064,32 @@ class RelayPrs:
                           kinds=[KIND_PR, KIND_PR_REVISION, KIND_APPLIED, KIND_CLOSED],
                           a_tag=self.address, since=int(since), limit=500,
                           secret=self.secret)
+        return self._fold(raw)
+
+    def statuses(self, pr_ids: Sequence[str]) -> PrFeed:
+        """Kinds 1631/1632 that name these PRs by `e`, whether or not they carry an `a`.
+
+        Unbounded by the cursor on purpose: a status that landed behind it is exactly the
+        one a `#a` read has stopped looking for, and a PR's status set is small enough to
+        re-read while the link is still open. The caller passes the ids it links, and the
+        fold drops a status for any other root, so nothing here can act on an unknown PR.
+        """
+        ids = [pr for pr in (event_hex(str(item)) for item in pr_ids) if pr]
+        if not ids:
+            return PrFeed()
+        if not self.relays:
+            raise NgitError("ngit.relays (or relays.read) is empty: "
+                            "nowhere to read a PR status")
+        raw = self._fetch_statuses(relays=self.relays, kinds=[KIND_APPLIED, KIND_CLOSED],
+                                   tag="e", values=ids, limit=STATUS_READ_AHEAD,
+                                   secret=self.secret)
+        # `fetch_tagged` names the relay that answered each event; a reader that just
+        # returns events is fine too, since a status is attributed by its own root id.
+        events = [item[1] if isinstance(item, tuple) else item for item in raw or ()]
+        return self._fold(events)
+
+    def _fold(self, raw: Sequence[Any]) -> PrFeed:
+        """One relay answer, split into proposals, revisions, merges and closes."""
         prs: dict[str, PullRequest] = {}
         merges: dict[str, Merge] = {}
         revisions: dict[str, Revision] = {}
@@ -1496,6 +1600,9 @@ def default_branch(repo: Path) -> str:
 IssueSource = Callable[[], list[Issue]]
 DetailSource = Callable[[Issue], Issue]
 PrSource = Callable[[int], PrFeed]
+#: `statuses(pr_ids) -> PrFeed`: the applied/closed statuses that name a known PR by `e`,
+#: whether or not the event carries the repository's `a` (see `RelayPrs.statuses`).
+StatusSource = Callable[[Sequence[str]], PrFeed]
 #: `notify(conversation, text, key)`: post one channel message, and let the daemon answer a
 #: repeated `key` with the message it already published instead of posting it twice.
 Notifier = Callable[[str, str, str], None]
@@ -1524,6 +1631,7 @@ class Sync:
     def __init__(self, *, store: Store, board: Board, control: ControlConfig,
                  config: BridgeConfig, target: Target, issues: IssueSource,
                  detail: DetailSource, prs: PrSource | None = None,
+                 statuses: StatusSource | None = None,
                  notify: Notifier | None = None, anchor: Optional[Anchor] = None,
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
                  now: Callable[[], float] = time.time):
@@ -1535,6 +1643,7 @@ class Sync:
         self.issues = issues
         self.detail = detail
         self.prs = prs
+        self.statuses = statuses
         self.notify = notify
         self.anchor = anchor or Anchor()
         self.labels = labels
@@ -1853,6 +1962,11 @@ class Sync:
             raise NgitError("no PR source configured")
         start = self._since(since)
         feed = self.prs(start)
+        # A status that names the PR by `e` and carries no repository `a` -- what
+        # `ngit pr close` publishes -- cannot pass the `#a` filter above. Read the open
+        # PRs' statuses by id and fold them in: attribution is by id already, so a status
+        # for a PR this board does not link changes nothing.
+        feed = self._with_statuses(feed, report)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
@@ -2020,6 +2134,44 @@ class Sync:
             edge = min(max(settled), *deferred) if deferred else max(settled)
             if edge - CURSOR_OVERLAP_S > start:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
+
+    def _with_statuses(self, feed: PrFeed, report: Report) -> PrFeed:
+        """Fold in the applied/closed statuses that name a linked PR by `e` alone.
+
+        A failure here must not cost the pass its ordinary read: the `#a` feed still
+        carries every status that has a repository tag, and the retry needs no cursor,
+        because this read is not bounded by one.
+        """
+        if self.statuses is None:
+            return feed
+        known = self._status_pr_ids()
+        if not known:
+            return feed
+        try:
+            extra = self.statuses(known)
+        except Exception as exc:  # noqa: BLE001 - a read that failed is a report line
+            report.errors.append(
+                f"pr statuses: {type(exc).__name__}: {exc}"[:200])
+            return feed
+        return merge_feeds(feed, extra)
+
+    def _status_pr_ids(self) -> list[str]:
+        """The PR ids whose status is still open to change: linked, applied and not closed.
+
+        Applied and closed are final for the board, so a status about a finished PR can
+        change nothing and is not asked for. Rows come oldest first; a board with more open
+        PRs than the cap asks about the newest, which are the ones news is about.
+        """
+        ids: list[str] = []
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            if str(link.get("state") or "") in ("merged", "closed"):
+                continue
+            if _detail(link).get("merge"):
+                continue
+            source = str(link.get("source_id") or "")
+            if event_hex(source):
+                ids.append(event_hex(source))
+        return ids[-MAX_STATUS_PRS:]
 
     def _fold_repeats(self, prs: Sequence[PullRequest],
                       applied: dict[str, Merge],

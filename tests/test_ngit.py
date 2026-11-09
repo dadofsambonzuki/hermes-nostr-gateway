@@ -138,7 +138,7 @@ class Harness:
 
     def __init__(self, home: Path, store: Store, *, issues=(), trusted=(TRUSTED_HEX,),
                  assignee: str = "default", anchor: Anchor | None = None,
-                 notifier=None, prs=((), ()), labeler=None, state=None):
+                 notifier=None, prs=((), ()), statuses=None, labeler=None, state=None):
         self.home = home
         self.store = store
         self.board = Board(home / "kanban" / "boards" / BOARD / "kanban.db")
@@ -147,6 +147,8 @@ class Harness:
         self.details: dict[str, ngit.Issue] = {}
         self.detail_calls: list[str] = []
         self.prs_data = prs
+        #: The second read: statuses for the PR ids the store already links, by `#e`.
+        self.statuses = statuses
         self.since_seen: list[int] = []
         self.label_calls: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
         self.labeler = labeler or self._label
@@ -206,7 +208,7 @@ class Harness:
             store=self.store, board=self.board, control=self.control,
             config=self.config, target=self.target,
             issues=lambda: list(self.issues), detail=self.detail,
-            prs=self.prs, notify=self.notifier, anchor=self.anchor,
+            prs=self.prs, statuses=self.statuses, notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state)
 
     def task(self, task_id: str):
@@ -1347,6 +1349,163 @@ def test_a_close_after_a_merge_does_not_undo_it(harness):
 
     assert harness.task(task_id)["status"] == "done"
     assert harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "merged"
+
+
+# -- statuses that name the PR by `e` and carry no repository `a` -------------
+#
+# `ngit pr close` publishes a kind-1631/1632 whose only reference to the PR is the `e`
+# tag: no `a`, so a read filtered by the repository address never returns it, and two PRs
+# wedged their cards until an operator hand-published a signed status. These read the
+# widening through the real `RelayPrs`: one fetch by `#a` (unchanged), one by `#e` over
+# the PR ids the store already links.
+
+class _RecordingRelay:
+    """A relay that answers a filter the way a relay does, and records what it was asked."""
+
+    def __init__(self, events: list[dict]):
+        self.events = [dict(event) for event in events]
+        self.asks: list[dict] = []
+
+    def many(self, *, relays, kinds, a_tag=None, since=0, limit=500, secret=None):
+        """The `#a` read: the repository's proposals, revisions and statuses."""
+        self.asks.append({"kinds": list(kinds), "a_tag": a_tag})
+        return [event for event in self.events
+                if int(event["kind"]) in kinds
+                and (not a_tag or ["a", a_tag] in event["tags"])]
+
+    def tagged(self, *, relays, kinds, tag, values, limit=50, a_tag=None, secret=None):
+        """The `#e` read: one filter per PR id, answered by a relay's own tag index."""
+        self.asks.append({"kinds": list(kinds), "tag": tag, "values": list(values)})
+        wanted = set(values)
+        return [("wss://relay.example", event) for event in self.events
+                if int(event["kind"]) in kinds
+                and any(t[0] == tag and t[1] in wanted for t in event["tags"])]
+
+
+def _proposal_event(seed: str, *, tip: str = "a" * 40) -> dict:
+    return {"id": event_id(seed), "kind": ngit.KIND_PR, "pubkey": TRUSTED_HEX,
+            "created_at": 1000,
+            "tags": [["a", ADDRESS], ["subject", "Add a widget"],
+                     ["branch-name", "pr/widget"], ["c", tip]]}
+
+
+def _applied_event(seed: str, pr_id: str, commit: str, *, created_at: int = 2000,
+                   a_tag: str = "") -> dict:
+    """`ngit pr close`'s shape: `e` names the PR, and there is no repository `a`."""
+    tags = [["e", pr_id], ["merge-commit-id", commit], ["alt", "PR applied"]]
+    if a_tag:
+        tags.append(["a", a_tag])
+    return {"id": event_id(seed), "kind": ngit.KIND_APPLIED, "pubkey": TRUSTED_HEX,
+            "created_at": created_at, "tags": tags}
+
+
+def _closed_event(seed: str, pr_id: str, *, created_at: int = 2000) -> dict:
+    return {"id": event_id(seed), "kind": ngit.KIND_CLOSED, "pubkey": TRUSTED_HEX,
+            "created_at": created_at,
+            "tags": [["e", pr_id], ["alt", "PR closed"]]}
+
+
+def _relay_reader(relay: _RecordingRelay) -> ngit.RelayPrs:
+    return ngit.RelayPrs(["wss://relay.example"], ADDRESS,
+                         fetcher=relay.many, status_fetcher=relay.tagged)
+
+
+def test_an_applied_status_with_no_repo_tag_completes_the_pr_card(home, store):
+    """The wedge: `ngit pr close` published a 1631 with `e` and no `a`; nothing saw it."""
+    pr = make_pr("c1", commit="a" * 40)
+    relay = _RecordingRelay([_proposal_event("c1"),
+                             _applied_event("c2", pr.id, "b" * 40)])
+    reader = _relay_reader(relay)
+    made = Harness(home, store, prs=reader.events(0), statuses=reader.statuses)
+    try:
+        made.sync()                                   # the PR is announced and linked
+        task_id = review_tasks(made)[0]["id"]
+        assert made.task(task_id)["status"] == "ready"
+
+        report = made.sync()                          # the status read reaches it by `e`
+
+        row = made.task(task_id)
+        assert row["status"] == "done" and "b" * 40 in str(row["result"])
+        assert report.prs["completed"] == 1
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "merged"
+        # The second fetch asked the relay about this PR and no other; the `#a` read stands.
+        assert relay.asks[0]["a_tag"] == ADDRESS
+        assert relay.asks[1] == {"kinds": [ngit.KIND_APPLIED, ngit.KIND_CLOSED],
+                                 "tag": "e", "values": [pr.id]}
+    finally:
+        made.close()
+
+
+def test_a_closed_status_with_no_repo_tag_blocks_the_pr_card(home, store):
+    """A 1632 with `e` and no `a` must still hand the card to a person, event named."""
+    pr = make_pr("c3", commit="a" * 40)
+    close = _closed_event("c4", pr.id)
+    relay = _RecordingRelay([_proposal_event("c3"), close])
+    reader = _relay_reader(relay)
+    made = Harness(home, store, prs=reader.events(0), statuses=reader.statuses)
+    try:
+        made.sync()
+        task_id = review_tasks(made)[0]["id"]
+
+        report = made.sync()
+
+        row = made.task(task_id)
+        assert row["status"] == "blocked" and row["block_kind"] == "dependency"
+        assert any(close["id"] in comment["body"] for comment in made.comments(task_id))
+        assert report.prs["blocked"] == 1
+        assert made.store.ngit_link(ADDRESS, ngit.KIND_PR, pr.id)["state"] == "closed"
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            made.board.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+        assert "closed without a merge" in str(refused.value)
+    finally:
+        made.close()
+
+
+def test_a_status_naming_an_unknown_pr_changes_nothing(home, store):
+    """The widened read is scoped by id: a status for a PR this board never linked is inert."""
+    pr = make_pr("c5", commit="a" * 40)
+    unknown = event_id("c6")
+    relay = _RecordingRelay([
+        _proposal_event("c5"),
+        # An issue's resolution shares the repository `a`, so this one reaches the feed;
+        # the bridge must not act on a root it never announced.
+        _applied_event("c7", unknown, "b" * 40, a_tag=ADDRESS),
+        # An `e`-only close for a PR the store does not link is never even asked for.
+        _closed_event("c8", unknown),
+    ])
+    reader = _relay_reader(relay)
+    made = Harness(home, store, prs=reader.events(0), statuses=reader.statuses)
+    try:
+        made.sync()
+        task_id = review_tasks(made)[0]["id"]
+
+        report = made.sync()
+
+        assert made.task(task_id)["status"] == "ready"
+        assert report.prs["completed"] == 0 and report.prs["blocked"] == 0
+        assert [task["idempotency_key"] for task in made.tasks()] == [f"ngit:pr:{pr.id}"]
+        assert [ask["values"] for ask in relay.asks if ask.get("tag") == "e"] == [[pr.id]]
+    finally:
+        made.close()
+
+
+def test_a_status_returned_by_both_reads_is_counted_once():
+    """The `#a` and `#e` reads overlap; a replayed older status must not undo a newer one."""
+    pr_id = event_id("c9")
+    merge = ngit.Merge(pr_id=pr_id, commit="b" * 40, created_at=2000,
+                       event_id=event_id("ca"))
+    older = ngit.Merge(pr_id=pr_id, commit="a" * 40, created_at=1000,
+                       event_id=event_id("cb"))
+
+    both = ngit.merge_feeds(ngit.PrFeed(merges=[merge]), ngit.PrFeed(merges=[merge]))
+    assert both.merges == [merge]
+    # A status that names a commit is the evidence a card finishes on: an older one, or a
+    # newer one with no commit, does not replace it.
+    assert ngit.merge_feeds(ngit.PrFeed(merges=[merge]),
+                            ngit.PrFeed(merges=[older])).merges == [merge]
+    assert ngit.merge_feeds(
+        ngit.PrFeed(merges=[merge]),
+        ngit.PrFeed(merges=[ngit.Merge(pr_id=pr_id, created_at=3000)])).merges == [merge]
 
 
 def test_the_cli_refuses_an_open_pr_card(harness):

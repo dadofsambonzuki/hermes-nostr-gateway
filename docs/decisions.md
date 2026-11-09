@@ -642,3 +642,23 @@ wording — decides what is a candidate: a card blocked on a person's question m
 so it is not listed by `--dry-run` and not moved by the real run. `--dry-run` prints the blast
 radius first, because a repair an operator cannot preview is a repair an operator cannot trust.
 
+## A PR status is read by `e` as well as by `a`
+
+NIP-34 addresses a status to a PR, and `ngit pr close` publishes exactly that: a kind-1631 or
+1632 carrying `e` (the PR root), `p` and `alt` — and **no `a`**. The bridge read every PR event
+under the repository's `#a` filter, so that close never came back: the link stayed `signalled`,
+the guard row stayed `open`, and the PR's card could not finish until an operator signed a
+status by hand. Two PRs wedged that way in one day.
+
+**The `#a` filter on proposals stays.** A kind-1618 with no `a` cannot be attributed to a
+repository, and dropping the filter would mean reading every ngit repository's PRs. **Statuses
+are widened by id, not by repository.** The pass makes a second fetch of kinds 1631/1632 under
+`#e` for the PR ids its own link table holds — relays index single-letter tags, so `#e` is a
+real relay filter — and folds the answer into the same feed, deduped by event id. A status is
+attributed by the root it names, so one for a PR the board does not link is discarded: the
+wider read cannot invent work or move a card.
+
+**Unbounded by the cursor, on purpose.** A status that landed behind the PR cursor is exactly
+the one the `#a` read has stopped looking for. The status read asks about open links only —
+applied and closed are final for the board — and it is re-asked every pass until the link
+finishes, so a late status heals on its own.

@@ -332,6 +332,18 @@ same branch and a revision all land on that one card; none of them makes a secon
   blocked with `block_kind=dependency`, a comment naming the closing event, and a guard that
   refuses completion — a person decides whether the work is re-filed, re-proposed or dropped.
   A queued "ready for review" line for a closed PR is dropped rather than posted.
+- **A status is read twice: by the repository's `#a`, and by the PR's own `#e`.** NIP-34
+  addresses a status to a PR, and `ngit pr close` publishes `e`/`alt`/`p` with **no `a` tag at
+  all**, so a read filtered by the repository address never sees it — which is how a merged or
+  closed PR kept its card `open` until an operator hand-published a signed status. The pass
+  makes a second fetch of kinds 1631/1632 filtered by `#e` over the PR ids its link table
+  already holds (open ones only: applied and closed are final), and folds it into the same
+  feed, deduped by event id. That read is not bounded by the cursor on purpose — a status
+  behind the cursor is the one the `#a` read stopped looking for — and it is safe to widen
+  because a status is attributed by its root id: one naming a PR the board does not link is
+  discarded, never acted on. The `#a` filter on 1618/1619 is unchanged: a proposal with no
+  `a` cannot be attributed to a repository, and the filter is what keeps the pass from reading
+  every ngit repository's PRs.
 - A card whose own premise is `after PR <short> merges` (or a `blocked on … PR <short>` line
   that names the merge) is **released** when the merge lands, with the commit named in the
   comment: the fact it waited on is now true. A blocked card that merely mentions the PR is

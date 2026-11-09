@@ -1385,8 +1385,9 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         store=store, board=board, control=ControlConfig.from_config(cfg.get("control")),
         config=ngit_cfg, target=target,
         issues=checkout.issues, detail=checkout.detail,
-        prs=prs.events if prs is not None else None, notify=notifier, anchor=anchor,
-        labels=labeler, state=state)
+        prs=prs.events if prs is not None else None,
+        statuses=prs.statuses if prs is not None else None,
+        notify=notifier, anchor=anchor, labels=labeler, state=state)
     return board, sync, note
 
 
