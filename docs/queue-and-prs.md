@@ -73,13 +73,17 @@ republished proposal and a revision of a `done` card — and, since the queue gr
 review card for a re-push, the two real kind-1618 roots it published (same `branch-name`, two
 tips, the second one based on the first).
 
-**The branch it compares is the one on the wire.** `branch-name` is the author's branch as
-typed, cut by ngit to 60 characters. `ngit pr view --json` prints
-`pr/<branch>-(<8 hex>)`, adding the short PR id so two roots of one branch stay apart on
-screen; that suffix is the client's display string and never reaches the bridge, so it is not
-stripped. Two roots of one re-push carry the **same** `branch-name` and fold; a `(<pr-id>)`
-mismatch is not a failure mode, and a normalisation for it would guard a string this code
-never sees.
+**The branch it compares is the one on the wire.** `branch-name` is the author's branch, cut
+by ngit to 60 characters. `ngit pr view --json` prints `pr/<branch>-(<8 hex>)`: a local ref
+name, adding the short PR id so two roots of one branch stay apart on screen. That ref does
+reach the tag through one path — a push made from the branch `ngit pr checkout` created —
+where ngit strips the `pr/` and then cuts the rest to 60. For a branch of 49 characters or
+fewer the whole `-(<8 hex>)` survives and is published; from 50 to 60 the cut leaves a
+partial suffix (`-(12345678`, `-(`, `-`) or nothing, which no rule can match back to the
+branch. The incident's own branch was 74 characters, so its two roots carry one name and
+fold. `tests/test_ngit.py` pins both the real pair and the decorated one; a `(<pr-id>)`
+mismatch matters only for the short branch, and any normalisation merges names that could
+be genuinely distinct.
 
 **So a second card for one branch means the pass that made it had no fold.** Check the
 checkout before the comparison: `hng status` prints `checkout: <branch> @ <sha> (<n> behind

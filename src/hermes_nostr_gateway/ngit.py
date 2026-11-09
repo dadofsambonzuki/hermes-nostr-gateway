@@ -3132,11 +3132,14 @@ class Sync:
         that root as a revision; the oldest link wins, because the 1618 that opened the PR
         is the record. A proposal with no tip names no revision and is left as a PR.
 
-        The key is the branch **as published**: the 1618's `branch-name`, which ngit cuts to
-        60 characters and never decorates. `ngit pr view --json` prints
-        `pr/<branch>-(<8 hex>)` to tell two roots apart on screen, and that suffix is the
-        client's display string -- it is not on the wire, so it is not stripped here: a
-        duplicate card is never a suffix mismatch (see `docs/queue-and-prs.md`).
+        The key is the branch **as published**: the 1618's `branch-name`, cut by ngit to 60
+        characters. `ngit pr view --json` prints `pr/<branch>-(<8 hex>)`, a local ref name;
+        that ref reaches the tag when a push is made from the branch `ngit pr checkout`
+        created, and survives the cut only for a source branch of 49 characters or fewer.
+        The incident's branch was 74, so its roots carry one name and fold; a short branch
+        publishes the suffix and does not, which
+        `test_a_repush_from_the_checked_out_branch_makes_one_card` pins. Folding it means
+        deciding whether two names that differ only by that suffix are one branch.
         """
         closed = closed or set()
         known: dict[tuple[str, str], str] = {}

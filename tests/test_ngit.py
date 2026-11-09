@@ -4559,3 +4559,50 @@ def test_the_two_roots_of_one_repush_make_one_card(harness):
     assert events[1]["tags"][[tag[0] for tag in events[1]["tags"]].index("c")][1] in \
         harness.comments(task_id)[-1]["body"]
     assert len(harness.messages) == 1
+
+
+# -- the suffix `ngit pr checkout` puts in the branch name --------------------
+#
+# `ngit pr checkout <root>` creates `pr/<branch>-(<root event id, first 8 hex>)`, and a push
+# made from that branch publishes the checked-out name as `branch-name` (ngit strips one
+# leading `pr/` and cuts the rest to 60 characters). A branch of 49 characters or fewer
+# therefore publishes `<branch>-(<8 hex>)` on a re-push, and `_fold_repeats` keys on the raw
+# name: two roots, two cards. The incident's own branch was 74 characters, so the 60-character
+# cut removed the suffix -- which is why its two events (the fixture above) carry one name.
+
+SUFFIX_FIXTURE = Path(__file__).parent / "fixtures" / "ngit-suffixed-branch-repush.json"
+
+
+def suffixed_repush_events() -> list[dict]:
+    return list(json.loads(SUFFIX_FIXTURE.read_text())["events"])
+
+
+def test_the_suffixed_fixture_is_one_branch_the_client_decorated():
+    """The wire shape of a re-push from a checked-out PR branch: `name-(<8 hex>)`."""
+    feed = repush_feed(suffixed_repush_events())
+    first, second = sorted(feed.prs, key=lambda pr: pr.created_at)
+
+    assert second.branch == f"{first.branch}-({first.id[:8]})"
+    assert len(second.branch) <= 60  # within the writer's cut, so this shape can be published
+    assert "E" not in [tag[0] for tag in suffixed_repush_events()[1]["tags"]]
+    assert feed.revisions == []
+
+
+@pytest.mark.xfail(strict=True,
+                  reason="t_e15d80e2: _fold_repeats compares the decorated branch name")
+def test_a_repush_from_the_checked_out_branch_makes_one_card(harness):
+    """Two names, one branch: one root, one card and one revision, as the docs promise."""
+    events = suffixed_repush_events()
+    harness.prs_data = repush_feed(events[:1])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+
+    harness.prs_data = repush_feed(events[1:])
+    report = harness.sync()
+
+    tasks = review_tasks(harness)
+    assert len(tasks) == 1 and tasks[0]["id"] == task_id
+    assert len(pr_links(harness)) == 1
+    assert report.prs["reopened"] == 1 and report.prs["tasks"] == 0
+    assert harness.task(task_id)["status"] == "ready"

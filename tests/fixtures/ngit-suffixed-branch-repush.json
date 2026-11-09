@@ -1,0 +1,163 @@
+{
+  "what": [
+    "One source branch pushed twice, the SECOND push made from the branch `ngit pr checkout`",
+    "creates: two kind-1618 roots whose `branch-name` tags differ only by the client's",
+    "`-(<root event id, first 8 hex>)` suffix. `_fold_repeats` keys on `(author, branch)`,",
+    "so this pair does not fold and the bridge makes two review cards for one branch.",
+    "",
+    "These events are hand-built, not captured. The real incident's events are in",
+    "`ngit-repush-two-roots.json` and carry identical names: that branch was 74 characters,",
+    "and ngit's writer cuts `branch-name` to 60, which removes a suffix appended after it.",
+    "A branch of 49 characters or fewer keeps the suffix (11 characters), and that is the shape",
+    "modelled here (43 chars; with the suffix, 54).",
+    "",
+    "Where the suffix comes from, in ngit 3.0.5's own source (the installed binary is",
+    "v3.0.5; `/tmp/t9db/ngit-cli-src` is that tag):",
+    "  - `src/lib/git_events.rs:912-922` `get_branch_name_with_pr_prefix_and_shorthand_id`",
+    "    builds `pr/{branch}({root_event_id.to_hex()[..8]})` -- the ref name.",
+    "  - `src/bin/ngit/sub_commands/checkout.rs:149,167-168` `ngit pr checkout` creates and",
+    "    checks out exactly that branch.",
+    "  - `src/lib/git_events.rs:720-739` `make_branch_name_tag_from_check_out_branch`",
+    "    publishes the checked-out branch as `branch-name`, stripping one leading `pr/` and",
+    "    then `.chars().take(60)`.",
+    "So a push made from the checked-out PR branch publishes `<branch>-(<8 hex>)` as its",
+    "`branch-name` whenever that string is 60 characters or fewer.",
+    "",
+    "The ids below are the NIP-01 sha256 of each event's own content (they verify), but the",
+    "events are unsigned: this file is a parser fixture, not a relay capture. The pubkey,",
+    "repository address, root commit, tips and timestamps are the incident's, so the shape",
+    "the bridge sees is the real one."
+  ],
+  "relay": "wss://relay.ngit.dev",
+  "address": "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+  "events": [
+    {
+      "id": "a7c5d5473e866cc12942c8b2e90d7f988f455c00e0b0831102a0cb346a7f2e74",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794152305,
+      "kind": 1618,
+      "tags": [
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "subject",
+          "Merge route: a commit names its card"
+        ],
+        [
+          "alt",
+          "git Pull Request: Merge route: a commit names its card"
+        ],
+        [
+          "branch-name",
+          "hermes-nostr-gateway/t_fc8bf1c9-merge-route"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ],
+        [
+          "c",
+          "1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7"
+        ],
+        [
+          "clone",
+          "https://relay.ngit.dev/npub1cn670f663n3ks02jnnlsvd5y88zjnefy8343ykaxs7y3nzzketrsrjwt8a/hermes-nostr-gateway.git"
+        ],
+        [
+          "merge-base",
+          "9b52622679dccf34e7fe646da8ac9fe70beaf112"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ]
+      ],
+      "content": "The first push: one commit, published as a proposal root because the branch had never been seen."
+    },
+    {
+      "id": "32665cddcf569dfc7a0cd4c11425ec6a74ee77eeedf621f1dda8caae2f526f41",
+      "pubkey": "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29",
+      "created_at": 1794152413,
+      "kind": 1618,
+      "tags": [
+        [
+          "a",
+          "30617:c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "a",
+          "30617:2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe:hermes-nostr-gateway",
+          "wss://relay.ngit.dev"
+        ],
+        [
+          "subject",
+          "Docs: the trailer is written at commit time"
+        ],
+        [
+          "alt",
+          "git Pull Request: Docs: the trailer is written at commit time"
+        ],
+        [
+          "branch-name",
+          "hermes-nostr-gateway/t_fc8bf1c9-merge-route-(a7c5d547)"
+        ],
+        [
+          "r",
+          "fbac49a3902253c8997463f92b71d1bed76243ce"
+        ],
+        [
+          "c",
+          "0ad9f8dad061e7505f9acad6d7f2bf9b6c6a6c6a"
+        ],
+        [
+          "clone",
+          "https://relay.ngit.dev/npub1cn670f663n3ks02jnnlsvd5y88zjnefy8343ykaxs7y3nzzketrsrjwt8a/hermes-nostr-gateway.git"
+        ],
+        [
+          "merge-base",
+          "1d7aa4ad88d10ff1fa0c724667fc7c91537c5cf7"
+        ],
+        [
+          "p",
+          "c4f5e7a75a8ce3683d529cff06368439c529e5243c6b125ba68789198856cac7"
+        ],
+        [
+          "p",
+          "740fcd907b10beedb9530aecf8cde87b274edd4706eafce108aa4fbb45cd2e29"
+        ],
+        [
+          "p",
+          "2e5709c613e41fb4061e95dda6cdf84d3d7e9b2dcf000b6a7a6f32ee09527abe"
+        ]
+      ],
+      "content": "The second push from the branch `ngit pr checkout` made: the same work, one commit further on."
+    }
+  ]
+}
