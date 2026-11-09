@@ -251,7 +251,11 @@ plus the part that is still convention.
 
 ## Quick start
 
-Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). One process serves one identity.
+Python 3.12+ and [`uv`](https://docs.astral.sh/uv/). One process serves one identity.
+
+3.11 is not supported: its `asyncio.wait_for` drops a cancellation that races a completed
+read, which deadlocks the adapter's replay path (the reason is in
+[`docs/decisions.md`](docs/decisions.md#python-312-is-the-floor)).
 
 ```sh
 uv venv .venv

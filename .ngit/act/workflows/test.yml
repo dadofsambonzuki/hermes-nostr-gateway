@@ -25,6 +25,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # Both interpreters in the declared range: 3.12 is the floor `requires-python` names, so
+      # a green run there is what proves the claim, and 3.13 is the range above it. A floor
+      # CI never runs is how the 3.11 claim survived while the suite hung on 3.11 — see
+      # docs/decisions.md, "Python 3.12 is the floor".
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
 
     steps:
       - name: Checkout repository
@@ -33,7 +41,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install the hash-pinned wheel, the package, and the dev tools
         run: |

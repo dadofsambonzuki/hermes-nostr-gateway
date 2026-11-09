@@ -1117,3 +1117,28 @@ forms a scheduled pass can act on.
 
 A channel the bot creates itself arrives through the same refresh, so it is announced by the
 same path; the claim makes a second restart harmless.
+
+## Python 3.12 is the floor
+
+`requires-python` is `>=3.12`, the README says 3.12+, CI runs 3.12 and 3.13, and
+`tests/test_python_floor.py` fails if any of them disagree. The Dockerfile's Python is checked
+against the same floor.
+
+Why: the floor had been 3.11 since the language decision, CI pinned 3.12, and nobody ran the
+suite on the declared floor — so the claim survived although it was false. On 3.11.16
+`tests/test_adapter_pending_replay.py` hangs: the reader loop is cancelled while an ack reply is
+in flight, `asyncio.wait_for` returns the reply and **drops the `CancelledError`**, and the loop
+then waits on a socket nothing will write to again. 3.11 wraps the awaitable in a task and, on
+the branch where that task has already completed, returns its result instead of re-raising;
+3.12 rewrote `wait_for` on `asyncio.timeout` and keeps the cancellation, which is why the same
+test passes there. A minimal reproduction — a task cancelled in the same loop pass that
+completes the awaited task — returns the value on 3.11 and raises `CancelledError` on 3.13.
+
+Why it is not worked around in this code: `asyncio.wait_for` is used throughout the daemon and
+the adapter, and any of those call sites can lose a shutdown the same way when the cancel lands
+as the awaited read completes. Replacing every one of them with a hand-rolled timeout to dodge a
+stdlib bug that CPython has already fixed is a worse trade than declining to support the
+interpreter — and the daemon kept serving on 3.11 throughout, so nothing here needs 3.11 either.
+
+Consequence: a contributor on 3.11 gets a resolver refusal that names the floor, not a hung test
+run; and the tested range is the declared range, so the next floor change has to move CI with it.

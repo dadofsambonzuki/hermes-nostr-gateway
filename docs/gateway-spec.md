@@ -244,7 +244,9 @@ and risk a duplicate in the peer's client.
 core. `nostr-sdk` 0.45.1 ships wheels for py>=3.9, so the Rust implementation's protocol coverage
 (NIP-44, NIP-59, NIP-42, subscriptions, signing) is available behind a Python API, and Hermes
 contributors need one toolchain rather than two. `pynostr` (0.7.0, one wheel, unmaintained) is
-not a candidate.
+not a candidate. The floor moved to **3.12** on 2026-11-09 — 3.11's `asyncio.wait_for` loses a
+cancellation that races a completed read; see
+[`decisions.md`](decisions.md#python-312-is-the-floor).
 
 The one deliberate exception to "official": the installed 0.45.1 binding is our fork build that
 exposes `nip44_v2_conversation_key` (Concord derives stream keys from it). `requirements.txt` pins
