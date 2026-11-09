@@ -165,6 +165,41 @@ def test_the_newest_verdict_wins_and_a_later_merge_line_does_not_erase_it():
     assert found.event_id == "3" * 64
 
 
+def test_the_history_is_every_verdict_newest_first_and_prose_is_not_one():
+    """A re-review is told what the earlier passes decided, in the order they decided it."""
+    events = [comment("## Verdict: changes needed", "1" * 64, 1000),
+              comment("fixed the two findings", "2" * 64, 1100),
+              comment("## Verdict: approve", "3" * 64, 1200)]
+    history = labels.verdict_history(events)
+
+    assert [found.event_id for found in history] == ["3" * 64, "1" * 64]
+    assert [found.label for found in history] == [labels.APPROVED, labels.CHANGES_REQUESTED]
+    # The comment's own words, and who signed it: the brief quotes rather than summarises.
+    assert history[0].body == "## Verdict: approve"
+    assert history[0].author == ""
+
+
+def test_the_history_carries_a_verdict_nobody_could_read_and_dedupes_by_event():
+    """One event served by two relays is one verdict; an unreadable one is still history."""
+    event = comment("Verdict: I have some thoughts", "1" * 64, 1000)
+    twice = [event, dict(event, relay=OTHER)]
+    history = labels.verdict_history(twice)
+
+    assert len(history) == 1
+    assert history[0].readable is False and history[0].label == ""
+
+
+def test_the_history_applies_the_same_reviewer_allowlist_as_the_newest_verdict():
+    """A stranger's `Verdict:` line is not history the brief may quote as a decision."""
+    reviewer = "ab" * 32
+    events = [dict(comment("## Verdict: changes needed", "1" * 64, 1000), pubkey=reviewer),
+              dict(comment("## Verdict: approve", "2" * 64, 1100), pubkey="cd" * 32)]
+    history = labels.verdict_history(events, [reviewer])
+
+    assert [found.event_id for found in history] == ["1" * 64]
+    assert history[0].author == reviewer
+
+
 def test_a_newer_verdict_we_cannot_read_does_not_fall_back_to_an_older_one():
     """Publishing a stale approval over a verdict nobody parsed is the wrong direction."""
     events = [comment("## Verdict: approve", "1" * 64, 1000),

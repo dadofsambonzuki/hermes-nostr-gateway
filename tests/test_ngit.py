@@ -228,6 +228,9 @@ class Harness:
         self.applied = applied or FakeApplied()
         #: What the relays say about a PR: the verdict comment and the labels it carries.
         self.verdicts: dict[str, ngit_labels.Verdict] = {}
+        #: Every verdict on the PR root, newest first -- what a re-review's brief is built
+        #: from. `review_verdict` appends to it the way the relay read does.
+        self.histories: dict[str, tuple[ngit_labels.Verdict, ...]] = {}
         self.carried: dict[str, tuple[ngit_labels.Label, ...]] = {}
         self.readings: dict[str, tuple[tuple[str, str, int], ...]] = {}
         self.read_calls: list[tuple[str, ...]] = []
@@ -338,7 +341,8 @@ class Harness:
                 verdict = replace(verdict, author=TRUSTED_HEX)
             prs[pr] = ngit.PrRead(verdict=verdict,
                                   labels=labels or (),
-                                  readings=self.readings.get(pr, ()))
+                                  readings=self.readings.get(pr, ()),
+                                  history=self.histories.get(pr, ()))
         return ngit.ReadState(prs=prs, relays=("wss://relay.example",))
 
     def _comments(self, ids):
@@ -2523,9 +2527,14 @@ def review_verdict(harness, pr_id: str, label: str, *, event_id: str = "",
     """One verdict comment on the PR root, as a reviewer publishes it."""
     event_id = event_id or (label[:1] or "v").ljust(64, "0")
     text = body or f"Verdict: {label}\n\nThe reviewer's reasons."
-    harness.verdicts[pr_id] = ngit_labels.Verdict(label=label, event_id=event_id,
-                                                  created_at=created_at, relay=relay,
-                                                  body=text)
+    verdict = ngit_labels.Verdict(label=label, event_id=event_id,
+                                  created_at=created_at, relay=relay, body=text)
+    harness.verdicts[pr_id] = verdict
+    # The relay read carries the whole thread, newest first: an earlier verdict stays in
+    # the history after a newer one replaces it as the one in force.
+    harness.histories[pr_id] = (verdict,) + tuple(
+        older for older in harness.histories.get(pr_id, ())
+        if older.event_id != event_id)
     return event_id
 
 
@@ -3617,6 +3626,175 @@ def test_a_review_card_parked_with_a_pushed_fix_reopens_for_review(harness):
     # The claim reviews the tip the PR carries, not the fix that already happened.
     assert "Review this PR" in row["body"] and "c0ffee" in row["body"]
     assert any("Fix pushed" in c["body"] for c in harness.comments(task_id))
+
+
+# -- a re-review reads the history before it writes a verdict ------------------
+#
+# A revision reopens the same card, so the second reviewer inherits the first one's
+# findings. Nothing used to put them in front of it: the brief was the same procedural
+# one, and a reviewer could re-derive a settled finding, miss an open one, or contradict
+# the last verdict without noticing. The brief now opens with that history.
+
+def a_reviewed_pr(harness, seed: str = "e7", *, tip: str = "a" * 40) -> tuple:
+    """A PR whose card has had one review, parked back in the review queue."""
+    pr = make_pr(seed, commit=tip)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+    return pr, task_id
+
+
+def test_a_re_review_carries_the_earlier_verdict_its_tip_and_its_findings(harness):
+    """A revision reopens the card with what the last verdict decided, not a blank brief."""
+    pr, task_id = a_reviewed_pr(harness)
+    review_verdict(
+        harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64, created_at=2000,
+        body="Verdict: changes-requested\n\nThe second claim is not what the code does.")
+    harness.prs_data = ([], [])
+    harness.sync()
+    assert harness.task(task_id)["status"] == "review"     # parked on the verdict; a fix card is queued
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+
+    row = harness.task(task_id)
+    body = row["body"]
+    assert row["status"] == "ready"
+    # The history first: what was decided, over which commit, in the verdict's own words.
+    assert body.index("re-review") < body.index("Review this PR and report a verdict")
+    assert "changes-requested" in body
+    assert "c" * 64 in body                                  # the verdict's event id
+    assert "a" * 40 in body                                  # the tip it was given for
+    assert "The second claim is not what the code does." in body
+    assert "b" * 40 in body                                  # the tip this pass reviews
+    # Both threads are named, because a quote cannot carry a conversation.
+    assert "ngit pr view" in body and "--comments" in body
+    assert f"kanban_show {task_id}" in body
+    # And what this pass owes the findings: one answer per finding.
+    assert "fixed" in body and "still open" in body and "not addressed" in body
+
+
+def test_a_re_review_quotes_the_author_reply_that_moved_the_tip(harness):
+    """The implementer's own `Revision:` park is on the card, so the brief carries it."""
+    pr, task_id = a_reviewed_pr(harness, seed="e8")
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64,
+                   created_at=2000)
+    harness.prs_data = ([], [])
+    harness.sync()
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+    assert harness.board.block(
+        task_id, kind="needs_input", author="default",
+        comment="Revision: bbbb -- the fix is pushed and the gates are green.")
+
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    body = harness.task(task_id)["body"]
+    assert "default" in body and "Revision: bbbb" in body
+    assert "This card's own thread" in body
+
+
+def test_a_long_review_history_is_capped_and_the_brief_says_so(harness):
+    """Five verdicts in the brief and the rest counted: a brief cannot grow without limit."""
+    pr, task_id = a_reviewed_pr(harness, seed="e9")
+    for number in range(1, 8):
+        review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED,
+                       event_id=f"{number:02d}".ljust(64, "0"), created_at=2000 + number)
+    harness.prs_data = ([], [])
+    harness.sync()          # the verdict pass reads all seven and re-queues the fix
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+
+    body = harness.task(task_id)["body"]
+    listed = [line for line in body.splitlines() if "covering tip" in line]
+    assert len(listed) == 5, f"expected five verdicts in the brief, saw {len(listed)}"
+    assert "newest 5 of 7" in body
+    assert "2 older ones not shown" in body
+    # The oldest ones are the ones left out, and the newest is the one this pass answers.
+    assert "01".ljust(64, "0") not in body
+    assert "07".ljust(64, "0") in body
+
+
+def test_a_re_review_after_an_approval_reviews_the_delta_without_a_finding_list(harness):
+    """An approval followed by a revision is still a re-review, but there is no checklist."""
+    pr, task_id = a_reviewed_pr(harness, seed="ea")
+    review_verdict(harness, pr.id, ngit_labels.APPROVED, event_id="a" * 64, created_at=2000)
+    harness.prs_data = ([], [])
+    harness.sync()
+    set_review_status(harness, task_id, "review")
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+
+    body = harness.task(task_id)["body"]
+    assert "re-review" in body.lower()
+    assert "approved" in body and "a" * 40 in body
+    assert "still open" not in body            # nothing was asked for, so nothing to answer
+
+
+def test_a_first_review_brief_has_no_history_section(harness):
+    """The plain brief is still the plain brief: a first review has nothing to inherit."""
+    pr = make_pr("eb", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+
+    harness.sync()
+
+    body = review_tasks(harness)[0]["body"]
+    assert "re-review" not in body.lower()
+    assert "earlier verdict" not in body.lower()
+    assert "What this pass is asked" not in body
+    assert "Review this PR and report a verdict." in body
+
+
+def test_a_hand_queued_re_review_gets_the_history_in_its_thread(harness):
+    """The bridge does not rewrite a person's brief, so the history goes in the comment."""
+    pr = make_pr("ed", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="c" * 64,
+                   created_at=2000)
+    harness.prs_data = ([], [])
+    harness.sync()                       # the bridge's own card takes the verdict
+    task_id = hand_queued_review_task(harness, pr)
+    set_review_status(harness, task_id, "review")
+
+    harness.prs_data = ngit.PrFeed(revisions=[revision_of(pr, "b" * 40, created_at=3000)])
+    harness.sync()
+
+    comment = harness.comments(task_id)[-1]["body"]
+    assert "re-review" in comment
+    assert "changes-requested" in comment and "c" * 64 in comment
+    assert "b" * 40 in comment
+    # Its body is the person's, and the bridge leaves it exactly as written.
+    assert harness.task(task_id)["body"].startswith("Re-review of PR")
+
+
+def test_an_older_verdict_is_placed_on_the_tip_it_was_given_for(harness):
+    """Two revisions later, the log still says which commit the verdict reviewed."""
+    pr = make_pr("ec", commit="a" * 40)
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    task_id = review_tasks(harness)[0]["id"]
+    set_review_status(harness, task_id, "review")
+
+    for number, tip in enumerate(("b" * 40, "c" * 40), start=1):
+        set_review_status(harness, task_id, "review")
+        harness.prs_data = ngit.PrFeed(revisions=[
+            revision_of(pr, tip, created_at=2000 * number, event=str(number))])
+        harness.sync()
+
+    # A verdict published for the middle tip, read back on a pass whose tip is the last one.
+    review_verdict(harness, pr.id, ngit_labels.CHANGES_REQUESTED, event_id="d" * 64,
+                   created_at=3000)
+    harness.prs_data = ([], [])
+    harness.sync()
+
+    logged = label_detail(harness, pr.id)["verdicts"]
+    assert [entry["event"] for entry in logged] == ["d" * 64]
+    assert logged[0]["tip"] == "b" * 40
 
 
 # -- reconcile: a verdict behind the pass's cursor ----------------------------

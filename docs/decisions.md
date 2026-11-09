@@ -1238,3 +1238,39 @@ no frame; only a destination explicitly named in `NOSTR_CONTROL_CHANNEL` is exem
 attachments are refused, never silently dropped. The daemon's policy remains the one allowlist
 — this adapter sets `enforces_own_access_policy`, and a second list here would be the drift that
 flag exists to prevent.
+
+## A re-review reads the history first
+
+One card serves a PR for its life, so a revision hands the second reviewer the first one's
+work — and the brief used to start again from the procedure. The card held the history (the
+verdict comment, the revision note, the implementer's reply) and told nobody to read it; the
+PR's own thread held the verdicts and the brief only said how to *publish* to it. A second
+review could therefore re-derive a settled finding, miss an open one, or contradict the last
+verdict without noticing — on a PR whose whole point is answering findings, the one context it
+must not guess at.
+
+**The brief opens with what was decided.** A card reopened by a revision or a pushed fix gets
+a preamble before the procedure: every earlier verdict with its comment id, its time, the tip
+it was given for and its findings in the comment's own words; the newest tip move; and the
+last few comments on the card itself. It names both records — `ngit pr view <id> --comments`
+and this card's thread — because a brief can quote a comment and cannot carry a conversation.
+A first review passes no history and gets exactly the brief it always got.
+
+**The tip is the bridge's knowledge, not the comment's.** A verdict covers the tip that was
+current when it was published; the comment rarely says which commit that was, and the review
+that needs to know is written after the tip has moved. So the pass records each verdict it
+reads on the link row with the tip `tip_covered` attributes to it, and each move of the tip as
+a revision performs it. Without the move log, a verdict given two revisions back could only be
+reported as "over some earlier tip" — the one fact a re-review exists to be exact about.
+
+**What the pass owes the last verdict.** A changes-requested verdict's findings become a
+checklist: each one answered `fixed`, `still open` or `not addressed`, with the evidence, in
+the new verdict. A conclusion the earlier verdict did not reach is stated as such, with the
+reason: a contradiction between two verdicts is information, and neither re-litigating a
+finding nor silently dropping one is allowed.
+
+**Bounded on both sides.** The row keeps the newest ten verdicts, the brief prints the newest
+five and quotes the newest three card comments, and a trimmed history says how many it left
+out rather than pretending to be the whole thread. A PR that has been round the loop ten times
+still gets a brief that fits in a card body, and the pointer to the PR's thread is what makes
+the truncation safe: the complete record never moved.

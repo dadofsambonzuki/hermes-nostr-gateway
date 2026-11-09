@@ -120,6 +120,7 @@ from .ngit_labels import (
     newest_verdict,
     reconcile_labels,
     review_labels,
+    verdict_history,
 )
 from .ngit_verdict import VerdictPublisherFn, card_verdict
 from .projects import ProjectMap, board_dir, hermes_home
@@ -1485,11 +1486,15 @@ class PrRead:
     which relay it read and where the relays disagreed. Two relays can hold different newest
     verdicts (one of them missed an event); the newest wins, and the others are named rather
     than silently dropped.
+
+    `history` is every verdict the PR root carries, newest first -- what a re-review's brief
+    is built from, and the read the pass records so a later one does not have to ask again.
     """
 
     verdict: Optional[Verdict] = None
     labels: tuple[Label, ...] = ()
     readings: tuple[tuple[str, str, int], ...] = ()
+    history: tuple[Verdict, ...] = ()
 
     @property
     def relay(self) -> str:
@@ -1598,7 +1603,8 @@ class RelayLabels:
                     readings.append((relay, found.label, found.created_at))
             prs[pr] = PrRead(verdict=newest_verdict(roots[pr], self.reviewers),
                              labels=tuple(labels[pr]),
-                             readings=tuple(readings))
+                             readings=tuple(readings),
+                             history=verdict_history(roots[pr], self.reviewers))
         return ReadState(prs=prs, relays=answered)
 
     #: The pass calls the reader; `read` is the name a caller that has the object uses.
@@ -1862,12 +1868,229 @@ def review_title(pr: PullRequest) -> str:
     return f"Review PR {pr.id[:8]}: {pr.subject}"
 
 
-def review_body(pr: PullRequest, target: Target) -> str:
+#: How many earlier verdicts the link row keeps, and how many of them a brief prints. The
+#: row keeps more than the brief shows so a truncated brief can say how many it left out,
+#: and the print cap is what stops a long argument from growing the card body forever.
+VERDICT_LOG = 10
+HISTORY_VERDICTS = 5
+#: How many moves of the branch's tip the row keeps, for placing a verdict that is older
+#: than the tip the PR carries now.
+TIP_LOG = 10
+#: How many of the card's own comments a re-review quotes, and how much of one comment.
+HISTORY_CARD_NOTES = 3
+HISTORY_EXCERPT = 900
+
+
+def _when(at: int) -> str:
+    """A timestamp as a reader's UTC clock, or a plain admission that there is none."""
+    if not at:
+        return "at an unrecorded time"
+    return dt.datetime.fromtimestamp(int(at), dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def _quote(text: str, limit: int = HISTORY_EXCERPT) -> list[str]:
+    """One comment as a markdown quote, cut at `limit` characters with the cut shown."""
+    body = (text or "").strip()
+    if not body:
+        return []
+    if len(body) > limit:
+        body = body[:limit].rstrip() + "\n[...]"
+    return [f"> {line}" if line.strip() else ">" for line in body.splitlines()]
+
+
+@dataclass(frozen=True)
+class EarlierVerdict:
+    """One verdict from a PR's past, as the bridge recorded it when it read it.
+
+    The comment stays on the PR; what the row adds is the **tip** it was given for, which
+    no comment is trusted to state and which the bridge is the only witness to. `findings`
+    is the comment's own words, trimmed -- a brief that summarised them would be the
+    paraphrase this feature exists to avoid.
+    """
+
+    label: str = ""
+    event_id: str = ""
+    created_at: int = 0
+    tip: str = ""
+    author: str = ""
+    findings: str = ""
+
+    @classmethod
+    def from_detail(cls, row: Mapping[str, Any]) -> "EarlierVerdict":
+        return cls(label=str(row.get("label") or ""),
+                   event_id=str(row.get("event") or ""),
+                   created_at=int(row.get("at") or 0),
+                   tip=str(row.get("tip") or ""),
+                   author=str(row.get("author") or ""),
+                   findings=str(row.get("findings") or ""))
+
+    def as_detail(self) -> dict[str, Any]:
+        return {"label": self.label, "event": self.event_id, "at": self.created_at,
+                "tip": self.tip, "author": self.author, "findings": self.findings}
+
+    def headline(self) -> tuple[str, str]:
+        """The two lines a reviewer scans: what was decided, then over which commit."""
+        label = self.label or "a verdict this bridge could not read"
+        where = f"comment {self.event_id}" if self.event_id else "an unnamed comment"
+        tip = (f"covering tip {self.tip}" if self.tip
+               else "covering a tip this bridge did not record")
+        who = f"; by {npub_of(self.author)}" if self.author else ""
+        return f"{label} -- {where}", f"{_when(self.created_at)}, {tip}{who}"
+
+
+@dataclass(frozen=True)
+class ReviewHistory:
+    """What a re-review has to know before it judges a new tip.
+
+    Built from the link row's verdict log and the card's own comments -- the facts the
+    bridge recorded as it read them, quoted, plus pointers at the PR's thread, where the
+    whole conversation lives. Empty for a first review, whose brief is unchanged.
+    """
+
+    verdicts: tuple[EarlierVerdict, ...] = ()      # newest first, already capped
+    revision: Mapping[str, Any] = field(default_factory=dict)   # the newest tip move
+    notes: tuple[Mapping[str, Any], ...] = ()      # the card's comments, oldest first
+    omitted: int = 0                               # earlier verdicts the caps left out
+
+    def empty(self) -> bool:
+        return not (self.verdicts or self.revision or self.notes)
+
+
+def tip_covered(detail: Mapping[str, Any], created_at: int, *, tip: str = "",
+                tip_at: int = 0) -> str:
+    """The tip a verdict was given for, from what the row remembers of the branch's moves.
+
+    A verdict covers the tip that was current when it was published -- the rule the label
+    pass already applies. The current tip answers that directly when the verdict is newer
+    than the last move; otherwise the newest recorded move older than the verdict does, and
+    the proposal's own commit is the last resort. Empty when the row cannot say, which the
+    brief prints as "a tip this bridge did not record" rather than guessing at one.
+    """
+    current = str(tip or detail.get("tip") or "")
+    current_at = int(tip_at or detail.get("tip_at") or 0)
+    if not created_at or (current and (not current_at or created_at >= current_at)):
+        return current
+    best, best_at = "", 0
+    for move in detail.get("tips") or ():
+        if not isinstance(move, Mapping):
+            continue
+        at = int(move.get("at") or 0)
+        if at and at <= created_at and at >= best_at:
+            best, best_at = str(move.get("tip") or ""), at
+    return best or str(detail.get("commit") or "")
+
+
+def review_history_lines(pr: PullRequest, history: ReviewHistory, *,
+                         task_id: str = "") -> list[str]:
+    """The preamble a re-review opens with: what was decided before, and where to read it.
+
+    The card body is regenerated when a revision reopens the card, so this is the one place
+    a second reviewer is told a first one has been here. Both records are named because a
+    brief can quote a comment and cannot carry a conversation; the quotes are excerpts of
+    the real comments, and the worker is told to read the threads rather than trust them.
+    """
+    lines = [
+        "# This is a re-review: the PR has a history",
+        "",
+        "Read both records before you judge anything. The quotes below are excerpts, and a",
+        "verdict written without them repeats work that was already done, or contradicts it",
+        "without noticing:",
+        "",
+        f"* the PR's own thread: `ngit pr view {pr.nevent or pr.id} --comments` -- every",
+        "  verdict published on the PR, and the author's replies to them;",
+    ]
+    if task_id:
+        lines.append(f"* this card's thread: `kanban_show {task_id}` -- the revision note(s)")
+        lines.append("  and the author's reply saying where the fix left the branch.")
+    else:
+        lines.append("* this card's thread -- the revision note(s) and the author's reply")
+        lines.append("  saying where the fix left the branch.")
+    if history.verdicts:
+        lines.append("")
+        if history.omitted:
+            lines.append(f"The newest {len(history.verdicts)} of"
+                         f" {len(history.verdicts) + history.omitted} earlier verdicts --"
+                         f" {_plural(history.omitted, 'older one')} not shown here, read"
+                         " them on the PR:")
+        else:
+            lines.append(f"The {_plural(len(history.verdicts), 'earlier verdict')},"
+                         " newest first:")
+        lines.append("")
+        for number, verdict in enumerate(history.verdicts, start=1):
+            first, second = verdict.headline()
+            lines.append(f"{number}. {first}")
+            lines.append(f"   {second}")
+            lines.extend(_quote(verdict.findings) or
+                         ["   (this bridge did not record the comment's words; read it on the PR)"])
+            lines.append("")
+    if history.revision:
+        revision = history.revision
+        tip = str(revision.get("tip") or "")
+        event = str(revision.get("event") or "")
+        moved = f" (event {event})" if event else ""
+        lines.append("## The revision this pass reviews")
+        lines.append("")
+        lines.append(f"The tip moved to {tip or '(unnamed)'}{moved} at"
+                     f" {_when(int(revision.get('at') or 0))}. A verdict recorded before that"
+                     " time covers the tip before it, not this one.")
+        lines.append("")
+    if history.notes:
+        lines.append(f"## This card's own thread (the newest"
+                     f" {_plural(len(history.notes), 'comment')})")
+        lines.append("")
+        for note in history.notes:
+            lines.append(f"* {str(note.get('author') or 'someone')} at"
+                         f" {_when(int(note.get('created_at') or 0))}:")
+            lines.extend(_quote(str(note.get("body") or ""), limit=400))
+        lines.append("")
+    lines.append("## What this pass is asked")
+    lines.append("")
+    last = history.verdicts[0] if history.verdicts else None
+    if last is not None and last.label == CHANGES_REQUESTED:
+        lines.extend([
+            "The last verdict asked for changes, so this pass answers it finding by finding.",
+            "For each finding in that verdict -- the ones quoted above, or read them from the",
+            "verdict on the PR -- state **fixed**, **still open** or **not addressed**, with",
+            "the evidence on the same line:",
+            "",
+            "  - <the finding, in a few words>: fixed -- <the file and line, the test, the output>",
+            "  - <the finding, in a few words>: still open -- <what is still wrong>",
+            "",
+        ])
+    elif last is not None:
+        lines.extend([
+            "The last verdict approved an earlier tip. This pass reviews the revision that",
+            "followed it: judge what changed, and say plainly whether it disturbs anything",
+            "the earlier verdict covered.",
+            "",
+        ])
+    lines.extend([
+        "If this pass concludes something the earlier verdict did not, say so explicitly and",
+        "give the reason. A contradiction between two verdicts is information: no finding is",
+        "re-litigated, and none is dropped, without saying what changed your mind.",
+        "",
+        "---",
+        "",
+    ])
+    return lines
+
+
+def review_body(pr: PullRequest, target: Target, *,
+                history: Optional[ReviewHistory] = None, task_id: str = "") -> str:
     """What a reviewer needs to judge this PR, and the one thing they must not do.
 
     The brief is the point of the task: "should this merge" answered with reasons, on the
     record, instead of in the channel's scrollback. Merging is left out on purpose -- it is
     the operator's decision, and a reviewed PR is evidence for it, not the decision itself.
+
+    A re-review opens with `history`, not with the procedure: a second pass that cannot see
+    what the first one decided is a first review with a PR attached, and the history is the
+    one context the card already holds and the brief never said. A first review passes no
+    history and gets the brief it always got.
     """
     source = pr.branch or "(the PR names no branch)"
     into = target.default_branch
@@ -1894,7 +2117,11 @@ def review_body(pr: PullRequest, target: Target) -> str:
         "   root, and the merge guard reads the same event; a verdict recorded only here is",
         "   neither, and cannot count as a second signature.",
     ]
+    opening: list[str] = []
+    if history is not None and not history.empty():
+        opening = review_history_lines(pr, history, task_id=task_id)
     return "\n".join([
+        *opening,
         f'PR "{pr.subject}" by {pr.author}',
         "",
         f"PR:         {pr.id}",
@@ -2398,6 +2625,12 @@ class Sync:
             return
         tip = str(detail.get("tip") or detail.get("commit") or "")
         tip_at = int(detail.get("tip_at") or 0)
+        if read is not None and read.verdict is not None:
+            # The manual repair reads the same root as the pass, so it keeps the same log:
+            # a card healed by `reconcile` and then revised has the same history as one
+            # that never needed healing.
+            self._remember_verdicts(detail, read.history or (read.verdict,),
+                                    tip=tip, tip_at=tip_at)
         anchor = anchor_verdict(detail, verdict, tip=tip, tip_at=tip_at)
         if anchor is None:
             report.notes.append(
@@ -3272,6 +3505,12 @@ class Sync:
             if revision.created_at < int(note.get("tip_at") or 0):
                 continue  # a replayed older revision must not move the tip back
             report.prs["revisions"] += 1
+            previous = str(note.get("tip") or "")
+            if tip != previous:
+                # The move is recorded before the brief is built, so a verdict given for
+                # the old tip can still be placed on it afterwards.
+                self._remember_tip(note, previous=previous, tip=tip,
+                                   at=int(revision.created_at), event=revision.event_id)
             note["tip"], note["tip_at"] = tip, int(revision.created_at)
             task_id = self._review_anchor(link)
             task = self.board.task(task_id) if task_id else None
@@ -3289,6 +3528,15 @@ class Sync:
             if task_id and (reopen or status in ("ready", "running")):
                 text = revision_note(note, revision)
                 brief = self._review_brief(task, note, pr_id=revision.pr_id, tip=tip)
+                if not brief and task is not None:
+                    # A card a person filed under the brief's own title: its body is theirs,
+                    # so the history goes in the comment. The reopen is the only moment it
+                    # can be handed over, and a reviewer who is not told is a first reviewer.
+                    history = self._review_history(task, note, tip=tip)
+                    if not history.empty():
+                        text += "\n\n" + "\n".join(review_history_lines(
+                            pr_from_note(revision.pr_id, note, tip=tip), history,
+                            task_id=str(task.get("id") or "")))
                 try:
                     if reopen:
                         if self.board.reopen(task_id, author="ngit", comment=text,
@@ -4171,10 +4419,101 @@ class Sync:
         round replaces the review brief, and a revision puts it back for the new tip. A
         re-review a person filed under the brief's own title has a body of theirs, and
         replacing it would be the bridge editing someone else's instruction.
+
+        A revision or a pushed fix reopens a card that has already had a review, so the
+        brief it gets carries that review: what was decided, over which tip, in whose
+        words. The card is the PR's for its whole life, which is exactly why the second
+        reviewer can be told what the first one found.
         """
         if task is None or not str(task.get("idempotency_key") or "").startswith("ngit:pr:"):
             return ""
-        return review_body(pr_from_note(pr_id, note, tip=tip), self.target)
+        history = self._review_history(task, note, tip=tip)
+        return review_body(pr_from_note(pr_id, note, tip=tip), self.target,
+                           history=history, task_id=str(task.get("id") or ""))
+
+    def _review_history(self, task: Mapping[str, Any], note: Mapping[str, Any], *,
+                        tip: str = "") -> ReviewHistory:
+        """What this PR decided before this pass, from the row's log and the card's thread.
+
+        The link row is the bridge's own record of every verdict it has read, each with the
+        tip that was current when it read it; the card's comments carry the revision note
+        and the author's reply saying where the fix left the branch. Both are bounded -- the
+        newest five verdicts and the newest three comments -- so a PR that has been round
+        the loop ten times still gets a brief, and the brief says how much it left out.
+        """
+        logged: list[EarlierVerdict] = []
+        for row in note.get("verdicts") or ():
+            if isinstance(row, Mapping):
+                verdict = EarlierVerdict.from_detail(row)
+                if verdict.event_id:
+                    logged.append(verdict)
+        newest = list(reversed(logged))[:HISTORY_VERDICTS]
+        omitted = int(note.get("verdicts_dropped") or 0) + max(0, len(logged) - len(newest))
+        revision: Mapping[str, Any] = {}
+        moves = [move for move in (note.get("tips") or ()) if isinstance(move, Mapping)]
+        if moves:
+            revision = dict(moves[-1])
+        elif tip and tip != str(note.get("commit") or ""):
+            # A tip this pass knows and the row never logged a move for (a row from before
+            # the log existed): the tip itself is the news, the time is the row's.
+            revision = {"tip": tip, "at": int(note.get("tip_at") or 0)}
+        notes: tuple[Mapping[str, Any], ...] = ()
+        try:
+            comments = self.board.comments(str(task.get("id") or ""))
+        except sqlite3.Error:
+            # The brief is the point of the reopen; a thread that cannot be read costs it
+            # the quotes, not the card.
+            comments = []
+        notes = tuple(comments[-HISTORY_CARD_NOTES:])
+        return ReviewHistory(verdicts=tuple(newest), revision=revision, notes=notes,
+                             omitted=omitted)
+
+    def _remember_verdicts(self, detail: dict[str, Any], verdicts: Sequence[Verdict], *,
+                           tip: str = "", tip_at: int = 0) -> None:
+        """Append the verdicts this read carried to the row's log, oldest first.
+
+        A verdict comment stays on the PR, but the **tip it was given for** is the bridge's
+        own knowledge: the comment rarely names the commit, and the review that has to know
+        is written after the tip has moved. Bounded, because a PR whose thread is a long
+        argument must not grow the row without limit; a trimmed log counts what it dropped
+        so the brief can say so rather than pretend it is the whole history.
+        """
+        rows = [EarlierVerdict.from_detail(row) for row in (detail.get("verdicts") or ())
+                if isinstance(row, Mapping)]
+        seen = {row.event_id for row in rows if row.event_id}
+        stored = [row for row in rows if row.event_id]
+        added = 0
+        for verdict in reversed(list(verdicts)):   # the read is newest first; the log is not
+            if not verdict.event_id or verdict.event_id in seen:
+                continue
+            stored.append(EarlierVerdict(
+                label=verdict.label, event_id=verdict.event_id,
+                created_at=verdict.created_at, author=verdict.author,
+                tip=tip_covered(detail, verdict.created_at, tip=tip, tip_at=tip_at),
+                findings=(verdict.body or "")[:HISTORY_EXCERPT]))
+            seen.add(verdict.event_id)
+            added += 1
+        if not added:
+            return
+        if len(stored) > VERDICT_LOG:
+            detail["verdicts_dropped"] = (int(detail.get("verdicts_dropped") or 0)
+                                          + len(stored) - VERDICT_LOG)
+        detail["verdicts"] = [row.as_detail() for row in stored[-VERDICT_LOG:]]
+
+    @staticmethod
+    def _remember_tip(detail: dict[str, Any], *, previous: str, tip: str, at: int,
+                      event: str = "") -> None:
+        """Record one move of the branch's tip, so an older verdict can be placed on it.
+
+        The row's `tip` is only ever the newest; without the moves, a verdict given for a
+        commit two revisions back can only be reported as "over some earlier tip", which is
+        the one thing a re-review's brief exists to be exact about.
+        """
+        moves = [dict(move) for move in (detail.get("tips") or ()) if isinstance(move, Mapping)]
+        if moves and str(moves[-1].get("tip") or "") == tip and int(moves[-1].get("at") or 0) == at:
+            return
+        moves.append({"was": previous, "tip": tip, "at": int(at or 0), "event": event})
+        detail["tips"] = moves[-TIP_LOG:]
 
     def _read_labels(self, pr_ids: Sequence[str], report: Report) -> ReadState:
         """One relay read for the whole pass, or the reason there is none."""
@@ -4219,6 +4558,11 @@ class Sync:
             self._save_detail(link, detail, task_id=task_id)
             return
         verdict = read.verdict
+        history = read.history or ((verdict,) if verdict is not None else ())
+        if history:
+            # Before the unreadable check: a verdict the parser cannot read is still part
+            # of the history a re-review has to be told about.
+            self._remember_verdicts(detail, history, tip=tip, tip_at=tip_at)
         if verdict is not None and not verdict.readable:
             report.notes.append(
                 f"review state {pr_id[:8]}: the newest verdict (event {verdict.event_id or '?'}"
@@ -4256,6 +4600,9 @@ class Sync:
             return
         labeler = self._labeler()
         if labeler is None:
+            # Nothing to publish, but the read still happened: the anchor and the verdict
+            # history are what the next pass, and a re-review's brief, decide from.
+            self._save_detail(link, detail, task_id=task_id)
             return
         # One label per PR, and the relays decide which event carries it. The row only says
         # what this pass published last: a second event carrying the same word is invisible

@@ -105,7 +105,9 @@ class Verdict:
     not only with a pointer to a relay a worker may not read.
 
     `author` is the comment's signing key. `newest_verdict` filters on it, and the caller
-    checks it again: a verdict is a review role's statement, not anyone's comment.
+    checks it again: a verdict is a review role's statement, not anyone's comment. A
+    re-review's brief also names who decided, because two verdicts from the same reviewer
+    and two from different ones mean different things.
     """
 
     label: str = ""
@@ -415,6 +417,50 @@ def newest_verdict(events: Iterable[Mapping[str, Any]],
                        body=str(event.get("content") or "") if stated else "",
                        author=_author_hex(event.get("pubkey") or event.get("author")))
     return None
+
+
+def verdict_history(events: Iterable[Mapping[str, Any]],
+                    authors: Optional[Sequence[str]] = None) -> tuple[Verdict, ...]:
+    """Every verdict a PR root carries, newest first: the record behind the newest one.
+
+    The label pass needs the newest verdict and nothing else; a re-review needs the ones
+    before it, because what a second pass is asked depends on what the first one found.
+    Every comment that states a verdict is returned, unreadable ones included -- "a
+    verdict was given and this bridge could not read it" is part of the history, and
+    dropping it would make the last verdict look like an earlier one.
+
+    One event served by two relays is one verdict, and prose comments are not verdicts:
+    the same rule `newest_verdict` applies, so the two cannot disagree about what counts,
+    and `authors` is the same reviewer allowlist -- a history that quoted a stranger's
+    `Verdict:` line would be the forged verdict the filter exists to stop.
+    """
+    allowed = (None if authors is None
+               else {_author_hex(value) for value in authors if str(value or "").strip()})
+    found: dict[str, Verdict] = {}
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        kind = event.get("kind")
+        if kind is not None and int(kind or 0) != KIND_COMMENT:
+            continue
+        if allowed is not None and (not allowed
+                                    or _author_hex(event.get("pubkey")) not in allowed):
+            continue
+        body = str(event.get("content") or "")
+        stated = _verdict_in(body)
+        if stated is None:
+            continue
+        event_id = str(event.get("id") or "")
+        if not event_id or event_id in found:
+            continue
+        found[event_id] = Verdict(
+            label=stated, event_id=event_id,
+            created_at=int(event.get("created_at") or 0),
+            relay=str(event.get("relay") or ""), readable=bool(stated),
+            body=body if stated else "", author=_author_hex(event.get("pubkey")))
+    return tuple(sorted(found.values(),
+                        key=lambda verdict: (verdict.created_at, verdict.event_id),
+                        reverse=True))
 
 
 def reconcile_labels(labels: Iterable[Label], desired: Sequence[str],

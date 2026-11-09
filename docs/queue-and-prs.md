@@ -69,10 +69,11 @@ verdict queues a fix card".
   explicitly, is folded back onto it, and so is a 1619.
 - **A revision reopens the card; it never creates one.** `review`/`done` -> `ready`, with one
   comment naming the new tip and the event that moved it, and the review brief rewritten for
-  that tip. A card already `ready` or `running` only gets the comment; a `blocked` card is
-  waiting for a person unless the bridge itself parked it (`Verdict:`/`Revision:` in the
-  reason), in which case the revision reopens it; an `applied` PR is final, so a late
-  revision cannot revive it.
+  that tip — as a re-review's brief, which opens with the earlier verdicts, the tips they
+  covered and their findings, and names both threads to read. A card already `ready` or
+  `running` only gets the comment; a `blocked` card is waiting for a person unless the bridge
+  itself parked it (`Verdict:`/`Revision:` in the reason), in which case the revision reopens
+  it; an `applied` PR is final, so a late revision cannot revive it.
 
 **Enforced in** `_fold_repeats`/`_fold_root` and `_revisions` in
 `src/hermes_nostr_gateway/ngit.py`, the `ngit:pr:<root>` idempotency key on the card, and

@@ -317,9 +317,13 @@ same branch and a revision all land on that one card; none of them makes a secon
 - A **revision** is an event, not an observation: kind 1619 (`E` names the PR, `c` the new
   tip), or a republished proposal carrying the same `E`/`P`/`c` tags. It reopens the PR's one
   card — `review`/`done` -> `ready` — with one comment naming the new tip and the event that
-  moved it, and with the review brief rewritten for that tip. A card already `ready` or
-  `running` only gets the comment and the brief (the queue, or the worker reading it, now knows
-  which tip is current); a `blocked` card is
+  moved it, and with the review brief rewritten for that tip (a fix round left the fix brief
+  behind). That brief is a **re-review's** brief: it opens with the earlier verdicts, the tips
+  they covered and their findings in their own words, names the PR's thread and the card's,
+  and — when the last verdict asked for changes — makes its findings a per-finding checklist.
+  See "A re-review reads the history first" in [`decisions.md`](decisions.md). A card already
+  `ready` or `running` only gets the comment and the brief (the
+  queue, or the worker reading it, now knows which tip is current); a `blocked` card is
   waiting for a person unless the bridge itself parked it (`Verdict:`/`Revision:` in the
   reason), in which case the revision reopens it; an `archived` one is left alone.
   A branch that moved without an event changes nothing: the tip the bridge knows is the tip
