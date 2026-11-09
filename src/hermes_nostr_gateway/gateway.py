@@ -1197,7 +1197,10 @@ class Gateway:
             self._tasks.append(asyncio.create_task(self._peer_relay_loop()))
         if self.marmot_worker is not None:
             self._tasks.append(asyncio.create_task(self._guard_marmot(self.marmot_worker)))
-        log.info("gateway up: %s on %d relays", self.me, len(self.workers))
+        # The identity as a person recognises it. The log filter keeps eight characters
+        # of the npub at INFO — the relay count still identifies the line — and
+        # `hng serve -v` prints it whole for the operator who needs to name the key.
+        log.info("gateway up: %s on %d relays", self.me_npub, len(self.workers))
 
     # -- advertisement (kind 0 + kind 10304) -----------------------------
     async def advertisement_relays(self) -> list[str]:

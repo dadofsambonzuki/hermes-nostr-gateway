@@ -1159,3 +1159,37 @@ allowlist keeps the line from re-teaching the same exception: tolerated-but-igno
 with a reason, not an unknown. The set of read keys lives beside the doctor and is checked against
 the shipped example, so a key added to the example without the merge that reads it is a red test
 rather than a fresh install that ships with an advisory.
+
+## A log line shortens keys; `-v` is how you read one whole
+
+`gateway up: <pubkey> on N relays` printed the identity in hex, and the lines that did carry a
+key either sliced it by hand or printed it whole. Neither is a rule, and a pasted `journalctl`
+excerpt with a peer's npub beside the relays it appears on is a social graph that outlives the
+incident. So the daemon installs one filter on its logger tree (`logs.py`) and the adapter
+carries the same two patterns beside its own logger: `nsec1…` is always `nsec1[redacted]`, and
+`npub1…` keeps eight characters unless the emitting logger is running at DEBUG. The startup
+line now names the identity as an npub — the form a person recognises — so it is shortened at
+INFO and whole at DEBUG.
+
+**DEBUG prints the npub whole, and `hng serve -v` is the documented way to ask for it.** The
+decision is the logger's effective level rather than the record's, because the startup line is
+logged at INFO in both modes: a filter that keyed on the record would leave `-v` unable to show
+the one key the runbook asks for.
+
+Three things stay as they are, deliberately. **A 64-hex id is not touched**: event ids are the
+store's debugging handle, and a hex pubkey is a key, but the two cannot be told apart by shape
+and hiding the first would cost more than it protects. **Socket frames are not logs**: they are
+the protocol, byte for byte, and the filter never sees them. **CLI output is evidence**: `hng
+status`, `hng health`, `hng peers` and `hng adapter status` print the full value they always
+printed, because the operator reading it is the one asking the question.
+
+The filter rewrites the *record*, not a handler's output string, and it is attached to the
+loggers that exist when logging is configured as well as to their handlers. That is what catches
+a logger added later that propagates to the root handler, and what makes the rewrite visible to
+every handler — a test's `caplog` included — rather than only the one it sits on. The adapter
+cannot import the daemon's module (it is installed by copying one file into
+`$HERMES_HOME/plugins/nostr`), so it carries the same two patterns with a comment naming the
+daemon's copy as the source of truth. The `nostr-sdk` uniffi binding declares no Python logger at
+all, so there is no third-party logger here to filter; if one appears, the root handler already
+covers anything that propagates, and a binding that prints straight to stderr is outside the
+logging tree and would need its own boundary.

@@ -33,6 +33,7 @@ from .health import (
     running_but_unconfigured,
     stale_rows,
 )
+from .logs import configure_logging
 from .media import MediaError, media_config, resolve_attachment
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.nip17 import Nip17Plane
@@ -2066,8 +2067,9 @@ def cmd_serve(args) -> int:
     from .routing import RoutingConfigError
     from .server import SocketPathError
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # DEBUG is the documented way to read a full key from the journal: at INFO the
+    # filter keeps eight characters of an npub and redacts an nsec entirely.
+    configure_logging(verbose=args.verbose)
     cfg = load_config(args.config)
     try:
         gw = Gateway(cfg, socket_path=args.socket,
@@ -2170,6 +2172,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_serve = sub.add_parser("serve", help="run the gateway daemon (socket + relays)")
     p_serve.add_argument("--socket", default=None, help="socket path override")
+    p_serve.add_argument("-v", "--verbose", action="store_true",
+                         help="DEBUG logging: full npubs in log lines (INFO keeps 8 characters)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_recent = sub.add_parser("recent", help="recent messages")

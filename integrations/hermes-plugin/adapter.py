@@ -103,6 +103,47 @@ REACTION_CHOICES = {
 
 logger = logging.getLogger(__name__)
 
+#: A log line is a document: a peer's npub plus the relay it arrived on is a social graph
+#: once it is pasted into a ticket. The daemon carries the same filter in
+#: ``src/hermes_nostr_gateway/logs.py``; this copy exists because the adapter is installed
+#: by copying one file into ``$HERMES_HOME/plugins/nostr`` and must not depend on the
+#: gateway package being importable inside Hermes. Change one, change the other.
+_NSEC_PATTERN = re.compile(r"nsec1[0-9a-z]+")
+_NPUB_PATTERN = re.compile(r"npub1[0-9a-z]{20,}")
+_NPUB_PREFIX_CHARS = 8
+
+
+class LogRedactionFilter(logging.Filter):
+    """Shorten npubs unless this module's logger is at DEBUG; redact nsecs always.
+
+    Filters run before formatting, so the rewrite is made to the record's message
+    objects: ``args`` are consumed into the message and dropped. Hermes' handler — and
+    anything else the record propagates to — then formats the shortened line.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a broken format string is the log's problem
+            return True
+        text = _NSEC_PATTERN.sub("nsec1[redacted]", message)
+        if not logger.isEnabledFor(logging.DEBUG):
+            text = _NPUB_PATTERN.sub(
+                lambda found: found.group(0)[:_NPUB_PREFIX_CHARS] + "…", text)
+        if text != message:
+            record.msg = text
+            record.args = ()
+        return True
+
+
+def _install_log_redaction(target: logging.Logger) -> None:
+    """Attach one filter to this module's logger; a repeated import stays single."""
+    if not any(isinstance(f, LogRedactionFilter) for f in target.filters):
+        target.addFilter(LogRedactionFilter())
+
+
+_install_log_redaction(logger)
+
 #: The approval choices that have a typed spelling, in the order the prompt offers them. The
 #: vocabulary is Hermes' own (`ExecApprovalPrompt.actions`); a smart deny drops the session and
 #: permanent rows, and the text we send lists exactly what the host would accept.

@@ -422,6 +422,23 @@ The rest answer one question each: `hng recent`, `hng drops`, `hng listen --once
 `hng profiles`, `hng route`, `hng control`, `hng replay-skip`,
 `hng deps run` / `hng deps dry-run` (dependency proposals; see `docs/deps.md`).
 
+## Logs
+
+Log lines go to the journal and get pasted into tickets, so the daemon rewrites them on the
+way out: a `nsec1…` is always `nsec1[redacted]`, and an `npub1…` keeps its first eight
+characters in the everyday (INFO) log — enough to follow one peer through a sequence of
+lines, not enough to resolve the key. The startup line names the identity as an npub,
+shortened the same way.
+
+`hng serve -v` turns on DEBUG and prints npubs whole; that is the way to read which key a
+line is about without keeping every key in the everyday log. The filter is installed on the
+logger tree, not called from each log site, so a new line is covered without doing anything;
+the Hermes adapter carries the same two patterns beside its own logger. A 64-hex event id is
+left alone — it is how the store is debugged — and socket frames are protocol, not logs.
+
+CLI output is evidence, not a log: `hng status`, `hng health` and `hng adapter status` print
+the values in full.
+
 ## What it refuses
 
 - **Untrusted senders instruct nothing.** The text still arrives; `authority: none` reaches the
