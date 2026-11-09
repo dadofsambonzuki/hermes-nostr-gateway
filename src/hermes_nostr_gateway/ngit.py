@@ -157,9 +157,12 @@ TRUSTED_PLANE = "concord"
 #: States a link can hold. `held` means the question has not reached the channel yet (a
 #: retry is correct); `asked` means it did (asking again is not). For a PR, `pending` is the
 #: same idea: it is known, and its notice is either queued or posted but not yet confirmed.
+#: `held`/`asked`/`declined` are the author gate: a PR whose author nobody recognises sits
+#: on one of them until a trusted person answers, and none of the three is authorised work.
 ISSUE_STATES = frozenset({"ready", "held", "asked", "authorised", "declined", "deleted",
                           "waiting"})
-PR_STATES = frozenset({"pending", "signalled", "merged", "closed"})
+PR_STATES = frozenset({"pending", "signalled", "held", "asked", "declined",
+                       "merged", "closed"})
 
 #: Guard states the pass must never walk back. A PR does not un-merge, a closed proposal does
 #: not reopen (a re-push is a second root, not a revival), and an approving verdict stays an
@@ -425,6 +428,8 @@ class Merge:
     event_id: str = ""
     #: Why the pass believes it is applied, for a merge read from the checkout.
     evidence: str = ""
+    #: The key that published the status. A merge is a maintainer's act, not anyone's.
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -434,6 +439,8 @@ class Closed:
     pr_id: str         # hex of the root PR event
     event_id: str = ""
     created_at: int = 0
+    #: The key that published the close; the PR's own author may close it too.
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -449,6 +456,8 @@ class Revision:
     commit: str = ""
     created_at: int = 0
     event_id: str = ""
+    #: The key that published the revision; only the PR's author may move its tip.
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -607,6 +616,20 @@ class BridgeConfig:
     issues: bool = True
     prs: bool = True
     priority: int = 0
+    #: Keys whose kind-1631/1632 status events are accepted. Empty accepts none; a config
+    #: entry is unioned with the repository announcement's own maintainers, which is where
+    #: the bridge normally gets them.
+    maintainers: tuple[str, ...] = ()
+    #: Keys whose kind-1111 comment can state a verdict. Empty accepts none: a verdict is
+    #: the review role's word, and "anyone who tags the PR" is the vulnerability this key
+    #: removes.
+    reviewers: tuple[str, ...] = ()
+    #: The review role's signing key, when it is stored where the bridge can read it. It is
+    #: only used to derive `reviewers` when that list is empty, so one source of truth.
+    review_secret_file: str = ""
+    #: Whether a verdict is read at all. False is the same posture as an empty reviewer
+    #: list, and it keeps a deployment that wants labels only from acting on a comment.
+    verdicts: bool = True
     #: How many new tasks one poll may create. A backlog (or a spam run of issues from an
     #: open relay) is spread over polls instead of filling the board and the channel in one
     #: go; nothing is dropped, and the report says how much is still waiting.
@@ -651,6 +674,22 @@ class BridgeConfig:
         if not isinstance(relays, (list, tuple)):
             relays = []
         cleaned = tuple(str(url).strip() for url in relays if str(url or "").strip())
+
+        def keys(name: str) -> tuple[str, ...]:
+            """A list of npubs/hex keys from the block, skipping anything unreadable."""
+            value = block.get(name)
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple)):
+                return ()
+            out: list[str] = []
+            for entry in value:
+                text = str(entry or "").strip()
+                if text and as_hex(text):
+                    out.append(text)
+                elif text:
+                    log.warning("ngit.%s: ignoring an unreadable key %r", name, text[:24])
+            return tuple(dict.fromkeys(out))
         # Tri-state on purpose: absent means "the default" (on once the bridge is
         # configured), and only an explicit false turns the watcher off.
         watch = block.get("watch")
@@ -684,6 +723,10 @@ class BridgeConfig:
             priority=int(block.get("priority", 0) or 0),
             max_new=max(1, int(block.get("max_new", 20) or 1)),
             max_prs=max(1, int(block.get("max_prs", 10) or 1)),
+            maintainers=keys("maintainers"),
+            reviewers=keys("reviewers"),
+            review_secret_file=str(block.get("review_secret_file") or "").strip(),
+            verdicts=bool(block.get("verdicts", True)),
             watch=None if watch is None else bool(watch),
             watch_debounce_s=debounce,
             labels=bool(block.get("labels", True)),
@@ -710,16 +753,16 @@ class Report:
     sweep_hours: int = 0
     issues: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "ready": 0, "held": 0, "existing": 0,
-        "comments": 0, "deleted": 0, "deferred": 0, "would_create": 0,
-        "waiting": 0, "would_wait": 0, "would_post": 0})
+        "comments": 0, "comments_skipped": 0, "deleted": 0, "deferred": 0,
+        "would_create": 0, "waiting": 0, "would_wait": 0, "would_post": 0})
     mentions: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "existing": 0, "ignored": 0, "deferred": 0,
         "would_create": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
-        "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0,
+        "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0, "held": 0,
         "labels": 0, "label_errors": 0, "revisions": 0, "reopened": 0, "would_reopen": 0,
-        "approved": 0, "changes": 0, "applied": 0,
+        "approved": 0, "changes": 0, "applied": 0, "ignored": 0,
         "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0,
         #: Status events the trailing sweep re-read: applied/closed only, never a proposal.
         "swept": 0})
@@ -773,6 +816,9 @@ class Report:
                           if self.dry_run and m["would_create"] else ""))
         out.append(f"prs:     {p['seen']} seen, {p['signalled']} signalled,"
                    f" {p['merged']} merged, {p['existing']} known"
+                   + (f", {p['held']} held for an answer" if p["held"] else "")
+                   + (f", {p['ignored']} ignored from an unauthorised author"
+                      if p["ignored"] else "")
                    + (f", {p['closed']} closed" if p["closed"] else "")
                    + (f", {p['pending']} pending (queued for the next pass)"
                       if p["pending"] else "")
@@ -998,28 +1044,63 @@ def pull_request_from_event(event: dict[str, Any]) -> PullRequest:
     )
 
 
-def merge_from_event(event: dict[str, Any]) -> Optional[Merge]:
+def looks_commit(value: str) -> bool:
+    """A git object id: a full 40- or 64-character hex commit, nothing else.
+
+    A `c` tag is written into review briefs, fix briefs and the merge record. It is also
+    attacker-controlled on any event the bridge did not write, so a value that is not a
+    commit is not a tip and is never stored or quoted as one.
+    """
+    text = str(value or "").strip().lower()
+    return len(text) in (40, 64) and set(text) <= _HEX
+
+
+def is_future(created_at: int, now: float, *, skew_s: int = 300) -> bool:
+    """True for a timestamp beyond the clock skew the read set tolerates.
+
+    A relay replaying an event cannot move a card if the event claims a time that has not
+    happened yet; the newest-wins rules are all `created_at` comparisons.
+    """
+    return int(created_at or 0) > int(now) + int(skew_s)
+
+
+def merge_from_event(event: dict[str, Any],
+                     maintainers: Sequence[str] | None = None) -> Optional[Merge]:
     """A kind-1631 that refers to a PR. Resolved issues come through here too; the caller
     only asks about PR ids it already knows, so an issue's resolution cannot post a merge.
 
     The commit comes from whichever spelling the publisher used: NIP-34's `merge-commit` or
     ngit's `merge-commit-id`. Only when neither names one is `applied-as-commits` read, which
     is what a proposal applied as patches carries -- there is no merge commit to name then.
+    A commit that is not hex is dropped rather than quoted, and the card then stays open for
+    want of evidence.
+
+    `maintainers` is the status allowlist. `None` means the caller configured none at this
+    layer -- a reader built only to parse, where the pass's own check is the gate -- while an
+    empty sequence is an explicit "trust nobody": a merge is the maintainer's act, and the
+    bridge must not finish cards on a stranger's word.
     """
+    author = as_hex(str(event.get("pubkey") or ""))
+    if maintainers is not None:
+        allowed = {as_hex(who) for who in maintainers if str(who or "").strip()}
+        if not allowed or author not in allowed:
+            return None
     pr_id = _root_id(event)
     if not event_hex(pr_id):
         return None
     commit = ""
     for name in MERGE_COMMIT_TAGS:
-        commit = _tag(event, name)
+        commit = _tag(event, name).strip()
         if commit:
             break
     if not commit:
         applied = _tags(event, APPLIED_COMMIT_TAG)
-        commit = applied[0] if applied else ""
+        commit = applied[0].strip() if applied else ""
+    if commit and not looks_commit(commit):
+        commit = ""
     return Merge(pr_id=event_hex(pr_id), commit=commit,
                  created_at=int(event.get("created_at") or 0),
-                 event_id=str(event.get("id") or ""))
+                 event_id=str(event.get("id") or ""), author=author)
 
 
 def closed_from_event(event: dict[str, Any]) -> Optional[Closed]:
@@ -1028,27 +1109,35 @@ def closed_from_event(event: dict[str, Any]) -> Optional[Closed]:
     A close is not a merge and cannot finish a card, but it is not noise either: the card
     must stop waiting for a merge that will never come and hand itself to a person, with the
     closing event named so the reason can be read.
+
+    The author travels with it. A maintainer may close any proposal; the PR's own author
+    may withdraw theirs. Anyone else's close is checked and ignored by the caller, which is
+    where the PR's author is known.
     """
     pr_id = event_hex(_root_id(event))
     if not pr_id:
         return None
     return Closed(pr_id=pr_id, event_id=str(event.get("id") or ""),
-                  created_at=int(event.get("created_at") or 0))
+                  created_at=int(event.get("created_at") or 0),
+                  author=as_hex(str(event.get("pubkey") or "")))
 
 
 def revision_from_event(event: dict[str, Any]) -> Optional[Revision]:
     """A kind-1619 PR update: the PR its `E` tag names, and the tip its `c` tag moves to.
 
     NIP-34 spells the reference `E` (NIP-22); an event without one cannot be attached to a
-    PR and is ignored rather than guessed at.
+    PR and is ignored rather than guessed at. The commit must be a hex object id: the tip is
+    written into review briefs and compared with an approval, so a free-text `c` tag is not
+    one. The author travels with it, and the caller accepts it only from the PR's author.
     """
     pr_id = event_hex(_tag(event, "E"))
-    commit = _tag(event, "c")
-    if not pr_id or not commit:
+    commit = _tag(event, "c").strip()
+    if not pr_id or not looks_commit(commit):
         return None
     return Revision(pr_id=pr_id, commit=commit,
                     created_at=int(event.get("created_at") or 0),
-                    event_id=str(event.get("id") or ""))
+                    event_id=str(event.get("id") or ""),
+                    author=as_hex(str(event.get("pubkey") or "")))
 
 
 # -- reading a checkout through ngit -----------------------------------------
@@ -1091,6 +1180,9 @@ class RepoRef:
     address: str = ""
     #: The announcement's relay hints: where that repository's issues and PRs are published.
     relays: tuple[str, ...] = ()
+    #: The announcement's maintainers, as hex. Status events (a merge, a close) are theirs
+    #: to publish; a stranger who tags the repository is not a maintainer.
+    maintainers: tuple[str, ...] = ()
 
 
 def _relay_url(host: str) -> str:
@@ -1129,6 +1221,12 @@ class Ngit:
         # retracted label has to reach every one of them, so they are read from the checkout
         # rather than left to the announcement's hints alone.
         hosts = tuple(_relay_url(str(host)) for host in _as_list(data.get("grasp_servers")))
+        # Maintainers come from the announcement, not from whoever tagged it. ngit spells
+        # the resolved set `confirmed_maintainers` and the raw set `maintainers`; the
+        # confirmed list is the one that has been through its signature check.
+        who = _as_list(data.get("confirmed_maintainers")) or _as_list(data.get("maintainers"))
+        maintainers = tuple(dict.fromkeys(
+            as_hex(str(key)) for key in who if as_hex(str(key or ""))))
         coordinate = str(data.get("coordinate") or "").strip()
         if coordinate:
             try:
@@ -1141,13 +1239,15 @@ class Ngit:
                 # rest of it.
                 hints = tuple(str(url) for url in parsed.relays())
                 return RepoRef(address=address,
-                               relays=tuple(dict.fromkeys((*hints, *[h for h in hosts if h]))))
+                               relays=tuple(dict.fromkeys((*hints, *[h for h in hosts if h]))),
+                               maintainers=maintainers)
             except Exception:  # noqa: BLE001 - fall through to the explicit fields
                 log.debug("ngit: could not decode repo coordinate %s", coordinate[:24])
         owner = as_hex(str(data.get("selected_maintainer") or ""))
         identifier = str(data.get("identifier") or "").strip()
         address = f"30617:{owner}:{identifier}" if owner and identifier else ""
-        return RepoRef(address=address, relays=tuple(h for h in hosts if h))
+        return RepoRef(address=address, relays=tuple(h for h in hosts if h),
+                       maintainers=maintainers)
 
     def issues(self) -> list[Issue]:
         data = self._run(self.repo, ["issue", "list"])
@@ -1175,17 +1275,31 @@ class RelayPrs:
     `#a` read can never return it, and the relay's `e` index can. Attribution of a status
     is by id already (`merge_from_event`/`closed_from_event` resolve the root the caller
     asks about), so the wider read cannot act on a PR the board does not link.
+
+    The trust rule is per kind, and it is a second split on top of that. Proposals and
+    revisions are read from everyone -- a stranger's PR must be seen so it can be *held*,
+    not silently dropped -- while a merge status is read only from the repository's
+    maintainers, and is checked again when parsed. An empty maintainer set accepts no
+    status at all.
     """
 
     def __init__(self, relays: Sequence[str], address: str, *,
                  fetcher: Callable[..., list[dict[str, Any]]] = fetch_many_blocking,
                  status_fetcher: Callable[..., list[Any]] = fetch_tagged_blocking,
-                 secret: str | None = None):
+                 secret: str | None = None, maintainers: Sequence[str] | None = None,
+                 now: Callable[[], float] = time.time):
         self.relays = tuple(str(url) for url in relays if url)
         self.address = address
         self._fetch = fetcher
         self._fetch_statuses = status_fetcher
         self.secret = secret
+        #: `None` is "no allowlist at this layer": a bare reader parses every status and the
+        #: pass's own check is the gate. A sequence -- including an empty one -- is an
+        #: explicit allowlist, and an empty one accepts no merge at all.
+        self.maintainers = (None if maintainers is None else
+                            tuple(as_hex(who) for who in maintainers
+                                  if str(who or "").strip()))
+        self._now = now
 
     def events(self, since: int) -> PrFeed:
         """Every PR, revision, applied and closed-status event newer than `since`."""
@@ -1196,10 +1310,34 @@ class RelayPrs:
             raise NgitError("ngit.relays (or relays.read) is empty: nowhere to read PR events")
         if not self.address:
             raise NgitError("this checkout has no NIP-34 address: no PRs to read")
-        raw = self._fetch(relays=self.relays, kinds=list(kinds),
-                          a_tag=self.address, since=int(since), limit=500,
-                          secret=self.secret)
-        return self._fold(raw, wanted={int(kind) for kind in kinds})
+        wanted = {int(kind) for kind in kinds}
+        raw: list[Any] = []
+        if self.maintainers is None:
+            # No allowlist at this layer: one read under the repository's address, every
+            # kind asked for. The pass's own check is the gate, and a bare reader (a test,
+            # a probe) parses what the relay answers.
+            raw = self._fetch(relays=self.relays, kinds=list(kinds), a_tag=self.address,
+                              since=int(since), limit=500, secret=self.secret) or []
+            return self._fold(raw, wanted=wanted)
+        # Proposals and revisions are read from everyone: a stranger's PR is read so it can
+        # be held, not silently dropped.
+        public = [kind for kind in kinds if int(kind) in (KIND_PR, KIND_PR_REVISION)]
+        if public:
+            raw += self._fetch(relays=self.relays, kinds=public, a_tag=self.address,
+                               since=int(since), limit=500, secret=self.secret) or []
+        # A merge status is a maintainer's act: narrowed at the relay, and checked again in
+        # `_fold`. An empty allowlist reads no merge status at all.
+        if KIND_APPLIED in wanted and self.maintainers:
+            raw += self._fetch(relays=self.relays, kinds=[KIND_APPLIED],
+                               authors=self.maintainers, a_tag=self.address,
+                               since=int(since), limit=500, secret=self.secret) or []
+        # A close may come from a maintainer or from the PR's own author, and the author is
+        # only known per PR. It is read broadly and decided per PR by the fold and `Sync`.
+        if KIND_CLOSED in wanted:
+            raw += self._fetch(relays=self.relays, kinds=[KIND_CLOSED],
+                               a_tag=self.address, since=int(since), limit=500,
+                               secret=self.secret) or []
+        return self._fold(raw, wanted=wanted)
 
     def statuses(self, pr_ids: Sequence[str]) -> PrFeed:
         """Kinds 1631/1632 that name these PRs by `e`, whether or not they carry an `a`.
@@ -1235,12 +1373,21 @@ class RelayPrs:
 
     def _fold(self, raw: Sequence[Any], *, wanted: set[int] | None = None) -> PrFeed:
         """One relay answer, split into proposals, revisions, merges and closes."""
+        now = float(self._now())
         prs: dict[str, PullRequest] = {}
         merges: dict[str, Merge] = {}
         revisions: dict[str, Revision] = {}
         closed: dict[str, Closed] = {}
-        for event in raw or []:
+        seen_ids: set[str] = set()
+        for event in raw:
             if not isinstance(event, dict) or not event.get("id"):
+                continue
+            event_id = str(event.get("id") or "")
+            if event_id in seen_ids:
+                continue
+            seen_ids.add(event_id)
+            if is_future(int(event.get("created_at") or 0), now):
+                log.warning("ngit: ignored a future-dated event %s…", event_id[:12])
                 continue
             kind = int(event.get("kind") or 0)
             if wanted is not None and kind not in wanted:
@@ -1267,7 +1414,7 @@ class RelayPrs:
                 # A re-publish can repeat a subject; the id is the PR.
                 prs[pr.id] = pr
             elif kind == KIND_APPLIED:
-                merge = merge_from_event(event)
+                merge = merge_from_event(event, self.maintainers)
                 if merge is not None:
                     merges[merge.pr_id] = merge
             elif kind == KIND_CLOSED:
@@ -1356,11 +1503,15 @@ class RelayLabels:
 
     def __init__(self, relays: Sequence[str], address: str = "", *,
                  fetcher: Callable[..., list[tuple[str, dict[str, Any]]]] = fetch_tagged_blocking,
-                 secret: str | None = None):
+                 secret: str | None = None, reviewers: Sequence[str] = ()):
         self.relays = tuple(str(url) for url in relays if str(url or "").strip())
         self.address = str(address or "")
         self._fetch = fetcher
         self.secret = secret
+        #: The only keys whose kind-1111 comment can state a verdict. Empty accepts none:
+        #: the relay filter and the parser both apply it, so a forged `Verdict:` line
+        #: neither changes a card nor publishes a label.
+        self.reviewers = tuple(str(who) for who in reviewers if str(who or "").strip())
 
     def read(self, pr_ids: Sequence[str]) -> ReadState:
         ids = [str(pr) for pr in pr_ids if str(pr or "").strip()]
@@ -1371,7 +1522,8 @@ class RelayLabels:
                                      "nowhere to read a verdict from",))
         try:
             comments = self._fetch(relays=self.relays, kinds=[KIND_COMMENT], tag="E",
-                                   values=ids, limit=READ_AHEAD, secret=self.secret)
+                                   values=ids, limit=READ_AHEAD, secret=self.secret,
+                                   authors=self.reviewers) if self.reviewers else []
             carried = self._fetch(relays=self.relays, kinds=[KIND_LABEL], tag="e",
                                   values=ids, limit=READ_AHEAD, a_tag=self.address,
                                   secret=self.secret)
@@ -1403,10 +1555,11 @@ class RelayLabels:
             for relay in self.relays:
                 on_relay = [event for event in roots[pr]
                             if str(event.get("relay") or "") == relay]
-                found = newest_verdict(on_relay)
+                found = newest_verdict(on_relay, self.reviewers)
                 if found is not None:
                     readings.append((relay, found.label, found.created_at))
-            prs[pr] = PrRead(verdict=newest_verdict(roots[pr]), labels=tuple(labels[pr]),
+            prs[pr] = PrRead(verdict=newest_verdict(roots[pr], self.reviewers),
+                             labels=tuple(labels[pr]),
                              readings=tuple(readings))
         return ReadState(prs=prs, relays=answered)
 
@@ -1628,6 +1781,28 @@ def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, A
     ])
 
 
+def pr_question_message(pr: PullRequest, task_id: str, target: Target,
+                        assignee: str) -> str:
+    """The one question an unrecognised PR author gets: no review runs until a human says yes.
+
+    A review task checks a proposal out and executes its tests, so an unauthorised PR is not
+    a message to announce -- it is a person's decision, asked once, with the command that
+    records the answer.
+    """
+    where = f" on {pr.branch}" if pr.branch else ""
+    return "\n".join([
+        f'Unrecognised author for PR "{pr.subject}"',
+        f"author: {pr.author}{where}",
+        f"PR: {pr.id}",
+        f"nevent: {pr.nevent}",
+        f"task: {task_id or '(none)'} (held, not queued)",
+        "",
+        "Nothing reviews or runs this proposal until someone trusts its author.",
+        f"Reply yes to queue it on board {target.board} for {assignee}, or no to leave it out.",
+        f"`hng ngit answer {task_id or '<task>'} --yes --by <npub>` records either answer.",
+    ])
+
+
 def ready_message(pr: PullRequest, *, review_task: str = "", problem: str = "") -> str:
     """The one message a new PR gets: what it is, where to read it, who reviews it.
 
@@ -1665,6 +1840,8 @@ def review_body(pr: PullRequest, target: Target) -> str:
         f" `git diff {into or '<target>'}...HEAD` (or `git log -p {into or '<target>'}..HEAD`).",
         "2. Run the repository's own gates from that tree: `ruff check` and `pytest`. Say",
         "   what ran and what it printed, including anything that was already failing.",
+        "   Run them in this card's worktree only -- never in the deploy checkout -- and do",
+        "   not give the PR's code the daemon's keys or its live config.",
         "3. Publish the verdict on the PR, then report it on this task with the reasons --",
         "   merge, or changes needed -- and say what the gates could not catch: behaviour,",
         "   tests that do not exercise the change, and anything the PR leaves out.",
@@ -1937,6 +2114,8 @@ def notice_state(kind: int, notice: str) -> str:
             return "merged"
         if notice == "closed":
             return "closed"
+        if notice == "question":
+            return "asked"
         return "signalled"
     if notice == "question":
         return "asked"
@@ -1970,6 +2149,11 @@ class Sync:
         self.control = control
         self.config = config
         self.target = target
+        #: Status events and verdicts are allowlisted by key. The config carries both; the
+        #: checkout's announcement contributes its maintainers before this point.
+        self.maintainers = {as_hex(who) for who in config.maintainers if str(who or "").strip()}
+        self.reviewers = ({as_hex(who) for who in config.reviewers if str(who or "").strip()}
+                          if config.verdicts else set())
         self.issues = issues
         self.detail = detail
         self.prs = prs
@@ -2005,6 +2189,14 @@ class Sync:
             except NgitError as exc:
                 report.errors.append(f"issues: {exc}")
         if self.config.prs and self.prs is not None:
+            if not self.maintainers:
+                report.notes.append(
+                    "no maintainers known: merge/close statuses are ignored (add "
+                    "ngit.maintainers or announce the repository with maintainers)")
+            if not self.reviewers:
+                report.notes.append(
+                    "no reviewers configured: verdicts are read from nobody and no card is "
+                    "finished by one (set ngit.reviewers)")
             try:
                 self._read_prs(report, since=since, dry_run=dry_run)
             except NgitError as exc:
@@ -2150,7 +2342,7 @@ class Sync:
             report.cards.append(row)
             return
         if in_force:
-            outcome = self._apply_verdict(pr_id, card, verdict, anchor, detail)
+            outcome = self._apply_verdict(pr_id, card, verdict, anchor, detail, report=report)
             if outcome != (APPLIED_APPROVED if anchor.label == APPROVED else APPLIED_CHANGES):
                 report.notes.append(
                     f"card {task_id} (PR {pr_id[:8]}): the board did not take the"
@@ -2348,8 +2540,19 @@ class Sync:
                 key, ref.hex):
             return
         issue = ref if (ref.comments or ref.body) else self.detail(ref)
+        issue_author = as_hex(issue.author)
         for comment in sorted(issue.comments, key=lambda c: (c.created_at, c.hex or c.id)):
             if not comment.hex or self.store.ngit_comment_seen(key, ref.hex, comment.hex):
+                continue
+            author = as_hex(comment.author)
+            # A comment is copied onto the card as instruction-bearing text, so it comes
+            # from a trusted npub or from the issue's own author -- the two people the
+            # issue's authorisation actually covers. Anyone else's words stay on the relay.
+            if not author or (author != issue_author
+                              and not self.control.is_trusted(comment.author, TRUSTED_PLANE)):
+                report.issues["comments_skipped"] += 1
+                if not dry_run:
+                    self.store.ngit_note_comment(key, ref.hex, comment.hex, task_id)
                 continue
             if dry_run:
                 report.issues["comments"] += 1
@@ -2456,6 +2659,19 @@ class Sync:
 
     # -- pull requests ---------------------------------------------------
 
+    def _pr_author_trusted(self, author: str) -> bool:
+        """Whether this PR's author may have a review card without a human's yes.
+
+        Two keys qualify: one the control pane trusts, and one the repository itself lists
+        as a maintainer. The second is not a widening for its own sake -- a maintainer can
+        merge the repository, and the ordinary worker PR is authored by the bot that holds
+        that membership -- while a stranger who merely tags the repository is neither.
+        """
+        who = as_hex(author)
+        if not who:
+            return False
+        return who in self.maintainers or self.control.is_trusted(author, TRUSTED_PLANE)
+
     def _read_prs(self, report: Report, *, since: int | None, dry_run: bool) -> None:
         """Decide what the channel should hear about, and queue it.
 
@@ -2480,6 +2696,12 @@ class Sync:
         swept = self._sweep(report, dry_run=dry_run)
         if swept is not None:
             feed = with_statuses(feed, swept)
+        # Then the trust rule, on everything the pass is about to act on: an applied status
+        # is a maintainer's, a close a maintainer's or the PR author's, a revision the
+        # author's alone. A relay is not a trust boundary, so this is checked here as well
+        # as in the filter. Refused events are returned as timestamps: they are dealt with,
+        # as refusals, so the cursor may move past them.
+        feed, refused = self._authorised_feed(feed, report)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
@@ -2504,11 +2726,12 @@ class Sync:
                       closed=feed.closed)
         budget = max(1, int(self.config.max_prs or 1))
         if not dry_run:
+            self._regate_ready_prs(report)
             self._requeue_stranded(report)
         report.prs["seen"] += len(feed.prs) + len(repeats)
         #: Events this poll dealt with (reported, queued, or deliberately passed over), and
         #: ones it only saw. The cursor may move past the first set and never the second.
-        settled: list[int] = []
+        settled: list[int] = list(refused)
         deferred: list[int] = []
 
         for pr in sorted(feed.prs, key=lambda p: (p.created_at, p.id)):
@@ -2537,18 +2760,23 @@ class Sync:
             if dry_run:
                 report.prs["would_post"] += 1
                 continue
+            trusted = self._pr_author_trusted(pr.author)
             # The task first, the message second: the message names it. A board that cannot
             # be written must not cost the channel its notice, so the failure comes back as
             # a line in the notice and is retried -- without a second message -- later.
             task_id, problem = ("", "")
             if merge is None and stopped is None and self.config.reviews:
-                task_id, problem = self._review_task(pr, report, dry_run=dry_run)
+                task_id, problem = self._review_task(pr, report, dry_run=dry_run,
+                                                     trusted=trusted)
             if merge is not None:
                 text = merged_message(pr, merge)
             elif stopped is not None:
                 text = closed_message(pr, stopped)
-            else:
+            elif trusted:
                 text = ready_message(pr, review_task=task_id, problem=problem)
+            else:
+                report.prs["held"] += 1
+                text = pr_question_message(pr, task_id, self.target, self.config.assignee)
             # `pending` is the lifecycle of a notice that has not been confirmed yet; the row
             # is its claim, and only a daemon receipt moves the link past it. The review
             # outcome is written here, with the claim: saving the link again afterwards would
@@ -2556,8 +2784,9 @@ class Sync:
             self.store.ngit_link_save(
                 self.target.key, KIND_PR, pr.id, board=self.target.board, state="pending",
                 task_id=task_id or None, detail=pr_detail(pr, task_error=problem))
-            notice = "merged" if merge is not None else ("closed" if stopped is not None
-                                                         else "ready")
+            notice = ("merged" if merge is not None else
+                      "closed" if stopped is not None else
+                      "ready" if trusted else "question")
             self._enqueue(KIND_PR, pr.id, notice, text)
 
         for merge in sorted(merges, key=lambda m: (m.created_at, m.pr_id)):
@@ -2748,6 +2977,112 @@ class Sync:
             self.store.ngit_set_cursor(self.target.key, SWEEP_CURSOR, now)
         return PrFeed(merges=feed.merges, closed=feed.closed)
 
+    def _authorised_feed(self, feed: PrFeed, report: Report) -> tuple[PrFeed, list[int]]:
+        """Drop status and revision events whose author is not allowed to publish them.
+
+        The relay read is already narrowed where it can be, but a relay is not a trust
+        boundary and a test or another reader may hand the pass an unfiltered feed. This is
+        the second check, at the point the event's own `pubkey` is attached to the object
+        the rest of the pass acts on:
+
+        * an applied status (1631) is a maintainer's;
+        * a closed status (1632) is a maintainer's or the PR author's;
+        * a revision (1619) is the PR author's alone.
+
+        Refused events are returned as timestamps so the cursor may move past them: they
+        are dealt with (as refusals), not unseen. A note names each refusal once.
+        """
+        refused: list[int] = []
+
+        def author_of(pr_id: str) -> str:
+            for pr in feed.prs:
+                if pr.id == pr_id:
+                    return as_hex(pr.author)
+            link = self.store.ngit_link(self.target.key, KIND_PR, pr_id)
+            return as_hex(str(_detail(link).get("author") or "")) if link else ""
+
+        def refuse(kind: str, pr_id: str, author: str, created_at: int) -> None:
+            report.prs["ignored"] += 1
+            report.notes.append(
+                f"ignored a {kind} for PR {pr_id[:8]} from {npub_of(as_hex(author)) or author}"
+                ": the author is not allowed to publish it")
+            refused.append(int(created_at or 0))
+
+        merges: list[Merge] = []
+        for merge in feed.merges:
+            author = as_hex(merge.author)
+            if author and author in self.maintainers:
+                merges.append(merge)
+            else:
+                refuse("merge status", merge.pr_id, merge.author, merge.created_at)
+        closed: list[Closed] = []
+        for stopped in feed.closed:
+            author = as_hex(stopped.author)
+            owner = author_of(stopped.pr_id)
+            if author and (author in self.maintainers or (owner and author == owner)):
+                closed.append(stopped)
+            else:
+                refuse("close status", stopped.pr_id, stopped.author, stopped.created_at)
+        revisions: list[Revision] = []
+        for revision in feed.revisions:
+            author = as_hex(revision.author)
+            owner = author_of(revision.pr_id)
+            if author and owner and author == owner:
+                revisions.append(revision)
+            else:
+                refuse("revision", revision.pr_id, revision.author, revision.created_at)
+        return replace(feed, merges=merges, closed=closed, revisions=revisions), refused
+
+    def _regate_ready_prs(self, report: Report) -> None:
+        """Hold a PR card that was queued before its author was checked.
+
+        A deployment that upgrades into the author gate can still hold cards made by the
+        old one. This is the conservative migration: only a card nobody has started
+        (`ready`) is moved to `blocked` and asked about, and only when its author is not
+        trusted. A running card is a worker mid-review -- interrupting it would be a
+        different decision -- and a card already in review/done is left to its verdict and
+        the merge route.
+        """
+        if not self.config.reviews:
+            return
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            if str(link.get("state") or "") != "signalled":
+                continue
+            note = _detail(link)
+            pr_id = str(link.get("source_id") or "")
+            author = str(note.get("author") or "")
+            if not pr_id or not author or self._pr_author_trusted(author):
+                continue
+            task_id = self._review_anchor(link)
+            task = self.board.task(task_id) if task_id else None
+            if task is None or str(task.get("status") or "") != "ready":
+                continue
+            if self.store.ngit_notice_queued(self.target.key, pr_id):
+                continue
+            try:
+                self.board.block(
+                    task_id, kind="dependency", author="ngit",
+                    comment=f"Held: {author} is not a trusted author. Nothing reviews or"
+                            " runs this proposal until a trusted npub authorises it"
+                            f" (`hng ngit answer {task_id} --yes --by <npub>`).")
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"author gate on {task_id}: {exc}")
+                continue
+            self.store.ngit_link_state(self.target.key, KIND_PR, pr_id, "held")
+            pr = pr_from_note(pr_id, note)
+            if not self._enqueue(KIND_PR, pr_id, "question",
+                                 pr_question_message(pr, task_id, self.target,
+                                                     self.config.assignee)):
+                # The queue could not take it; leave the link where a later pass will try
+                # the same gate again rather than a held row nobody will ask about.
+                self.store.ngit_link_state(self.target.key, KIND_PR, pr_id, "signalled")
+                report.errors.append(f"author gate on {task_id}: the question could not be queued")
+                continue
+            report.prs["held"] += 1
+            log.info("ngit: held existing review task %s for PR %s (author not trusted)",
+                     task_id, pr_id[:8])
+
     def _fold_repeats(self, prs: Sequence[PullRequest],
                       applied: dict[str, Merge],
                       closed: set[str] | None = None) -> tuple[list[PullRequest], list[Revision]]:
@@ -2792,7 +3127,8 @@ class Sync:
             root = known.get((pr.author, pr.branch)) if pr.branch and pr.commit else None
             if root and root != pr.id:
                 repeats.append(Revision(pr_id=root, commit=pr.commit,
-                                        created_at=pr.created_at, event_id=pr.id))
+                                        created_at=pr.created_at, event_id=pr.id,
+                                        author=as_hex(pr.author)))
                 continue
             fresh.append(pr)
         return fresh, repeats
@@ -2918,12 +3254,18 @@ class Sync:
                 report.prs["review_errors"] += 1
                 report.errors.append(f"fixed card {task_id} for PR {pr_id[:8]}: {exc}")
 
-    def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool) -> tuple[str, str]:
+    def _review_task(self, pr: PullRequest, report: Report, *, dry_run: bool,
+                     trusted: bool = True) -> tuple[str, str]:
         """One review task for this PR, or the reason there is none.
 
         Keyed `ngit:pr:<event id>`, so a re-poll, a retry after a failed send and a retry
         after a failed create all land on the same task. Never raises: the caller still has
         a channel message to post, and "no task because ..." is a better message than none.
+
+        `trusted` is the author gate. A trusted author's card is `ready`; anyone else's is
+        created `blocked`, so the dispatcher cannot start a worker on a proposal whose code
+        nobody has authorised. The card still carries the review brief: `hng ngit answer
+        --yes` releases it into the same review lane.
         """
         if dry_run:
             return "", ""
@@ -2934,13 +3276,27 @@ class Sync:
                 return str(existing["id"]), ""
             task_id = self.board.create(
                 title=review_title(pr), body=review_body(pr, self.target),
-                assignee=self.config.review_assignee or "default", status="ready",
+                assignee=self.config.review_assignee or "default",
+                status="ready" if trusted else "blocked",
                 idempotency_key=key, anchor=self.anchor, priority=self.config.priority)
         except (BoardError, sqlite3.Error) as exc:
             report.prs["review_errors"] += 1
             report.errors.append(f"review task for PR {pr.id[:8]}: {exc}")
             log.warning("ngit: no review task for %s: %s", pr.id[:8], exc)
             return "", str(exc)[:200]
+        if not trusted:
+            try:
+                self.board.comment(
+                    task_id, "ngit",
+                    f"Held: {pr.author} is not a trusted author. Nothing reviews or runs"
+                    " this proposal until a trusted npub authorises it"
+                    f" (`hng ngit answer {task_id} --yes --by <npub>`).")
+            except BoardError as exc:
+                report.errors.append(f"hold note on {task_id}: {exc}")
+            report.prs["tasks"] += 1
+            log.info("ngit: review task %s for PR %s is held for an author answer",
+                     task_id, pr.id[:8])
+            return task_id, ""
         # The card is the PR's, and its PR is open: from this moment completion refuses
         # until a merge is applied. Guarding at creation (rather than only on the next
         # pass) closes the window in which a worker could finish the card first. A guard
@@ -2978,7 +3334,8 @@ class Sync:
             return
         if not self.config.reviews or not _detail(link).get("task_error"):
             return
-        task_id, problem = self._review_task(pr, report, dry_run=dry_run)
+        trusted = self._pr_author_trusted(pr.author)
+        task_id, problem = self._review_task(pr, report, dry_run=dry_run, trusted=trusted)
         if dry_run:
             return
         self._note_review(pr, link, task_id, problem)
@@ -3106,6 +3463,15 @@ class Sync:
         waiting = re.compile(rf"(?i)blocked\s+on[^\n]*PR\s+{short}\b")
         found: list[dict[str, Any]] = []
         for card in self.board.blocked_cards():
+            task_id = str(card.get("id") or "")
+            # A card whose own work was never authorised is not waiting on a fact -- it is
+            # waiting on a person, and its title and body are the stranger's text. Releasing
+            # it here would turn an unanswered trust question into queued work (the issue
+            # gate's own bypass). Only a link that reached an accepted state may premise.
+            link = self.store.ngit_link_for_task(task_id) if task_id else None
+            if link is not None and str(link.get("state") or "") in (
+                    "pending", "held", "asked", "declined"):
+                continue
             text = f"{card.get('title') or ''}\n{card.get('body') or ''}"
             for line in text.splitlines():
                 lower = line.lower()
@@ -3287,6 +3653,12 @@ class Sync:
                     for card in cards:
                         if str(card.get("status") or "") in (DONE, "archived"):
                             continue  # finished by a merge or by an approval; prune drops it
+                        if str(card.get("status") or "") == BLOCKED \
+                                and not self.board.parked_by_bridge(str(card["id"])):
+                            # A question, not a hand-off (the author gate): it is not work
+                            # in progress, so an open-PR guard here would say the wrong
+                            # thing about a card nobody has authorised.
+                            continue
                         held = self.board.guard_state(str(card["id"])) or {}
                         if _guard_covers_tip(held, tip):
                             # No news in this window is not evidence the PR is open: the
@@ -3346,11 +3718,21 @@ class Sync:
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             pr_id = str(link.get("source_id") or "")
             detail = _detail(link)
-            if str(link.get("state") or "") in ("merged", "closed"):
-                # A merge -- or a close -- leaves the label it was decided on: there is
-                # nothing left to publish, and skipping finished PRs keeps this walk to
-                # the live ones.
+            if str(link.get("state") or "") in ("merged", "closed", "held", "asked",
+                                                "declined"):
+                # A merge or a close leaves the label it was decided on; a PR held for an
+                # author answer has no review state to publish and acting on a verdict
+                # would finish work nobody authorised.
                 continue
+            if str(link.get("state") or "") == "pending":
+                # The first pass decides and delivers in one tick, and the label walk runs
+                # before delivery. A pending *trusted* PR still gets its label now; a
+                # pending card waiting on an author question does not.
+                task_id = self._review_anchor(link)
+                task = self.board.task(task_id) if task_id else None
+                if task is not None and str(task.get("status") or "") == BLOCKED \
+                        and not self.board.parked_by_bridge(str(task.get("id") or "")):
+                    continue
             published = detail.get("label") or ()
             if pr_id not in active and not published and not detail.get("label_pending"):
                 # A PR announced before the bridge published labels. Retrofitting a label
@@ -3384,12 +3766,14 @@ class Sync:
         return self.labels
 
     def _apply_verdict(self, pr_id: str, card: dict[str, Any], verdict: Verdict,
-                       anchor: VerdictAnchor, detail: dict[str, Any]) -> str:
+                       anchor: VerdictAnchor, detail: dict[str, Any],
+                       report: Report | None = None) -> str:
         """Finish the PR's card on an approval, or send it back on a changes request.
 
         The verdict is the review's end, so the card it was given for does not stay parked
-        on one. `approved` completes it -- the merge is still a person's, and the PR's
-        `approved` label is what the merge route reads. `changes-requested` puts it back on
+        on one. `approved` completes it -- the merge is still a person's, and the merge
+        route reads the approval's tip from the link (`verdict_tip`) before it applies
+        anything. `changes-requested` puts it back on
         the implementer's desk as `ready`, with the findings, which is the transition the
         kernel's `request_changes` writes.
 
@@ -3411,6 +3795,16 @@ class Sync:
         if not task_id or status not in (BLOCKED, REVIEW):
             return ""
         if status == BLOCKED and not self.board.parked_by_bridge(task_id):
+            return ""
+        if not self.reviewers or as_hex(verdict.author) not in self.reviewers:
+            # Defence in depth: the reader already filters, but a verdict object from
+            # another source must not finish a card either. No configured reviewer means
+            # no verdict is in force at all.
+            note = (f"verdict on PR {pr_id[:8]} ignored: its author is not a configured "
+                    "reviewer")
+            if report is not None:
+                report.notes.append(note)
+            log.warning("ngit: %s", note)
             return ""
         tip = str(anchor.tip or detail.get("tip") or "")
         if anchor.label == APPROVED:
@@ -3522,7 +3916,7 @@ class Sync:
         if anchor is not None and verdict is not None and card is not None \
                 and tuple(desired or ()) == (anchor.label,):
             # The verdict is in force: it decided the label, so it decides the card too.
-            outcome = self._apply_verdict(pr_id, card, verdict, anchor, detail)
+            outcome = self._apply_verdict(pr_id, card, verdict, anchor, detail, report=report)
             if outcome == APPLIED_APPROVED:
                 report.prs["approved"] += 1
                 report.notes.append(
@@ -3802,11 +4196,12 @@ def task_body(issue: Issue, target: Target) -> str:
 def answer(store: Store, control: ControlConfig, *, ref: str, yes: bool, by: str,
            reason: str = "", home: str | Path | None = None,
            now: Callable[[], float] = time.time) -> dict[str, Any]:
-    """Promote (yes) or decline (no) a held issue's task, recording who decided and when.
+    """Promote (yes) or decline (no) a held issue's or PR's task, recording who decided.
 
     The answer is a person's, so it must come from a trusted npub: a stranger who filed the
-    issue must not also be able to authorise it. The decision is written as a task comment
-    first and the link state second, so an audit line exists even if the later write fails.
+    issue or opened the PR must not also be able to authorise it. The decision is written as
+    a task comment first and the link state second, so an audit line exists even if the later
+    write fails.
     """
     who = as_hex(by)
     if not who:
@@ -3837,23 +4232,25 @@ def answer(store: Store, control: ControlConfig, *, ref: str, yes: bool, by: str
                     "note": "the task is not blocked; nothing to answer"}
 
         stamp = dt.datetime.fromtimestamp(int(now()), dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        kind = int(link.get("kind") or 0)
+        noun = "PR" if kind == KIND_PR else "issue"
         try:
             if yes:
                 promoted = board.release(
                     task_id, author="ngit",
-                    comment=f"Authorised by {npub_of(who)} at {stamp}: issue {issue_nevent}"
+                    comment=f"Authorised by {npub_of(who)} at {stamp}: {noun} {issue_nevent}"
                             " -> ready")
                 if not promoted:
                     raise NgitError(f"task {task_id} changed state while answering; "
                                     "nothing was recorded, try again")
-                store.ngit_link_state(link["repo"], KIND_ISSUE, link["source_id"],
-                                      "authorised")
+                store.ngit_link_state(link["repo"], kind, link["source_id"],
+                                      "signalled" if kind == KIND_PR else "authorised")
                 return {"task": task_id, "status": "ready", "changed": True,
                         "issue": issue_nevent, "by": npub_of(who)}
             board.comment(task_id, "ngit",
                           f"Declined by {npub_of(who)} at {stamp}: "
                           f"{reason.strip() or 'no reason given'}; the task stays blocked.")
-            store.ngit_link_state(link["repo"], KIND_ISSUE, link["source_id"], "declined")
+            store.ngit_link_state(link["repo"], kind, link["source_id"], "declined")
             return {"task": task_id, "status": "blocked", "changed": True,
                     "issue": issue_nevent, "by": npub_of(who), "reason": reason.strip()}
         except BoardError as exc:
@@ -3870,6 +4267,8 @@ def _link_for(store: Store, ref: str) -> dict[str, Any]:
         link = store.ngit_link_for_task(text)
     else:
         link = store.ngit_link_for_source(KIND_ISSUE, event_hex(text))
-    if link is None or int(link.get("kind") or 0) != KIND_ISSUE:
-        raise NgitError(f"no ngit issue is linked to {text!r}")
+        if link is None:
+            link = store.ngit_link_for_source(KIND_PR, event_hex(text))
+    if link is None or int(link.get("kind") or 0) not in (KIND_ISSUE, KIND_PR):
+        raise NgitError(f"no ngit issue or PR is linked to {text!r}")
     return link

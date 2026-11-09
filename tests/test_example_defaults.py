@@ -9,6 +9,7 @@ group names. Revert the example's `strangers` rule, move it below a wildcard rul
 the digest fallback in `Policy`, and these fail.
 """
 
+import time
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,7 @@ def test_a_dropped_stranger_is_still_recorded_as_not_allowlisted(example, policy
     with Store(tmp_path / "drops.db") as store:
         assert store.add(Inbound(
             id="ab" * 32, wrapper_id="cd" * 32, sender=STRANGER, kind=14,
-            created_at=1_700_000_000, content="let me in", conversation=STRANGER,
+            created_at=int(time.time()), content="let me in", conversation=STRANGER,
             reply_to=None, plane="nip17", reach=decision.reach,
             authority=decision.authority, rule=decision.rule, why=decision.why,
             blocked_reason=decision.blocked_reason,

@@ -17,7 +17,7 @@ import yaml
 from .bots import BotRegistry
 from .checkout import inspect as inspect_checkout
 from .control import ControlConfig, as_hex
-from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret
+from .crypto import CryptoError, SdkCrypto, npub_encode, parse_secret, pubkey_from_secret
 from .fetch import fetch_many_blocking, stream_events
 from .health import (
     BAD,
@@ -129,6 +129,30 @@ def _checked_secret(secret: str, source: str) -> str:
         return parse_secret(secret)
     except CryptoError as exc:
         raise SystemExit(f"{source}: {exc}") from None
+
+
+def reviewer_keys(ngit_cfg: Any) -> tuple[str, ...]:
+    """The keys whose verdict comments count, from the explicit list or the review key.
+
+    An explicit `ngit.reviewers` wins. When it is empty and `ngit.review_secret_file` names
+    the review role's key, the public half is derived from it -- one source of truth, the
+    same key the reviewer signs with, rather than a second list someone must keep in step.
+    A key file that cannot be read is a warning, not a dead pass: no reviewers means no
+    verdict is accepted, which is the safe direction.
+    """
+    keys = [str(who) for who in getattr(ngit_cfg, "reviewers", ()) if str(who or "").strip()]
+    if not getattr(ngit_cfg, "verdicts", True):
+        return ()
+    path = str(getattr(ngit_cfg, "review_secret_file", "") or "").strip()
+    if not keys and path:
+        try:
+            secret = _checked_secret(read_secret_file(os.path.expanduser(path)),
+                                     f"ngit.review_secret_file {path}")
+            keys.append(pubkey_from_secret(secret))
+        except (SystemExit, CryptoError) as exc:
+            print(f"ngit: reviewers unavailable ({exc}); no verdict will be applied",
+                  file=sys.stderr)
+    return tuple(dict.fromkeys(keys))
 
 
 def secret_from(cfg: dict[str, Any]) -> str:
@@ -1259,7 +1283,8 @@ def _read_relays(cfg: dict[str, Any]) -> list[str]:
 
 
 def cmd_ngit(args) -> int:
-    """The ngit bridge: one sync pass, one verdict reconcile, one answer, one merge check."""
+    """The ngit bridge: one sync pass, one verdict reconcile, one answer to a held issue or
+    PR, one merge check."""
     cfg = load_config(args.config)
     if args.ngit_cmd == "answer":
         return cmd_ngit_answer(cfg, args)
@@ -1354,7 +1379,13 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
     except Exception:
         board.close()
         raise
-    ngit_cfg = replace(ngit_cfg, assignee=assignee)
+    # The allowlists come from configuration, and the repository's own announcement adds
+    # its maintainers. Both are normalised to npub/hex by BridgeConfig; dedupe on the
+    # read so a key named in both places is not a second entry.
+    maintainers = tuple(dict.fromkeys((*ngit_cfg.maintainers, *repository.maintainers)))
+    reviewers = reviewer_keys(ngit_cfg)
+    ngit_cfg = replace(ngit_cfg, assignee=assignee, maintainers=maintainers,
+                       reviewers=reviewers)
     prs = None
     labeler = None
     state = None
@@ -1373,14 +1404,16 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
             note = "no relays to read PRs from (ngit.relays or relays.read): " \
                    "PRs are not announced"
         else:
-            prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg))
+            prs = bridge.RelayPrs(relays, target.address, secret=secret_from(cfg),
+                                  maintainers=maintainers)
     # One reader serves four jobs -- PR labels, a reconcile's verdict, issue labels and
     # comment mentions -- so it is built whenever any of them needs a relay, not only when
     # PRs are announced. `reader` is the reconcile path: it reads a verdict to apply one
     # even when this deployment publishes no labels at all.
     if target.address and relays and (ngit_cfg.labels or ngit_cfg.mentions
                                       or ngit_cfg.ready_label or reader):
-        state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg))
+        state = bridge.RelayLabels(relays, target.address, secret=secret_from(cfg),
+                                   reviewers=reviewers)
         if ngit_cfg.labels:
             # One reader, one writer, the same relay set: the pass reads the verdict
             # and the live labels from where it publishes them, so a retraction and
@@ -2136,8 +2169,8 @@ def main(argv: list[str] | None = None) -> int:
     p_ngit_reconcile.set_defaults(func=cmd_ngit)
 
     p_ngit_answer = ngit_sub.add_parser(
-        "answer", help="yes or no for an issue held for a human")
-    p_ngit_answer.add_argument("ref", help="the task id, or the issue's nevent")
+        "answer", help="yes or no for an issue or PR held for a human")
+    p_ngit_answer.add_argument("ref", help="the task id, or the issue/PR nevent")
     verdict = p_ngit_answer.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--yes", action="store_true", help="queue it: the task becomes ready")
     verdict.add_argument("--no", dest="no", action="store_true",

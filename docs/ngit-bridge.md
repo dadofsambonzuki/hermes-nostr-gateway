@@ -31,6 +31,11 @@ ngit:
   priority: 0              # task priority for anything the bridge creates
   max_new: 20              # new tasks per poll; the rest wait for the next one
   max_prs: 10              # PR messages per poll; the rest wait for the next one
+  maintainers: [npub1...] # keys whose 1631/1632 status events are accepted; the repo
+                           # announcement's maintainers are added, and empty accepts none
+  reviewers: [npub1...]   # keys whose `Verdict:` comment may finish a card; empty with
+                           # review_secret_file derives the review key, else none
+  verdicts: true           # false = read no verdict and finish no card by one
   labels: true             # publish each PR's review state as a NIP-34 label (see below)
   ready_label: ready       # an issue is queued only when a trusted npub labels it this
   mentions: true           # an @mention in an issue/PR comment becomes a reply task
@@ -45,7 +50,12 @@ Trusted authors are the control pane's (`control.trusted_npubs` unioned with
 `control.planes.concord.trusted_npubs`). They are who may authorise an issue (by labelling it
 `ready`), whose mentions become reply tasks, and — with `ready_label: ""` — whose issues are
 queued on sight. With no trusted npubs configured nothing is queued automatically, and nothing
-is guessed.
+is guessed: every issue is held, and a PR is held unless its author is also a maintainer of the
+repository (the announcement's own list, unioned with `ngit.maintainers`). The other two
+allowlists are per event type, because a repository tag is not an author: `maintainers` (the
+announcement's own maintainers are unioned in) own kind-1631/1632 statuses, and `reviewers`
+own kind-1111 verdicts. Both are applied in the relay filter and again on the parsed event;
+an empty list trusts nobody. A revision is accepted only from the PR's own author.
 
 The repository address is read from the checkout itself (`ngit repo --json`, the kind-30617
 coordinate). Nothing about a particular box is compiled in.
@@ -222,7 +232,9 @@ Two operational notes:
 - A NIP-22 kind-1111 comment becomes a task comment, in `created_at` order, once (tracked per
   comment id). A comment added later is appended; nothing is rewritten. The kind is 1111
   because that is what `ngit issue comment` and `ngit pr comment` publish on 3.0.5 — no ngit
-  release ever wrote 1622.
+  release ever wrote 1622. Only a trusted npub's comment, or the issue author's own, is copied:
+  a comment is instruction-bearing text on the card, and a stranger does not get to write one.
+  The rest are recorded as seen and skipped, not re-read every poll.
 - **An issue is queued only when a trusted npub labels it `ready`, not when its author is
   trusted.** A label is kind 1985, targets the issue (`e`) and is published by someone in the
   control pane's trusted set for the concord plane. Any NIP-32 namespace counts — the gate reads
@@ -264,7 +276,7 @@ the gateway's own identity). The wording is the worker's; the bridge does not an
 credential rather than a file leaves `reply_secret_file` empty, in which case the task says
 the reply cannot be published and why.
 
-## Answering a held issue
+## Answering a held issue or PR
 
 ```bash
 hng ngit answer <task-id|nevent> --yes --by <npub>
@@ -272,11 +284,13 @@ hng ngit answer <task-id|nevent> --no --by <npub> --reason "..."
 ```
 
 - Only a trusted npub (the control pane's, for the concord plane) can answer: filing an issue
-  does not authorise it.
+  or opening a PR does not authorise it.
 - A `yes` promotes `blocked -> ready` and writes an audit comment naming the npub and the time;
-  the link state becomes `authorised`. Answering again changes nothing.
+  the link state becomes `authorised` (an issue) or `signalled` (a PR, whose review card then
+  behaves exactly like one made for a trusted author). Answering again changes nothing.
 - A `no` leaves the task blocked, records the reason as a comment, and marks the link
-  `declined` so the issue is never asked about again.
+  `declined` so the issue/PR is never asked about again. A declined card is never released by
+  a merge premise, either: only an accepted state may be waiting on a fact.
 
 ## Outbound: PRs signalled for review
 
@@ -290,7 +304,11 @@ same branch and a revision all land on that one card; none of them makes a secon
   announced twice, and the idempotency key means a re-poll cannot make a second task either.
   A re-push that a client published as a *second* 1618 is folded back onto the root (same
   author, same source branch) and read as a revision: the oldest proposal is the root, because
-  that is the event the PR opened with.
+  that is the event the PR opened with. **A PR's author is gated exactly as an issue's**: a
+  trusted npub's PR -- or a repository maintainer's -- gets the `ready` review task; anyone
+  else's is created `blocked` and the channel gets one question naming the PR and the command
+  that answers it. A review task
+  checks code out and runs its tests, so nothing does that on a stranger's word.
 - A **revision** is an event, not an observation: kind 1619 (`E` names the PR, `c` the new
   tip), or a republished proposal carrying the same `E`/`P`/`c` tags. It reopens the PR's one
   card — `review`/`done` -> `ready` — with one comment naming the new tip and the event that
@@ -309,14 +327,18 @@ same branch and a revision all land on that one card; none of them makes a secon
   no card to reopen; an `applied` PR is final — a late update event cannot revive it, and the
   merge commit is written on the row as soon as the merge is seen, so a notice still queued
   does not leave a window; and a revision older than the tip the row already knows is a relay
-  replay, not news.
+  replay, not news. **A revision is accepted only from the PR's own author**, and a merge
+  status only from a maintainer; a close may come from either. Those checks run on the
+  event's own `pubkey` as well as in the relay filter, and a future-dated event or a `c` tag
+  that is not a hex commit is dropped before it can reach a card or a brief.
 - The task is titled `Review PR <first 8 of the root event id>: <subject>` and its body names
   the PR's event id and nevent, the repository address, the author, the source branch
   (`branch-name`) and the target branch — NIP-34 carries no target tag, so it is the
   checkout's default branch, read from git. The brief: check the proposal out
   (`ngit pr checkout <nevent>`), read the diff, run the repository's gates (`ruff check`,
   `pytest`), report a verdict with reasons. **It never merges**: merging is the operator's,
-  or a follow-up task.
+  or a follow-up task. A blocked card carries the same brief, so `hng ngit answer --yes`
+  releases it into the review lane without a second edit.
 - The notice names the task (`review task <id>`) instead of a second message announcing it.
   One PR, one channel event.
 - `ngit.review_assignee` (default `default`) is the profile the task is dispatched to and
@@ -461,7 +483,10 @@ the same thing in the one word a reader has to look at.
 
 **The verdict is read from the PR root, not from the board.** A reviewer publishes its verdict
 as a NIP-22 kind-1111 comment on the PR (`ngit pr comment ...`; root `E` = the PR) and reports
-the same verdict on the task, naming the comment's event id. The newest verdict comment wins.
+the same verdict on the task, naming the comment's event id. The newest verdict comment wins —
+**from a configured reviewer**. The `reviewers` list (or the review key it is derived from) is
+applied in the relay read and again on the parsed comment; an empty list means no verdict is
+in force, and no card is finished or re-queued by one.
 The card is the queue and the PR is the record: a reader of the label can fetch the comment it
 was derived from, and a verdict recorded only on the card leaves the label where it was rather
 than publishing a state the PR itself does not carry.

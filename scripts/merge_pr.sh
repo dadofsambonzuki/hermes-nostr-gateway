@@ -96,6 +96,16 @@ case "$status" in
   *) echo "FAIL $pr is ${status:-unknown}, not open"; exit 3 ;;
 esac
 
+# The tip the merge will actually apply, read from the remote now rather than from the
+# bridge's last pass: a push after the approval is exactly the revision the merge must not
+# land on the old word. A fork branch the origin does not carry gives no tip, and the check
+# falls back to the link's recorded one.
+branch=$(timeout 60 ngit pr view "$pr" 2>/dev/null | awk '/^Branch:/ {print $2}')
+tip=""
+if [ -n "$branch" ]; then
+  tip=$(git -C "$REPO" ls-remote origin "refs/heads/$branch" 2>/dev/null | awk '{print $1}')
+fi
+
 wt=$(mktemp -d "${TMPDIR:-/tmp}/merge-pr.XXXXXX")
 git worktree add --detach -q "$wt" origin/master || { echo "FAIL worktree"; exit 3; }
 
@@ -175,6 +185,7 @@ fi
 # operator's `Card: operator` does not release a worker's running card. Exit 7 is the refusal;
 # 3 means the box cannot answer (no config, no board), which is this script's own state error.
 set -- "$pr" --repo "$REPO"
+if [ -n "$tip" ]; then set -- "$@" --tip "$tip"; fi
 for value in $cards; do
   [ "$value" = operator ] && continue
   set -- "$@" --card "$value"

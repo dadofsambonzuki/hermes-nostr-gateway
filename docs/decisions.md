@@ -217,6 +217,46 @@ issue were enough to put work in the queue, the queue would be writable by stran
 bridge silently ignored them, a real report from a new contributor would vanish. Holding it and
 asking a person is the only option that is neither.
 
+## Every event type has an author, and a repository tag is not one
+
+A PR's author is gated as an issue's: a trusted npub or a repository maintainer gets a `ready`
+review card, and anyone else's PR is blocked with one question. A kind-1631/1632 status is accepted only from
+a maintainer (the announcement's own list, unioned with `ngit.maintainers`), a close also from the
+PR's author, and a kind-1619 revision only from the PR's author. A kind-1111 verdict is accepted
+only from `ngit.reviewers` (or the review key it is derived from), never from anyone who tags the
+PR. The allowlists are applied in the relay filter and checked again on the parsed event; an empty
+list trusts nobody, and a commit id that is not hex or a `created_at` in the future is dropped.
+
+Why: findings 1–4 of the security review all had one root cause — the reads filtered on the
+repository address (`#a`) and nothing else, so a stranger could get a review card dispatched
+(which checks code out and runs `pytest`), release a held issue into the queue with an `after PR`
+title, finish or rewrite a review card with a forged `Verdict:` comment, or complete every card
+with a forged merge. A review task is a code-execution path as well as a queue entry, so the
+question is asked before the card can be claimed.
+
+## A joined Concord community is pinned to the invite that joined it
+
+A re-invite that changes the community root, control key, epoch or relays — or replaces or adds a
+channel grant — is held for a person unless its inviter is trusted or is the owner. Streams are
+built only from rows that were actually joined, not from every invite ever recorded.
+
+Why: `community_id` self-certifies the owner and salt and nothing else, and an untrusted member
+could otherwise replace the root key and relays of a community the agent had joined, sending the
+agent's replies, approval prompts and ngit notices to the attacker, and hiding them from the real
+members. The same pinning keeps a held invite from becoming a subscription or a send target.
+
+## Every plane refuses a message outside the age window
+
+An inbound rumor whose own `created_at` is older than three days or more than five minutes in the
+future is stored as blocked (`stale_or_future`) and never delivered. The check runs in the store
+before the row is written — where the deferred writer cannot race it — and again at the gateway's
+one emission point, so it applies to NIP-17, NIP-04, kind-1, Concord and Marmot alike, and the
+blocked row cannot be replayed after a restart.
+
+Why: a relay in the read set can serve an old, never-seen message from a trusted sender with full
+authority. The spec already promised this window (§10.5); the planes did not implement it, and the
+Marmot path bypassed the reach filter entirely.
+
 ## The gateway is a bridge as well as a pump
 
 Planes are live and fail per message; the ngit bridge is a batch reconciler with its own cursor,
@@ -709,7 +749,9 @@ card with the verdict as its result; `changes-requested` puts it back on the imp
 as `ready`, with the fix brief and the findings — the transition the kernel's
 `request_changes` writes, written by the bridge because the review card was never claimed from
 `review` and the kernel's provenance check has nothing to route on. The merge stays a person's:
-the card being `done` says the review is over, and the PR's label is what the merge route reads.
+the card being `done` says the review is over, and the bridge records the reviewed tip on the
+link (`verdict_tip`) so the merge route refuses a tip the approval does not cover. The label is
+a public copy of the state, not the gate.
 
 **Why the bridge and not the reviewer.** The reviewer cannot complete the card (the guard
 refuses a completion on an open PR, and it must: a worker's word is not a review), and it cannot

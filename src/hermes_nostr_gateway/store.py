@@ -412,6 +412,18 @@ class Inbound:
         return frame
 
 
+#: The window every plane shares (spec §10.5). It lives in the store because that is the
+#: one place every path writes a rumor: a relay in the read set can replay an old message
+#: from a trusted sender, and a row refused here can never be offered as pending again.
+MAX_MESSAGE_AGE_S = 3 * 86400
+MAX_FUTURE_S = 300
+
+
+def _out_of_window(created_at: int, now: int) -> bool:
+    return (created_at < now - MAX_MESSAGE_AGE_S
+            or created_at > now + MAX_FUTURE_S)
+
+
 class Store:
     #: Applied to every connection. `busy_timeout` is not optional once two threads
     #: hold the file: without it a reader that arrives mid-checkpoint gets SQLITE_BUSY
@@ -785,6 +797,20 @@ class Store:
             return self._writer.offer(msg)
         return self.add_many([msg], now=now)[0]
 
+    def block_rumor(self, rumor_id: str, reason: str) -> bool:
+        """Refuse a stored rumor after the fact, and say why.
+
+        The age check runs in the daemon after the plane has stored the message: a row
+        that is refused for its timestamp must stop being replayable, not merely go
+        undelivered this time. `blocked_reason` is exactly what `pending_immediate`
+        excludes, so this is the durable half of that refusal.
+        """
+        cur = self.db.execute(
+            "UPDATE rumors SET blocked_reason = ? WHERE id = ? AND blocked_reason IS NULL",
+            (str(reason)[:200], str(rumor_id)),
+        )
+        return cur.rowcount > 0
+
     def reserve_cursors(self, count: int) -> int:
         """Reserve a block of cursors and return the first one.
 
@@ -846,6 +872,12 @@ class Store:
                     next_rumor, max_used + 1)
                 digest_rule = msg.rule if msg.reach in ("digest", "drop") and msg.rule else None
                 digest_state = None
+                if _out_of_window(int(msg.created_at or 0), stamp):
+                    # Refuse it before it is written, not after: the row's blocked_reason
+                    # is what keeps `pending_immediate` from offering it after a restart,
+                    # and the writer owns the insert, so a post-hoc update could miss it.
+                    msg.reach = "drop"
+                    msg.blocked_reason = msg.blocked_reason or "stale_or_future"
                 if msg.reach == "digest":
                     digest_state = "queued"
                 elif msg.reach == "drop" and msg.interval_s is not None:

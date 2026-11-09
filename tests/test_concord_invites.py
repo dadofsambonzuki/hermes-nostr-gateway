@@ -306,6 +306,124 @@ async def test_a_reinvite_for_a_joined_community_does_not_join_again(tmp_path, m
         gateway.store.close()
 
 
+async def test_a_reinvite_that_changes_the_root_is_held_not_joined(tmp_path, monkeypatch):
+    """Key substitution: a member's re-invite must not replace a joined community's root."""
+    owner, attacker, me = sdk.Keys.generate(), sdk.Keys.generate(), sdk.Keys.generate()
+    sent = captured_publish(monkeypatch)
+    gateway = gateway_for(tmp_path, me, control={"trusted_npubs": [npub(owner)]})
+    first, _ = make_invite(owner.public_key().to_hex())
+    hostile = c.Invite(
+        bundle=dict(first.bundle, community_root=os.urandom(32).hex()),
+        inviter=attacker.public_key().to_hex(), relay="", wrap_id=os.urandom(32).hex())
+    try:
+        record(gateway.store, first)
+        assert (await gateway.decide_invite(first))["status"] == "joined"
+        record(gateway.store, hostile)
+
+        frame = await gateway.decide_invite(hostile)
+
+        assert frame["status"] == "held"
+        assert "changes the community" in frame["why"]
+        assert len(sent["events"]) == 1, "a held re-invite must not publish a second join"
+        row = gateway.store.concord_invite(hostile.wrap_id)
+        assert row is not None and row["status"] == "held"
+    finally:
+        gateway.store.close()
+
+
+async def test_the_owner_may_rotate_a_joined_community_s_root(tmp_path, monkeypatch):
+    """The owner's own re-invite is the one expected way the pinned fields change."""
+    owner, me = sdk.Keys.generate(), sdk.Keys.generate()
+    sent = captured_publish(monkeypatch)
+    gateway = gateway_for(tmp_path, me, control={"trusted_npubs": [npub(owner)]})
+    first, _ = make_invite(owner.public_key().to_hex())
+    rotated = c.Invite(
+        bundle=dict(first.bundle, community_root=os.urandom(32).hex(),
+                    root_epoch=1),
+        inviter=owner.public_key().to_hex(), relay="", wrap_id=os.urandom(32).hex())
+    try:
+        record(gateway.store, first)
+        assert (await gateway.decide_invite(first))["status"] == "joined"
+        record(gateway.store, rotated)
+
+        frame = await gateway.decide_invite(rotated)
+
+        assert frame["status"] == "joined"
+        assert len(sent["events"]) == 1, "the owner's rotation is not a second Guestbook join"
+        row = gateway.store.concord_invite(rotated.wrap_id)
+        assert row is not None and row["status"] == "joined"
+    finally:
+        gateway.store.close()
+
+
+async def test_a_member_may_not_add_a_channel_grant_to_a_joined_community(tmp_path, monkeypatch):
+    """A new room is additive only from the owner (or a trusted npub); a member's is held."""
+    owner, member, me = sdk.Keys.generate(), sdk.Keys.generate(), sdk.Keys.generate()
+    sent = captured_publish(monkeypatch)
+    gateway = gateway_for(tmp_path, me, control={"trusted_npubs": [npub(owner)]})
+    first, _ = make_invite(owner.public_key().to_hex())
+    injected = c.Invite(
+        bundle=dict(first.bundle,
+                    channels=[*first.bundle["channels"],
+                              {"id": os.urandom(32).hex(), "name": "injected", "epoch": 0}]),
+        inviter=member.public_key().to_hex(), relay="", wrap_id=os.urandom(32).hex())
+    try:
+        record(gateway.store, first)
+        assert (await gateway.decide_invite(first))["status"] == "joined"
+        record(gateway.store, injected)
+
+        frame = await gateway.decide_invite(injected)
+
+        assert frame["status"] == "held"
+        assert "adds a channel grant" in frame["why"]
+        assert len(sent["events"]) == 1
+    finally:
+        gateway.store.close()
+
+
+async def test_a_held_community_builds_no_streams(tmp_path, monkeypatch):
+    """A held invite is a record, not a subscription: it may not become a send target."""
+    owner, me = sdk.Keys.generate(), sdk.Keys.generate()
+    captured_publish(monkeypatch)
+    gateway = gateway_for(tmp_path, me, control={})   # nobody trusted
+    invite, _ = make_invite(owner.public_key().to_hex())
+    try:
+        record(gateway.store, invite)
+        assert (await gateway.decide_invite(invite))["status"] == "held"
+
+        watched = await gateway.refresh_concord()
+
+        assert watched == 0
+        assert gateway.concord.channels() == []
+        assert gateway.concord.channel_for_conversation(
+            f"concord:{invite.community_id.hex()}:{OPS}") is None
+    finally:
+        gateway.store.close()
+
+
+async def test_a_reinvite_that_only_adds_a_channel_is_still_accepted(tmp_path, monkeypatch):
+    """One owner action mints one invite per room; a later room is additive, not hostile."""
+    owner, me = sdk.Keys.generate(), sdk.Keys.generate()
+    sent = captured_publish(monkeypatch)
+    gateway = gateway_for(tmp_path, me, control={"trusted_npubs": [npub(owner)]})
+    first, _ = make_invite(owner.public_key().to_hex())
+    extra = os.urandom(32).hex()
+    more = c.Invite(
+        bundle=dict(first.bundle,
+                    channels=[*first.bundle["channels"],
+                              {"id": extra, "name": "later", "epoch": 0}]),
+        inviter=owner.public_key().to_hex(), relay="", wrap_id=os.urandom(32).hex())
+    try:
+        record(gateway.store, first)
+        assert (await gateway.decide_invite(first))["status"] == "joined"
+        record(gateway.store, more)
+
+        assert (await gateway.decide_invite(more))["status"] == "joined"
+        assert len(sent["events"]) == 1
+    finally:
+        gateway.store.close()
+
+
 async def test_the_same_wrap_from_two_relays_asks_only_once(tmp_path, monkeypatch):
     """One invite arrives from every relay that carries it: one question, not one each."""
     owner, other, me = sdk.Keys.generate(), sdk.Keys.generate(), sdk.Keys.generate()
@@ -328,10 +446,14 @@ async def test_the_same_wrap_from_two_relays_asks_only_once(tmp_path, monkeypatc
 
 # ── the wire ────────────────────────────────────────────────────────────────
 
-async def test_a_join_is_a_real_event_on_the_wire():
+async def test_a_join_is_a_real_event_on_the_wire(monkeypatch):
     """Not a stub: the Guestbook wrap goes out as an EVENT and the relay says OK."""
     relay = await LocalRelay().start()
     try:
+        # The local test relay is plain `ws://127.0.0.1`; production refuses exactly that
+        # (a bundle must not point the daemon into its own network), so this test opts the
+        # one URL in rather than weakening the check for every caller.
+        monkeypatch.setattr(c, "relay_url", lambda url: str(url))
         owner, me = sdk.Keys.generate(), sdk.Keys.generate()
         invite, _ = make_invite(owner.public_key().to_hex(), relays=[relay.url])
         assert await write.join_guestbook(me, invite) == {relay.url: "ok"}

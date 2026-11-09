@@ -27,8 +27,10 @@ recovery path.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
@@ -67,12 +69,38 @@ def normalise_relay(url: object) -> str:
     return text.rstrip("/").lower() if text else ""
 
 
+def public_host(host: str) -> bool:
+    """False for loopback, private, link-local, reserved or unresolvable names."""
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return literal.is_global
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    addresses = {str(info[4][0]).split("%")[0] for info in infos}
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                return False
+        except ValueError:  # pragma: no cover - getaddrinfo only returns addresses
+            return False
+    return True
+
+
 def relay_url(url: object) -> str | None:
     """A usable relay URL, or None.
 
     `wss://` only. A 10050 is peer-controlled input, and an entry there is not a
     licence to open a plaintext (`ws://`) or non-network (`file://`, `http://`)
-    connection.
+    connection. An address the peer can point at our own box is the same problem in a
+    different scheme -- `wss://127.0.0.1:8080` or `wss://localhost` is a blind request
+    into the host's private network -- so a non-public host is refused here too.
     """
     text = str(url or "").strip()
     if not text:
@@ -80,7 +108,15 @@ def relay_url(url: object) -> str | None:
     parts = urlsplit(text)
     if parts.scheme.lower() != "wss" or not parts.netloc:
         return None
-    return text
+    host = (parts.hostname or "").strip().lower()
+    if not host or host in {"localhost", "localhost.localdomain", "ip6-localhost"} \
+            or host.endswith(".local"):
+        return None
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        return text
+    return text if literal.is_global else None
 
 
 def _unique_relays(values: Iterable[object], *, strict: bool, where: str,

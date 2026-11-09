@@ -1,5 +1,7 @@
 """Plane behaviour: the rules that keep a gift wrap from becoming an agent run."""
 
+import time
+
 import pytest
 
 from hermes_nostr_gateway.planes.nip17 import Nip17Plane
@@ -41,7 +43,7 @@ def rumor(rid, sender, kind=14, content="hi", recipient=ME, eid=None):
     tags = [["p", recipient]] if recipient else []
     if eid:
         tags.append(["e", eid])
-    return {"id": rid, "pubkey": sender, "kind": kind, "created_at": 1_700_000_000,
+    return {"id": rid, "pubkey": sender, "kind": kind, "created_at": int(time.time()),
             "content": content, "tags": tags}
 
 

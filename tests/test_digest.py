@@ -10,7 +10,7 @@ ME = "aa" * 32
 PEER = "bb" * 32
 
 
-def inbound(rid, *, reach="digest", rule="unknown-dms", interval=60, now=1000,
+def inbound(rid, *, reach="digest", rule="unknown-dms", interval=60, now=0,
             plane="nip17", content=None):
     return Inbound(
         id=rid, wrapper_id=f"w-{rid}", sender=PEER, kind=14, created_at=now,

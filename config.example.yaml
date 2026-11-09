@@ -291,7 +291,18 @@ defaults:
 #   priority: 0                  # task priority for anything the bridge creates
 #   max_new: 20                  # new tasks per poll; the rest wait for the next one
 #   max_prs: 10                  # notices decided on, and handed to the daemon, per poll
-#   labels: true                 # publish each PR's review state as one NIP-34 label on the PR
+#   maintainers:                 # keys whose kind-1631/1632 status events are accepted;
+#     - npub1...                 # the repository announcement's own maintainers are added
+#                                # automatically, and an empty set accepts no merge
+#   reviewers:                   # keys whose `Verdict:` comment can finish a review card,
+#     - npub1...                 # and the only authors whose verdict is published as a
+#                                # label. Empty + review_secret_file derives the review key;
+#                                # otherwise no verdict is applied at all
+#   review_secret_file: /etc/hermes-nostr-gateway/review.json
+#   verdicts: true               # false = read no verdict and finish no card by one
+#   labels: true                 # publish each PR's review state (review-required,
+#                                # changes-requested, approved) as one NIP-34 label on the
+#                                # PR; false publishes no extra events
 #   ready_label: ready           # an issue is queued only when a trusted npub labels it "ready"
 #   mentions: true               # an @mention in an issue/PR comment becomes a reply task
 #   mention_assignee: default    # profile a mention reply task is dispatched to

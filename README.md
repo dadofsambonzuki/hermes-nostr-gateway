@@ -153,7 +153,7 @@ supplies the checkout and the board:
 | kind-1621 issue | a task on the channel's board, once a trusted npub labels it `ready` |
 | kind-1111 comment | a comment on that task, in `created_at` order, once |
 | kind-1111 @mention | one reply task, naming the thread and the command that answers in it |
-| kind-1618 PR | one notice in the channel, and one review task on the board |
+| kind-1618 PR | one notice in the channel, and one review task on the board (held for a question if its author is neither trusted nor a maintainer) |
 | kind-1631 applied | a `merged as <commit>` follow-up; it completes the review task |
 
 An issue is queued when a trusted npub (`control.trusted_npubs`, or the concord plane's own list)

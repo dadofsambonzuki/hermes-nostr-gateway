@@ -16,11 +16,13 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
+from urllib.parse import urlsplit
 
 import nostr_sdk as sdk
 from websockets.asyncio.client import connect as ws_connect
 
 from ... import crypto
+from ...peer_inbox import public_host, relay_url
 from .derive import (
     CURVE_ORDER,
     DEFAULT_COMMUNITY_RELAYS,
@@ -45,12 +47,28 @@ __all__ = [
 async def fetch_events(relays: Iterable[str], filters: list[dict[str, Any]],
                        per_relay_timeout: float = 8.0,
                        total_limit: int = 5000) -> list[dict[str, Any]]:
-    """Collect matching events from every reachable relay, de-duplicated by id."""
+    """Collect matching events from every reachable relay, de-duplicated by id.
+
+    A relay in a bundle or a 10050 list is peer-controlled input, so it is dialled only if
+    it is `wss://` and resolves to a public address: otherwise a stranger's invite makes
+    the daemon open a WebSocket to whatever host they name. The scheme/literal check is
+    the cheap half (`relay_url`); the DNS half runs off the loop, because an invite is not
+    worth blocking the relay reader on.
+    """
     seen: dict[str, dict[str, Any]] = {}
 
     async def one(relay: str) -> None:
+        safe = relay_url(relay)
+        if safe is None:
+            return
+        host = (urlsplit(safe).hostname or "")
         try:
-            async with ws_connect(relay, ping_interval=20, max_size=8 * 1024 * 1024,
+            if not await asyncio.to_thread(public_host, host):
+                return
+        except Exception:  # noqa: BLE001 - an unanswerable DNS query is a refusal
+            return
+        try:
+            async with ws_connect(safe, ping_interval=20, max_size=8 * 1024 * 1024,
                                   open_timeout=10) as ws:
                 await ws.send(json.dumps(["REQ", "concord", *filters]))
                 deadline = time.time() + per_relay_timeout
@@ -87,7 +105,13 @@ class Invite:
 
     @property
     def relays(self) -> list[str]:
-        return list(self.bundle.get("relays") or DEFAULT_COMMUNITY_RELAYS)
+        """The bundle's relays, minus anything that is not a public `wss://` endpoint.
+
+        A bundle's relay list is attacker-controlled when the invite is; the plane only
+        ever connects to the ones that survive this check.
+        """
+        values = self.bundle.get("relays") or DEFAULT_COMMUNITY_RELAYS
+        return [url for url in (relay_url(value) for value in values) if url]
 
     @property
     def community_id(self) -> bytes:
@@ -111,6 +135,42 @@ def verify_bundle(bundle: dict[str, Any]) -> None:
         raise ConcordError("invite bundle fails its owner self-certification")
 
 
+def bundle_identity(bundle: dict[str, Any]) -> tuple[str, str, int, tuple[str, ...]]:
+    """The part of a bundle that must not change under a joined community."""
+    return (str(bundle.get("community_root") or "").lower(),
+            str(bundle.get("control_pk") or "").lower(),
+            int(bundle.get("root_epoch") or 0),
+            tuple(sorted({str(url).strip().lower().rstrip("/")
+                          for url in (bundle.get("relays") or []) if str(url).strip()})))
+
+
+def same_community(bundle: dict[str, Any], pinned: dict[str, Any]) -> bool:
+    """Whether two bundles describe the same community root, control key, epoch and relays."""
+    return bundle_identity(bundle) == bundle_identity(pinned)
+
+
+def replaced_grants(pinned: dict[str, Any],
+                    fresh: dict[str, Any]) -> list[str]:
+    """Channel ids whose grant the newer bundle *replaces* (same id, different key/epoch).
+
+    A re-invite that adds a room is additive and welcome; one that re-grants an existing
+    room with a different key or epoch is either a legitimate rotation or an attempt to
+    swap the stream key under a private channel. The caller can tell those apart only by
+    who sent it, so this returns the ids for that decision.
+    """
+    old = {str(c.get("id")): c for c in pinned.get("channels") or [] if c.get("id")}
+    changed: list[str] = []
+    for grant in fresh.get("channels") or []:
+        cid = str(grant.get("id") or "")
+        if not cid or cid not in old:
+            continue
+        was = old[cid]
+        if (str(grant.get("key") or "") != str(was.get("key") or "")
+                or int(grant.get("epoch") or 0) != int(was.get("epoch") or 0)):
+            changed.append(cid)
+    return changed
+
+
 async def own_inbox_relays(secret: str, seed_relays: Iterable[str]) -> list[str]:
     """Relays where a Direct Invite would land: NIP-17 inbox (10050) then NIP-65 read (10002).
 
@@ -129,7 +189,7 @@ async def own_inbox_relays(secret: str, seed_relays: Iterable[str]) -> list[str]
                 out.append(tag[1])
             elif kind == 10002 and tag[0] == "r" and (len(tag) < 3 or tag[2] != "write"):
                 out.append(tag[1])
-    return [r for r in dict.fromkeys(out) if str(r).startswith("ws")]
+    return [url for url in (relay_url(r) for r in dict.fromkeys(out)) if url]
 
 
 async def discover_invite(keys: sdk.Keys, relays: Iterable[str],
@@ -165,10 +225,16 @@ async def discover_invite(keys: sdk.Keys, relays: Iterable[str],
 
     # One owner action mints ONE invite per room it grants, so the newest invite is not the
     # richest: picking it alone silently drops the keys of every earlier room. Union the
-    # channel grants (newest first) while keeping the newest bundle's roots/relays.
+    # channel grants (newest first) while keeping the newest bundle's roots/relays -- but
+    # only from invites that are the same community and from the same inviter. Otherwise a
+    # member's bundle could ride on the owner's trusted `inviter` and inject a room key.
     if merge_channels:
+        identity = bundle_identity(bundle)
         granted: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
+            if (str(candidate["inviter"]) != str(head["inviter"])
+                    or bundle_identity(candidate["bundle"]) != identity):
+                continue
             for channel in candidate["bundle"].get("channels") or []:
                 if channel.get("id"):
                     granted.setdefault(channel["id"], channel)

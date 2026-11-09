@@ -240,12 +240,12 @@ def _answering_adapter(chat_id: str):
     inst = adapter.NostrGatewayAdapter.__new__(adapter.NostrGatewayAdapter)
     inst.platform = "nostr"
     inst._approval_prompts = OrderedDict()
-    inst._remember_approval_prompt(PROMPT, chat_id, SESSION)
+    inst._remember_approval_prompt(PROMPT, chat_id, SESSION, "req-0")
     inst.resolved = []
     inst.acked = []
 
-    def resolve(session_key: str, choice: str) -> int:
-        inst.resolved.append((session_key, choice))
+    def resolve(session_key: str, choice: str, request_id: str = "") -> int:
+        inst.resolved.append((session_key, choice, request_id))
         return 1
 
     async def ack(message_id: str) -> bool:
@@ -263,7 +263,7 @@ async def test_the_planes_frame_answers_the_gate_once(tmp_path):
 
     await inst._deliver_reaction(frame, frame["id"])
 
-    assert inst.resolved == [(SESSION, "once")]
+    assert inst.resolved == [(SESSION, "once", "req-0")]
     assert inst.acked == [frame["id"]]     # acked, so nothing replays it
 
 
@@ -273,7 +273,7 @@ async def test_a_thumbs_down_denies_through_the_same_frame(tmp_path):
 
     await inst._deliver_reaction(frame, frame["id"])
 
-    assert inst.resolved == [(SESSION, "deny")]
+    assert inst.resolved == [(SESSION, "deny", "req-0")]
 
 
 async def test_a_reaction_that_is_not_a_decision_leaves_the_gate_alone(tmp_path):
@@ -287,7 +287,7 @@ async def test_a_reaction_that_is_not_a_decision_leaves_the_gate_alone(tmp_path)
     # The gate is still answerable by a real answer afterwards.
     answer, _ = _frame_for(tmp_path, "\U0001f44d", name="fire2.db")
     await inst._deliver_reaction(answer, answer["id"])
-    assert inst.resolved == [(SESSION, "once")]
+    assert inst.resolved == [(SESSION, "once", "req-0")]
 
 
 async def test_a_second_reaction_on_the_same_prompt_does_nothing(tmp_path):
@@ -298,5 +298,5 @@ async def test_a_second_reaction_on_the_same_prompt_does_nothing(tmp_path):
     second, _ = _frame_for(tmp_path, "\U0001f44d", name="twice.db")
     await inst._deliver_reaction(second, second["id"])
 
-    assert inst.resolved == [(SESSION, "once")]
+    assert inst.resolved == [(SESSION, "once", "req-0")]
     assert inst.acked == [first["id"], second["id"]]

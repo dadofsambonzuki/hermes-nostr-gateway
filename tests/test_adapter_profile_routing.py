@@ -125,7 +125,7 @@ def test_an_approval_prompt_on_a_routed_channel_keys_its_gate_with_the_profile()
 
     asyncio.run(inst.send(ROOM, "may I touch production?", metadata={"is_approval_prompt": True}))
 
-    _chat, session_key = inst._approval_prompts["sent-1"]
+    _chat, session_key, _request_id = inst._approval_prompts["sent-1"]
     assert session_key == f"agent:ops:nostr:dm:{ROOM}"
 
 
@@ -134,7 +134,7 @@ def test_a_prompt_on_an_unrouted_channel_keeps_the_default_namespace():
     inst = _keyed_adapter()
     asyncio.run(inst._deliver(_frame(conversation=PEER)))
     asyncio.run(inst.send(PEER, "may I?", metadata={"is_approval_prompt": True}))
-    _chat, session_key = inst._approval_prompts["sent-1"]
+    _chat, session_key, _request_id = inst._approval_prompts["sent-1"]
     assert session_key == f"agent:main:nostr:dm:{PEER}"
 
 
@@ -154,8 +154,6 @@ def test_a_reaction_reaches_the_gate_of_a_routed_channel(monkeypatch):
     stub_profiles({"default", "ops"})
     inst = _keyed_adapter()
     asyncio.run(inst._deliver(_frame(profile="ops")))
-    asyncio.run(inst.send(ROOM, "may I?", metadata={"is_approval_prompt": True}))
-    session_key = inst._approval_prompts["sent-1"][1]
 
     seen = {}
 
@@ -167,11 +165,15 @@ def test_a_reaction_reaches_the_gate_of_a_routed_channel(monkeypatch):
         seen["resolved"] = (key, choice, request_id)
         return 1
 
+    # Installed before the send: the adapter records the prompt's request id at send
+    # time, exactly as the host has already queued the gate by then.
     monkeypatch.setitem(__import__("sys").modules, "tools", type("m", (), {})())
     monkeypatch.setitem(__import__("sys").modules, "tools.approval", type("m", (), {
         "list_gateway_approvals": staticmethod(list_gateway_approvals),
         "resolve_gateway_approval": staticmethod(resolve_gateway_approval),
     })())
+    asyncio.run(inst.send(ROOM, "may I?", metadata={"is_approval_prompt": True}))
+    session_key = inst._approval_prompts["sent-1"][1]
     asyncio.run(inst._deliver_reaction(
         {"type": "reaction", "sender": PEER, "reply_to": "sent-1",
          "content": "\U0001f44d", "authority": "instructions"},

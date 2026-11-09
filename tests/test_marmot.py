@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,7 @@ class FakeWnAgent:
         self.group_info_fail_groups: set[str] = set()
         self.timeline_rows: list[dict] = []
         self._server: asyncio.AbstractServer | None = None
-        self._stamp = 1_790_000_000
+        self._stamp = int(time.time())
 
     async def start(self) -> "FakeWnAgent":
         self._server = await asyncio.start_unix_server(self._handle, path=str(self.path))
@@ -242,7 +243,7 @@ async def test_inbound_message_is_normalised_and_policy_applied(store, agent):
     plane = plane_for(store, agent)
     message = {
         "message_id_hex": "11" * 32, "sender": {"account_id_hex": MUM, "is_self": False},
-        "kind": 9, "recorded_at": 1_790_000_123, "text": "dinner at seven",
+        "kind": 9, "recorded_at": int(time.time()), "text": "dinner at seven",
         "reply_to_message_id_hex": "22" * 32,
     }
     msg = plane.handle({"type": "inbound_message", "account_id_hex": ACCOUNT,
@@ -264,7 +265,7 @@ async def test_our_own_echo_is_never_delivered(store, agent):
     plane = plane_for(store, agent)
     message = {"message_id_hex": "33" * 32,
                "sender": {"account_id_hex": ACCOUNT, "is_self": True},
-               "recorded_at": 1_790_000_200, "text": "my own words"}
+               "recorded_at": int(time.time()) + 1, "text": "my own words"}
     assert plane.handle({"type": "inbound_message", "group_id_hex": GROUP,
                          "message": message}) is None
     assert store.recent(10) == []
@@ -275,7 +276,7 @@ async def test_a_repeated_message_id_is_stored_once(store, agent):
     event = {"type": "inbound_message", "group_id_hex": GROUP,
              "message": {"message_id_hex": "44" * 32,
                          "sender": {"account_id_hex": MUM},
-                         "recorded_at": 1_790_000_300, "text": "twice"}}
+                         "recorded_at": int(time.time()) + 2, "text": "twice"}}
     assert plane.handle(event) is not None
     assert plane.handle(dict(event)) is None
     assert len(store.recent(10)) == 1
@@ -286,7 +287,7 @@ async def test_a_stranger_is_stored_but_only_digests_without_authority(store, ag
     event = {"type": "inbound_message", "group_id_hex": GROUP,
              "message": {"message_id_hex": "55" * 32,
                          "sender": {"account_id_hex": STRANGER},
-                         "recorded_at": 1_790_000_400, "text": "buy my token"}}
+                         "recorded_at": int(time.time()) + 3, "text": "buy my token"}}
     msg = plane.handle(event)
     assert msg is not None
     assert (msg.reach, msg.authority) == ("digest", "none")

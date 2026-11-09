@@ -1,5 +1,7 @@
 """nip01 plane: only interesting kind-1 events, each with a stated reason."""
 
+import time
+
 import pytest
 
 from hermes_nostr_gateway.planes.nip01 import FeedRule, Nip01Plane
@@ -38,7 +40,7 @@ def note(pubkey, content="hello", p=None, hashtags=()):
     tags = [["p", p]] if p else []
     tags += [["t", h] for h in hashtags]
     return {"id": f"id-{pubkey[:4]}-{content[:6]}-{p or ''}", "pubkey": pubkey, "kind": 1,
-            "created_at": 1_700_000_000, "content": content, "tags": tags}
+            "created_at": int(time.time()), "content": content, "tags": tags}
 
 
 def test_friend_mention_is_immediate(store):

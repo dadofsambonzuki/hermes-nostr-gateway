@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import nostr_sdk as sdk
@@ -58,7 +59,7 @@ def make_issue(seed: str, *, author: str = TRUSTED_HEX, subject: str = "Fix the 
                       comment_count=len(comments), status=status)
 
 
-def make_comment(seed: str, *, author: str = STRANGER_HEX, body: str = "Same here.",
+def make_comment(seed: str, *, author: str = TRUSTED_HEX, body: str = "Same here.",
                  created_at: int = 1) -> ngit.Comment:
     identifier = event_id(seed)
     return ngit.Comment(id=nevent(identifier, kind=ngit.KIND_COMMENT),
@@ -73,6 +74,13 @@ def make_pr(seed: str, *, author: str = TRUSTED_HEX, subject: str = "Add a widge
     return ngit.PullRequest(id=identifier, author=npub(author), subject=subject,
                             branch=branch, created_at=created_at, commit=commit,
                             nevent=nevent(identifier, kind=ngit.KIND_PR, author=author))
+
+
+def bridge_config(**kwargs) -> ngit.BridgeConfig:
+    """A BridgeConfig with the allowlists these fixtures assume, unless a test overrides."""
+    kwargs.setdefault("maintainers", (TRUSTED_HEX,))
+    kwargs.setdefault("reviewers", (TRUSTED_HEX,))
+    return ngit.BridgeConfig(**kwargs)
 
 
 BOARD_SCHEMA = """
@@ -229,8 +237,8 @@ class Harness:
         self.state = state or _Reader(self)
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
-        self.config = ngit.BridgeConfig(assignee=assignee, lookback_hours=0,
-                                        reply_secret_file="/etc/example/reply.json")
+        self.config = bridge_config(assignee=assignee, lookback_hours=0,
+                                    reply_secret_file="/etc/example/reply.json")
         self.anchor = anchor
         self.self_npub = SELF_HEX
         self.notifier = notifier or (lambda who, text, key="": self.messages.append((who, text)))
@@ -244,20 +252,43 @@ class Harness:
         self.detail_calls.append(ref.hex)
         return self.details.get(ref.hex, ref)
 
+    @staticmethod
+    def _signed(item, owner: str = ""):
+        """Give a fixture status/revision the author the gate expects, when it names none.
+
+        The fixtures are about the *consequence* of an event, not its signature; a test
+        about a forged author sets one explicitly. Blank would otherwise mean "from
+        nobody", which the production rule rightly refuses. A revision/close defaults to
+        the PR's own author, because that is the only key allowed to move or withdraw it.
+        """
+        if isinstance(item, ngit.Merge) and not item.author:
+            return replace(item, author=TRUSTED_HEX)
+        if isinstance(item, (ngit.Closed, ngit.Revision)) and not item.author:
+            return replace(item, author=owner or TRUSTED_HEX)
+        return item
+
     def prs(self, since: int):
         self.since_seen.append(since)
         # Tests set `prs_data` either as a PrFeed or as the older (prs, merges) pair; the
         # harness is the one place the shape is allowed to be loose.
-        if isinstance(self.prs_data, ngit.PrFeed):
-            return self.prs_data
-        return ngit.PrFeed(*self.prs_data)
+        feed = self.prs_data if isinstance(self.prs_data, ngit.PrFeed) \
+            else ngit.PrFeed(*self.prs_data)
+        owners = {pr.id: pr.author for pr in feed.prs}
+        return replace(feed, merges=[self._signed(m) for m in feed.merges],
+                       closed=[self._signed(c, owners.get(c.pr_id, "")) for c in feed.closed],
+                       revisions=[self._signed(r, owners.get(r.pr_id, ""))
+                                  for r in feed.revisions])
 
     def sweep(self, since: int):
         """The trailing sweep's source: whatever `sweep_data` holds, or the exception to raise."""
         self.sweep_since.append(since)
         if isinstance(self.sweep_data, BaseException):
             raise self.sweep_data
-        return self.sweep_data
+        feed = self.sweep_data
+        # The same author default as `prs()`: a status fixture names the consequence, not
+        # its signature, and a swept feed carries no proposal to borrow an author from.
+        return replace(feed, merges=[self._signed(m) for m in feed.merges],
+                       closed=[self._signed(c) for c in feed.closed])
 
     def _issue_labels(self, ids):
         """What a label read returns for issues: the default trusted `ready`, or a test's set."""
@@ -288,7 +319,12 @@ class Harness:
             labels = self.carried.get(pr)
             if labels is None and pr in issues:
                 labels = issues[pr]
-            prs[pr] = ngit.PrRead(verdict=self.verdicts.get(pr),
+            verdict = self.verdicts.get(pr)
+            if verdict is not None and not verdict.author:
+                # A verdict's author decides whether it counts, so the fixture's default is
+                # the trusted key rather than nobody.
+                verdict = replace(verdict, author=TRUSTED_HEX)
+            prs[pr] = ngit.PrRead(verdict=verdict,
                                   labels=labels or (),
                                   readings=self.readings.get(pr, ()))
         return ngit.ReadState(prs=prs, relays=("wss://relay.example",))
@@ -585,7 +621,7 @@ def test_comments_append_in_order_and_only_once(harness):
     task_id = harness.tasks()[0]["id"]
     bodies = [c["body"] for c in harness.comments(task_id)]
     assert bodies == ["First thought.", "Second thought."]
-    assert harness.comments(task_id)[0]["author"] == npub(STRANGER_HEX)
+    assert harness.comments(task_id)[0]["author"] == npub(TRUSTED_HEX)
 
     # A new comment arrives; only it is appended, after the ones already there.
     fresh = make_comment("e3", body="Third thought.", created_at=300)
@@ -682,7 +718,7 @@ def test_only_max_new_issues_are_created_per_poll(home, store):
     first = make_issue("f5")
     second = make_issue("f6", subject="Second issue")
     made = Harness(home, store, issues=[first, second])
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, max_new=1)
+    made.config = bridge_config(assignee="default", lookback_hours=0, max_new=1)
     made.details = {first.hex: first, second.hex: second}
     try:
         first_run = made.sync()
@@ -700,7 +736,7 @@ def test_only_max_new_issues_are_created_per_poll(home, store):
 def test_only_max_prs_are_announced_per_poll(home, store):
     prs = tuple(make_pr(f"c{index}", created_at=1000 + index) for index in range(3))
     made = Harness(home, store, prs=(list(prs), ()))
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, max_prs=2)
+    made.config = bridge_config(assignee="default", lookback_hours=0, max_prs=2)
     try:
         first = made.sync()
         assert first.prs["signalled"] == 2
@@ -1032,7 +1068,7 @@ def test_a_pending_link_with_no_notice_is_requeued(home, store):
 def test_a_deleted_cursor_starts_from_now_not_from_the_lookback(home, store):
     """A reset must not replay a week of PRs into the channel."""
     made = Harness(home, store, prs=([make_pr("d8", created_at=5000)], ()))
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=168)
+    made.config = bridge_config(assignee="default", lookback_hours=168)
     try:
         made.sync()
         before = int(time.time())
@@ -1066,7 +1102,7 @@ def test_since_can_be_given_explicitly(harness):
 
 
 def test_the_first_poll_has_a_lookback_floor(harness):
-    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=24)
+    harness.config = bridge_config(assignee="default", lookback_hours=24)
     harness.prs_data = ([], [])
     before = int(time.time())
     harness.sync()
@@ -1229,7 +1265,7 @@ def test_a_second_pass_makes_neither_a_task_nor_a_message(harness):
 def test_the_review_task_goes_to_the_review_profile_and_priority(home, store):
     pr = make_pr("b3")
     made = Harness(home, store, prs=([pr], []))
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0,
+    made.config = bridge_config(assignee="default", lookback_hours=0,
                                     review_assignee="reviewer", priority=7)
     try:
         made.sync()
@@ -1594,11 +1630,16 @@ def test_the_applied_record_the_merge_script_publishes_releases_the_guard(harnes
     """
     pr, task_id = pr_with_review_task(harness)
     commit = "f" * 40
+    # A merge status is a maintainer's: sign it as the key the allowlist names, not a
+    # throwaway one, or the gate refuses the record this test is about.
+    signer = sdk.Keys.generate()
+    harness.config = replace(harness.config,
+                             maintainers=(signer.public_key().to_hex(),))
     event = pr_status.signed(
         pr_status.applied_event(
             pr_id=pr.id, address=ADDRESS, merge_commit=commit, authors=(TRUSTED_HEX,),
             relay_hint="wss://relay.example", created_at=1100),
-        sdk.Keys.generate().secret_key().to_hex())
+        signer.secret_key().to_hex())
 
     def fetch(**kwargs):
         assert kwargs["a_tag"] == ADDRESS
@@ -1620,11 +1661,15 @@ def test_the_applied_record_the_merge_script_publishes_releases_the_guard(harnes
 def test_a_close_the_tooling_publishes_is_seen_and_blocks_the_card(harness):
     """The same filter, for the other status: without the `a` tag the close never arrives."""
     pr, task_id = pr_with_review_task(harness)
+    # A close is a maintainer's or the PR author's act; sign it as a maintainer.
+    signer = sdk.Keys.generate()
+    harness.config = replace(harness.config,
+                             maintainers=(signer.public_key().to_hex(),))
     event = pr_status.signed(
         pr_status.closed_event(
             pr_id=pr.id, address=ADDRESS, reason="Superseded by PR 1234abcd.",
             authors=(TRUSTED_HEX,), relay_hint="wss://relay.example", created_at=1100),
-        sdk.Keys.generate().secret_key().to_hex())
+        signer.secret_key().to_hex())
 
     def fetch(**kwargs):
         assert kwargs["a_tag"] == ADDRESS
@@ -2287,7 +2332,7 @@ def test_a_dry_run_writes_no_review_task(harness):
 def test_reviews_can_be_turned_off_without_losing_the_pr_message(home, store):
     pr = make_pr("c3")
     made = Harness(home, store, prs=([pr], []))
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    made.config = bridge_config(assignee="default", lookback_hours=0, reviews=False)
     try:
         made.sync()
         assert review_tasks(made) == []
@@ -2514,7 +2559,7 @@ def test_a_row_that_says_approved_over_a_stale_relay_label_republishes_it(harnes
 
 def test_no_verdict_and_no_review_card_carries_no_label(harness):
     """Reviews turned off: no card, no verdict, no label -- and a leftover is removed."""
-    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    harness.config = bridge_config(assignee="default", lookback_hours=0, reviews=False)
     pr = make_pr("f1", commit="c1")
     harness.prs_data = ([pr], [])
     leftover = "r" * 64
@@ -2528,7 +2573,7 @@ def test_no_verdict_and_no_review_card_carries_no_label(harness):
 
 
 def test_no_verdict_and_no_review_card_publishes_nothing_when_there_is_nothing_to_remove(harness):
-    harness.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, reviews=False)
+    harness.config = bridge_config(assignee="default", lookback_hours=0, reviews=False)
     pr = make_pr("f2", commit="c2")
     harness.prs_data = ([pr], [])
 
@@ -2686,7 +2731,7 @@ def test_a_pr_announced_before_labels_existed_is_not_retrofitted(home, store):
 
 def test_labels_can_be_turned_off(home, store):
     made = Harness(home, store)
-    made.config = ngit.BridgeConfig(assignee="default", lookback_hours=0, labels=False)
+    made.config = bridge_config(assignee="default", lookback_hours=0, labels=False)
     pr = make_pr("e5", commit="c3")
     made.prs_data = ([pr], [])
     try:
@@ -2915,8 +2960,12 @@ def test_the_two_roots_ngit_publishes_for_one_repush_name_the_same_branch():
     assert (first.commit, second.commit) == _NGIT_REPUSH_TIPS
 
 
-def test_one_poll_carrying_both_roots_of_a_repush_makes_one_card(harness):
+def test_one_poll_carrying_both_roots_of_a_repush_makes_one_card(home, store):
     """The incident: one branch, two roots, two review cards. It is one card and one link."""
+    # The captured event's author is a real contributor; this test is about the fold, so
+    # the deployment's trusted list names that key rather than rewriting the event.
+    harness = Harness(home, store,
+                      trusted=(TRUSTED_HEX, _NGIT_REPUSH[0]["pubkey"]))
     harness.prs_data = ngit.RelayPrs(
         ["wss://relay.example"], ADDRESS,
         fetcher=lambda **kwargs: list(_NGIT_REPUSH)).events(0)
@@ -3660,7 +3709,8 @@ def test_applied_event_names_the_root_pr_and_the_merge_commit():
     merge = ngit.merge_from_event({
         "id": event_id("d5"), "pubkey": REPO_OWNER, "kind": ngit.KIND_APPLIED,
         "created_at": 20, "content": "",
-        "tags": [["e", event_id("d6"), "", "root"], ["merge-commit", "a" * 40]]})
+        "tags": [["e", event_id("d6"), "", "root"], ["merge-commit", "a" * 40]]},
+        [REPO_OWNER])
 
     assert merge is not None
     assert merge.pr_id == event_id("d6") and merge.commit == "a" * 40
@@ -3686,7 +3736,7 @@ def test_a_merged_pr_is_read_from_the_tag_ngit_publishes():
             ["r", "f" * 40],
             ["merge-commit-id", merge_commit],
             ["r", merge_commit],
-        ]})
+        ]}, [REPO_OWNER])
 
     assert merge is not None
     assert merge.pr_id == event_id("d9")
@@ -3701,7 +3751,7 @@ def test_an_applied_patch_names_the_first_commit_it_was_replayed_as():
         "created_at": 40, "content": "",
         "tags": [["e", event_id("dc"), "", "root"],
                  ["applied-as-commits", "1" * 40, "2" * 40],
-                 ["r", "1" * 40], ["r", "2" * 40]]})
+                 ["r", "1" * 40], ["r", "2" * 40]]}, [REPO_OWNER])
 
     assert merge is not None
     assert merge.pr_id == event_id("dc") and merge.commit == "1" * 40
@@ -3974,9 +4024,10 @@ def test_ngit_status_names_the_fix_when_the_binary_is_unusable(monkeypatch, prob
 LABEL_PR = "ab" * 32
 
 
-def relay_comment(relay: str, *, event_id: str, body: str, created_at: int) -> tuple[str, dict]:
+def relay_comment(relay: str, *, event_id: str, body: str, created_at: int,
+                  pubkey: str = TRUSTED_HEX) -> tuple[str, dict]:
     return (relay, {"id": event_id, "kind": ngit.KIND_COMMENT, "content": body,
-                    "created_at": created_at, "relay": relay,
+                    "created_at": created_at, "relay": relay, "pubkey": pubkey,
                     "tags": [["E", LABEL_PR], ["K", "1618"]]})
 
 
@@ -3999,7 +4050,8 @@ def test_the_relay_read_takes_the_newest_verdict_and_keeps_each_relay_s_answer()
                                   body="Verdict: approved", created_at=2000)]
         return [relay_label("wss://a.example", value="in-review", event_id="l" * 64)]
 
-    reader = ngit.RelayLabels(["wss://a.example", "wss://b.example"], ADDRESS, fetcher=fetch)
+    reader = ngit.RelayLabels(["wss://a.example", "wss://b.example"], ADDRESS, fetcher=fetch,
+                              reviewers=[TRUSTED_HEX])
     read = reader.read([LABEL_PR]).prs[LABEL_PR]
 
     assert read.verdict is not None

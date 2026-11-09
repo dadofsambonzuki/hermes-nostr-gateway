@@ -8,6 +8,7 @@ import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
 
 import nostr_sdk as sdk
 import yaml
@@ -24,7 +25,7 @@ from .advertise import (
     resolve_relays,
 )
 from .bots import BotRegistry, kind0_fetcher
-from .control import ControlConfig
+from .control import ControlConfig, as_hex
 from .crypto import SdkCrypto, normalize_pubkey
 from .health import (
     DEFAULT_PENDING_STALE_MINUTES,
@@ -52,8 +53,11 @@ from .peer_inbox import (
     now_seconds,
     peer_inbox_config,
     peer_pubkeys,
+    public_host,
+    relay_url,
 )
 from .planes import nip04
+from .planes.concord import read as concord_read
 from .planes.concord import write as concord_write
 from .planes.concord.channels import is_conversation as is_concord_conversation
 from .planes.concord.channels import stream_key as concord_stream_key
@@ -75,7 +79,12 @@ from .projects import ProjectMap, project_for_conversation
 from .publisher import Publisher, make_publisher
 from .routing import Resolution, load_router, reported_route
 from .server import SocketServer
-from .store import Store, drops_ttl_seconds
+from .store import (
+    MAX_FUTURE_S,
+    MAX_MESSAGE_AGE_S,
+    Store,
+    drops_ttl_seconds,
+)
 from .writer import StoreWriter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -611,17 +620,32 @@ class Gateway:
 
         watched = 0
         for community_id, rows in by_community.items():
-            bundle = dict(rows[0]["bundle"])
-            # One owner action mints one invite per room, so union the grants across them.
+            # Only an invite that was actually joined may build streams. A held question,
+            # a declined invite and a failed join are records, not subscriptions: using
+            # their bundle would put the agent in a room nobody accepted (and let a
+            # stranger's re-invite replace the relays and keys). The newest accepted row is
+            # the pin, and grants are unioned only from rows that agree with it -- a room
+            # added by the same owner is additive; a changed root, control key, epoch or
+            # relay set is not this community any more.
+            joined = [row for row in rows if str(row.get("status") or "") == "joined"]
+            if not joined:
+                continue
+            pinned = max(joined, key=lambda row: int(row.get("decided_at") or 0))
+            bundle = dict(pinned["bundle"])
             grants: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                for channel in row["bundle"].get("channels") or []:
+            for row in joined:
+                row_bundle = row["bundle"]
+                if not concord_read.same_community(row_bundle, pinned["bundle"]):
+                    log.warning("concord: ignoring a re-invite for %s… that changes the "
+                                "community identity", community_id[:12])
+                    continue
+                for channel in row_bundle.get("channels") or []:
                     if channel.get("id"):
                         grants.setdefault(channel["id"], channel)
             if grants:
                 bundle["channels"] = list(grants.values())
-            invite = concord_read.Invite(bundle=bundle, inviter=rows[0]["inviter"],
-                                         relay="", wrap_id=rows[0]["id"])
+            invite = concord_read.Invite(bundle=bundle, inviter=pinned["inviter"],
+                                         relay="", wrap_id=pinned["id"])
             try:
                 community = await concord_read.load_community(invite)
                 members = await concord_read.read_guestbook(invite)
@@ -794,6 +818,26 @@ class Gateway:
         community = invite.community_id.hex()
         async with self.invite_lock:
             if self.store.concord_joined(community):
+                pinned = self._pinned_invite(community)
+                if pinned is not None:
+                    changed = not concord_read.same_community(invite.bundle, pinned["bundle"])
+                    replaced = concord_read.replaced_grants(pinned["bundle"], invite.bundle)
+                    known = {str(c.get("id")) for c in pinned["bundle"].get("channels") or []
+                             if c.get("id")}
+                    added = [str(c.get("id")) for c in invite.bundle.get("channels") or []
+                             if c.get("id") and str(c.get("id")) not in known]
+                    if changed or replaced or added:
+                        owner = as_hex(str(invite.bundle.get("owner") or ""))
+                        trusted = self.concord.invite_verdict(invite).accept
+                        if not trusted and as_hex(invite.inviter) != owner:
+                            why = ("re-invite changes the community's root, control key, "
+                                   "relays or epoch" if changed else
+                                   "re-invite replaces a channel grant" if replaced else
+                                   "re-invite adds a channel grant")
+                            why += (f" (channels: {', '.join(cid[:8] for cid in replaced)})"
+                                    if replaced else "")
+                            why += f"; inviter {invite.inviter[:12]}… is neither trusted nor the owner"
+                            return await self._hold_invite(invite, InviteVerdict(False, why))
                 self._record_decision(invite, status="joined",
                                       why="already a member of this community",
                                       decided_by="auto")
@@ -845,6 +889,15 @@ class Gateway:
 
     async def _hold_invite(self, invite: Invite, verdict: InviteVerdict) -> dict[str, Any]:
         """Keep the invite, and ask a human in the control pane — the only other answer."""
+        row = self.store.concord_invite(invite.wrap_id) or {}
+        if row.get("announced_at"):
+            # The same wrap reaches us from every relay that carries it, and a held
+            # re-invite can reach us again after a restart: the question is already in the
+            # pane, so record the decision and do not ask it twice.
+            self._record_decision(invite, status="held", why=verdict.why)
+            log.info("concord invite %s...: held again, already asked", invite.wrap_id[:12])
+            return {**self._invite_base(invite), "status": "held", "announced": True,
+                    "why": verdict.why}
         self._record_decision(invite, status="held", why=verdict.why)
         log.info("concord invite %s...: held (%s)", invite.wrap_id[:12], verdict.why)
         destination = self.control.target("concord")
@@ -896,6 +949,18 @@ class Gateway:
                 "inviter": invite.inviter,
                 "community": invite.community_id.hex(),
                 "name": str(invite.bundle.get("name") or "")}
+
+    def _pinned_invite(self, community_id: str) -> dict[str, Any] | None:
+        """The invite a joined community is pinned to: its newest accepted row.
+
+        A re-invite is checked against this bundle, not against `rows[0]`: the newest row
+        may be the one nobody has decided yet, and comparing against it would let a
+        held invite define the identity it is supposed to be checked against.
+        """
+        rows = [row for row in self.store.concord_invites(50)
+                if str(row.get("community_id") or "") == str(community_id)
+                and str(row.get("status") or "") == "joined"]
+        return max(rows, key=lambda row: int(row.get("decided_at") or 0)) if rows else None
 
     def _record_decision(self, invite: Invite, *, status: str, why: str,
                          decided_by: str = "") -> None:
@@ -1312,6 +1377,33 @@ class Gateway:
         if msg is None:
             return
         self.store.note_relay(relay, events=1)
+        self._deliver_inbound(msg)
+
+    def _deliver_inbound(self, msg: Any) -> None:
+        """Emit one inbound frame, after the checks that every plane shares.
+
+        The age window is spec §10.5 and lives here rather than in a plane: every plane's
+        messages pass through this point, and a replay from a relay in the read set is not
+        more trustworthy than a fresh one. A refused row is marked blocked, so it cannot
+        be offered again by `pending_immediate` after a restart.
+
+        The reach filter is here for the same reason: only `immediate` is news, a `drop`
+        still has to tell the adapter why, and a digest waits for its window. Marmot used
+        to bypass this entirely by calling `_emit`; that is how a rule that reads as
+        uniform in the docs was true on every plane but one.
+        """
+        created = int(getattr(msg, "created_at", 0) or 0)
+        now = time.time()
+        if created < now - MAX_MESSAGE_AGE_S or created > now + MAX_FUTURE_S:
+            reason = "stale_or_future"
+            msg.reach = "drop"
+            msg.blocked_reason = reason
+            try:
+                self.store.block_rumor(str(msg.id), reason)
+            except Exception:  # noqa: BLE001 - the row may not exist (a CLI-built msg)
+                log.debug("could not mark %s blocked", getattr(msg, "id", "?"))
+            log.info("inbound %s refused: %s (created_at %d, now %d)",
+                     getattr(msg, "id", "?"), reason, created, int(now))
         # Immediate is the only reach that becomes a socket frame now: digest rows wait
         # for their window. A drop or a rate-limited row still has to emit its `blocked`
         # frame, or a refusal reaches the agent as silence.
@@ -1406,7 +1498,7 @@ class Gateway:
             return
         if msg is None:
             return
-        self._emit(msg)
+        self._deliver_inbound(msg)
 
 
     def _handle_nip04(self, relay: str, event: dict) -> Any:
@@ -1653,13 +1745,28 @@ class Gateway:
         return dict(zip(labels, sent, strict=True))
 
     def _recipient_relays(self, peer: str) -> list[str]:
+        """Where this peer's DM goes: our write set, plus the inbox relays they advertise.
+
+        A kind-10050 is the peer's own input. It may name an arbitrary host, so an entry
+        is added only if it is a public `wss://` relay and only after the configured write
+        set. The cap is the same one the send path already applies: a peer cannot turn
+        one reply into a fan-out.
+        """
         from .fetch import fetch_first_blocking
 
         relays = list(self.relays_publish)
         event = fetch_first_blocking(relays=relays[:2], kinds=[10050], author=peer)
         for tag in (event or {}).get("tags", []):
-            if tag and tag[0] == "relay" and len(tag) > 1 and tag[1] not in relays:
-                relays.append(tag[1])
+            if not tag or tag[0] != "relay" or len(tag) < 2:
+                continue
+            url = relay_url(tag[1])
+            if not url or url in relays:
+                continue
+            # The scheme/literal check is cheap; the DNS half matters here because this
+            # runs in a worker thread already (`_dispatch_send` calls it via to_thread).
+            host = urlsplit(url).hostname or ""
+            if public_host(host):
+                relays.append(url)
         return relays[:6]
 
     @staticmethod

@@ -18,6 +18,11 @@ is not in `review` or `done`, 8 merged but the applied record (kind-1631) did no
 [every commit says which card wrote it](#every-commit-says-which-card-wrote-it) and
 [a merge needs the card finished](#a-merge-needs-the-card-in-review-or-done).
 
+**A merge is for the tip a reviewer approved.** The check reads the bridge's `verdict_tip` for
+the PR and refuses when the tip differs — `merge_pr.sh` reads the branch's current tip from
+origin, so a push after the approval is caught even before the next bridge pass — or when an
+approval names no tip at all. Re-review the new tip; do not merge it on the old word.
+
 **PRs are not branches here.** The remote is an ngit remote: a fetch prunes `pr/*` refs back to
 `master`, so `git merge origin/pr/<something>` answers *"not something we can merge"* however
 cleanly the PR would apply. The patches ride on the PR event itself, so `ngit pr apply` is the

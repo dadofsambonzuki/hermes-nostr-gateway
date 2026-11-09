@@ -338,6 +338,18 @@ def directed_text(frame: dict[str, Any], text: str) -> str:
     return f"{command} {text}" if command and text.strip() else text
 
 
+def plain_text(text: str) -> str:
+    """*text* with a leading `/` made inert, for a sender that may not issue commands.
+
+    Hermes reads a message that starts with `/` as one of its commands whatever the
+    adapter's `role_authorized` says, so an unlisted sender could type `/approve` or any
+    other command into a DM and have it run. A zero-width space before the slash keeps
+    every visible character the sender wrote and stops the parser seeing a command: the
+    words still reach the agent as data, which is what an `authority: none` sender is.
+    """
+    return "\u200b" + text if (text or "").lstrip().startswith("/") else text
+
+
 # A digest is the gateway batching many low-priority items into one frame. It has no human
 # author, so the frame carries the literal `sender`/`conversation` "digest" — not a pubkey.
 # Hermes admits an inbound by sender identity (`NOSTR_ALLOWED_USERS`), so a frame signed
@@ -609,7 +621,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         self._delivered_ids: deque[str] = deque(maxlen=512)
         # Approval prompts this adapter delivered, newest last: event id → (chat_id,
         # session_key). A reaction on one of these is a decision about that gate.
-        self._approval_prompts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._approval_prompts: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
         #: conversation → the route its last delivered turn ran on, so the reply can report it
         #: back for the audit trail. Bounded: a busy gateway hears from many peers.
         self._routes: OrderedDict[str, dict[str, str]] = OrderedDict()
@@ -720,22 +732,49 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         return bool(target) and target in allowed | {self._control_chat()}
 
     # -- approval reactions ---------------------------------------------
-    def _approvals(self) -> OrderedDict[str, tuple[str, str]]:
-        """Prompt id → (chat_id, session_key) for gates a reaction can still answer."""
+    def _approvals(self) -> OrderedDict[str, tuple[str, str, str]]:
+        """Prompt id → (chat_id, session_key, request_id) for gates a reaction can answer."""
         tracked = getattr(self, "_approval_prompts", None)
         if tracked is None:  # an adapter built by __new__ in a test or a wrapper
             tracked = self._approval_prompts = OrderedDict()
         return tracked
 
-    def _remember_approval_prompt(self, message_id: str, chat_id: str, session_key: str) -> None:
-        """Remember a delivered prompt, keeping only the newest few."""
+    def _remember_approval_prompt(self, message_id: str, chat_id: str, session_key: str,
+                                  request_id: str = "") -> None:
+        """Remember a delivered prompt, keeping only the newest few.
+
+        `request_id` is the gate this exact prompt opened. It is what makes a late 👍 a
+        stale tap rather than an approval of whatever is pending next: resolving by
+        "the only one waiting" approves a different command after the first is gone.
+        """
         if not message_id:
             return
         tracked = self._approvals()
-        tracked[message_id] = (chat_id.lower(), session_key)
+        tracked[message_id] = (chat_id.lower(), session_key, str(request_id or ""))
         tracked.move_to_end(message_id)
         while len(tracked) > MAX_TRACKED_APPROVALS:
             tracked.popitem(last=False)
+
+    def _pending_request_id(self, session_key: str) -> str:
+        """The request id of the one gate waiting for *session_key*, or "" when unsure.
+
+        The host enqueues the approval before it asks the adapter to send the prompt, so at
+        send time this is exactly the gate the prompt names. Two pending means it is not
+        one question, and no id is safer than the wrong one.
+        """
+        if not session_key:
+            return ""
+        try:
+            from tools.approval import list_gateway_approvals
+        except Exception:  # noqa: BLE001 - the adapter also loads outside Hermes
+            return ""
+        try:
+            pending = list_gateway_approvals(session_key) or []
+        except Exception:  # noqa: BLE001 - an unreadable queue is not a guess
+            return ""
+        if len(pending) != 1:
+            return ""
+        return str(pending[0].get("request_id") or "")
 
     def _session_key_for_chat(self, chat_id: str) -> str:
         """The session key this chat's gates are registered under.
@@ -781,15 +820,20 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         while len(known) > MAX_TRACKED_APPROVALS * 8:
             known.popitem(last=False)
 
-    def _resolve_approval(self, session_key: str, choice: str) -> int:
-        """Resolve the pending gate for *session_key*; 0 when it cannot be pinned down.
+    def _resolve_approval(self, session_key: str, choice: str,
+                          request_id: str = "") -> int:
+        """Resolve the gate named by *request_id*; 0 when it cannot be pinned down.
 
-        Zero is the safe answer at every step: no session key, no pending approval, or more
-        than one waiting (a reaction names a message, not a queue position, and resolving the
-        oldest would approve whatever was asked first — a different command).
+        Zero is the safe answer at every step: no session key, no request id, no pending
+        approval with that id. The prompt's own gate is the only one a reaction may answer,
+        and a reaction that names a prompt whose gate is gone resolves nothing -- it must
+        never fall through to whichever gate happens to be waiting now.
         """
         if not session_key:
             logger.warning("nostr reaction ignored: no session key for that conversation")
+            return 0
+        if not request_id:
+            logger.warning("nostr reaction ignored: the prompt is not bound to a request id")
             return 0
         try:
             from tools.approval import list_gateway_approvals, resolve_gateway_approval
@@ -802,11 +846,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             logger.warning("nostr reaction ignored: the approval queue could not be read",
                            exc_info=True)
             return 0
-        if len(pending) != 1:
-            logger.warning("nostr reaction ignored: %d approvals are pending for that session",
-                           len(pending))
+        if not any(str(entry.get("request_id") or "") == request_id for entry in pending):
+            logger.warning("nostr reaction ignored: request %s is no longer pending",
+                           request_id[:12])
             return 0
-        request_id = str(pending[0].get("request_id") or "") or None
         try:
             count = resolve_gateway_approval(session_key, choice, request_id=request_id)
         except Exception as exc:  # noqa: BLE001
@@ -834,15 +877,22 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                          _short(sender))
             await self._ack(message_id)
             return
-        chat_id, session_key = entry
-        # Who may answer. In a DM the chat id *is* the peer, so only that key counts — another
-        # author's reaction is an opinion about a message even if the policy would let them
-        # instruct elsewhere. A room-style chat id (`concord:<community>:<channel>`, note the
-        # colons) names a place, not a person, so there the test is authority: answering a gate
-        # is an instruction, and whoever may instruct in that room may answer it.
+        chat_id, session_key, request_id = entry
+        # Who may answer: the policy's `instructions` authority, always. In a DM the chat
+        # id is also the peer, so only that key counts -- another author's reaction is an
+        # opinion about a message even if they could instruct elsewhere. In a room-style
+        # chat id (`concord:<community>:<channel>`, note the colons) the id names a place,
+        # not a person, so authority is the whole test. A sender with `authority: none` is
+        # not allowed to answer a gate in either shape, even if the prompt was addressed
+        # to their DM: the policy may have changed since the prompt went out, and a
+        # reaction is a decision, not chat.
+        if frame.get("authority") != "instructions":
+            logger.warning("nostr reaction ignored: %s may not instruct in that conversation",
+                           _short(sender))
+            await self._ack(message_id)
+            return
         room_style = ":" in chat_id
-        authorised_in_room = room_style and frame.get("authority") == "instructions"
-        if sender != chat_id and not authorised_in_room:
+        if not room_style and sender != chat_id:
             # Only the conversation the prompt was sent to may answer it: anyone else's
             # reaction is an opinion about a message, not a decision about our gate.
             logger.warning("nostr reaction ignored: %s is not the prompt's recipient",
@@ -857,7 +907,8 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # One reaction answers one prompt, once: a stale 👍 must never resolve the next gate
         # this session happens to open.
         del tracked[target]
-        self._resolve_approval(session_key or self._session_key_for_chat(chat_id), choice)
+        self._resolve_approval(session_key or self._session_key_for_chat(chat_id), choice,
+                               request_id=request_id)
         await self._ack(message_id)
 
     # -- attachments ----------------------------------------------------
@@ -1253,6 +1304,9 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # named in the text rather than dropped — an image the agent cannot see must not read
         # as a message that never had one.
         text = directed_text(frame, frame.get("content") or "")
+        if not authoritative:
+            # The words are data. A leading `/command` must not become one.
+            text = plain_text(text)
         media_urls: list[str] = []
         media_types: list[str] = []
         kinds: list[str] = []
@@ -1329,7 +1383,7 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 message_id or "(no id)")
             return _HELD_DIGEST
         event = MessageEvent(
-            text=frame.get("content") or "",
+            text=plain_text(frame.get("content") or ""),
             message_type=MessageType.TEXT,
             user_id=owner,
             user_name="digest",
@@ -1488,10 +1542,14 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             # The host blocks the agent thread until this gate is answered, and the typed
             # commands are not the only way in: remember which message carried the prompt so
             # a reaction on it can resolve the same queue. Only a send that actually landed
-            # is remembered — a prompt nobody received must not be answerable.
+            # is remembered — a prompt nobody received must not be answerable. The request
+            # id is read now, while that gate is the one waiting: a reaction later must not
+            # be able to approve whatever gate happens to be open by then.
+            chat = str(chat_id or "").strip()
+            session_key = self._session_key_for_chat(chat)
             self._remember_approval_prompt(
-                result.message_id or "", str(chat_id or "").strip(),
-                self._session_key_for_chat(str(chat_id or "").strip()))
+                result.message_id or "", chat, session_key,
+                self._pending_request_id(session_key))
         return result
 
     async def _request(self, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:

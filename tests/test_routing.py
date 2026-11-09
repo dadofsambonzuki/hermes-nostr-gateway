@@ -10,6 +10,7 @@ needs when a channel's answers come out on the wrong model: `hng route` says whi
 from __future__ import annotations
 
 import json
+import time
 from collections import deque
 
 import nostr_sdk as sdk
@@ -464,7 +465,7 @@ def learn_channel(gateway: Gateway, *, channel_id: str = OPS, name: str = "ops")
 
 
 def inbound(conversation: str, *, plane: str = "concord", **overrides) -> Inbound:
-    fields = dict(id="r1", wrapper_id="w1", sender="ab" * 32, kind=9, created_at=1,
+    fields = dict(id="r1", wrapper_id="w1", sender="ab" * 32, kind=9, created_at=int(time.time()),
                   content="hello", conversation=conversation, reply_to=None, plane=plane,
                   reach="immediate", authority="instructions", rule="r", why="w")
     fields.update(overrides)

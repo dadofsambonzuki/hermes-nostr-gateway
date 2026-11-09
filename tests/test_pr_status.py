@@ -23,6 +23,8 @@ PR_ID = "a" * 64
 COMMIT = "b" * 40
 ROOT = "e" * 40
 SECRET = sdk.Keys.generate().secret_key().to_hex()
+#: The fixtures are dated 1_800_000_000; the reader's future guard needs a clock beside them.
+NOW = 1_800_000_100
 
 
 def applied() -> dict:
@@ -79,7 +81,7 @@ def test_the_bridge_feed_sees_the_applied_record_and_drops_one_without_the_addre
             "content": "", "tags": [["e", PR_ID, "", "root"], ["merge-commit-id", COMMIT]]}
     seen: dict = {}
 
-    feed = ngit.RelayPrs(RELAYS, ADDRESS,
+    feed = ngit.RelayPrs(RELAYS, ADDRESS, now=lambda: NOW,
                          fetcher=feed_reader([applied(), bare], seen)).events(0)
 
     assert seen["a_tag"] == ADDRESS
@@ -94,7 +96,8 @@ def test_the_bridge_feed_sees_the_applied_record_and_drops_one_without_the_addre
 def test_a_close_the_tooling_publishes_is_visible_to_the_repository_feed():
     seen: dict = {}
 
-    feed = ngit.RelayPrs(RELAYS, ADDRESS, fetcher=feed_reader([closed()], seen)).events(0)
+    feed = ngit.RelayPrs(RELAYS, ADDRESS, now=lambda: NOW,
+                         fetcher=feed_reader([closed()], seen)).events(0)
 
     assert seen["a_tag"] == ADDRESS
     assert [stopped.pr_id for stopped in feed.closed] == [PR_ID]
@@ -107,7 +110,7 @@ def test_a_close_without_the_repository_address_is_invisible():
                           ["e", PR_ID, "", "root"], ["alt", "PR closed"],
                           ["p", AUTHOR]]}
 
-    feed = ngit.RelayPrs(RELAYS, ADDRESS,
+    feed = ngit.RelayPrs(RELAYS, ADDRESS, now=lambda: NOW,
                          fetcher=feed_reader([hand_published], {})).events(0)
 
     assert feed.closed == []

@@ -315,7 +315,7 @@ def _outbound(store: Store, peer: str, text: str, at: int, n: int) -> None:
         id=f"out-{n}", wrapper_id=f"out-wrap-{n}", sender=ME, kind=14,
         created_at=at, content=text, conversation=peer, reply_to=None,
         reach="sent", authority="self", rule="outbound", why="sent by us",
-    ))
+    ), now=at)
 
 
 def _inbound(store: Store, peer: str, text: str, at: int, event_id: str,
@@ -326,7 +326,7 @@ def _inbound(store: Store, peer: str, text: str, at: int, event_id: str,
         reach=decision.reach, authority=decision.authority, rule=decision.rule,
         why=decision.why, blocked_reason=decision.blocked_reason,
         interval_s=decision.interval_s,
-    ))
+    ), now=at)
 
 
 def echo_lookup(store: Store):

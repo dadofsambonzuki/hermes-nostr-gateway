@@ -12,6 +12,11 @@ import pytest
 
 from hermes_nostr_gateway import sdkloop
 
+#: The bridge's fixtures (a miniature board, its store, and a sync with every collaborator
+#: injected) are shared with the security-review tests. Importing them here is what makes
+#: them pytest fixtures for every module rather than one test file's private helpers.
+from test_ngit import harness, home, store  # noqa: F401
+
 if len(tempfile.gettempdir()) > 20:
     os.environ["TMPDIR"] = "/tmp"
     tempfile.tempdir = None

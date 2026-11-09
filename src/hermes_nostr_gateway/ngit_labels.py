@@ -103,6 +103,9 @@ class Verdict:
     `body` is the comment's own words -- the findings, when the verdict asks for changes.
     The card that answers the verdict carries them so the work is queued with the reasons,
     not only with a pointer to a relay a worker may not read.
+
+    `author` is the comment's signing key. `newest_verdict` filters on it, and the caller
+    checks it again: a verdict is a review role's statement, not anyone's comment.
     """
 
     label: str = ""
@@ -111,6 +114,7 @@ class Verdict:
     relay: str = ""
     readable: bool = True
     body: str = ""
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -350,7 +354,19 @@ def _verdict_in(body: str) -> Optional[str]:
     return None
 
 
-def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
+def _author_hex(value: Any) -> str:
+    """A pubkey as lowercase hex, whether the event or the config spelled it as npub."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return sdk.PublicKey.parse(text).to_hex()
+    except Exception:  # noqa: BLE001 - an unparseable key matches nothing
+        return text.lower()
+
+
+def newest_verdict(events: Iterable[Mapping[str, Any]],
+                   authors: Optional[Sequence[str]] = None) -> Optional[Verdict]:
     """The newest verdict among a PR root's kind-1111 comments, or None for no verdict.
 
     Newest is by `created_at`, then by event id: a relay replaying an older comment must
@@ -359,13 +375,24 @@ def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
     what lets a review's reasoning, and the bridge's own merge line, sit above a verdict
     without erasing it. A verdict-looking line nobody can parse stops the search and comes
     back marked unreadable.
+
+    `authors` is the reviewer allowlist. `None` means "this is a pure parse" and filters
+    nothing -- the module's own tests use that shape. A sequence is the caller's configured
+    reviewer set, applied here as well as in the relay filter because the relay is not a
+    trust boundary: an event can arrive through a reader that never applied the filter.
+    An empty sequence means no verdict is accepted -- never "anyone who tags the PR".
     """
+    allowed = (None if authors is None
+               else {_author_hex(value) for value in authors if str(value or "").strip()})
     comments = []
     for event in events or ():
         if not isinstance(event, Mapping):
             continue
         kind = event.get("kind")
         if kind is not None and int(kind or 0) != KIND_COMMENT:
+            continue
+        if allowed is not None and (not allowed
+                                    or _author_hex(event.get("pubkey")) not in allowed):
             continue
         comments.append(event)
     comments.sort(key=lambda event: (int(event.get("created_at") or 0),
@@ -377,7 +404,8 @@ def newest_verdict(events: Iterable[Mapping[str, Any]]) -> Optional[Verdict]:
         return Verdict(label=stated, event_id=str(event.get("id") or ""),
                        created_at=int(event.get("created_at") or 0),
                        relay=str(event.get("relay") or ""), readable=bool(stated),
-                       body=str(event.get("content") or "") if stated else "")
+                       body=str(event.get("content") or "") if stated else "",
+                       author=_author_hex(event.get("pubkey")))
     return None
 
 

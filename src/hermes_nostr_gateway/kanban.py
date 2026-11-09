@@ -632,8 +632,9 @@ class Board:
         """The reviewer approved the PR: the verdict, not the merge, finishes this card.
 
         A review card's `done` is the review's end, and an approval is the review's end. The
-        merge stays a person's -- the card is finished, the PR is not landed, and the label
-        on the PR says `approved` for the merge route to read. Releasing rather than
+        merge stays a person's -- the card is finished, the PR is not landed, and the bridge
+        records the reviewed tip on the link (`verdict_tip`) for the merge route to compare
+        before it applies anything. Releasing rather than
         removing the trigger keeps the guard row, so the pass can say what it saw.
         """
         try:

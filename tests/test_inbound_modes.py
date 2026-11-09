@@ -16,6 +16,7 @@ that queues twice.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import nostr_sdk as sdk
 import pytest
@@ -287,7 +288,7 @@ async def test_a_row_written_before_the_rename_replays_as_a_steer(tmp_path, monk
     try:
         gw.store.add(Inbound(
             id="a" * 64, wrapper_id="b" * 64,
-            sender=senders["family"].public_key().to_hex(), kind=14, created_at=1,
+            sender=senders["family"].public_key().to_hex(), kind=14, created_at=int(time.time()),
             content="stop, wrong file", conversation="c" * 64, reply_to=None,
             reach="immediate", mode="guide", authority="instructions"))
         await gw.flush_writes()
