@@ -1970,10 +1970,20 @@ def test_a_status_returned_by_both_reads_is_counted_once():
 # that can still see that close.
 
 def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
-    """Acceptance (1): the sweep sees a close the incremental poll has moved past."""
+    """Acceptance (1): the sweep sees a close the incremental poll has moved past.
+
+    Both ends of the gap are measured from the clock at run time, because the window they
+    are measured against is: `now - sweep_hours`. A literal date here asserts fine until the
+    window's floor has rolled past it and then fails on master for everyone, whatever the
+    code does -- which is what happened to the 2026-11-08 fixtures. The close sits deep in
+    the default window so that shortening the window still breaks this test: that is the
+    property it pins.
+    """
     pr, task_id = pr_with_review_task(harness)
-    reached = 1794174410                                     # 2026-11-08 21:46:50Z
-    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64, created_at=1794152523)
+    now = int(time.time())
+    stopped = ngit.Closed(pr_id=pr.id, event_id="9" * 64,
+                          created_at=now - 20 * 3600)        # deep inside the 24h window
+    reached = now - 2 * 3600                                 # the poll has read past the close
     harness.store.ngit_set_cursor(ADDRESS, "prs", reached)
     # The poll carries nothing: its window starts long after the close was published.
     harness.prs_data = ngit.PrFeed()
@@ -1988,6 +1998,10 @@ def test_a_close_behind_the_cursor_heals_on_the_next_pass(harness):
     assert report.prs["blocked"] == 1 and report.prs["swept"] == 1
     # The sweep read a window that reaches back past the close ...
     assert harness.sweep_since[-1] <= stopped.created_at
+    # ... because the window is (nearly) the whole default day, not a sliver of it: this is
+    # the line a shortened `sweep_hours` breaks, and the reason the close above is 20h old.
+    # The minute is slack for the clock read either side of the pass, so the pin has no tie.
+    assert harness.sweep_since[-1] <= now - 23 * 3600 - 60
     # ... and left the cursor the proposals are read with exactly where it was.
     assert harness.store.ngit_cursor(ADDRESS, "prs") == str(reached)
     # The guard refuses the completion, naming the close: the card cannot be finished by it.
