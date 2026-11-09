@@ -1445,6 +1445,35 @@ class Store:
             self._with_attachments(items)
         return items
 
+    def preceding(self, conversation: str, before_at: int, before_id: str,
+                  limit: int = 20) -> list[dict[str, Any]]:
+        """One conversation's messages that ended before an anchor, oldest first.
+
+        The anchor is the triggering message itself, named as `(created_at, id)`: a
+        strict total order, so the predicate excludes that row and every row after it
+        even when two messages were stamped in the same second. `limit` bounds the page
+        from the anchor backwards, which is the end a reader wants — the lines just
+        before the trigger, not the room's first week.
+
+        Age and authority are the caller's questions: a room's history is evidence like
+        any other stored row. The conversation is the `concord:<community>:<channel>` id
+        the plane wrote, never a sender, so a room's scrollback cannot leak into a DM.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM rumors WHERE conversation = ?"
+            " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (str(conversation), int(before_at), int(before_at), str(before_id),
+             max(0, int(limit))),
+        ).fetchall()
+        items = [dict(row) for row in rows]
+        # Same reason as `recent`: `route` is stored as JSON text and every reader wants
+        # the mapping, not a string it has to decode again.
+        for item in items:
+            item["route"] = _json_or_none(item.get("route"))
+        items.reverse()
+        return items
+
     def rumor(self, event_id: str) -> dict[str, Any] | None:
         """One stored row by id, or None.
 

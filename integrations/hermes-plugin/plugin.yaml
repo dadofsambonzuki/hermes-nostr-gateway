@@ -50,3 +50,11 @@ config_schema:
     type: number
     default: 60
     description: Seconds inside which an identical send to the same chat is dropped as a replay (0 disables the windowed rule)
+  channel_context:
+    type: object
+    description: >-
+      Recent Concord room history attached to a gated room turn as context, never as a
+      trigger. On by default: the 20 messages / 8000 characters / 2 hours ending at the
+      triggering message, roughly two thousand tokens per room turn. Set false to pay
+      nothing, or a mapping with enabled, max_messages, max_chars and max_age_secs to
+      change the cost radius. DMs and Marmot groups never carry it.

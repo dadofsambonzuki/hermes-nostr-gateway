@@ -1041,3 +1041,39 @@ every other verdict red.
 
 Why: a signal that is always amber is a signal nobody reads, and the cost of a relay whose policy
 is not ours is one config line, not a degraded gateway.
+
+## A room turn carries the room's preceding lines, bounded by the client
+
+A Concord message reached the agent as the trigger alone. The store already held every
+message per `concord:<community>:<channel>`, but nothing put the lines before the trigger in
+front of the model, so a mention in a busy room was answered blind and the agent had to think
+to call `history` — which was the whole store, newest first, with no way to ask for one
+conversation or stop at one message.
+
+**The daemon answers a scoped page; the adapter decides how much.** `history` gained an
+optional `conversation` with `before_at` + `before_id` (the trigger's `(created_at, id)` anchor)
+and honours only `limit`. The adapter chooses the window — 20 messages, 8000 characters, 2
+hours back from the trigger — because that is a cost preference per deployment, like the
+Marmot plugin's own timeline page, and a per-client cap can change without a daemon release.
+The cost is real: `channel_context` is charged to the model like any other text, and a
+20-message room turn can dwarf the trigger, so the character cap is part of the feature, not a
+safety valve on it.
+
+**The anchor is exact.** The predicate is `(created_at, id) < (before_at, before_id)`, so the
+trigger is never read back as its own context and nothing after it leaks in; the id breaks a
+same-second tie rather than letting the trigger's second become a window. `limit` takes the
+rows nearest the anchor, because the line just before the question is the one it is about.
+
+**Only a turn that already passed the gate gets context.** The adapter attaches the page in
+`_deliver`, after the reaction, digest and blocked branches: a message frame there is already
+a mention, a solo room, or a command the policy admits. Context never widens delivery and a
+missed chatter line never starts a turn. DMs and Marmot groups are excluded — a DM's history
+is scrollback, not a room — and the trigger remains the user message.
+
+**On by default, with the caps, and failure is silence.** The failure being fixed is an agent
+answering a room it has not read; the caps bound what fixing it costs, so the shipped setting
+is on. A failed lookup logs at debug and the turn runs without context — never a refusal,
+never a second turn. An older daemon that ignores the extra fields answers with unscoped rows,
+so a scoped reply echoes `scoped`, `conversation`, `before_at` and `before_id`; an adapter
+that does not see its own request echoed back warns once and runs without context rather than
+treating another room's lines as this one's.

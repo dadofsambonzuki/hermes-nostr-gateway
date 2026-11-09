@@ -65,6 +65,13 @@ Under them:
 - **One adapter.** `integrations/hermes-plugin/` is the Hermes platform plugin. It maps frames
   onto Hermes' platform contract and `authority` onto `source.role_authorized`, and it owns the
   outbound replay guard, so a reply Hermes redelivers is not published twice.
+- **A room turn is not answered blind.** When a channel frame is already a turn, the adapter
+  asks the daemon for that conversation's rows ending just before the trigger and hands them to
+  Hermes as `channel_context` — user-role context, never a second trigger, and never a change to
+  what triggers. DMs get none. The window is the adapter's (`channel_context`: 20 messages /
+  8000 characters / 2 hours by default), so its cost is a per-deployment choice; the daemon only
+  honours the count, and a daemon too old to scope the page degrades to no context with one
+  warning rather than to another room's lines.
 - **Durability.** A message is stored before it is delivered, replayed if the adapter never
   acknowledged it, and retried per relay by republishing the same signed event — never a re-wrap,
   which would change its id and show the peer a duplicate. A reconnect batch is shaped: only the
@@ -77,7 +84,11 @@ Under them:
 ### The socket
 
 Ops in: `subscribe`, `ack`, `mark_read`, `send`, `status`, `health`, `history`, `drops`, `peers`,
-`media.get`, `marmot.group`, `marmot.timeline`, `replay.skip`, `ping`.
+`media.get`, `marmot.group`, `marmot.timeline`, `replay.skip`, `ping`. `history` is either the
+store's newest rows, or — with `conversation` + `before_at` + `before_id` — one conversation's
+page ending strictly before that anchor, oldest first; a scoped reply echoes the request
+(`scoped`, `conversation`, `before_at`, `before_id`) so a client can tell it from an older
+daemon's unscoped answer.
 
 Frames out: `message`, `blocked`, `delivery`, `reaction`, `concord_invite`, `media`, plus a reply
 envelope per op (`subscribed`, `status`, `health`, `history`, `drops`, `peers`, `ok`, `pong`,

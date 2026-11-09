@@ -47,8 +47,10 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -414,6 +416,155 @@ def is_digest_frame(frame: dict[str, Any]) -> bool:
     return frame.get("plane") == "digest" or frame.get("sender") == "digest"
 
 
+# -- recent channel context ------------------------------------------------------
+# A message in a busy Concord room used to reach the agent as the trigger alone, so the
+# reply answered a discussion it had never seen. The daemon stores every message per
+# `concord:<community>:<channel>` conversation; a bounded page of the rows ending at the
+# trigger is attached to the event as `channel_context`, which Hermes prepends as
+# user-role context without it becoming a second trigger. The trigger stays the user
+# message, and a turn that had no context before is unchanged.
+#
+# The caps are the cost radius, not decoration: `channel_context` is charged to the model
+# like any other text, and twenty room messages can dwarf the trigger. ~20 lines and 8k
+# characters is roughly two thousand tokens on a room turn. `max_age_secs` is measured
+# back from the triggering message (not from now), so a replayed turn sees the room as it
+# was when it was said.
+#
+# The window belongs to the adapter, matching the Marmot plugin; the daemon only honours
+# `limit`. That keeps the cost a per-client preference rather than a socket contract, and
+# the age/char caps can change without a daemon restart.
+DEFAULT_CHANNEL_CONTEXT_MESSAGES = 20
+DEFAULT_CHANNEL_CONTEXT_CHARS = 8000
+DEFAULT_CHANNEL_CONTEXT_AGE_SECS = 7200
+#: A supplemental read must not hold the trigger: a wedged daemon costs this much, then
+#: the turn runs without context. The socket's own ops keep the longer default.
+CHANNEL_CONTEXT_TIMEOUT_S = 5.0
+
+#: Told to the model immediately above the page. "Context, not a new request" matters:
+#: the lines are other people's words and carry no authority of their own.
+CHANNEL_CONTEXT_HEADER = (
+    "Recent messages in this channel before the one you are answering "
+    "(oldest first; context, not a new request):"
+)
+
+
+@dataclass(frozen=True)
+class ChannelContextSettings:
+    """How much of a room's history to attach, and whether to attach it at all."""
+
+    enabled: bool = True
+    max_messages: int = DEFAULT_CHANNEL_CONTEXT_MESSAGES
+    max_chars: int = DEFAULT_CHANNEL_CONTEXT_CHARS
+    max_age_secs: int = DEFAULT_CHANNEL_CONTEXT_AGE_SECS
+
+
+def _cap(raw: Any, default: int, name: str) -> int:
+    """One cap from the settings, tolerating the string a YAML scalar becomes."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("nostr %s %r is not an integer; using %d", name, raw, default)
+        return default
+
+
+def _enabled(raw: Any, default: bool = True) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def channel_context_settings(config: Any) -> ChannelContextSettings:
+    """The room-context settings: `channel_context` is a bool or a mapping.
+
+    On by default with the caps above, because the failure it fixes is an agent
+    answering a room blind, and the caps bound what that costs. A deployment that would
+    rather pay nothing sets `channel_context: false`; a mapping can change one cap
+    without restating the rest.
+    """
+    raw = _extra(config).get("channel_context")
+    if raw is None:
+        return ChannelContextSettings()
+    if not isinstance(raw, dict):
+        return ChannelContextSettings(enabled=_enabled(raw))
+    return ChannelContextSettings(
+        enabled=_enabled(raw.get("enabled")),
+        max_messages=max(0, _cap(raw.get("max_messages"),
+                                 DEFAULT_CHANNEL_CONTEXT_MESSAGES,
+                                 "channel_context.max_messages")),
+        max_chars=max(0, _cap(raw.get("max_chars"), DEFAULT_CHANNEL_CONTEXT_CHARS,
+                              "channel_context.max_chars")),
+        max_age_secs=_cap(raw.get("max_age_secs"), DEFAULT_CHANNEL_CONTEXT_AGE_SECS,
+                          "channel_context.max_age_secs"),
+    )
+
+
+def is_channel_conversation(conversation: str) -> bool:
+    """True for a Concord room id — the only conversation that is a room, not a person.
+
+    A DM's conversation is the peer's pubkey and a Marmot group's is its group id;
+    neither has a room's scrollback. `concord:<community>:<channel>` is the daemon's own
+    namespace, written by the Concord plane when it stores a channel message.
+    """
+    return str(conversation or "").startswith("concord:")
+
+
+def _one_line(text: Any) -> str:
+    """*text* on one line: a stored message's newlines must not become context lines."""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def render_channel_context(
+    rows: list[dict[str, Any]], *, before_at: int, settings: ChannelContextSettings,
+) -> Optional[tuple[str, int]]:
+    """`(rendered, lines)` for a page of room history, or None when nothing survives.
+
+    Rows are oldest-first, as the store returns them. Newest lines are kept when the
+    character cap bites: the line just before the trigger is the one the answer is most
+    likely to be about, and dropping it to fit the room's opening is the wrong trade.
+    Returns None rather than a header with no lines — an empty page is not context.
+    """
+    if not settings.max_messages or settings.max_chars <= 0:
+        return None
+    floor = (int(before_at) - settings.max_age_secs
+             if settings.max_age_secs > 0 else None)
+    lines: list[str] = []
+    for row in rows[-settings.max_messages:]:
+        try:
+            created = int(row.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if floor is not None and created < floor:
+            continue
+        text = _one_line(row.get("content"))
+        if not text:
+            continue
+        prefix = "[bot] " if row.get("authority") == "self" else ""
+        lines.append(f"{prefix}{_short(str(row.get('sender') or ''))}: {text}")
+    if not lines:
+        return None
+
+    budget = settings.max_chars - len(CHANNEL_CONTEXT_HEADER) - 1
+    kept: list[str] = []
+    for line in reversed(lines):
+        cost = len(line) + (1 if kept else 0)
+        if cost > budget:
+            if not kept and budget > 1:
+                # One over-long message is still the thing being answered: clip it
+                # rather than hand back nothing.
+                kept.append(line[:budget - 1].rstrip() + "…")
+            break
+        kept.append(line)
+        budget -= cost
+    if not kept:
+        return None
+    kept.reverse()
+    return CHANNEL_CONTEXT_HEADER + "\n" + "\n".join(kept), len(kept)
+
+
 # -- routing --------------------------------------------------------------------
 # The gateway decides which provider, model and credential a conversation's turn asks for, and
 # says so on the frame: `route` carries names only, and `key` is the *name* of a variable. Even
@@ -685,6 +836,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
         # What this process has already delivered, so a replayed reply (Hermes' recovery
         # path, a retried send, a racing duplicate) is not published a second time.
         self._delivery_dedupe = DeliveryDedupe(dedupe_window_seconds(config))
+        # One warning per process when the daemon cannot scope `history` by conversation:
+        # an older daemon degrades to no room context, and repeating that on every turn
+        # would bury the one line that says why.
+        self._channel_context_warned = False
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -1326,6 +1481,94 @@ class NostrGatewayAdapter(BasePlatformAdapter):
                 delay *= 2
         return False
 
+    async def _channel_context(self, frame: dict[str, Any]) -> Optional[str]:
+        """A bounded page of this room's messages before the trigger, or None.
+
+        Called only for a frame that is already a turn: the daemon's gate decided that
+        (a mention, a solo room, or a command its policy admits), and re-deriving it here
+        would be a second policy that can drift. DMs and Marmot groups return None — a
+        DM's history is scrollback, not a room.
+
+        The lookup is supplemental. Every failure — no daemon, an error reply, a daemon
+        too old to scope `history` — returns None and the turn runs as it did before:
+        never a refusal, never a second turn. The one warning for an old daemon is
+        deliberate; the debug line is the per-turn record.
+        """
+        settings = getattr(self, "_context_settings", None)
+        if settings is None:
+            # The plugin settings are read at the adapter's construction in practice, and
+            # a change needs a restart either way; caching keeps a malformed cap from
+            # warning on every turn.
+            settings = self._context_settings = channel_context_settings(
+                getattr(self, "_config", None))
+        if not settings.enabled or not settings.max_messages or settings.max_chars <= 0:
+            return None
+        conversation = str(frame.get("conversation") or "")
+        if not is_channel_conversation(conversation):
+            return None
+        try:
+            before_at = int(frame.get("created_at") or 0)
+        except (TypeError, ValueError):
+            before_at = 0
+        before_id = str(frame.get("id") or "")
+        if before_at <= 0 or not before_id:
+            return None
+        try:
+            reply = await self._request({
+                "op": "history", "conversation": conversation,
+                "before_at": before_at, "before_id": before_id,
+                "limit": settings.max_messages,
+            }, timeout=CHANNEL_CONTEXT_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
+            logger.debug("nostr channel_context lookup failed for %s: %s",
+                         _short(conversation), exc)
+            return None
+        if not self._scoped_history(reply, conversation, before_at, before_id):
+            self._warn_channel_context_unsupported()
+            return None
+        rows = reply.get("messages")
+        if not isinstance(rows, list) or not rows:
+            return None
+        rendered = render_channel_context(rows, before_at=before_at, settings=settings)
+        if rendered is None:
+            return None
+        text, lines = rendered
+        logger.info("nostr channel_context lines=%d chars=%d", lines, len(text))
+        return text
+
+    @staticmethod
+    def _scoped_history(reply: dict[str, Any], conversation: str, before_at: int,
+                        before_id: str) -> bool:
+        """Whether the daemon answered the scoped request *as* the scoped request.
+
+        The echo is the compatibility check: a daemon from before the scoped op ignores
+        `conversation`/`before_*` and answers with the store's newest rows from every
+        conversation. Treating that as a window would hand the agent another room's
+        chatter, so only an answer that names the request back is used.
+        """
+        if not isinstance(reply, dict):
+            return False
+        raw_at = reply.get("before_at")
+        if raw_at is None:
+            return False
+        try:
+            echoed_at = int(raw_at)
+        except (TypeError, ValueError):
+            return False
+        return (reply.get("type") == "history" and reply.get("scoped") is True
+                and reply.get("conversation") == conversation
+                and echoed_at == before_at and reply.get("before_id") == before_id)
+
+    def _warn_channel_context_unsupported(self) -> None:
+        """Say once that the daemon cannot scope history, then keep the turns running."""
+        if getattr(self, "_channel_context_warned", False):
+            return
+        self._channel_context_warned = True
+        logger.warning(
+            "nostr channel_context is unavailable: the daemon at %s does not scope "
+            "history by conversation; turns run without room context (restart it after "
+            "upgrading)", getattr(self, "_socket", "?"))
+
     async def _deliver(self, frame: dict[str, Any]) -> Optional[str]:
         """Deliver one inbound message, and say whether it was consumed.
 
@@ -1434,6 +1677,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             (kind_type for kind, kind_type in _MEDIA_KIND_TO_MESSAGE_TYPE if kind in kinds),
             MessageType.DOCUMENT if media_urls else MessageType.TEXT,
         )
+        # The room's own preceding lines, attached to an already-gated turn as context.
+        # Hermes prepends `channel_context` to the trigger text; the trigger itself is
+        # unchanged, so nothing here can start a second turn or widen delivery.
+        channel_context = await self._channel_context(frame)
         source = SessionSource(
             platform=self.platform,
             chat_id=conversation,
@@ -1458,6 +1705,10 @@ class NostrGatewayAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            # A bounded page of what was said in this room before the trigger. Hermes
+            # treats it as user-role context and never as a trigger; `None` is the old
+            # behaviour, and a DM has none by design.
+            channel_context=channel_context,
             # The route the gateway resolved travels with the event, so the host can apply it
             # per turn and audit it. Names only: the credential itself was read above and goes
             # nowhere near a frame, a log line or this metadata.

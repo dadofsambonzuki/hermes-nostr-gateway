@@ -171,7 +171,7 @@ socket 0600, directory 0700. No TCP in v1; no HTTP.
 | `send` | `identity`, `to`, `text`, `transport=auto`, `reply_to?`, `attachments?: [{path, alt?}]`, `route?` | `rumor_id`, `event_ids`, `relays_ok[]`, `relays_failed[]`, `sent_at`, `attachments[]`, `route?` |
 | `react` | `identity`, `to`, `rumor_id`, `emoji="+"` | `reaction_rumor_id`, per-relay results |
 | `media.get` | `identity`, `sha256` or `url` (or `rumor_id`) | `path`, `mime`, `size`, verified `sha256`, `cached` |
-| `history` | `identity`, `peer`, `limit`, `before?` | messages, newest first |
+| `history` | `limit`, and optionally `conversation` + `before_at` + `before_id` (a trigger's anchor) | messages, newest first; with a conversation and an anchor, that conversation's rows ending strictly before the anchor, oldest first, and the reply echoes `scoped`, `conversation`, `before_at`, `before_id` so a client can tell a scoped page from an older daemon's unscoped answer |
 | `drops` | `plane?`, `reason?`, `since?` (epoch seconds), `limit?` | refused messages: id, plane, sender, `reason`, `why`, `received_at`, `age_s`, `expired`; plus `total`/`live`/`expired` over the whole matching set |
 | `peers` | `identity` | known peers + last activity + blocked count |
 | `ack` | `cursor` | advances the durable cursor (§7) |

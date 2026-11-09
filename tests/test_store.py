@@ -371,3 +371,64 @@ def test_live_wrap_table_gains_created_at_dated_by_last_attempt(tmp_path):
         rows = {row["id"]: row for row in s.db.execute("SELECT * FROM outbound_wraps")}
         assert rows["aa"]["created_at"] == attempted, "the last attempt is the only age known"
         assert rows["bb"]["created_at"] > attempted, "an undated pending row stays retryable"
+
+def test_preceding_returns_one_conversations_page_ending_before_the_anchor(tmp_path):
+    """`history` with a conversation and a before-anchor: exact, oldest-first, bounded.
+
+    The anchor is the trigger itself. It must never be read back as its own context,
+    and nothing after it may appear — a room's history is what was said *before* the
+    question, not whatever arrived while it was being answered.
+    """
+    from hermes_nostr_gateway.store import Inbound, Store
+
+    room = "concord:" + "ab" * 32 + ":" + "cd" * 32
+    other = "concord:" + "ab" * 32 + ":" + "ee" * 32
+
+    def add(s, ident: str, *, at: int, content: str, conversation: str = room) -> None:
+        assert s.add(Inbound(
+            id=ident, wrapper_id=ident, sender="11" * 32, kind=9, created_at=at,
+            content=content, conversation=conversation, reply_to=None, plane="concord",
+            reach="immediate", authority="instructions", rule="room", why="t",
+        ), now=at)
+
+    with Store(tmp_path / "preceding.db") as s:
+        add(s, "b1" * 32, at=700, content="first")
+        add(s, "b2" * 32, at=800, content="second")
+        add(s, "c1" * 32, at=850, content="other room", conversation=other)
+        add(s, "b3" * 32, at=900, content="third")
+        add(s, "a0" * 32, at=1_000, content="the trigger")
+        add(s, "d1" * 32, at=1_100, content="after the trigger")
+
+        page = s.preceding(room, 1_000, "a0" * 32, limit=10)
+        assert [row["content"] for row in page] == ["first", "second", "third"]
+        assert [row["created_at"] for row in page] == [700, 800, 900]
+        assert all(row["conversation"] == room for row in page)
+        assert "the trigger" not in {row["content"] for row in page}
+
+        # The limit is the page nearest the anchor, not the room's opening.
+        assert [row["content"] for row in s.preceding(room, 1_000, "a0" * 32, limit=2)] == [
+            "second", "third"]
+        # Zero is an empty page, never SQLite's unbounded `LIMIT -1`.
+        assert s.preceding(room, 1_000, "a0" * 32, limit=0) == []
+
+
+def test_preceding_uses_the_id_to_break_a_same_second_tie(tmp_path):
+    """The anchor is `(created_at, id)`: a same-second row sorts on one side, not both."""
+    from hermes_nostr_gateway.store import Inbound, Store
+
+    room = "concord:" + "ab" * 32 + ":" + "cd" * 32
+
+    def add(s, ident: str, *, at: int) -> None:
+        assert s.add(Inbound(
+            id=ident, wrapper_id=ident, sender="11" * 32, kind=9, created_at=at,
+            content=f"row {ident[:4]}", conversation=room, reply_to=None, plane="concord",
+            reach="immediate", authority="instructions", rule="room", why="t",
+        ), now=at)
+
+    with Store(tmp_path / "tie.db") as s:
+        add(s, "9f" * 32, at=1_000)   # same second, before the anchor by id
+        add(s, "a0" * 32, at=1_000)   # the anchor
+        add(s, "f0" * 32, at=1_000)   # same second, after the anchor by id
+
+        page = s.preceding(room, 1_000, "a0" * 32, limit=10)
+        assert [row["id"] for row in page] == ["9f" * 32]

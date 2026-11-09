@@ -201,6 +201,12 @@ manual — run `ngit skill install` for the rest.
   before the copy was written (a stale import); `hng doctor`'s `adapter` check fails when they
   differ. The repair is `hng adapter install` — which backs the live copy up and never restarts a
   unit — followed by the restart **you** perform (`sudo systemctl restart hermes-gateway`).
+- **A room turn's context comes from the store, not from the relay.** A gated Concord turn
+  carries up to 20 preceding messages (8000 chars, 2 hours back) as Hermes `channel_context`;
+  DMs and Marmot groups get none, and the trigger is still the user message. The caps are the
+  plugin's `channel_context` setting (adapter side, so a Hermes config edit and gateway restart,
+  not a daemon restart). The daemon only has to answer the scoped `history` op — pointing the
+  adapter at a daemon too old to scope it is safe: it warns once and runs the turn bare.
 - Key every `concord.projects` entry by the channel **id** (hex), or by the whole
   `concord:<community-id>:<channel-id>` string. A friendly name resolves inbound messages
   fine and looks correct, but a scheduled pass that names the channel by id cannot match it,

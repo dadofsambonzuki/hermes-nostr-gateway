@@ -2080,8 +2080,21 @@ class Gateway:
                 "events": getattr(worker, "events", 0),
                 "last_error": getattr(worker, "last_error", None)}
 
-    def history(self, limit: int) -> dict[str, Any]:
-        return {"messages": self.store.recent(limit, with_attachments=True)}
+    def history(self, limit: int, *, conversation: str | None = None,
+                before_at: int | None = None, before_id: str | None = None) -> dict[str, Any]:
+        """Stored messages, or one conversation's page ending before an anchor.
+
+        The unscoped answer is the operator's view, newest first, over every plane. A
+        scoped answer is a channel client's: the rows of one `concord:` conversation
+        strictly before the trigger, oldest first, so a room turn is answered with the
+        lines it is answering. The daemon bounds only the count — the age and character
+        caps are a client preference, because they are a per-deployment cost choice.
+        """
+        bounded = max(0, min(int(limit), 500))
+        if conversation and before_at is not None and before_id:
+            return {"messages": self.store.preceding(conversation, before_at, before_id,
+                                                     bounded)}
+        return {"messages": self.store.recent(bounded, with_attachments=True)}
 
     def drops(self, *, plane: str | None = None, reason: str | None = None,
               since: int | None = None, limit: int = 100) -> dict[str, Any]:

@@ -87,7 +87,9 @@ class Handler(Protocol):
                      pending_stale_minutes: int | None = None) -> dict[str, Any]: ...
     async def send(self, *, to: str, text: str, reply_to: str | None, cid: str | None,
                    route: Any = None) -> dict[str, Any]: ...
-    def history(self, limit: int) -> dict[str, Any]: ...
+    def history(self, limit: int, *, conversation: str | None = None,
+                before_at: int | None = None,
+                before_id: str | None = None) -> dict[str, Any]: ...
     def drops(self, *, plane: str | None, reason: str | None,
               since: int | None, limit: int) -> dict[str, Any]: ...
     def peers(self) -> dict[str, Any]: ...
@@ -228,8 +230,30 @@ class SocketServer:
                         )
                         await self._send(writer, frame)
                     elif op == "history":
-                        await self._send(writer, {"type": "history",
-                                                  **self.handler.history(int(req.get("limit", 20)))})
+                        # The unscoped answer is the operator's view of the store. A scoped
+                        # one is a channel client asking for the page ending at its trigger:
+                        # the echo is load-bearing, because an older daemon silently ignores
+                        # the extra fields and would otherwise hand back a page from other
+                        # conversations that looks like a window.
+                        limit = int(req.get("limit", 20))
+                        conversation = str(req.get("conversation") or "")
+                        before_at = req.get("before_at")
+                        before_id = str(req.get("before_id") or "")
+                        if conversation and before_at not in (None, "") and before_id:
+                            requested_at = int(before_at)
+                            await self._send(writer, {
+                                "type": "history",
+                                "scoped": True,
+                                "conversation": conversation,
+                                "before_at": requested_at,
+                                "before_id": before_id,
+                                **self.handler.history(limit, conversation=conversation,
+                                                       before_at=requested_at,
+                                                       before_id=before_id),
+                            })
+                        else:
+                            await self._send(writer, {"type": "history",
+                                                      **self.handler.history(limit)})
                     elif op == "drops":
                         since = req.get("since")
                         await self._send(writer, {"type": "drops", **self.handler.drops(
