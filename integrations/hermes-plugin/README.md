@@ -48,7 +48,7 @@ hermes config set plugins.nostr.home_channel <peer-hex>
 
 | Setting | Meaning |
 |---|---|
-| `socket_path` | The daemon's Unix socket. Unset, `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock`, or `~/.local/state/hermes-nostr-gateway/gateway.sock` |
+| `socket_path` | The daemon's Unix socket. Unset, `~/.local/state/hermes-nostr-gateway/gateway.sock` — the adapter's only fallback, with no `$XDG_RUNTIME_DIR` branch. The daemon's own unset default *is* `$XDG_RUNTIME_DIR/hermes-nostr-gateway.sock` when that is set, so a daemon running under `XDG_RUNTIME_DIR` needs this (or `NOSTR_GATEWAY_SOCKET`) set explicitly to the same path |
 | `home_channel` | The peer a message with no conversation goes to, and where cron delivery lands |
 | `dedupe_window_s` | Seconds inside which an identical message to the same peer is a replay and is dropped (default 60). `0` disables the windowed rule and leaves only the recovered-reply one |
 | `channel_context` | Room history that rides with a channel turn as background, never as a trigger: on by default at 20 messages / 8 000 characters / 2 hours. `false` pays nothing; a mapping changes `max_messages`, `max_chars`, `max_age_secs`. DMs and Marmot groups never carry it |
@@ -93,8 +93,13 @@ All optional. A value set here beats the setting of the same name.
 - **It holds no keys and speaks to no relay itself.** Its only network-shaped act is the Unix
   socket: the daemon's identity, relays and trusted senders are all on the other side of it, and
   are described in the daemon's own README.
-- **It writes one file**: `commands.json`, beside the daemon socket (default
-  `~/.local/state/hermes-nostr-gateway/`, or `NOSTR_GATEWAY_COMMANDS`). No other path is written.
+- **It writes two files**, in the catalogue directory: `commands.json`, the command catalogue, and
+  `commands.status.json`, the outcome of that write — whether it succeeded, how many commands it
+  wrote, the error when it failed, and when — which the daemon's `status` verb reports. The
+  directory is `~/.local/state/hermes-nostr-gateway/`, unless `NOSTR_GATEWAY_COMMANDS` names the
+  catalogue file or `NOSTR_GATEWAY_SOCKET` moves the default beside that socket. Each write stages
+  a `*.tmp` beside its target and renames it into place, so a reader never sees half a file. No
+  other path is written.
 - **It runs one command**: `nak decode` when a destination is given as an `npub` rather than hex.
   Without `nak` on `PATH`, give destinations as hex.
 - **No background processes** of its own: the adapter runs inside the Hermes gateway, and the
