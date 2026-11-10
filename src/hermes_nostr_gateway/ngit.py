@@ -4997,7 +4997,14 @@ def _fold_root(known: Mapping[tuple[str, str], str], author: str, branch: str, *
     different branch unless `deadbeef` happens to open the root of `topic`. `pr_id` is the
     proposal itself, which the caller has already seeded into `known`: an exact match on it
     names no root, so the decorated lookup still has to run.
+
+    `HEAD` is not a branch name, and never folds. A client that published it pushed whatever
+    commit the worktree had checked out, so two cards can arrive on it without being the same
+    work; folding the second onto the first leaves it with no link, no card and no reader for
+    its comments. It is treated as its own branch, which is what it is.
     """
+    if branch.split("(", 1)[0] == "HEAD":
+        return None
     root = known.get((author, branch))
     if root is not None and root != pr_id:
         return root

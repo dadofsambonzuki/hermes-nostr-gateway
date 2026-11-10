@@ -5284,6 +5284,26 @@ def test_a_branch_that_only_looks_decorated_is_a_new_pr(harness):
     assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
 
 
+def test_two_cards_that_both_pushed_head_are_two_prs(harness):
+    """`HEAD` is the client's checked-out commit, not the work's branch: it folds nothing.
+
+    Two cards pushed `HEAD:refs/heads/pr/HEAD` in the same afternoon; the first is applied,
+    and folding the second onto it left a live PR with no link, no card and no reply task
+    for the comments on it. The branch names nothing, so it cannot name a re-push either.
+    """
+    docs = make_pr("aa", commit="a" * 40, branch="HEAD",
+                   subject="Docs: merged work takes applied")
+    tests = make_pr("ab", commit="b" * 40, branch="HEAD",
+                    subject="tests: the sweep test's close is relative to now", created_at=2000)
+    harness.prs_data = ([docs], [])
+    harness.sync()
+    harness.prs_data = ([tests], [])
+    report = harness.sync()
+
+    assert len(pr_links(harness)) == 2 and len(review_tasks(harness)) == 2
+    assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
+
+
 def test_a_decorated_branch_from_another_author_is_a_new_pr(harness):
     """The suffix names a root, not a branch: the author is still half the fold key."""
     pr = make_pr("f3", commit="a" * 40, branch="pr/widget")
