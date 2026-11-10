@@ -14,6 +14,7 @@ never becomes a turn) lives beside the reader-loop harness in
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 import nostr_sdk as sdk
@@ -84,6 +85,40 @@ def test_three_pending_rows_in_one_conversation_are_one_turn_and_two_context_row
         assert store.drops()["total"] == 0, (
             "a superseded message was accepted: `drops` is refusals, not context"
         )
+
+
+def test_an_ack_reason_outside_the_closed_vocabulary_still_delivers(tmp_path, caplog):
+    """The store decides against an unknown reason: delivered, not refused.
+
+    `server.py` forwards `reason` only when the key is present and `Gateway.ack` passes it
+    through unread, so an unknown string reaches `mark_delivered` intact. The vocabulary stays
+    closed — the row is delivered with no `settled_reason`, and so is not a `drop` — but the
+    discard is named at DEBUG, with the ids and the string it refused, instead of vanishing.
+    """
+    with _store(tmp_path, "unknown-reason.db") as store:
+        _add(store, "one")
+        with caplog.at_level(logging.DEBUG, logger="hng.store"):
+            store.mark_delivered(["one"], reason="nonsense")
+
+        row = store.rumor("one")
+        assert row is not None
+        assert row["delivered_at"] is not None, "an unknown reason is not a refusal"
+        assert row["settled_reason"] is None, (
+            "settled_reason is a closed vocabulary: an unknown string must not label the row"
+        )
+        assert store.drops()["total"] == 0, (
+            "the row was delivered: `drops` lists refusals, not acks we chose not to name"
+        )
+        assert "nonsense" in caplog.text and "one" in caplog.text, (
+            "the discarded reason is visible at DEBUG rather than silently dropped"
+        )
+
+        # And the line is conditional: a plain ack carries no reason to report.
+        caplog.clear()
+        _add(store, "two")
+        with caplog.at_level(logging.DEBUG, logger="hng.store"):
+            store.mark_delivered(["two"])
+        assert "not a settled reason" not in caplog.text
 
 
 def test_a_shaped_row_stays_context_when_the_newer_row_is_acked_first(tmp_path):

@@ -29,6 +29,7 @@ the CLI, the tests and a ``kill -9`` recovery script keep their simple behaviour
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -39,6 +40,10 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from .writer import StoreWriter
+
+#: One name for the store, the same one writer.py logs under: the two halves of the same
+#: subsystem, and two names for one of them only splits the journal.
+log = logging.getLogger("hng.store")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rumors (
@@ -1109,12 +1114,21 @@ class Store:
         ``reason`` records a delivery that ended without a turn (`superseded`, when the
         adapter filed a shaped replay row as context). It is a closed vocabulary and is
         kept apart from ``blocked_reason``: a superseded message was accepted and remains
-        in `history`, so it must not appear in `drops` as a refusal.
+        in `history`, so it must not appear in `drops` as a refusal. A reason outside the
+        vocabulary is discarded — the row is still delivered, with no ``settled_reason`` —
+        and named at DEBUG, so a mis-acked reason is visible instead of silent.
         """
         ids = [i for i in ids if i]
         if not ids:
             return
         settled = str(reason) if reason in SETTLED_REASONS else None
+        if reason is not None and settled is None:
+            # The vocabulary is closed on purpose: an unknown reason cannot label a row, and
+            # a typo must not turn a delivery into a refusal. Saying so at DEBUG is what keeps
+            # the discard deliberate rather than invisible.
+            log.debug(
+                "ack reason %r is not a settled reason: recording %s delivered with"
+                " settled_reason NULL", reason, ", ".join(ids))
         now = int(time.time())
         whole: set[str] = set()
         touched: set[str] = set()
