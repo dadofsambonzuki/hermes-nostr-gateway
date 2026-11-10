@@ -36,7 +36,7 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `channel`, `config`, `checkout`, `project`, `board`; exit 1 on any gap. A `channel` check appears only when the key is not a 64-hex channel id (or `concord:<community-id>:<channel-id>`): a name resolves inbound messages and then loses every notice at send time. Plain `hng projects --json` lists the map only. |
 | Which channel ids may I key `concord.projects` by? | `hng concord channels --json` | `[{id, name, community}]` for every readable channel of every joined community; `--community <id>` narrows it. It performs the same Control-plane read a refresh does (the store's grants alone are not the channel list) and falls back to the grants, with a note on stderr, when a relay is silent. A held invite contributes nothing. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
-| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{seen,created,ready,held,existing,comments,deleted,deferred,waiting,would_create,would_wait}`, `mentions{seen,created,existing,ignored,deferred,would_create}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
+| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{seen,created,ready,held,existing,comments,deleted,deferred,waiting,would_create,would_wait}`, `mentions{seen,created,existing,ignored,deferred,would_create,requested,would_request}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,healed,would_heal,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
 | Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
 | What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
 | Does the live Nostr plugin match this checkout's adapter? | `hng adapter status --json`; `hng adapter install` writes it | `repo`/`live` (both paths), `repo_hash`/`live_hash`, both mtimes, `equal`, `unit`, `unit_started`, `stale_import`, `problems`, `detail`; exit 1 when the copies differ or one cannot be read. |
@@ -83,11 +83,16 @@ Every refusal is a word, and the word decides what to do.
   `hng ngit answer <ref> --yes|--no --by <who>`; `authorised`/`declined` are those recorded
   answers. `deleted` means a human removed the task and the bridge will not recreate it
   without `--recreate`.
-- **mentions**: a kind-1111 comment carrying this gateway's `p` tag (or its npub in the
-  words), on a linked issue or PR, becomes one reply task from a trusted author — one per
-  comment, keyed `ngit:mention:<comment id>`, with the thread and the publishing command in
-  the body. An untrusted author's mention is recorded and ignored (`mentions: false` turns
-  it off).
+- **mentions**: a kind-1111 comment carrying a role's `p` tag (or its npub in the words), on a
+  linked issue or PR, from a trusted author. The answer is the role's: the gateway's key
+  becomes one reply task (keyed `ngit:mention:<comment id>`, with the thread and the
+  publishing command in the body); the review role's key on a PR puts that PR's review card
+  back in the queue for the tip it carries (a request older than the card's completion is
+  already answered, and is recorded, not replayed); a role with no profile (the Deps Bot) gets
+  a task carrying the run that answers it. An untrusted author's mention is recorded and
+  ignored (`mentions: false` turns it off).
+- **the heal**: a pass also re-queues a card whose PR link records a tip newer than the card's
+  completion — a revision that was recorded without a re-open — reported as `healed`.
 
 ## The bridge's rules
 

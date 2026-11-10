@@ -6,11 +6,17 @@ the same lookup serves the inbound and the outbound half of this module:
 
     inbound   kind-1621 issue    -> a task on the channel's board
               kind-1111 comment  -> a task comment, in the order the issue carries them
+              a comment naming a role -> the role's answer (see `roles.py`): a reply task for
+                                   the gateway, the PR's review re-queued for the review
+                                   role, the run to make for a role with no profile -- from
+                                   a trusted npub only, on the same gate on every plane
     outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
                                    review task on that board (a verdict, never a merge:
                                    merging is the operator's)
               kind-1619 revision -> reopens that one task with the new tip, as one comment;
                                    a revision never makes a second card
+              a card finished before the tip moved -> re-queued for the tip the PR carries
+                                   (the heal for a move that was recorded without a re-open)
               a verdict comment  -> finishes the review task's role: approved completes it
                                    with the verdict as its result, changes-requested queues
                                    one fix card (keyed on the verdict event) for the
@@ -124,6 +130,7 @@ from .ngit_labels import (
 )
 from .ngit_verdict import VerdictPublisherFn, card_verdict
 from .projects import ProjectMap, board_dir, hermes_home
+from .roles import GATEWAY, REVIEW_ACTION, Role, addressed
 from .store import Store
 
 log = logging.getLogger("hng.ngit")
@@ -791,7 +798,7 @@ class Report:
         "would_create": 0, "waiting": 0, "would_wait": 0, "would_post": 0})
     mentions: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "existing": 0, "ignored": 0, "deferred": 0,
-        "would_create": 0})
+        "would_create": 0, "requested": 0, "would_request": 0})
     prs: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "signalled": 0, "merged": 0, "existing": 0, "deferred": 0,
         "pending": 0, "would_post": 0, "tasks": 0, "review_errors": 0, "held": 0,
@@ -799,6 +806,9 @@ class Report:
         "approved": 0, "changes": 0, "applied": 0, "ignored": 0,
         "completed": 0, "unblocked": 0, "blocked": 0, "would_close": 0, "closed": 0,
         "verdicts": 0, "verdict_errors": 0, "would_verdict": 0,
+        #: Cards re-queued because the branch moved after the card was finished, under a
+        #: version that recorded the tip without re-queuing it: the heal for that state.
+        "healed": 0, "would_heal": 0,
         #: Status events the trailing sweep re-read: applied/closed only, never a proposal.
         "swept": 0})
     posted: int = 0
@@ -844,11 +854,14 @@ class Report:
         m = self.mentions
         if any(m.values()):
             out.append(f"mentions: {m['seen']} seen, {m['created']} reply task(s)"
+                       + (f", {m['requested']} review(s) re-queued" if m["requested"] else "")
                        + (f", {m['existing']} known" if m["existing"] else "")
                        + (f", {m['ignored']} from an untrusted author" if m["ignored"] else "")
                        + (f", {m['deferred']} waiting for the next poll" if m["deferred"] else "")
                        + (f", {m['would_create']} would create a task"
-                          if self.dry_run and m["would_create"] else ""))
+                          if self.dry_run and m["would_create"] else "")
+                       + (f", {m['would_request']} would re-queue a review"
+                          if self.dry_run and m["would_request"] else ""))
         out.append(f"prs:     {p['seen']} seen, {p['signalled']} signalled,"
                    f" {p['merged']} merged, {p['existing']} known"
                    + (f", {p['held']} held for an answer" if p["held"] else "")
@@ -860,6 +873,10 @@ class Report:
                    + (f", {p['tasks']} review task(s)" if p["tasks"] else "")
                    + (f", {p['revisions']} revision(s)" if p["revisions"] else "")
                    + (f", {p['reopened']} card(s) reopened" if p["reopened"] else "")
+                   + (f", {p['healed']} card(s) re-queued for a newer tip"
+                      if p["healed"] else "")
+                   + (f", {p['would_heal']} would be re-queued"
+                      if self.dry_run and p["would_heal"] else "")
                    + (f", {p['approved']} card(s) finished by an approval"
                       if p["approved"] else "")
                    + (f", {p['changes']} fix card(s) queued" if p["changes"] else "")
@@ -1773,16 +1790,18 @@ def waiting_message(issue: Issue, label: str) -> str:
     ])
 
 
-def mention_title(kind: str, root_subject: str, author: str) -> str:
+def mention_title(kind: str, root_subject: str, author: str,
+                  role: Optional[Role] = None) -> str:
     """A reply task's title: short, and unambiguous about which thread it answers."""
     subject = (root_subject or "(no subject)").strip()
     if len(subject) > 80:
         subject = subject[:77].rstrip() + "..."
-    return f"Reply to {author[:14]}'s mention on {kind} \"{subject}\""
+    who = "" if role is None or role.name == GATEWAY else f" the {role.name} role"
+    return f"Reply to {author[:14]}'s mention{who} on {kind} \"{subject}\""
 
 
 def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, Any],
-                 target: Target, secret_file: str) -> str:
+                 target: Target, secret_file: str, role: Optional[Role] = None) -> str:
     """What a reply needs: the words, the thread, and the exact command that publishes it.
 
     The wording is the worker's to write -- this is a person asking the bot a question in
@@ -1790,19 +1809,25 @@ def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, A
     keeps the answer in the thread, and the key file is the only identity whose reply reads
     as the bot's own. Writing it here means the worker does not have to rediscover ngit's
     spelling of either.
+
+    When the comment names a role rather than the gateway, the body says which one, and a
+    role with no profile of its own (the Deps Bot) carries the command its answer actually
+    is: a run, not a message.
     """
     body = str(comment.get("content") or "").strip() or "(the comment has no words)"
     author = npub_of(str(comment.get("pubkey") or ""))
     comment_id = str(comment.get("id") or "")
     command = "pr" if kind == "PR" else "issue"
+    named = ("this gateway" if role is None or role.name == GATEWAY
+             else f"the {role.name} role ({role.npub or role.key})")
     if secret_file:
         publish = (f"ngit {command} comment {root_nevent} --body-file <path to your reply> "
                    f"--reply-to {comment_id} --nsec-file {secret_file}")
     else:
         publish = ("no reply key is configured (`ngit.reply_secret_file`): answer in the "
                    "channel instead and say why")
-    return "\n".join([
-        f"{author} mentioned this gateway on a {kind} in {target.address or target.repo}.",
+    lines = [
+        f"{author} mentioned {named} on a {kind} in {target.address or target.repo}.",
         "",
         "Their comment:",
         "",
@@ -1814,6 +1839,16 @@ def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, A
         f"Comment: {comment_id}",
         f"Author: {author}",
         "",
+    ]
+    if role is not None and role.how:
+        lines += [
+            f"The {role.name} role has no profile of its own. Its answer here is not a",
+            "paragraph: carry out the request with the command below and report what it did.",
+            "",
+            f"  {role.how}",
+            "",
+        ]
+    lines += [
         "Write one reply as this gateway (its own voice, not a summary of the repo) and publish",
         "it in the thread:",
         "",
@@ -1822,7 +1857,8 @@ def mention_body(*, kind: str, root: str, root_nevent: str, comment: dict[str, A
         "Then add a one-line comment on this task naming what you posted, and complete it.",
         "Do not change code, labels, or the issue/PR state, and do not reply with anything the",
         "comment did not ask for.",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def pr_question_message(pr: PullRequest, task_id: str, target: Target,
@@ -2457,6 +2493,7 @@ class Sync:
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
                  applied: Optional[AppliedSource] = None, self_npub: str = "",
                  verdicts: Optional[VerdictPublisherFn] = None,
+                 roles: Sequence[Role] = (),
                  now: Callable[[], float] = time.time):
         self.store = store
         self.board = board
@@ -2488,6 +2525,14 @@ class Sync:
         #: This gateway's own key, hex: a mention is a `p` tag naming it, and a comment that
         #: carries it is the one thing in a repo addressed to the bot rather than the repo.
         self.self_npub = str(self_npub or "").lower()
+        #: Every identity a comment can be addressed to, gateway first. Callers pass the ones
+        #: config defines (`roles.roles_from_config`); a bare pass still answers for itself,
+        #: which is the single-identity deployment this bridge grew up as.
+        self.roles = tuple(roles) or (
+            Role(name=GATEWAY, key=self.self_npub, npub=npub_of(self.self_npub),
+                 profile=self.config.mention_assignee or self.config.assignee,
+                 secret_file=self.config.reply_secret_file),
+        ) if self.self_npub else ()
         #: The keys this instance answers for, hex. A changes-requested verdict queues work,
         #: and the queue that can push to a PR's branch is the one that opened it: an
         #: external author's PR is left to them (and to whoever else watches the repo).
@@ -2911,14 +2956,17 @@ class Sync:
     # -- mentions --------------------------------------------------------
 
     def _mentions(self, report: Report, *, dry_run: bool) -> None:
-        """Turn a comment that names this gateway into one reply task.
+        """Route a comment that names one of this installation's roles.
 
-        A mention is a NIP-27 `p` tag naming this key on a kind-1111 comment whose root is an
-        issue or PR the bridge has linked -- the same read `read` uses for verdicts, kept
-        unfolded because the `p` tags are the whole signal. Only a trusted npub's mention
-        becomes work: a stranger can already file an issue, and a stranger's mention must not
-        be a second way to spend a worker turn. Every mention is remembered, refused ones
-        included, so the decision is made once and a re-poll cannot re-litigate it.
+        A request is a NIP-27 `p` tag naming a role's key on a kind-1111 comment whose root
+        is an issue or PR the bridge has linked, or the same key left in the words as a
+        `nostr:npub...` reference; the read is the one `read` uses for verdicts, kept
+        unfolded because the `p` tags are the whole signal. The gate is the control pane's
+        trusted npubs, on every plane: a stranger can already file an issue, and naming a bot
+        must not be a second way to spend a worker turn. The answer is the role's -- the
+        gateway replies, the review role re-queues the PR's review, a role with no profile
+        says what to run -- and it is remembered either way, refusals included, so the
+        decision is made once and a re-poll cannot re-litigate it.
         """
         key = self.target.key
         info: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -2927,7 +2975,7 @@ class Sync:
         for row in self.store.ngit_links(key, KIND_PR):
             info[str(row["source_id"])] = ("PR", _detail(row))
         roots = list(info)[:MAX_MENTION_ROOTS]
-        if not roots or not self.self_npub:
+        if not roots or not self.roles:
             return
         if self.state is None:
             report.notes.append("mentions: no relays to read comments from")
@@ -2942,18 +2990,18 @@ class Sync:
             report.errors.append(f"mentions: {type(exc).__name__}: {exc}"[:200])
             return
         budget = max(1, int(self.config.max_new or 1))
-        me = npub_of(self.self_npub)
         for root, events in grouped.items():
             kind, note = info.get(root, ("issue", {}))
             for event in sorted(events, key=lambda e: (int(e.get("created_at") or 0),
                                                        str(e.get("id") or ""))):
                 comment_id = str(event.get("id") or "")
-                if not comment_id or not self._mentions_me(event):
+                role = addressed(event, self.roles) if comment_id else None
+                if role is None:
                     continue
                 report.mentions["seen"] += 1
                 author = npub_of(str(event.get("pubkey") or ""))
-                if not author or author == me:
-                    continue                    # our own comment is not a mention to answer
+                if not author or author == role.npub:
+                    continue                    # a role's own comment is not a request
                 if self.store.ngit_mention(key, comment_id) is not None:
                     report.mentions["existing"] += 1
                     continue
@@ -2961,44 +3009,94 @@ class Sync:
                     if not dry_run:
                         self.store.ngit_mention_save(key, comment_id,
                                                      detail={"author": author, "root": root,
+                                                             "role": role.name,
                                                              "why": "untrusted author"})
                     report.mentions["ignored"] += 1
                     continue
                 if budget <= 0:
                     report.mentions["deferred"] += 1
                     continue
+                action = REVIEW_ACTION if (role.action == REVIEW_ACTION
+                                           and kind == "PR") else ""
                 if dry_run:
-                    report.mentions["would_create"] += 1
+                    if action:
+                        report.mentions["would_request"] += 1
+                    else:
+                        report.mentions["would_create"] += 1
+                    continue
+                if action:
+                    why = self._review_requested(role=role, root=root, note=note,
+                                                 comment=event, author=author,
+                                                 report=report)
+                    self.store.ngit_mention_save(key, comment_id,
+                                                 detail={"author": author, "root": root,
+                                                         "role": role.name,
+                                                         "action": action, "why": why})
+                    budget -= 1
                     continue
                 task_id = self.board.create(
-                    title=mention_title(kind, str(note.get("subject") or ""), author),
+                    title=mention_title(kind, str(note.get("subject") or ""), author,
+                                        role=role),
                     body=mention_body(kind=kind, root=root,
                                       root_nevent=str(note.get("nevent") or root),
                                       comment=event, target=self.target,
-                                      secret_file=self.config.reply_secret_file),
-                    assignee=self.config.mention_assignee or self.config.assignee,
+                                      secret_file=role.secret_file
+                                      or self.config.reply_secret_file,
+                                      role=role),
+                    assignee=(role.profile or self.config.mention_assignee
+                              or self.config.assignee),
                     status="ready", idempotency_key=f"ngit:mention:{comment_id}",
                     anchor=self.anchor, priority=self.config.priority)
                 self.store.ngit_mention_save(key, comment_id, task_id=task_id,
                                              detail={"author": author, "root": root,
-                                                     "kind": kind})
+                                                     "role": role.name, "kind": kind})
                 budget -= 1
                 report.mentions["created"] += 1
 
-    def _mentions_me(self, event: Mapping[str, Any]) -> bool:
-        """True when a comment names this gateway: a `p` tag, or its key in the words.
+    def _review_requested(self, *, role: Role, root: str, note: Mapping[str, Any],
+                          comment: Mapping[str, Any], author: str,
+                          report: Report) -> str:
+        """Put a PR's review back in the queue for a person's request; "" when it is queued.
 
-        The tag is the NIP-27 spelling and what gitworkshop writes for an `@npub` mention.
-        The text fallback exists because a client that dropped the tag still leaves the
-        `nostr:npub…` reference in the body, and answering a person's question matters more
-        than insisting on their client's correctness.
+        The review role's answer is not a message, it is the review: a request that names it
+        on a PR makes the same transition a revision makes, to the tip the PR carries now. A
+        request that is older than the card's own completion is already answered -- the
+        review it asked for happened -- and re-queuing it would review a tip nobody asked
+        about, in a thread that has moved on. The return value is the reason it did nothing,
+        written to the store so the decision is made once.
         """
-        for tag in event.get("tags") or ():
-            if (isinstance(tag, (list, tuple)) and len(tag) >= 2 and str(tag[0]) == "p"
-                    and str(tag[1]).lower() == self.self_npub):
-                return True
-        body = str(event.get("content") or "").lower()
-        return bool(body) and (self.self_npub in body or npub_of(self.self_npub) in body)
+        link = self.store.ngit_link(self.target.key, KIND_PR, root)
+        if link is None:
+            return "no review card is linked to this PR"
+        detail = _detail(link)
+        if str(link.get("state") or "") in ("merged", "closed") or detail.get("merge"):
+            return "the PR is applied or closed"
+        task_id = self._review_anchor(link)
+        task = self.board.task(task_id) if task_id else None
+        if task is None:
+            return "the PR has no review card"
+        status = str(task.get("status") or "")
+        if status in (READY, "running"):
+            return "the review is already queued"
+        if (status == DONE
+                and int(task.get("completed_at") or 0) >= int(comment.get("created_at") or 0)):
+            return "the card was finished after this request"
+        if status == BLOCKED and not self.board.parked_by_bridge(task_id):
+            return "the card waits on a person's question"
+        tip = str(detail.get("tip") or detail.get("commit") or "")
+        brief = self._review_brief(task, detail, pr_id=root, tip=tip)
+        comment_id = str(comment.get("id") or "")
+        text = (f"Re-review requested by {author} in comment {comment_id[:12]}"
+                + (f", for the tip the PR carries ({tip[:12]})." if tip
+                   else ", for the tip the PR carries.")
+                + "\n\nThe request names the review role, so the review is back in the queue"
+                  " for that tip.")
+        if not self.board.reopen(task_id, author="ngit", comment=text,
+                                 statuses=(REVIEW, DONE, BLOCKED), body=brief):
+            return "the card moved while the request was read"
+        report.mentions["requested"] += 1
+        log.info("ngit: re-review of %s queued by %s in %s", task_id, author, comment_id[:12])
+        return ""
 
     # -- pull requests ---------------------------------------------------
 
@@ -3211,6 +3309,11 @@ class Sync:
         # label walk reads the card in the state this pass leaves it.
         self._revisions(feed, report, dry_run=dry_run)
         settled.extend(revision.created_at for revision in feed.revisions)
+
+        # A card finished before the tip its PR carries is the state a revision makes and a
+        # missed one leaves behind: the same transition, asked of the board instead of the
+        # poll, so a move recorded under an older version is not stuck behind a verdict.
+        self._stale_reviews(report, dry_run=dry_run)
 
         # The other end of the fix hand-off: a worker that pushed and parked says where it
         # left the branch, and the card goes back to the review queue. Before the guards so
@@ -3578,6 +3681,53 @@ class Sync:
             # hand), or one waiting on a human: the tip is still recorded, so the label
             # and any later pass read it.
             self._save_detail(link, note, task_id=task_id)
+
+    def _stale_reviews(self, report: Report, *, dry_run: bool) -> None:
+        """Re-queue a card that was finished before the tip its PR now carries.
+
+        The state this heals is a card and a link that disagree: the row records a tip the
+        PR moved to *after* the card was completed, and nothing re-opened the card for it.
+        A revision that arrives while the bridge is running makes that transition itself;
+        one recorded by an earlier version (which wrote the tip and had no re-open), or by a
+        pass that found the card in a state it would not touch, leaves the PR with a verdict
+        for an older tip and no reviewer looking at the new one. The link is the evidence and
+        the board is the state, so the heal is the same comparison a revision makes, asked
+        again on every pass -- and it is a no-op once the card is back in the queue.
+        """
+        for link in self.store.ngit_links(self.target.key, KIND_PR):
+            if str(link.get("state") or "") in ("merged", "closed"):
+                continue
+            note = _detail(link)
+            if note.get("merge"):
+                continue                       # applied is final
+            tip = str(note.get("tip") or note.get("commit") or "")
+            tip_at = int(note.get("tip_at") or 0)
+            if not tip or not tip_at:
+                continue
+            task_id = self._review_anchor(link)
+            task = self.board.task(task_id) if task_id else None
+            if task is None or str(task.get("status") or "") != DONE:
+                continue
+            if tip_at <= int(task.get("completed_at") or 0):
+                continue                       # the card was finished after the move
+            if dry_run:
+                report.prs["would_heal"] += 1
+                continue
+            pr_id = str(link.get("source_id") or "")
+            brief = self._review_brief(task, note, pr_id=pr_id, tip=tip)
+            try:
+                if self.board.reopen(
+                        task_id, author="ngit", statuses=(DONE,), body=brief,
+                        comment=(f"The branch moved to {tip[:12]} at "
+                                 f"{_when(tip_at)}, after this card was finished. The card"
+                                 " is back in the queue for the tip the PR carries -- its"
+                                 " verdict covered the commit before it.")):
+                    report.prs["healed"] += 1
+                    log.info("ngit: re-queued %s for PR %s at %s (finished before the move)",
+                             task_id, pr_id[:8], tip[:12])
+            except (BoardError, sqlite3.Error) as exc:
+                report.prs["review_errors"] += 1
+                report.errors.append(f"stale review of PR {pr_id[:8]}: {exc}")
 
     def _released_fixes(self, report: Report, *, dry_run: bool) -> None:
         """Put a fixed card back in the review queue: the worker's park is the news.
