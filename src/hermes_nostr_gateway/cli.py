@@ -47,6 +47,7 @@ from .profiles import (
 )
 from .projects import Project, ProjectMap, checks_for, load_registry, project_for_conversation
 from .publisher import publish
+from .roles import roles_from_config
 from .routing import Route, Router, RoutingConfigError
 from .store import Store, drops_ttl_seconds
 
@@ -1483,6 +1484,11 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
     if reply_secret:
         reply_secret = os.path.abspath(os.path.expanduser(reply_secret))
     ngit_cfg = replace(ngit_cfg, reply_secret_file=reply_secret)
+    # Every identity a comment can be addressed to. The gateway's own key is first, and the
+    # bots come from the keys config already names -- the review role through the same
+    # reviewer derivation the verdict gate uses, the Deps Bot through `deps.signer`. A plane
+    # does not keep its own list: it resolves against this one.
+    roles = roles_from_config(cfg, self_npub=crypto.our_pubkey(), reviewers=reviewers)
     notifier = bridge.DaemonNotifier(
         os.path.expanduser(str(getattr(args, "socket", None) or cfg.get("socket")
                               or default_socket_path())))
@@ -1494,7 +1500,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         statuses=prs.statuses if prs is not None else None,
         sweep=prs.sweep if prs is not None else None,
         notify=notifier, anchor=anchor, labels=labeler, state=state,
-        self_npub=crypto.our_pubkey(), verdicts=verdicts)
+        self_npub=crypto.our_pubkey(), verdicts=verdicts, roles=roles)
     return board, sync, note
 
 

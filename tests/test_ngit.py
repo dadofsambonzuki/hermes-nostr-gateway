@@ -22,9 +22,11 @@ import nostr_sdk as sdk
 import pytest
 
 from hermes_nostr_gateway import cli, kanban, ngit, ngit_labels, ngit_verdict, pr_status
+from hermes_nostr_gateway import roles as roles_mod
 from hermes_nostr_gateway.applied import Evidence
 from hermes_nostr_gateway.control import ControlConfig
 from hermes_nostr_gateway.kanban import Anchor, Board
+from hermes_nostr_gateway.roles import Role
 from hermes_nostr_gateway.store import Store
 
 COMMUNITY = "ab" * 32
@@ -37,6 +39,8 @@ TRUSTED_HEX = "11" * 32
 STRANGER_HEX = "22" * 32
 OTHER_HEX = "33" * 32
 SELF_HEX = "44" * 32
+REVIEW_HEX = "55" * 32
+DEPS_HEX = "66" * 32
 CHANNEL_ID = "cd" * 32
 
 
@@ -206,6 +210,7 @@ class Harness:
                  notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
                  applied: FakeApplied | None = None, sweep=None, verdicts=None,
                  owns: tuple[str, ...] = (TRUSTED_HEX,),
+                 roles: tuple | None = None,
                  now: Callable[[], float] = time.time):
         self.home = home
         self.store = store
@@ -258,6 +263,16 @@ class Harness:
                                     owns=owns)
         self.anchor = anchor
         self.self_npub = SELF_HEX
+        #: Every identity a comment can name. The gateway's own key plus the review role,
+        #: which is what production derives from `ngit.review_secret_file`. A test that
+        #: wants the Deps Bot (or no roles at all) replaces the tuple.
+        self.roles = roles if roles is not None else (
+            Role(name=roles_mod.GATEWAY, key=SELF_HEX, npub=npub(SELF_HEX),
+                 profile="default", secret_file="/etc/example/reply.json"),
+            Role(name=roles_mod.REVIEW, key=REVIEW_HEX, npub=npub(REVIEW_HEX),
+                 profile="review", action=roles_mod.REVIEW_ACTION,
+                 secret_file="/etc/example/review.json"),
+        )
         self.notifier = notifier or (lambda who, text, key="": self.messages.append((who, text)))
         self.repo = home.parent / "checkout"
         self.repo.mkdir(exist_ok=True)
@@ -406,7 +421,8 @@ class Harness:
             prs=self.prs, statuses=self.statuses, sweep=self.sweep,
             notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state, applied=self.applied,
-            self_npub=self.self_npub, verdicts=self.verdict_publisher, now=self.now)
+            self_npub=self.self_npub, verdicts=self.verdict_publisher, roles=self.roles,
+            now=self.now)
 
     def task(self, task_id: str):
         return self.board.task(task_id)
@@ -4696,13 +4712,14 @@ def test_the_gate_can_be_turned_off(harness):
 # -- mentions ----------------------------------------------------------------
 
 def mention_event(seed: str, *, author: str = TRUSTED_HEX, root: str,
-                  content: str = "what does this do?", tags: list | None = None) -> dict:
+                  content: str = "what does this do?", tags: list | None = None,
+                  created_at: int = 100) -> dict:
     """A NIP-22 comment, the way gitworkshop writes an @npub mention."""
     return {
         "id": event_id(seed),
         "pubkey": author,
         "kind": ngit_labels.KIND_COMMENT,
-        "created_at": 100,
+        "created_at": created_at,
         "content": content,
         "tags": tags if tags is not None else [
             ["E", root, "", REPO_OWNER], ["K", "1621"], ["P", REPO_OWNER],
@@ -4791,6 +4808,117 @@ def test_a_mention_on_a_pull_request_uses_the_pr_command(harness):
     reply = [task for task in harness.tasks() if task["idempotency_key"].startswith(
         "ngit:mention:")][0]
     assert "on PR" in reply["title"] and "ngit pr comment" in reply["body"]
+
+
+def finish_card(harness, task_id: str, at: int) -> None:
+    """Put a card in `done` at a chosen second: the fact a re-review turns on.
+
+    The board refuses `done` on an open PR card today, so this uses the same escape the
+    label tests do (drop this card's trigger) -- the state being simulated is one written
+    before that guard existed, which is exactly the state the bridge has to heal.
+    """
+    set_review_status(harness, task_id, "done", force=True)
+    harness.board.db.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (at, task_id))
+    harness.board.db.commit()
+
+
+def move_tip(harness, pr_id: str, tip: str, at: int) -> None:
+    """Record a branch moving, the way a revision pass does: the tip and when it moved."""
+    row = harness.store.ngit_link(ADDRESS, ngit.KIND_PR, pr_id)
+    detail = json.loads(row["detail"])
+    detail["tip"], detail["tip_at"] = tip, at
+    harness.store.ngit_link_save(ADDRESS, ngit.KIND_PR, pr_id, state=str(row["state"]),
+                                 task_id=str(row["task_id"] or ""), detail=detail)
+
+
+def test_a_review_request_on_a_pr_puts_its_review_back_in_the_queue(harness):
+    """A comment that names the review role is work, not a message: the card goes back."""
+    pr, task_id = pr_with_review_task(harness)
+    finish_card(harness, task_id, at=1500)   # after the tip the link already records
+    harness.comments_by_root[pr.id] = [mention_event(
+        "r1", root=pr.id, created_at=2000,
+        content=f"nostr:{npub(REVIEW_HEX)} - re-review pls.",
+        tags=[["E", pr.id], ["K", "1618"], ["p", REVIEW_HEX]])]
+
+    report = harness.sync()
+
+    assert report.mentions["requested"] == 1 and report.mentions["created"] == 0
+    assert harness.task(task_id)["status"] == "ready"
+    assert any("Re-review requested" in comment["body"]
+               for comment in harness.comments(task_id))
+    row = harness.store.ngit_mention(ADDRESS, event_id("r1"))
+    assert not row["task_id"] and json.loads(row["detail"])["role"] == roles_mod.REVIEW
+
+    # The decision is made once: the same comment on the next poll is known, not replayed.
+    again = harness.sync()
+    assert again.mentions["requested"] == 0 and again.mentions["existing"] == 1
+
+
+def test_a_review_request_older_than_the_card_is_not_replayed(harness):
+    """The review it asked for already happened; re-queuing it would review a stale tip."""
+    pr, task_id = pr_with_review_task(harness)
+    finish_card(harness, task_id, at=1500)
+    harness.comments_by_root[pr.id] = [mention_event(
+        "r2", root=pr.id, created_at=900,
+        content=f"nostr:{npub(REVIEW_HEX)} please look again",
+        tags=[["E", pr.id], ["K", "1618"], ["p", REVIEW_HEX]])]
+
+    report = harness.sync()
+
+    assert report.mentions["requested"] == 0
+    assert harness.task(task_id)["status"] == "done"
+    row = harness.store.ngit_mention(ADDRESS, event_id("r2"))
+    assert "finished after this request" in json.loads(row["detail"])["why"]
+
+
+def test_a_mention_of_a_role_without_a_profile_becomes_a_task_to_run_it(harness):
+    """The Deps Bot's answer is a run, not a reply: the task carries the command."""
+    extra = roles_mod.roles_from_config({"deps": {"signer": npub(DEPS_HEX)}},
+                                        self_npub=SELF_HEX)
+    assert [role.name for role in extra] == [roles_mod.GATEWAY, roles_mod.DEPS]
+    harness.roles = harness.roles + extra[1:]
+    issue = make_issue("g1")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.comments_by_root[issue.hex] = [mention_event(
+        "g2", root=issue.hex, content=f"nostr:{npub(DEPS_HEX)} is this bumped?",
+        tags=[["E", issue.hex], ["K", "1621"], ["p", DEPS_HEX]])]
+
+    harness.sync()
+
+    task = [task for task in harness.tasks()
+            if str(task["idempotency_key"]).startswith("ngit:mention:")][0]
+    assert task["assignee"] == "default"
+    assert "hng deps run --repo" in task["body"]
+    assert roles_mod.DEPS in task["title"]
+
+
+def test_a_card_finished_before_the_branch_moved_is_requeued(harness):
+    """The heal for a tip recorded without a re-open: the card goes back for the new tip."""
+    pr, task_id = pr_with_review_task(harness)
+    finish_card(harness, task_id, at=1000)
+    move_tip(harness, pr.id, "b" * 40, at=1100)
+
+    report = harness.sync()
+
+    assert report.prs["healed"] == 1
+    assert harness.task(task_id)["status"] == "ready"
+    assert any("branch moved" in comment["body"] for comment in harness.comments(task_id))
+    # One heal per state, not one per poll.
+    again = harness.sync()
+    assert again.prs["healed"] == 0
+
+
+def test_a_card_finished_after_the_tip_moved_is_left_alone(harness):
+    """The reviewer read the branch after the move: nothing is stale."""
+    pr, task_id = pr_with_review_task(harness)
+    move_tip(harness, pr.id, "b" * 40, at=100)
+    finish_card(harness, task_id, at=200)
+
+    report = harness.sync()
+
+    assert report.prs["healed"] == 0
+    assert harness.task(task_id)["status"] == "done"
 
 
 def test_issue_labels_accepts_any_namespace_and_keeps_the_author():

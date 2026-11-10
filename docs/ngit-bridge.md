@@ -283,6 +283,31 @@ the gateway's own identity). The wording is the worker's; the bridge does not an
 credential rather than a file leaves `reply_secret_file` empty, in which case the task says
 the reply cannot be published and why.
 
+## Roles: who a comment can address
+
+The gateway is not the only identity a person can address. Every role the installation defines
+is resolvable from the same comment, and `roles.roles_from_config` builds the list from keys
+config already names — so enrolling a bot is naming its key, not maintaining a second registry:
+
+| Role | Key from | Answer |
+|---|---|---|
+| `gateway` | `identity` | a reply task: the profile answers in the thread |
+| `review` | `ngit.review_secret_file` (through the same reviewer derivation the verdict gate uses) | the PR's review card goes back in the queue — a verdict, not a message |
+| `deps` | `deps.signer` | a task carrying the run its answer actually is: `hng deps run --repo <name>` |
+
+The resolution is `roles.addressed`: a `p` tag, or the `nostr:npub…` reference in the words, and
+role order decides a comment that names two of ours (the gateway first — the general profile
+answering is the safe default). The gate is the same one on every plane — `control.trusted_npubs`
+— because authorisation is a property of the person, not of the transport. A plane that learns
+to read a new kind of message calls `addressed` and the gate; it does not grow its own rule.
+
+A request that names the review role on a PR is the transition a revision makes: the card goes
+back to `ready` for the tip the PR carries, with the review brief and a comment naming the
+requesting comment. A request older than the card's own completion is answered already — the
+review it asked for happened — so it is recorded and not replayed; re-queuing it would review a
+tip nobody asked about. A role with no profile of its own (the Deps Bot) gets a task that says
+what to run and to comment back with what it did, because its answer is a run.
+
 ## Answering a held issue or PR
 
 ```bash
@@ -532,6 +557,16 @@ Three properties the pass keeps:
 `ngit.verdicts: false` turns the publication off; with no `review_secret_file` the pass
 publishes nothing and says so in its report — a deployment that has not adopted the review bot
 is quiet, not broken.
+
+**A card finished before the tip moved is re-queued.** A revision re-opens the card for the new
+tip, but the row records the tip whether or not the re-open happened: a move read by a version
+without that transition, or by a pass that found the card in a state it would not touch, leaves
+the PR with a verdict for an older commit and no reviewer looking at the new one — the same
+silence as a dropped revision, and invisible in every count. So each pass also asks the board
+the question the revision asks: a PR still open, whose link records a tip newer than its card's
+completion, gets that card back in the queue (`healed` in the report) with the review brief and
+a comment naming the move. It is the comparison, not the event, that is remembered, so the heal
+is a no-op once the card is queued and cannot loop.
 
 ## The label on the PR
 

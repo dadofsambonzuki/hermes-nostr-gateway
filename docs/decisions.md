@@ -1306,3 +1306,34 @@ five and quotes the newest three card comments, and a trimmed history says how m
 out rather than pretending to be the whole thread. A PR that has been round the loop ten times
 still gets a brief that fits in a card body, and the pointer to the PR's thread is what makes
 the truncation safe: the complete record never moved.
+
+## A comment to a bot is work, and the gate is the person
+
+The review bot was addressable in principle and unreachable in practice. A `p` tag naming its
+key was read by nothing: the mention pass compared against the gateway's own key, and every
+other comment on a PR was read only for a verdict — so "Review Bot - re-review pls." sat in the
+thread while the card stayed finished and the label stayed `changes-required` on a tip nobody
+would look at.
+
+**Roles are derived, not registered.** The gateway's key, the reviewer's (from
+`ngit.review_secret_file`, through the derivation the verdict gate already uses) and the Deps
+Bot's (`deps.signer`) are the identities this installation speaks as, and `roles.addressed`
+resolves any of them from the same comment. Adding a bot is naming its key. A plane that reads a
+new kind of message calls `addressed` and the one gate; it does not grow its own list.
+
+**The gate belongs to the person, not the transport.** `control.trusted_npubs` decides whether a
+request is work, exactly as it does for a mention, because naming a bot must not be a second way
+to spend a worker turn. What differs by role is only the answer: the gateway replies in the
+thread, the review role re-queues the PR's review (its answer *is* a verdict), and a role with
+no profile — the Deps Bot — gets a task carrying the run that answers it.
+
+**A request older than the card is answered already.** The card's completion time is the fact
+that separates a request from a replay: re-queuing a review that has since happened would review
+a tip nobody asked about. The decision is recorded once, refusals included, like every other
+comment decision.
+
+**The heal is a comparison, not an event.** The same pass also asks the board what a revision
+asks: a still-open PR whose link records a tip newer than its card's completion has a card behind
+its branch, whether or not the revision was noticed. That is the state an older version left
+behind — it wrote the tip and had no re-open — and the state a missed event leaves. Comparing
+costs one row per PR and cannot loop; waiting for the event again would wait forever.
