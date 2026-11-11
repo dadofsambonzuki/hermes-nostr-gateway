@@ -1788,11 +1788,22 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def ngit_link_for_task(self, task_id: str) -> dict[str, Any] | None:
-        row = self.db.execute(
-            "SELECT * FROM ngit_links WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1",
-            (str(task_id),),
-        ).fetchone()
+    def ngit_link_for_task(self, task_id: str, kind: int | None = None
+                           ) -> dict[str, Any] | None:
+        """The newest link this card holds, optionally of one kind.
+
+        A card can hold more than one: a work card began as an issue and can also be a
+        PR's review card, so the newest row is not necessarily the one a caller means.
+        `kind` says which; without it the newest is what a caller that wants "the card's
+        link" gets.
+        """
+        sql = "SELECT * FROM ngit_links WHERE task_id = ?"
+        args: list[Any] = [str(task_id)]
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(int(kind))
+        sql += " ORDER BY updated_at DESC LIMIT 1"
+        row = self.db.execute(sql, tuple(args)).fetchone()
         return dict(row) if row is not None else None
 
     def ngit_link_for_source(self, kind: int, source_id: str) -> dict[str, Any] | None:

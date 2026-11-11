@@ -8,7 +8,9 @@
 #       4 a card workspace (not the operator's), 5 the live checkout moved,
 #       6 a commit does not say which card wrote it, 7 the card is not in review or done,
 #       8 merged, but the applied record (kind-1631) did not publish,
-#       9 no approved verdict from a permitted reviewer covering this tip.
+#       9 no approved verdict from a permitted reviewer covering this tip,
+#      10 merged and applied, but the resolved record (kind-1631) for an issue the card
+#         came from did not publish.
 #
 # Why by PR id and not by branch: this repository's remote is an ngit remote, and a
 # fetch prunes `pr/*` refs back to `master`. `git merge origin/pr/...` therefore fails
@@ -261,4 +263,25 @@ if ! record=$("${record_cmd[@]}" 2>&1); then
 fi
 echo "OK   applied $pr | $tests | master $(git -C "$REPO" rev-parse --short origin/master)"
 echo "     $record"
+
+# The issue half. A card that began life as an issue has an `ngit_links` row naming that
+# issue, and this merge is the issue's answer: publish one kind-1631 resolution per linked
+# issue, through the same key and relay set as the applied record. A card with no issue link
+# is a quiet no-op -- most cards have none -- and the command reads the issue's status first,
+# so running it twice publishes once. The applied record above stays published whatever
+# happens here; exit 10 says the merge landed and the issue still reads open.
+resolved_cmd=("${hng[@]}" ngit resolved)
+for value in $cards; do
+  [ "$value" = operator ] && continue
+  if ! resolved=$("${resolved_cmd[@]}" --card "$value" --pr "$pr" --commit "$commit" \
+      --repo "$REPO" "${nsec[@]}" 2>&1); then
+    echo "FAIL resolved $pr: content and the applied record are in; an issue's resolution is not"
+    printf '%s\n' "$resolved" | sed 's/^/     /' | head -3
+    echo "     card $value is linked to an issue that still reads unresolved. Retry:"
+    printf '     '; printf '%q ' "${resolved_cmd[@]}" --card "$value" --pr "$pr" \
+      --commit "$commit" --repo "$REPO" "${nsec[@]}"; echo
+    exit 10
+  fi
+  [ -n "$resolved" ] && printf '%s\n' "$resolved"
+done
 

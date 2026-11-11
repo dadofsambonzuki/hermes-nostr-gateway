@@ -10,6 +10,9 @@ the same lookup serves the inbound and the outbound half of this module:
                                    the gateway, the PR's review re-queued for the review
                                    role, the run to make for a role with no profile -- from
                                    a trusted npub only, on the same gate on every plane
+              kind-1631 resolved -> the issue the card's work answered is resolved by a
+                                   merge: the link moves to `resolved`, one line in the
+                                   channel, and a card still open is completed by it
     outbound  kind-1618 PR       -> one "ready for review" message in the channel, and one
                                    review task on that board (a verdict, never a merge:
                                    merging is the operator's)
@@ -795,7 +798,10 @@ class Report:
     issues: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "ready": 0, "held": 0, "existing": 0,
         "comments": 0, "comments_skipped": 0, "deleted": 0, "deferred": 0,
-        "would_create": 0, "waiting": 0, "would_wait": 0, "would_post": 0})
+        "would_create": 0, "waiting": 0, "would_wait": 0, "would_post": 0,
+        #: Issues a maintainer's kind-1631 resolved: the link moved and the card (if one
+        #: was still open) was finished by it.
+        "resolved": 0, "would_resolve": 0})
     mentions: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "existing": 0, "ignored": 0, "deferred": 0,
         "would_create": 0, "requested": 0, "would_request": 0})
@@ -845,11 +851,14 @@ class Report:
         i, p = self.issues, self.prs
         out.append(f"issues:  {i['seen']} seen, {i['created']} created ({i['ready']} ready,"
                    f" {i['held']} held), {i['existing']} known, {i['comments']} comment(s)"
+                   + (f", {i['resolved']} resolved" if i["resolved"] else "")
                    + (f", {i['waiting']} waiting for a ready label" if i["waiting"] else "")
                    + (f", {i['deleted']} deleted by hand" if i["deleted"] else "")
                    + (f", {i['deferred']} waiting for the next poll" if i["deferred"] else "")
                    + (f", {i['would_wait']} would wait for a ready label"
                       if self.dry_run and i["would_wait"] else "")
+                   + (f", {i['would_resolve']} would resolve"
+                      if self.dry_run and i["would_resolve"] else "")
                    + (f", {i['would_create']} would be created" if self.dry_run else ""))
         m = self.mentions
         if any(m.values()):
@@ -1122,8 +1131,11 @@ def is_future(created_at: int, now: float, *, skew_s: int = 300) -> bool:
 
 def merge_from_event(event: dict[str, Any],
                      maintainers: Sequence[str] | None = None) -> Optional[Merge]:
-    """A kind-1631 that refers to a PR. Resolved issues come through here too; the caller
-    only asks about PR ids it already knows, so an issue's resolution cannot post a merge.
+    """A kind-1631 that refers to a root: a PR applied, or an issue resolved.
+
+    NIP-34 spells both with one kind and the root id decides which the caller sees. The pass
+    asks only about roots it links (see `Sync._status_roots`), and the link's kind is what
+    decides whether a result means "the PR landed" or "the issue was answered".
 
     The commit comes from whichever spelling the publisher used: NIP-34's `merge-commit` or
     ngit's `merge-commit-id`. Only when neither names one is `applied-as-commits` read, which
@@ -1326,11 +1338,12 @@ class RelayPrs:
     Two reads, because NIP-34 spells a status twice over. Kinds 1618/1619/1631/1632 are
     fetched under the repository's `#a` filter -- a proposal with no `a` cannot be
     attributed to a repository, so attributing one would mean reading every ngit repo's
-    PRs. Kinds 1631/1632 alone are also fetched by `#e` over the PR ids the caller already
-    knows, because `ngit pr close` publishes a status with `e`/`alt`/`p` and no `a`: the
-    `#a` read can never return it, and the relay's `e` index can. Attribution of a status
-    is by id already (`merge_from_event`/`closed_from_event` resolve the root the caller
-    asks about), so the wider read cannot act on a PR the board does not link.
+    PRs. Kinds 1631/1632 alone are also fetched by `#e` over the root ids the caller already
+    knows (PRs and issues alike), because `ngit pr close` publishes a status with
+    `e`/`alt`/`p` and no `a`: the `#a` read can never return it, and the relay's `e` index
+    can. Attribution of a status is by id already (`merge_from_event`/`closed_from_event`
+    resolve the root the caller asks about), so the wider read cannot act on a root the
+    board does not link.
 
     The trust rule is per kind, and it is a second split on top of that. Proposals and
     revisions are read from everyone -- a stranger's PR must be seen so it can be *held*,
@@ -2318,6 +2331,19 @@ def merged_message(pr: PullRequest | None, merge: Merge, nevent: str = "") -> st
     return f'PR "{pr.subject}" by {pr.author} {how}\n{pr.nevent or nevent}'
 
 
+def resolved_message(issue: Issue | None, merge: Merge) -> str:
+    """One line for an issue a maintainer's status record resolved: the merge, in words.
+
+    It says *what* landed, not just that something did: the commit is the fact a reader can
+    check, and the issue's own reference is what the line is about.
+    """
+    how = f"resolved as {merge.commit}" if merge.commit else "resolved"
+    if issue is None or not issue.subject:
+        where = issue.id if issue is not None and issue.id else merge.pr_id
+        return f"issue {where} {how}"
+    return f'issue "{issue.subject}" by {issue.author} {how}\n{issue.id}'
+
+
 def review_verdict_message(pr_id: str, verdict: str, task_id: str) -> str:
     """The one line a published verdict puts in the channel.
 
@@ -2490,6 +2516,10 @@ def notice_state(kind: int, notice: str) -> str:
         # keep saying `waiting` so the next pass re-reads the label instead of assuming a
         # question was asked (or that a hand-deleted task was decided).
         return "waiting"
+    if notice == "resolved":
+        # A resolution is final for the issue: the record that said so is the state, and
+        # the delivery must not fall through to `ready` and reopen what it just closed.
+        return "resolved"
     return "ready"
 
 
@@ -2803,6 +2833,14 @@ class Sync:
         # `ready` label was on it. It must fall through to the label check, not to the
         # deleted-by-hand branch.
         waiting = bool(link is not None and task is None and link.get("state") == "waiting")
+        # A resolution with no card is final: there is no work to queue and the channel was
+        # told when it landed. It must not read as a task a person deleted, and must not
+        # fall through and be re-created as new work.
+        resolved = bool(link is not None and task is None and link.get("state") == "resolved")
+
+        if resolved:
+            report.issues["existing"] += 1
+            return "resolved"
 
         if link is not None and task is None and not waiting:
             if not recreate:
@@ -2969,6 +3007,60 @@ class Sync:
                 continue
             self.store.ngit_note_comment(key, ref.hex, comment.hex, task_id)
             report.issues["comments"] += 1
+
+    def _resolve_issues(self, merges: Sequence[Merge], report: Report, *,
+                        dry_run: bool) -> None:
+        """Finish the work of an issue a maintainer resolved with a kind-1631.
+
+        The record that resolves an issue is the same status a merge publishes, naming the
+        issue root instead of a PR. `_authorised_feed` has already checked its author; this
+        asks whether the root is an issue this board links, and if so the link moves to
+        `resolved`, the channel is told once, and a card that is still open is completed by
+        the merge. A root the board does not link is ignored, exactly as for a PR: the pass
+        narrates what it watched, not the repository's whole history.
+        """
+        for merge in sorted(merges, key=lambda item: (item.created_at, item.pr_id)):
+            link = self.store.ngit_link(self.target.key, KIND_ISSUE, merge.pr_id)
+            if link is None or str(link.get("state") or "") == "resolved":
+                continue
+            if dry_run:
+                report.issues["would_resolve"] += 1
+                continue
+            note = _detail(link)
+            issue = Issue(id=str(note.get("nevent") or merge.pr_id), hex=merge.pr_id,
+                          author=str(note.get("author") or ""),
+                          subject=str(note.get("subject") or ""))
+            # The notice first and the state second: a pass cut off between them leaves
+            # the link unresolved, and the next pass queues the same notice row again --
+            # `ngit_notice_put` refuses a second copy, so there is still exactly one.
+            self._enqueue(KIND_ISSUE, merge.pr_id, "resolved", resolved_message(issue, merge))
+            note["resolved"] = merge.commit
+            if merge.event_id:
+                note["resolved_event"] = merge.event_id
+            self.store.ngit_link_save(self.target.key, KIND_ISSUE, merge.pr_id,
+                                      state="resolved", detail=note)
+            report.issues["resolved"] += 1
+            task_id = str(link.get("task_id") or "")
+            task = self.board.task(task_id) if task_id else None
+            if task is None or str(task.get("status") or "") in (DONE, "archived"):
+                continue
+            how = applied_how(merge)
+            what = f'issue "{issue.subject}"' if issue.subject else f"issue {merge.pr_id}"
+            try:
+                # A work card is not normally guarded; the release covers the card that is
+                # also a PR's, where a merge record is the proof the guard waits for.
+                self.board.release_guard(task_id, merge_commit=merge.commit)
+                if self.board.complete(
+                    task_id, author="ngit",
+                    comment=f"{what} is resolved by the merge ({how})."
+                            + (f" {issue.id}" if issue.id else ""),
+                    result=f"Issue {merge.pr_id} is resolved: the work is on master ({how}).",
+                ):
+                    log.info("ngit: completed %s for resolved issue %s", task_id,
+                             merge.pr_id[:8])
+            except (BoardError, sqlite3.Error) as exc:
+                report.errors.append(
+                    f"issue card {task_id} for resolved issue {merge.pr_id[:8]}: {exc}")
 
     # -- mentions --------------------------------------------------------
 
@@ -3160,6 +3252,10 @@ class Sync:
         # as in the filter. Refused events are returned as timestamps: they are dealt with,
         # as refusals, so the cursor may move past them.
         feed, refused = self._authorised_feed(feed, report)
+        # An issue's resolution is the same read as a PR's applied record: a maintainer's
+        # kind-1631 naming the issue root. It finishes the work card and tells the channel
+        # once; a root this board does not link is ignored, exactly as for a PR.
+        self._resolve_issues(feed.merges, report, dry_run=dry_run)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}
@@ -3365,7 +3461,7 @@ class Sync:
                 self.store.ngit_set_cursor(self.target.key, "prs", edge - CURSOR_OVERLAP_S)
 
     def _with_statuses(self, feed: PrFeed, report: Report) -> PrFeed:
-        """Fold in the applied/closed statuses that name a linked PR by `e` alone.
+        """Fold in the applied/closed statuses that name a linked root by `e` alone.
 
         A failure here must not cost the pass its ordinary read: the `#a` feed still
         carries every status that has a repository tag, and the retry needs no cursor,
@@ -3373,7 +3469,7 @@ class Sync:
         """
         if self.statuses is None:
             return feed
-        known = self._status_pr_ids()
+        known = self._status_roots()
         if not known:
             return feed
         try:
@@ -3384,14 +3480,16 @@ class Sync:
             return feed
         return merge_feeds(feed, extra)
 
-    def _status_pr_ids(self) -> list[str]:
-        """The PR ids whose status is still open to change: linked, applied and not closed.
+    def _status_roots(self) -> list[str]:
+        """The root ids whose status is still open to change: linked PRs and linked issues.
 
-        Applied and closed are final for the board, so a status about a finished PR can
-        change nothing and is not asked for. Rows come oldest first; a board with more open
-        PRs than the cap asks about the newest, which are the ones news is about.
+        Both statuses name their root by `e`, and both are read the same way: an issue's
+        kind-1631 resolution is the applied record of the work a card did. Applied, resolved
+        and closed links are final for the board, so they are not asked about. Issues keep
+        their own slice of the cap, so a long PR history cannot push a resolution out of the
+        window this read exists for.
         """
-        ids: list[str] = []
+        pr_ids: list[str] = []
         for link in self.store.ngit_links(self.target.key, KIND_PR):
             if str(link.get("state") or "") in ("merged", "closed"):
                 continue
@@ -3399,8 +3497,15 @@ class Sync:
                 continue
             source = str(link.get("source_id") or "")
             if event_hex(source):
-                ids.append(event_hex(source))
-        return ids[-MAX_STATUS_PRS:]
+                pr_ids.append(event_hex(source))
+        issue_ids: list[str] = []
+        for link in self.store.ngit_links(self.target.key, KIND_ISSUE):
+            if str(link.get("state") or "") in ("resolved", "deleted"):
+                continue
+            source = str(link.get("source_id") or "")
+            if event_hex(source):
+                issue_ids.append(event_hex(source))
+        return list(dict.fromkeys([*issue_ids[-MAX_STATUS_PRS:], *pr_ids[-MAX_STATUS_PRS:]]))
 
     def _sweep(self, report: Report, *, dry_run: bool) -> PrFeed | None:
         """Re-read the two PR status kinds over a trailing window. Best effort, every pass.
@@ -3467,13 +3572,23 @@ class Sync:
             for pr in feed.prs:
                 if pr.id == pr_id:
                     return as_hex(pr.author)
-            link = self.store.ngit_link(self.target.key, KIND_PR, pr_id)
-            return as_hex(str(_detail(link).get("author") or "")) if link else ""
+            # An issue's own author is the second key allowed to speak about its root (the
+            # close rule); the issue link is where it is recorded.
+            for kind in (KIND_PR, KIND_ISSUE):
+                link = self.store.ngit_link(self.target.key, kind, pr_id)
+                if link is not None:
+                    return as_hex(str(_detail(link).get("author") or ""))
+            return ""
+
+        def noun(pr_id: str) -> str:
+            return ("issue" if self.store.ngit_link(self.target.key, KIND_ISSUE, pr_id)
+                    is not None else "PR")
 
         def refuse(kind: str, pr_id: str, author: str, created_at: int) -> None:
             report.prs["ignored"] += 1
             report.notes.append(
-                f"ignored a {kind} for PR {pr_id[:8]} from {npub_of(as_hex(author)) or author}"
+                f"ignored a {kind} for {noun(pr_id)} {pr_id[:8]} from"
+                f" {npub_of(as_hex(author)) or author}"
                 ": the author is not allowed to publish it")
             refused.append(int(created_at or 0))
 
@@ -4915,9 +5030,10 @@ class Sync:
 
         A merge supersedes a review line that has not gone out yet: telling the channel a PR
         is ready for review after it has already merged is noise, and the review line never
-        landed, so nothing is being hidden. A close supersedes it for the same reason.
+        landed, so nothing is being hidden. A close supersedes it for the same reason, and an
+        issue's resolution supersedes whatever was waiting to be said about that issue.
         """
-        if notice in ("merged", "closed"):
+        if notice in ("merged", "closed", "resolved"):
             self.store.ngit_notice_drop(self.target.key, source_id)
         return self.store.ngit_notice_put(
             self.target.key, kind, source_id, notice,

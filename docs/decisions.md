@@ -1368,3 +1368,41 @@ because a revision superseded it.
 
 Why: the verdict is the record, and a record with two authors is not a record -- the label pass
 and the merge guard both read the newest comment, so a duplicate is a second opinion nobody gave.
+
+## The merge route writes an issue's resolution, and the bridge reads it back
+
+Work that began as an issue already ended as a card, and nothing joined the two on the way out.
+The card's PR merged, the PR said `applied`, and the issue — the thing a contributor watches —
+stayed `open`. The join existed the whole time: `ngit_links` records the issue a card came from,
+and every mergeable commit already carries the `Card:` trailer.
+
+**The mechanism is a record, not a keyword.** `Closes #deadbeef` was the obvious candidate and is
+the wrong one: `ngit pr apply` replays a proposal's patches as *new* commits, so a `Closes` line
+in the PR description never reaches `master`, and no reader that looks at the branch can find it.
+A keyword that only exists in the PR thread would also depend on the worker remembering it, and a
+forgotten keyword leaves the issue open silently — the failure mode this change exists to remove.
+The keyword path stays as a fallback the bridge's reader understands, not as the writer's job.
+
+**The merge route publishes, because the merge is the fact.** `scripts/merge_pr.sh` already knows
+the PR, the commit the push left and every card the trailer names, and `hng ngit applied` already
+resolves the key, the repository and the relay set. `hng ngit resolved` reuses exactly that
+context and publishes one kind-1631 with the issue as its root. A card with no issue link is a
+quiet no-op, so the script can run it for every card it finds, and the command reads the issue's
+status first so a retry — or a second run of the merge route — publishes once. It selects the
+issue from the store's `ngit_links` row, never from an `Issue:` line in the card body: a body is
+display text a person may edit, and a resolution naming the wrong root is worse than none.
+
+**The bridge remains the reader, so the board follows.** The pass already reads kind-1631 by `e`
+for the PR roots it links; the same read now covers linked issue roots. A maintainer-authored
+resolution moves the link to `resolved`, queues one channel line, and completes a card that is
+still open — the merge is the end of the work, and a card left in `review` is where a merge with
+no worker left to notice it would otherwise sit. A stranger's 1631 and a root the board does not
+link are ignored exactly as before, and a resolved issue with no card is final rather than
+re-created as new work.
+
+**Why not on card completion, and why no completion guard.** Completion can precede the merge, or
+happen with no merge at all, so publishing there would claim a landing that has not happened. The
+reverse guard would be wrong for the same reason a missing record is not a missing merge: the
+merge gate's `review`/`done` requirement is already the "work is done" signal, and a merge whose
+record did not publish is a record to publish by hand (`hng ngit resolved …`), not a card the
+board refuses to close.

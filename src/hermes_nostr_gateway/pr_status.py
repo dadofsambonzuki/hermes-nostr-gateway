@@ -1,4 +1,4 @@
-"""The applied (kind-1631) and closed (kind-1632) records a merge has to publish.
+"""The applied/resolved (kind-1631) and closed (kind-1632) records a merge has to publish.
 
 Why a merge helper has to publish anything: `ngit pr apply` replays a proposal's patches
 as **new** commits, so the proposal's own commits never become ancestors of the target and
@@ -6,6 +6,13 @@ ngit's inference ("the proposal is in master") never fires. The content is in, a
 still reads `open`. Only a maintainer kind-1631 that names the resulting commit moves it
 to `applied` -- measured on ngit 3.0.5 -- which is why `scripts/merge_pr.sh` publishes one
 after the push.
+
+The same kind does the other half. An issue that began life as a card's work is *resolved*
+by a kind-1631 naming the issue root: NIP-34 spells one status kind with two readings, so
+`resolved_event` is `applied_event` with the root being an issue and the `alt` saying so.
+The merge route writes it because the merge is the fact; a commit keyword depends on a
+worker remembering one, and `ngit pr apply` replays patches, so a `Closes` line in a PR
+description never reaches the branch a reader looks at.
 
 The tags are decided by two readers, and both are written here:
 
@@ -47,6 +54,7 @@ KIND_CLOSED = 1632
 #: know the kind shows instead of an empty row. Both spellings match what readers expect.
 APPLIED_ALT = "git proposal merged / applied"
 CLOSED_ALT = "PR closed"
+RESOLVED_ALT = "issue resolved"
 
 #: A full commit id. A short one is refused at the door: a status naming `60fc1107` is a
 #: status naming nothing, and the failure reads like a PR that never applied.
@@ -100,12 +108,16 @@ def _a_tag(address: str, relay_hint: str) -> list[str]:
 
 
 def _people(address: str, authors: Iterable[str]) -> list[list[str]]:
-    """One `p` per person worth notifying: the proposal's author, then the repository owner."""
+    """One `p` per person worth notifying: the proposal's author, then the repository owner.
+
+    Dedupe is by key, not by position: the signer is often the owner, and an author can be
+    both -- a record that names the same person twice reads as two people.
+    """
     owner, _identifier = address_parts(address)
     out: list[list[str]] = []
     for who in (*tuple(authors), owner):
         key = str(who or "").strip().lower()
-        if key and [["p", key]] not in out:
+        if key and ["p", key] not in out:
             out.append(["p", key])
     return out
 
@@ -152,6 +164,62 @@ def applied_event(*, pr_id: str, address: str, merge_commit: str, root_commit: s
     return {
         "kind": KIND_APPLIED,
         "content": applied_content(commit),
+        "created_at": int(created_at if created_at is not None else time.time()),
+        "tags": tags,
+    }
+
+
+def resolved_content(commit: str, pr_id: str = "") -> str:
+    """What a resolved record says, in words a reader who has no board can act on."""
+    by = f" (PR {pr_id[:8]})" if pr_id else ""
+    return (f"Resolved on master as {commit}{by}. The work that answered this issue is"
+            " merged; `ngit pr apply` re-signs a proposal's commits, so this status names"
+            " the resulting commit.")
+
+
+def resolved_event(*, issue_id: str, address: str, merge_commit: str, root_commit: str = "",
+                   pr_id: str = "", authors: Sequence[str] = (), relay_hint: str = "",
+                   created_at: Optional[int] = None) -> dict[str, Any]:
+    """An unsigned kind-1631 saying which issue was answered by which commit.
+
+    The root is the issue, not a PR: `_root_tags` writes the `e`/`E`/`q` a NIP-22 reader
+    follows, `a` is what a repository feed filters on, and `merge-commit-id`/`merge-commit`
+    hold the same full commit so ngit's reader and NIP-34's see the same fact. `pr_id` is
+    the proposal that landed the work, named in the content only -- the record exists to
+    answer the issue, and a proposal that was replayed as new commits is not resolvable
+    from the issue's thread.
+
+    Both ids are enforced at the door: a short issue id names no issue a reader can load,
+    and a short commit names no commit at all.
+    """
+    iid = str(issue_id or "").strip().lower()
+    if not re.match(r"^[0-9a-f]{64}$", iid):
+        raise NgitError(f"{iid[:16]!r} is not a full event id: a resolved record names"
+                        " the issue root by its 64-character id")
+    coordinate = str(address or "").strip()
+    if not all(address_parts(coordinate)):
+        raise NgitError(f"{coordinate!r} is not a NIP-34 repository address"
+                        " (30617:<owner-hex>:<identifier>)")
+    commit = full_commit(merge_commit)
+    tags = [
+        *_root_tags(iid, relay_hint),
+        _a_tag(coordinate, relay_hint),
+        *_people(coordinate, authors),
+        ["r", commit],
+    ]
+    root = str(root_commit or "").strip().lower()
+    if root and _COMMIT.match(root) and root != commit:
+        tags.append(["r", root])
+    tags += [
+        ["merge-commit-id", commit],
+        ["merge-commit", commit],
+        ["alt", RESOLVED_ALT],
+    ]
+    proposal = str(pr_id or "").strip().lower()
+    return {
+        "kind": KIND_APPLIED,
+        "content": resolved_content(commit, proposal if re.match(r"^[0-9a-f]{64}$", proposal)
+                                    else ""),
         "created_at": int(created_at if created_at is not None else time.time()),
         "tags": tags,
     }

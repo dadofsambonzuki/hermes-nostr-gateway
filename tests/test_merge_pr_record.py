@@ -25,20 +25,34 @@ PUSH_GUARD = REPO / "scripts" / "worker_push_guard.sh"
 #: A stand-in ngit: the two calls the script makes, and a patch application that leaves a
 #: commit behind -- which is what `ngit pr apply` does to the worktree (`-d` is detached).
 #: The commit carries a `Card:` trailer because the merge route now refuses one that does not
-#: (master's exit 6), and this fixture is about the step after that refusal.
+#: (master's exit 6), and this fixture is about the step after that refusal. `CARD` decides
+#: which card the commit names, so a test can ask for an issue-linked one.
 NGIT = """#!/bin/sh
 case "$1 $2" in
   "pr view") echo "Status:   open"; exit 0 ;;
   "pr apply") echo applied > applied.txt; git add applied.txt
-              git commit -qm "apply the proposal" -m "Card: operator" || exit 1; exit 0 ;;
+              git commit -qm "apply the proposal" -m "Card: ${CARD:-operator}" || exit 1; exit 0 ;;
 esac
 echo "stub ngit: unexpected $*" >&2
 exit 99
 """
 
-#: A stand-in hng: record the command line, then answer like the real one.
+#: A stand-in hng: record the command line, then answer like the real one. The applied record
+#: answers everything except `ngit resolved`, which answers only for the card a test says is
+#: issue-linked -- every other card is the quiet no-op the real command is.
 HNG = """#!/bin/sh
 printf '%s\\n' "$*" >> "$HNG_LOG"
+if [ "$1 $2" = "ngit resolved" ]; then
+  if [ "${HNG_RESOLVED_STATUS:-0}" != 0 ]; then
+    echo "resolved-record FAILED 11111111: no relay took the status" >&2
+    exit 1
+  fi
+  case " $* " in
+    *" --card ${HNG_RESOLVE_CARD:-none} "*)
+      echo "resolved-record 11111111 -> ${HNG_RESOLVE_COMMIT:-0123456789abcdef} | event bbbbbbbb on 2/2 relays" ;;
+  esac
+  exit 0
+fi
 if [ "${HNG_RECORD_STATUS:-0}" != 0 ]; then
   echo "applied-record FAILED deadbeef: no relay took the status" >&2
   exit 1
@@ -52,7 +66,7 @@ def write_executable(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def prepare(tmp_path: Path) -> tuple[Sandbox, dict[str, str], Path]:
+def prepare(tmp_path: Path, *, card: str = "operator") -> tuple[Sandbox, dict[str, str], Path]:
     """A sandbox clone with the three scripts, a config, and the two stand-ins on PATH."""
     made = make_clone(tmp_path)
     scripts = made.repo / "scripts"
@@ -78,7 +92,7 @@ exit 0
 """)
     log = tmp_path / "hng.log"
     env = clean_env(PATH=f"{bindir}:{os.environ.get('PATH', '')}", VENV=str(tmp_path / "venv"),
-                    HNG_LOG=str(log))
+                    HNG_LOG=str(log), CARD=card)
     return made, env, log
 
 
@@ -128,3 +142,39 @@ def test_the_checked_merge_publishes_nothing(tmp_path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert not log.exists()
     assert "would apply" in result.stdout
+
+
+def test_a_merge_resolves_the_issue_a_trailer_card_came_from(tmp_path) -> None:
+    """After the applied record, the same commit is published as the issue's resolution."""
+    made, env, log = prepare(tmp_path, card="t_abcd1234")
+    env = {**env, "HNG_RESOLVE_CARD": "t_abcd1234"}
+
+    result = run_merge(made, env, "deadbeef")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    pushed = git(made.repo, "rev-parse", "origin/master").stdout.strip()
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith(f"ngit resolved --card t_abcd1234 --pr deadbeef"
+                               f" --commit {pushed}") for line in lines)
+    # The applied record still comes first, and the resolution line is one line per issue.
+    assert lines[0].startswith("ngit applied deadbeef")
+    assert "resolved-record 11111111" in result.stdout
+    assert "OK   applied deadbeef" in result.stdout
+
+
+def test_a_resolution_that_did_not_publish_exits_10_and_keeps_the_applied_record(tmp_path) -> None:
+    """Exit 10 is a distinct outcome: the PR is recorded, the issue it answered is not."""
+    made, env, log = prepare(tmp_path, card="t_abcd1234")
+    env = {**env, "HNG_RESOLVE_CARD": "t_abcd1234", "HNG_RESOLVED_STATUS": "1"}
+
+    result = run_merge(made, env, "deadbeef")
+
+    assert result.returncode == 10, result.stdout + result.stderr
+    # The merge and its applied record happened; only the issue's record is missing.
+    assert "OK   applied deadbeef" in result.stdout
+    assert "applied-record deadbeef" in result.stdout
+    assert "an issue's resolution is not" in result.stdout
+    assert "ngit resolved --card t_abcd1234" in result.stdout
+    pushed = git(made.repo, "rev-parse", "origin/master").stdout.strip()
+    assert any(f"ngit resolved --card t_abcd1234 --pr deadbeef --commit {pushed}" in line
+               for line in log.read_text(encoding="utf-8").splitlines())

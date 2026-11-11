@@ -14,9 +14,11 @@ Exit codes: 0 applied (or would), 1 conflict, 2 gate failure or a refused push, 
 error, 4 a card workspace (not the operator's), 5 the live checkout moved mid-run, 6 a commit
 carries no card trailer (none at all, or one that names something that is not a card), 7 the card
 is not in `review` or `done`, 8 merged but the applied record (kind-1631) did not publish, 9 no
-approved verdict from a permitted reviewer covering this tip. One code, one meaning: 5 says the
-checkout moved and the operator backs it out, 8 says the content is in `master` and the record is
-missing, and 6, 7 and 9 are the authorship route refusing — each names the part it refused:
+approved verdict from a permitted reviewer covering this tip, 10 merged and applied but the
+resolved record (kind-1631) for an issue the card came from did not publish. One code, one
+meaning: 5 says the checkout moved and the operator backs it out, 8 says the content is in
+`master` and the record is missing, 10 says the PR is recorded and the issue it answered still
+reads open, and 6, 7 and 9 are the authorship route refusing — each names the part it refused:
 [the commit trailer](#every-commit-says-which-card-wrote-it),
 [the card](#a-merge-needs-the-card-in-review-or-done),
 [the signature](#a-merge-needs-a-second-signature-covering-the-tip-it-lands).
@@ -64,6 +66,29 @@ card's guard (`done` requires `applied`), so a merge without one leaves the card
 completion with its content already merged — exit 8 from the script says precisely that, and
 prints the retry. The commit must be the full 40 characters: a short id names nothing a reader
 can resolve, and the failure looks like a PR that never applied.
+
+**The issue a card came from is resolved by the same merge, not by a keyword.** A card that
+began life as an issue holds the store's `ngit_links` row for it, and the merge route publishes a
+kind-1631 *resolved* record for every non-`operator` trailer card the PR names: `e` = the issue
+root, `a` = the repository, `p` = the issue's author and the owner, `merge-commit-id`/`merge-commit`
+= the commit master now points at. A card with no issue link is a quiet no-op. A commit keyword
+(`Closes #deadbeef`) is not the mechanism and cannot be: `ngit pr apply` replays the patches as
+new commits, so a line in the PR description never reaches the branch, and a worker who forgets
+leaves the issue open silently. The keyword path stays a fallback the *reader* understands.
+
+The same record by hand, from the store's link or by issue id:
+
+```sh
+hng ngit resolved --card <t_xxx> --pr <pr-id> --commit <full 40-char sha> [--dry-run]
+hng ngit resolved <issue-id|nevent> --commit <full 40-char sha> [--dry-run]
+```
+
+It reads the issue's own status first: one already resolved (by a maintainer) prints the existing
+event id and publishes nothing, so a retry is safe and two runs publish once. The bridge reads the
+record back, moves the link to `resolved`, posts one channel line, and completes the card if it is
+still open. A merge with no resolution is a record to republish by hand — `hng ngit resolved
+--card <t_xxx> …` — not a completion the board refuses: the merge gate's `review`/`done` rule is
+already the "work is done" signal.
 
 **Closing a proposal** is `hng ngit closed <id|nevent> --reason "<why>"`, not `ngit pr close`.
 `ngit pr close` writes a 1632 with `e`/`alt`/`p` and no `a` tag; a repository's feed is filtered
