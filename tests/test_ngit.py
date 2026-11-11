@@ -5481,3 +5481,88 @@ def test_a_decorated_branch_from_another_author_is_a_new_pr(harness):
 
     assert len(harness.tasks()) == 2 and len(pr_links(harness)) == 2
     assert report.prs["tasks"] == 1 and report.prs["revisions"] == 0
+
+
+# -- an issue resolved by a maintainer's kind-1631 ----------------------------
+
+RESOLVE_COMMIT = "b" * 40
+
+
+def resolution(issue: ngit.Issue, *, author: str = TRUSTED_HEX,
+               commit: str = RESOLVE_COMMIT, event_id: str = "7" * 64) -> ngit.Merge:
+    """The status `hng ngit resolved` publishes: a kind-1631 naming the issue root."""
+    return ngit.Merge(pr_id=issue.hex, commit=commit, created_at=1500,
+                      event_id=event_id, author=author)
+
+
+def test_a_maintainer_resolution_finishes_the_issue_card_and_tells_the_channel_once(harness):
+    """The merge route writes the record; the pass reads it back and closes the loop."""
+    issue = make_issue("e1", subject="Fix the parser")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.sync()
+    task_id = harness.tasks()[0]["id"]
+    assert harness.task(task_id)["status"] == "ready"
+    before = len(harness.messages)
+
+    asked: list[list[str]] = []
+
+    def statuses(ids):
+        asked.append(list(ids))
+        return ngit.PrFeed(merges=[resolution(issue)])
+
+    harness.statuses = statuses
+    report = harness.sync()
+
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    # The status read covers the linked issue root, not only PR roots.
+    assert issue.hex in asked[0]
+    assert link["state"] == "resolved"
+    assert report.issues["resolved"] == 1
+    card = harness.task(task_id)
+    assert card["status"] == "done" and card["completed_at"]
+    assert any("is resolved by the merge" in comment["body"]
+               for comment in harness.comments(task_id))
+    # One channel line, naming the commit that landed.
+    assert len(harness.messages) == before + 1
+    assert "resolved as " + RESOLVE_COMMIT in harness.messages[-1][1]
+
+    # A later poll has nothing left to do: the link is final and the notice is not re-sent.
+    report = harness.sync()
+    assert report.issues["resolved"] == 0
+    assert len(harness.messages) == before + 1
+
+
+def test_a_strangers_resolution_is_ignored(harness):
+    """Only a maintainer's kind-1631 resolves an issue, exactly as for a PR."""
+    issue = make_issue("e2")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.sync()
+    task_id = harness.tasks()[0]["id"]
+
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[resolution(issue, author=STRANGER_HEX)])
+    report = harness.sync()
+
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    assert link["state"] == "ready"
+    assert harness.task(task_id)["status"] == "ready"
+    assert report.issues["resolved"] == 0
+    assert any("ignored a merge status" in note for note in report.notes)
+
+
+def test_a_resolution_for_a_root_the_board_does_not_link_is_ignored(harness):
+    """A relay can answer with more than it was asked for; an unknown root changes nothing."""
+    issue = make_issue("e3")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.sync()
+    task_id = harness.tasks()[0]["id"]
+    other = make_issue("e4")          # never filed, never linked
+
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[resolution(other)])
+    report = harness.sync()
+
+    assert report.issues["resolved"] == 0
+    assert report.errors == []
+    assert harness.task(task_id)["status"] == "ready"

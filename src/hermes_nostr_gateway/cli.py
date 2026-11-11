@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 
@@ -1334,6 +1334,8 @@ def cmd_ngit(args) -> int:
         return cmd_ngit_applied(cfg, args)
     if args.ngit_cmd == "closed":
         return cmd_ngit_closed(cfg, args)
+    if args.ngit_cmd == "resolved":
+        return cmd_ngit_resolved(cfg, args)
     return cmd_ngit_sync(cfg, args)
 
 
@@ -1586,6 +1588,34 @@ def _status_secret(cfg: dict[str, Any], args) -> str:
     return secret_from(cfg)
 
 
+def _status_context(cfg: dict[str, Any], args, repo: Path) -> tuple[str, str, Any,
+                                                                   tuple[str, ...], str]:
+    """The key, its pubkey, the repository and the relay set a status is published with.
+
+    `hng ngit applied`, `closed` and `resolved` share this so the record that resolves an
+    issue is signed and addressed exactly like the record that applies its PR: the same
+    `--nsec-file` (else the gateway identity), the same repository announcement, and the
+    same read set -- `ngit.relays` when the operator named one, otherwise the
+    announcement's hints and the gateway's read relays.
+    """
+    from . import ngit as bridge
+    from . import pr_status
+
+    secret = _status_secret(cfg, args)
+    signer = pr_status.signer_pubkey(secret)
+    repository = bridge.Ngit(repo).repository()
+    if not repository.address:
+        raise bridge.NgitError(
+            f"{repo} has no NIP-34 address (ngit repo --json named no coordinate):"
+            " there is no repository to publish a status against")
+    ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
+    relays = tuple(ngit_cfg.relays or ())
+    if not relays:
+        relays = tuple(dict.fromkeys((*repository.relays, *_read_relays(cfg))))[:8]
+    hint = repository.relays[0] if repository.relays else ""
+    return secret, signer, repository, relays, hint
+
+
 def _publish_pr_status(cfg: dict[str, Any], args, *, kind: str) -> int:
     """Publish the status record for one proposal: `applied` or `closed`.
 
@@ -1602,26 +1632,12 @@ def _publish_pr_status(cfg: dict[str, Any], args, *, kind: str) -> int:
     repo = Path(os.path.expanduser(str(args.repo or os.getcwd())))
     label = "applied-record" if kind == "applied" else "close-record"
     try:
-        secret = _status_secret(cfg, args)
-        signer = pr_status.signer_pubkey(secret)
-        repository = bridge.Ngit(repo).repository()
-        if not repository.address:
-            raise bridge.NgitError(
-                f"{repo} has no NIP-34 address (ngit repo --json named no coordinate):"
-                " there is no repository to publish a status against")
+        secret, signer, repository, relays, hint = _status_context(cfg, args, repo)
         detail = pr_status.pr_detail(repo, args.pr)
         pr_id = bridge.event_hex(str(detail.get("id") or ""))
         if not pr_id:
             raise bridge.NgitError(f"ngit pr view {args.pr} named no event id")
         authors = [key for key in (as_hex(str(detail.get("author") or "")), signer) if key]
-        # The same read set `ngit sync` publishes labels to: `ngit.relays` when the operator
-        # named one, otherwise the announcement's hints and the gateway's read relays --
-        # where a repository that predates the hints still publishes.
-        ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
-        relays = tuple(ngit_cfg.relays or ())
-        if not relays:
-            relays = tuple(dict.fromkeys((*repository.relays, *_read_relays(cfg))))[:8]
-        hint = repository.relays[0] if repository.relays else ""
         if kind == "applied":
             commit = pr_status.full_commit(args.commit)
             event = pr_status.applied_event(
@@ -1660,6 +1676,137 @@ def cmd_ngit_applied(cfg: dict[str, Any], args) -> int:
 def cmd_ngit_closed(cfg: dict[str, Any], args) -> int:
     """The kind-1632 that closes a proposal -- with the `a` tag a repository reader filters on."""
     return _publish_pr_status(cfg, args, kind="closed")
+
+
+def _link_detail(link: dict[str, Any] | None) -> dict[str, Any]:
+    """The note a link row carries, as a dict; {} when it carries none or cannot be read."""
+    try:
+        note = json.loads(str((link or {}).get("detail") or "{}"))
+    except ValueError:
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
+def _issue_author(repo: Path, issue_id: str) -> str:
+    """The issue's author (npub), best effort, from `ngit issue view`.
+
+    A `p` tag naming the issue's author is worth having and not worth failing a merge over:
+    the repository owner and the signer are always in the record, so a checkout that cannot
+    answer leaves one name off rather than publishing nothing.
+    """
+    from . import ngit as bridge
+
+    try:
+        data = bridge.run_ngit(repo, ["issue", "view", issue_id])
+    except Exception:  # noqa: BLE001 - the `p` tag is enrichment, not the record
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(bridge.issue_from_json({**data, "id": data.get("id") or issue_id}).author or "")
+
+
+def _resolved_by(relays: Sequence[str], address: str, issue_id: str, secret: str,
+                 maintainers: Sequence[str]) -> str:
+    """The id of the status event that already resolves this issue, or "".
+
+    Read from where the bridge reads it: the two status kinds that name the issue by `e`.
+    Only a maintainer's record counts -- an empty allowlist counts none -- so a stranger's
+    `resolved` cannot stop the record this command exists to publish.
+    """
+    from . import ngit as bridge
+
+    if not relays or not address:
+        return ""
+    try:
+        feed = bridge.RelayPrs(relays, address, secret=secret,
+                               maintainers=maintainers).statuses([issue_id])
+    except bridge.NgitError:
+        return ""
+    seen = [*feed.merges, *feed.closed]
+    if not seen:
+        return ""
+    newest = max(seen, key=lambda event: (event.created_at, event.event_id))
+    return str(newest.event_id)
+
+
+def cmd_ngit_resolved(cfg: dict[str, Any], args) -> int:
+    """The kind-1631 that resolves the issue a card's work answered.
+
+    The join is the store's, not the card body's: `ngit_links` holds the issue a work card
+    came from, while an `Issue:` line in the body is display text a person can edit. With
+    `--card` and no issue link this is a quiet no-op (most cards have none), and it reads
+    the issue's own status first, so a resolution published once is not published twice.
+    """
+    from . import ngit as bridge
+    from . import pr_status
+
+    repo = Path(os.path.expanduser(str(args.repo or os.getcwd())))
+    card = str(getattr(args, "card", "") or "").strip()
+    issue_ref = str(getattr(args, "issue", "") or "").strip()
+    issue_id, issue_author = "", ""
+    _crypto, store, _policy, _plane = build(cfg)
+    try:
+        if card:
+            link = store.ngit_link_for_task(card, kind=bridge.KIND_ISSUE)
+            if link is None:
+                # A card with no issue link: nothing to resolve, and the merge route runs
+                # this for every card it finds, so it must not be an error.
+                return 0
+            issue_id = bridge.event_hex(str(link.get("source_id") or ""))
+            issue_author = str(_link_detail(link).get("author") or "")
+        else:
+            issue_id = bridge.event_hex(issue_ref)
+            if not issue_id:
+                print(f"ngit resolved: {issue_ref!r} is not an event id or nevent",
+                      file=sys.stderr)
+                return 1
+            link = store.ngit_link_for_source(bridge.KIND_ISSUE, issue_id)
+            issue_author = str(_link_detail(link).get("author") or "")
+    finally:
+        store.close()
+    if not issue_id:
+        print(f"ngit resolved: {card} has a link with no event id", file=sys.stderr)
+        return 1
+    if not issue_author:
+        issue_author = _issue_author(repo, issue_id)
+    try:
+        secret, signer, repository, relays, hint = _status_context(cfg, args, repo)
+        linked_repo = str((link or {}).get("repo") or "")
+        if linked_repo.startswith("30617:") and linked_repo != repository.address:
+            raise bridge.NgitError(
+                f"issue {issue_id[:8]} is linked in {linked_repo}, but {repo} is"
+                f" {repository.address}: resolve it from the checkout it was filed in")
+        ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
+        maintainers = tuple(dict.fromkeys((*ngit_cfg.maintainers, *repository.maintainers)))
+        existing = _resolved_by(relays, repository.address, issue_id, secret, maintainers)
+        if existing:
+            # The record is already out. Publishing an identical one would only add a
+            # second event saying the same thing to every reader.
+            print(f"resolved-record {issue_id[:8]}: already resolved by event {existing}")
+            return 0
+        authors = [key for key in (as_hex(issue_author), signer) if key]
+        commit = pr_status.full_commit(args.commit)
+        proposal = bridge.event_hex(str(getattr(args, "pr", "") or ""))
+        event = pr_status.resolved_event(
+            issue_id=issue_id, address=repository.address, merge_commit=commit,
+            root_commit=pr_status.root_commit(repo), pr_id=proposal, authors=authors,
+            relay_hint=hint)
+    except bridge.NgitError as exc:
+        print(f"ngit resolved: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "dry_run", False):
+        print(json.dumps(event, indent=2))
+        return 0
+    try:
+        published = pr_status.publish_status(event, relays, secret)
+    except bridge.NgitError as exc:
+        print(f"ngit resolved: {exc}", file=sys.stderr)
+        return 1
+    if not published.ok:
+        print(f"resolved-record FAILED {issue_id[:8]}: {published.line()}", file=sys.stderr)
+        return 1
+    print(f"resolved-record {issue_id[:8]} -> {commit} | {published.line()}")
+    return 0
 
 
 def cmd_deps(args) -> int:
@@ -2384,6 +2531,31 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="print the event it would publish; publish nothing")
     p_ngit_closed.set_defaults(func=cmd_ngit)
+
+    p_ngit_resolved = ngit_sub.add_parser(
+        "resolved",
+        help="publish the kind-1631 that resolves the issue a card's merge answered")
+    p_ngit_resolved.add_argument(
+        "issue", nargs="?", default="",
+        help="the issue: event id or nevent (omit with --card, which names it in the store)")
+    p_ngit_resolved.add_argument(
+        "--card", default="",
+        help="the card whose linked issue is resolved (the ngit_links row, never the body)")
+    p_ngit_resolved.add_argument(
+        "--pr", default="",
+        help="the proposal the merge landed, named in the record's content")
+    p_ngit_resolved.add_argument(
+        "--commit", required=True,
+        help="the full 40-character commit on the target branch that the push left")
+    p_ngit_resolved.add_argument(
+        "--repo", default=None, help="checkout override (default: the current directory)")
+    p_ngit_resolved.add_argument(
+        "--nsec-file", default=None,
+        help="sign with this key file instead of the gateway identity")
+    p_ngit_resolved.add_argument(
+        "--dry-run", action="store_true",
+        help="print the event it would publish; publish nothing")
+    p_ngit_resolved.set_defaults(func=cmd_ngit)
 
     p_deps = sub.add_parser(
         "deps", help="dependency proposals: scan, gate and push a pr/deps-* branch")

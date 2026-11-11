@@ -36,7 +36,7 @@ The daemon's watcher only wakes a pass early; it never decides anything.
 | Does each channel map to a real checkout, project and board? | `hng projects --check --json` | Per entry: the mapping fields plus `checks[]` of `{name, ok, detail}` for `channel`, `config`, `checkout`, `project`, `board`; exit 1 on any gap. A `channel` check appears only when the key is not a 64-hex channel id (or `concord:<community-id>:<channel-id>`): a name resolves inbound messages and then loses every notice at send time. Plain `hng projects --json` lists the map only. |
 | Which channel ids may I key `concord.projects` by? | `hng concord channels --json` | `[{id, name, community}]` for every readable channel of every joined community; `--community <id>` narrows it. It performs the same Control-plane read a refresh does (the store's grants alone are not the channel list) and falls back to the grants, with a note on stderr, when a relay is silent. A held invite contributes nothing. |
 | Which profile, model and key would a conversation's turn use? | `hng route <conversation> --json`, or `hng route --check` for the whole config | The winning rule, `profile`, `model`/`provider`, `env_file`, and `ok`/`error` (`route_*`, `profile_*`). Exit 1 on an unresolved route. |
-| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{seen,created,ready,held,existing,comments,deleted,deferred,waiting,would_create,would_wait}`, `mentions{seen,created,existing,ignored,deferred,would_create,requested,would_request}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,healed,would_heal,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
+| What would a bridge pass do, without writing anything? | `hng ngit sync --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `assignee`, `issues{seen,created,ready,held,existing,comments,deleted,deferred,waiting,would_create,would_wait,resolved,would_resolve}`, `mentions{seen,created,existing,ignored,deferred,would_create,requested,would_request}`, `prs{seen,signalled,merged,closed,existing,pending,tasks,review_errors,deferred,would_post,revisions,reopened,healed,would_heal,approved,changes,applied,completed,unblocked,blocked,would_close}`, `posted`, `failed`, `errors`, `notes`. |
 | Which cards are parked on a verdict no pass will read again? | `hng ngit reconcile --channel concord:<community-id>:<channel-id> --dry-run --json` | `channel`, `repo`, `repo_address`, `board`, `dry_run`, `cards[]{card,pr,from,to,assignee,verdict,verdict_event,why}`, `errors`, `notes`. Drop `--dry-run` to apply them; a second run moves nothing. |
 | What does this identity advertise to clients? | `hng profile --json`, or `hng profile publish` to publish what differs | `advertise{enabled, targets, profile, catalogue, relays}` and `published[]` (`kind`, `event_id`, `content_hash`, `published_at`, `refused`, `retrying`). `publish` reports the event id per kind and the per-relay read-back (`retained`, `absent`, `superseded`). |
 | Does the live Nostr plugin match this checkout's adapter? | `hng adapter status --json`; `hng adapter install` writes it | `repo`/`live` (both paths), `repo_hash`/`live_hash`, both mtimes, `equal`, `unit`, `unit_started`, `stale_import`, `problems`, `detail`; exit 1 when the copies differ or one cannot be read. |
@@ -191,7 +191,10 @@ re-granting access changes nothing.
   stranger's approval, a changes request, or an approval of an earlier revision all stop it. It
   also refuses a PR whose commits carry no card trailer — none at all, or one that names
   something that is not a card (exit 6) — and one whose card is not finished (exit 7: `review` or
-  `done`; the PR's own card may also be the `blocked` a reviewer parks it as).
+  `done`; the PR's own card may also be the `blocked` a reviewer parks it as). Exit 8 is merged
+  with the applied record missing; exit 10 is merged and applied with the issue a trailer card
+  came from still unresolved (the PR record is published either way, so retry the issue record
+  alone — `hng ngit resolved --card <t_xxx> --pr <pr> --commit <sha>`).
   `hng ngit merge-check <pr> --repo <checkout>` is the same card answer on its own.
 - **Every commit says which card wrote it.** A `commit-msg` hook installed by
   `scripts/card_trailer.sh install` writes `Card: t_xxxxxxxx` from a card workspace and
@@ -238,6 +241,13 @@ manual — run `ngit skill install` for the rest.
 - A **merged** proposal needs its own kind-1631: `ngit pr apply` re-signs the commits, so the
   proposal can never infer `applied`. `scripts/merge_pr.sh` publishes it after the push, and
   `hng ngit applied <id> --commit <full sha>` does it by hand (`--dry-run` shows the event).
+- **The issue a card came from is resolved by the same merge.** `scripts/merge_pr.sh` also runs
+  `hng ngit resolved --card <card> --pr <pr> --commit <sha>` for every non-`operator` trailer
+  card; the issue is read from the store's `ngit_links` row, never from an `Issue:` line in the
+  card body. No issue link is a quiet no-op, an already-resolved issue prints its event id and
+  publishes nothing, and the bridge reads the record back to set the link `resolved`, post one
+  channel line and complete a card still open. A `Closes #…` keyword is not the mechanism —
+  `ngit pr apply` replays patches, so the line never reaches `master`.
 - Read **`ngit pr view <id> --json`** for state, and judge a push by it — a self-hosted GRASP
   can fail its ref update while the ngit relay took the change.
 
