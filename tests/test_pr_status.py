@@ -432,3 +432,12 @@ def test_the_positional_route_resolves_the_issue_named_on_the_command_line(
     assert ["e", ISSUE_ID, RELAYS[0], "root"] in event["tags"]
     assert ["p", AUTHOR] in event["tags"]
     assert f"resolved-record {ISSUE_ID[:8]}" in out.out
+
+
+def test_each_person_is_named_once_even_when_signer_and_owner_are_the_same():
+    """The signer is often the owner; one person must not read as two in the record."""
+    event = pr_status.resolved_event(issue_id=ISSUE_ID, address=ADDRESS, merge_commit=COMMIT,
+                                     authors=(OWNER, AUTHOR))
+    people = [tag[1] for tag in event["tags"] if tag[0] == "p"]
+
+    assert people == [OWNER, AUTHOR]

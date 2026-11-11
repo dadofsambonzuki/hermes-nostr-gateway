@@ -108,12 +108,16 @@ def _a_tag(address: str, relay_hint: str) -> list[str]:
 
 
 def _people(address: str, authors: Iterable[str]) -> list[list[str]]:
-    """One `p` per person worth notifying: the proposal's author, then the repository owner."""
+    """One `p` per person worth notifying: the proposal's author, then the repository owner.
+
+    Dedupe is by key, not by position: the signer is often the owner, and an author can be
+    both -- a record that names the same person twice reads as two people.
+    """
     owner, _identifier = address_parts(address)
     out: list[list[str]] = []
     for who in (*tuple(authors), owner):
         key = str(who or "").strip().lower()
-        if key and [["p", key]] not in out:
+        if key and ["p", key] not in out:
             out.append(["p", key])
     return out
 
