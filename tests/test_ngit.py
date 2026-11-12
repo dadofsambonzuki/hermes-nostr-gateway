@@ -21,6 +21,7 @@ from pathlib import Path
 import nostr_sdk as sdk
 import pytest
 
+from git_sandbox import git as sandbox_git
 from hermes_nostr_gateway import cli, kanban, ngit, ngit_labels, ngit_verdict, pr_status
 from hermes_nostr_gateway import roles as roles_mod
 from hermes_nostr_gateway.applied import Evidence
@@ -209,6 +210,7 @@ class Harness:
                  assignee: str = "default", anchor: Anchor | None = None,
                  notifier=None, prs=((), ()), statuses=None, labeler=None, state=None,
                  applied: FakeApplied | None = None, sweep=None, verdicts=None,
+                 resolver=None,
                  owns: tuple[str, ...] = (TRUSTED_HEX,),
                  roles: tuple | None = None,
                  now: Callable[[], float] = time.time):
@@ -253,6 +255,10 @@ class Harness:
         self.verdict_tips: list[str] = []
         self.verdict_ok = True
         self.verdict_publisher = verdicts or self._publish_verdict
+        #: What the pass may publish for an off-box merge: the issue's resolved record. A
+        #: test that wants one installs a `FakeResolver`; `None` is a deployment with no
+        #: maintainer key, and the pass then says so instead of writing.
+        self.resolver = resolver
         self.control = ControlConfig.from_config(
             {"trusted_npubs": [npub(key) for key in trusted]})
         #: The pass's clock. Pinned by the tests whose fixtures sit inside a time window,
@@ -421,7 +427,8 @@ class Harness:
             prs=self.prs, statuses=self.statuses, sweep=self.sweep,
             notify=self.notifier, anchor=self.anchor,
             labels=self.labeler, state=self.state, applied=self.applied,
-            self_npub=self.self_npub, verdicts=self.verdict_publisher, roles=self.roles,
+            self_npub=self.self_npub, verdicts=self.verdict_publisher,
+            resolver=self.resolver, roles=self.roles,
             now=self.now)
 
     def task(self, task_id: str):
@@ -5566,3 +5573,256 @@ def test_a_resolution_for_a_root_the_board_does_not_link_is_ignored(harness):
     assert report.issues["resolved"] == 0
     assert report.errors == []
     assert harness.task(task_id)["status"] == "ready"
+
+
+# -- a merge made off-box: the pass publishes the issue's record ---------------
+
+class FakeResolver:
+    """The pass's one write, replaced: it records the call and answers as a relay would.
+
+    `existing` is what the publisher says when the issue already carries a record -- the
+    state `scripts/merge_pr.sh` leaves behind -- and `error` is a publish that did not land.
+    """
+
+    def __init__(self, *, existing: str = "", error: str = ""):
+        self.calls: list[tuple[str, str, str, tuple[str, ...]]] = []
+        self.existing = existing
+        self.error = error
+
+    def __call__(self, issue_id: str, *, commit: str, pr_id: str = "",
+                 authors=()) -> ngit.Resolution:
+        self.calls.append((issue_id, commit, pr_id, tuple(authors)))
+        if self.error:
+            return ngit.Resolution(error=self.error)
+        if self.existing:
+            return ngit.Resolution(ok=True, event_id=self.existing, existing=True)
+        return ngit.Resolution(ok=True, event_id=f"r{len(self.calls):03d}".ljust(64, "0"),
+                               relays=2)
+
+
+def _repo(harness) -> Path:
+    """The checkout the harness points the pass at, as a git repository."""
+    repo = harness.repo
+    sandbox_git(repo, "init", "-b", "master")
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    sandbox_git(repo, "add", "base.txt")
+    sandbox_git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def _commit(repo: Path, name: str, card: str) -> None:
+    (repo / name).write_text(name + "\n", encoding="utf-8")
+    sandbox_git(repo, "add", name)
+    sandbox_git(repo, "commit", "-qm", f"the change in {name}\n\nCard: {card}")
+
+
+def off_box_merge(harness, *cards: str) -> str:
+    """A true merge in the checkout, as another box's merge button would leave it."""
+    repo = _repo(harness)
+    sandbox_git(repo, "checkout", "-qb", "work")
+    for number, card in enumerate(cards):
+        _commit(repo, f"work{number}.txt", card)
+    sandbox_git(repo, "checkout", "-q", "master")
+    sandbox_git(repo, "merge", "--no-ff", "-q", "-m", "Merge the proposal", "work")
+    return sandbox_git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def off_box_replay(harness, *cards: str) -> tuple[str, list[str]]:
+    """A replay: new commits on `master`, no merge commit, the tip last."""
+    repo = _repo(harness)
+    made: list[str] = []
+    for number, card in enumerate(cards):
+        _commit(repo, f"replay{number}.txt", card)
+        made.append(sandbox_git(repo, "rev-parse", "HEAD").stdout.strip())
+    return made[-1], made
+
+
+def issue_and_pr(harness) -> tuple[ngit.Issue, str, ngit.PullRequest]:
+    """An issue whose card the work was done under, and the PR that went with it."""
+    issue = make_issue("f1", subject="Fix the parser", body="The parser drops lines.")
+    harness.issues = [issue]
+    harness.details = {issue.hex: issue}
+    harness.sync()
+    card = harness.tasks()[0]["id"]
+    pr = make_pr("f2", commit="c0ffee")
+    harness.prs_data = ([pr], [])
+    harness.sync()
+    return issue, card, pr
+
+
+def remote_status(pr: ngit.PullRequest, commit: str, *, author: str = TRUSTED_HEX,
+                  commits: tuple[str, ...] = (), event: str = "9") -> ngit.Merge:
+    """A maintainer's applied status, as relay.ngit.dev would carry it."""
+    return ngit.Merge(pr_id=pr.id, commit=commit, created_at=2500, event_id=event * 64,
+                      author=author, commits=commits)
+
+
+def test_a_merge_made_off_box_resolves_the_issue_its_card_answered(harness):
+    """GitWorkshop publishes the PR's status and no issue record: the pass writes that half."""
+    issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+
+    report = harness.sync()
+
+    assert [call[:3] for call in resolver.calls] == [(issue.hex, merge, pr.id)]
+    assert TRUSTED_HEX in resolver.calls[0][3]
+    assert report.issues["published"] == 1
+    assert report.issues["resolved"] == 1
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    assert link["state"] == "resolved"
+    detail = json.loads(link["detail"])
+    assert detail["resolved"] == merge
+    assert detail["resolved_event"] == "r001".ljust(64, "0")
+    finished = harness.task(card)
+    assert finished["status"] == "done" and finished["completed_at"]
+    assert any("is resolved by the merge" in comment["body"]
+               for comment in harness.comments(card))
+    # One channel line for the resolution, naming the commit that landed.
+    assert sum(1 for _who, text in harness.messages if "resolved as " + merge in text) == 1
+
+
+def test_a_second_pass_publishes_nothing(harness):
+    """The link is the state: a re-poll of the same status writes no second record."""
+    _issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+    harness.sync()
+
+    report = harness.sync()
+
+    assert len(resolver.calls) == 1
+    assert report.issues["published"] == 0 and report.issues["resolved"] == 0
+
+
+def test_a_strangers_applied_status_is_ignored(harness):
+    """Only a maintainer's status is read; a stranger's publishes nothing."""
+    issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(
+        merges=[remote_status(pr, merge, author=STRANGER_HEX)])
+
+    report = harness.sync()
+
+    assert resolver.calls == []
+    assert report.issues["published"] == 0 and report.issues["resolved"] == 0
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    assert link["state"] != "resolved"
+    assert any("ignored a merge status" in note for note in report.notes)
+
+
+def test_a_merge_commit_the_checkout_lacks_degrades_with_an_error_line(harness):
+    """Never guess a commit: an unreadable merge is a report line, and the issue stays open."""
+    issue, _card, pr = issue_and_pr(harness)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(
+        merges=[remote_status(pr, "f" * 40)])
+
+    report = harness.sync()
+
+    assert resolver.calls == []
+    assert report.issues["published"] == 0
+    assert any("is not in the checkout" in error for error in report.errors)
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    assert link["state"] != "resolved"
+
+
+def test_a_replayed_merge_is_read_through_the_commits_the_status_names(harness):
+    """`ngit pr apply` leaves no merge commit; the `applied-as-commits` list is the set."""
+    issue, card, pr = issue_and_pr(harness)
+    tip, commits = off_box_replay(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(
+        merges=[remote_status(pr, tip, commits=tuple(commits))])
+
+    report = harness.sync()
+
+    assert [call[:3] for call in resolver.calls] == [(issue.hex, tip, pr.id)]
+    assert report.issues["published"] == 1 and report.issues["resolved"] == 1
+
+
+def test_a_trailer_naming_a_card_with_no_issue_link_is_a_no_op(harness):
+    """Most cards answer no issue: the pass publishes nothing and reports nothing."""
+    _issue, _card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, "t_99999999")
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+
+    report = harness.sync()
+
+    assert resolver.calls == []
+    assert report.issues["published"] == 0 and report.errors == []
+
+
+def test_a_merge_the_merge_script_already_recorded_publishes_nothing(harness):
+    """The two routes converge on one event: the pass adopts the record it finds."""
+    issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[
+        remote_status(pr, merge), resolution(issue)])
+
+    report = harness.sync()
+
+    assert resolver.calls == []
+    assert report.issues["published"] == 0 and report.issues["resolved"] == 1
+    detail = json.loads(harness.store.ngit_link(
+        harness.target.key, ngit.KIND_ISSUE, issue.hex)["detail"])
+    assert detail["resolved_event"] == "7" * 64      # the merge route's event, not a new one
+
+
+def test_a_record_already_on_the_issue_is_adopted_instead_of_published_again(harness):
+    """`merge_pr.sh` may have published behind this pass's cursor: the publisher says so."""
+    issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    existing = "8" * 64
+    resolver = FakeResolver(existing=existing)
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+
+    report = harness.sync()
+
+    assert len(resolver.calls) == 1
+    assert report.issues["published"] == 0 and report.issues["resolved"] == 1
+    detail = json.loads(harness.store.ngit_link(
+        harness.target.key, ngit.KIND_ISSUE, issue.hex)["detail"])
+    assert detail["resolved_event"] == existing
+
+
+def test_a_dry_run_decides_the_record_and_writes_nothing(harness):
+    """The pass says what it would publish, and publishes none of it."""
+    issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    resolver = FakeResolver()
+    harness.resolver = resolver
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+
+    report = harness.sync(dry_run=True)
+
+    assert resolver.calls == []
+    assert report.issues["would_publish"] == 1 and report.issues["would_resolve"] == 1
+    link = harness.store.ngit_link(harness.target.key, ngit.KIND_ISSUE, issue.hex)
+    assert link["state"] != "resolved"
+    assert harness.task(card)["status"] != "done"
+
+
+def test_a_pass_with_no_maintainer_key_says_what_to_run(harness):
+    """No key, no record: silence would read as "nothing to do", so the pass names the fix."""
+    _issue, card, pr = issue_and_pr(harness)
+    merge = off_box_merge(harness, card)
+    harness.statuses = lambda ids: ngit.PrFeed(merges=[remote_status(pr, merge)])
+
+    report = harness.sync()
+
+    assert report.issues["published"] == 0
+    assert any("hng ngit resolved" in note for note in report.notes)

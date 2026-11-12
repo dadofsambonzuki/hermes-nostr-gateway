@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import yaml
 
@@ -1491,6 +1491,19 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
     # reviewer derivation the verdict gate uses, the Deps Bot through `deps.signer`. A plane
     # does not keep its own list: it resolves against this one.
     roles = roles_from_config(cfg, self_npub=crypto.our_pubkey(), reviewers=reviewers)
+    # The pass may write one thing about a merge it did not make: the record that resolves
+    # the issue a card came from, when the merge was made off-box (GitWorkshop's button) and
+    # nothing here published one. It is signed by the gateway identity, which is a maintainer
+    # -- otherwise the bridge would not read its own record back, and publishing would only
+    # add an event nobody accepts.
+    resolver = None
+    if target.address and relays:
+        gateway = as_hex(crypto.our_pubkey())
+        if gateway and gateway in {as_hex(who) for who in maintainers if str(who or "").strip()}:
+            resolver = _resolved_publisher(
+                repo=target.repo, address=target.address, relays=relays,
+                hint=repository.relays[0] if repository.relays else "",
+                secret=secret_from(cfg), maintainers=maintainers)
     notifier = bridge.DaemonNotifier(
         os.path.expanduser(str(getattr(args, "socket", None) or cfg.get("socket")
                               or default_socket_path())))
@@ -1502,7 +1515,7 @@ def _ngit_pass(cfg: dict[str, Any], args, *, reader: bool = False):
         statuses=prs.statuses if prs is not None else None,
         sweep=prs.sweep if prs is not None else None,
         notify=notifier, anchor=anchor, labels=labeler, state=state,
-        self_npub=crypto.our_pubkey(), verdicts=verdicts, roles=roles)
+        self_npub=crypto.our_pubkey(), verdicts=verdicts, resolver=resolver, roles=roles)
     return board, sync, note
 
 
@@ -1705,28 +1718,37 @@ def _issue_author(repo: Path, issue_id: str) -> str:
     return str(bridge.issue_from_json({**data, "id": data.get("id") or issue_id}).author or "")
 
 
-def _resolved_by(relays: Sequence[str], address: str, issue_id: str, secret: str,
-                 maintainers: Sequence[str]) -> str:
-    """The id of the status event that already resolves this issue, or "".
+def _resolved_publisher(*, repo: Path, address: str, relays: Sequence[str], hint: str,
+                        secret: str, maintainers: Sequence[str]) -> Callable[..., Any]:
+    """The one writer of an issue's resolved record, shared by the CLI and the bridge pass.
 
-    Read from where the bridge reads it: the two status kinds that name the issue by `e`.
-    Only a maintainer's record counts -- an empty allowlist counts none -- so a stranger's
-    `resolved` cannot stop the record this command exists to publish.
+    `scripts/merge_pr.sh` and `hng ngit resolved` write it from the merge side; the pass
+    writes it for a merge made off-box, where nothing here published one. Both go through
+    `pr_status.publish_resolved`, so the event, the key and the idempotency check cannot
+    drift into two records for one issue. The key is the gateway identity -- a maintainer,
+    so the bridge reads its own record back -- never the review key, whose word is a
+    verdict rather than a merge.
     """
-    from . import ngit as bridge
+    from . import pr_status
 
-    if not relays or not address:
-        return ""
-    try:
-        feed = bridge.RelayPrs(relays, address, secret=secret,
-                               maintainers=maintainers).statuses([issue_id])
-    except bridge.NgitError:
-        return ""
-    seen = [*feed.merges, *feed.closed]
-    if not seen:
-        return ""
-    newest = max(seen, key=lambda event: (event.created_at, event.event_id))
-    return str(newest.event_id)
+    def publish(issue_id: str, *, commit: str, pr_id: str = "",
+                authors: Sequence[str] = ()) -> Any:
+        from . import ngit as bridge
+
+        try:
+            published = pr_status.publish_resolved(
+                issue_id=issue_id, address=address, merge_commit=commit, relays=relays,
+                secret=secret, maintainers=maintainers, pr_id=pr_id, authors=authors,
+                relay_hint=hint, root=pr_status.root_commit(repo))
+        except bridge.NgitError as exc:
+            # A refusal here is the pass's error line, never an exception: one issue's record
+            # that cannot be built must not cost the pass its other news.
+            return bridge.Resolution(error=str(exc))
+        return bridge.Resolution(ok=published.ok, event_id=published.event_id,
+                                 existing=published.existing,
+                                 relays=len(published.delivered), error=published.error)
+
+    return publish
 
 
 def cmd_ngit_resolved(cfg: dict[str, Any], args) -> int:
@@ -1778,33 +1800,38 @@ def cmd_ngit_resolved(cfg: dict[str, Any], args) -> int:
                 f" {repository.address}: resolve it from the checkout it was filed in")
         ngit_cfg = bridge.BridgeConfig.from_config(cfg.get("ngit"))
         maintainers = tuple(dict.fromkeys((*ngit_cfg.maintainers, *repository.maintainers)))
-        existing = _resolved_by(relays, repository.address, issue_id, secret, maintainers)
-        if existing:
-            # The record is already out. Publishing an identical one would only add a
-            # second event saying the same thing to every reader.
-            print(f"resolved-record {issue_id[:8]}: already resolved by event {existing}")
-            return 0
         authors = [key for key in (as_hex(issue_author), signer) if key]
         commit = pr_status.full_commit(args.commit)
         proposal = bridge.event_hex(str(getattr(args, "pr", "") or ""))
-        event = pr_status.resolved_event(
-            issue_id=issue_id, address=repository.address, merge_commit=commit,
-            root_commit=pr_status.root_commit(repo), pr_id=proposal, authors=authors,
-            relay_hint=hint)
-    except bridge.NgitError as exc:
-        print(f"ngit resolved: {exc}", file=sys.stderr)
-        return 1
-    if getattr(args, "dry_run", False):
-        print(json.dumps(event, indent=2))
-        return 0
-    try:
-        published = pr_status.publish_status(event, relays, secret)
+        if getattr(args, "dry_run", False):
+            # A dry run decides the whole thing and prints the event it would publish,
+            # having asked the same question the publish would ask.
+            existing = pr_status.resolved_by(relays, repository.address, issue_id, secret,
+                                             maintainers)
+            if existing:
+                print(f"resolved-record {issue_id[:8]}: already resolved by event {existing}")
+                return 0
+            print(json.dumps(pr_status.resolved_event(
+                issue_id=issue_id, address=repository.address, merge_commit=commit,
+                root_commit=pr_status.root_commit(repo), pr_id=proposal, authors=authors,
+                relay_hint=hint), indent=2))
+            return 0
+        published = pr_status.publish_resolved(
+            issue_id=issue_id, address=repository.address, merge_commit=commit, relays=relays,
+            secret=secret, maintainers=maintainers, pr_id=proposal, authors=authors,
+            relay_hint=hint, root=pr_status.root_commit(repo))
     except bridge.NgitError as exc:
         print(f"ngit resolved: {exc}", file=sys.stderr)
         return 1
     if not published.ok:
         print(f"resolved-record FAILED {issue_id[:8]}: {published.line()}", file=sys.stderr)
         return 1
+    if published.existing:
+        # The record is already out. Publishing an identical one would only add a second
+        # event saying the same thing to every reader -- whoever wrote it, the issue is
+        # resolved, and `scripts/merge_pr.sh` treats this exactly like its own success.
+        print(f"resolved-record {issue_id[:8]}: already resolved by event {published.event_id}")
+        return 0
     print(f"resolved-record {issue_id[:8]} -> {commit} | {published.line()}")
     return 0
 

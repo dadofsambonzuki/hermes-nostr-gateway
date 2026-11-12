@@ -1406,3 +1406,43 @@ reverse guard would be wrong for the same reason a missing record is not a missi
 merge gate's `review`/`done` requirement is already the "work is done" signal, and a merge whose
 record did not publish is a record to publish by hand (`hng ngit resolved …`), not a card the
 board refuses to close.
+
+## A merge made elsewhere is resolved by the bridge, and only by the bridge
+
+The record above closes the loop when the merge goes through this box. A maintainer pressing
+GitWorkshop's merge button does not: the forge publishes the proposal's kind-1631 and nothing
+about the issue, because the issue→card join is this box's `ngit_links` and the tool that merged
+had no board to read. The issue stayed `open` after work that had landed, and no health check
+saw it — the gateway was green, the relay had the status, and the record simply did not exist.
+
+**The status and the trailer already hold the join.** An applied status names the commit; every
+commit a worker pushes carries `Card: t_xxxxxxxx`. So the pass reads the commits the merge landed
+— a true merge through its second parent (`<merge>^1..<merge>^2`), a replay through the
+`applied-as-commits`/`c` list the status carries, because `ngit pr apply` re-signs the patches
+and leaves no merge commit to walk — collects the cards, and publishes, per linked issue, the
+event `scripts/merge_pr.sh` would have written. Not a second builder: `pr_status.publish_resolved`
+is the one both routes call, so the event, the full commit, the `a` tag and the idempotency check
+cannot drift apart.
+
+**This is the one case where the bridge is a writer**, and the reason is that nobody else can be.
+`merge_pr.sh` is a command a person runs in this checkout; an off-box merge runs no command here
+at all. Leaving it to `hng ngit resolved` needs a person to notice, and the failure mode is an
+issue that reads open for ever while every check is green — which is the failure this change
+exists to remove. The signature is the gateway identity, which is a maintainer, so the bridge
+reads its own record back through the same allowlist that gates everyone else's. The review key
+is deliberately not used: a verdict is a reviewer's word, and a merge record signed with it would
+be a second opinion the merge guard already refuses to trust.
+
+**Both routes converge on one event, and the test is the issue's own status.** Before signing
+anything, `pr_status.resolved_by` asks the relays whether the issue already carries a maintainer's
+status (`#e`, unbounded by the cursor) and adopts it if so; the pass also skips an issue whose
+record is already in this pass's feed or whose link is `resolved`. So a `merge_pr.sh` merge
+followed by a pass publishes one event, and a pass followed by a retried merge route publishes
+one event: whichever writer runs second finds the first.
+
+**What it will not do.** Only a status `_authorised_feed` kept is acted on, so a stranger's is
+still ignored. A status that names no commit, or a commit the checkout cannot read after one
+best-effort `git fetch origin`, is an error line and nothing else: a record naming a commit no
+reader can resolve is worse than one the next pass can still publish. `Card: operator` names no
+card, a trailer that is not `t_xxxxxxxx` is reported and skipped rather than resolved against the
+board, and a card with no issue link is a quiet no-op — most cards answer no issue.

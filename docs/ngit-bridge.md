@@ -402,6 +402,24 @@ same branch and a revision all land on that one card; none of them makes a secon
   (`hng ngit applied <pr> --commit <sha>` by hand). It must carry the repository `a`
   coordinate, because that is the filter this feed is read with: a status without it is stored
   by the relay and seen by nobody here.
+- **A merge made off-box publishes the issue's record here.** GitWorkshop's merge button
+  publishes the proposal's applied status and nothing about the issue the work answered: the
+  issue→card join is `ngit_links`, which that tool cannot read, so the issue stayed `open`
+  after work that had landed. The pass closes it from what the status does carry — the commit —
+  and from the `Card: t_xxxxxxxx` trailer every mergeable commit has (`card_trailer.sh`). A true
+  merge is read through its second parent (`git log <merge>^1..<merge>^2`); a replay has no
+  merge commit, so the status's own `applied-as-commits`/`c` list is the set. Per card with a
+  linked issue that is not already resolved, the pass publishes the same kind-1631
+  `pr_status.publish_resolved` builds for `merge_pr.sh` — same full commit, same `a` tag, signed
+  by the gateway identity (a maintainer, so the bridge reads its own record back) — and then the
+  ordinary resolution walk moves the link, posts one channel line and finishes a card that is
+  still open. It is idempotent against the issue's own status: `pr_status.resolved_by` reads
+  `#e` for the issue before signing, so a merge `merge_pr.sh` recorded and a merge this pass
+  recorded converge on one event whichever ran first. It runs only on a maintainer's status (a
+  stranger's is still ignored), never guesses a commit (an absent one, after one best-effort
+  `git fetch origin`, is an error line), skips `Card: operator`, and does nothing for a card
+  with no issue link. This is the one case where the bridge is a writer of a repository record;
+  why is [`decisions.md`](decisions.md), "A merge made elsewhere is resolved by the bridge".
 - **`applied` has two witnesses: the record and the content.** The record is the kind-1631
   above. The other is the checkout, because `ngit pr apply` replays a proposal's patches as
   **new** commits — the tip the PR event names never becomes an ancestor of the branch it

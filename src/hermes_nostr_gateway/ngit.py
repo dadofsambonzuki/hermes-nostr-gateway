@@ -97,7 +97,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import nostr_sdk as sdk
 
-from . import ngit_guard
+from . import ngit_guard, ngit_resolve
 from .applied import Checkout as AppliedCheckout
 from .applied import Evidence
 from .control import ControlConfig, as_hex
@@ -445,6 +445,40 @@ class Merge:
     evidence: str = ""
     #: The key that published the status. A merge is a maintainer's act, not anyone's.
     author: str = ""
+    #: Every commit the status names, tip first: `merge-commit`/`merge-commit-id`, then the
+    #: `applied-as-commits`/`c` list. A replay has no merge commit to walk, so this is where
+    #: the commits it landed are found (`ngit_resolve`).
+    commits: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """What one attempt to publish an issue's resolved record did.
+
+    `event_id` is the kind-1631 a reader will find on the issue root -- published now, or
+    already there (`existing`), which is the same fact as far as the board is concerned.
+    `error` is the sentence a pass prints when it could not publish one at all.
+    """
+
+    ok: bool = False
+    event_id: str = ""
+    existing: bool = False
+    relays: int = 0
+    error: str = ""
+
+    def line(self) -> str:
+        if self.error:
+            return self.error
+        if not self.event_id:
+            return "no relay took the resolved record"
+        if self.existing:
+            return f"already resolved by event {self.event_id}"
+        return f"event {self.event_id} on {self.relays} relays"
+
+
+#: `resolver(issue_id, commit=…, pr_id=…, authors=…) -> Resolution`. Injected because the one
+#: thing the bridge must not own is a key: the gateway identity signs it, in `cli`.
+ResolveFn = Callable[..., Resolution]
 
 
 @dataclass(frozen=True)
@@ -801,7 +835,10 @@ class Report:
         "would_create": 0, "waiting": 0, "would_wait": 0, "would_post": 0,
         #: Issues a maintainer's kind-1631 resolved: the link moved and the card (if one
         #: was still open) was finished by it.
-        "resolved": 0, "would_resolve": 0})
+        "resolved": 0, "would_resolve": 0,
+        #: Issue records this pass published itself, because the merge that answered them
+        #: was made off-box and published only the proposal's applied status.
+        "published": 0, "would_publish": 0})
     mentions: dict[str, int] = field(default_factory=lambda: {
         "seen": 0, "created": 0, "existing": 0, "ignored": 0, "deferred": 0,
         "would_create": 0, "requested": 0, "would_request": 0})
@@ -1161,14 +1198,19 @@ def merge_from_event(event: dict[str, Any],
         commit = _tag(event, name).strip()
         if commit:
             break
+    listed = [*_tags(event, APPLIED_COMMIT_TAG), *_tags(event, "c")]
     if not commit:
-        applied = _tags(event, APPLIED_COMMIT_TAG)
-        commit = applied[0].strip() if applied else ""
+        commit = listed[0].strip() if listed else ""
     if commit and not looks_commit(commit):
         commit = ""
+    # Every commit the status names, so a replayed set can be read for its `Card:` trailers
+    # even though there is no merge commit to walk. `commit` first: it is the one a record
+    # names, and a reader that needs "the" commit takes the first.
+    named = tuple(dict.fromkeys(item.strip().lower() for item in (commit, *listed)
+                                if looks_commit(item)))
     return Merge(pr_id=event_hex(pr_id), commit=commit,
                  created_at=int(event.get("created_at") or 0),
-                 event_id=str(event.get("id") or ""), author=author)
+                 event_id=str(event.get("id") or ""), author=author, commits=named)
 
 
 def closed_from_event(event: dict[str, Any]) -> Optional[Closed]:
@@ -2540,6 +2582,7 @@ class Sync:
                  labels: Optional[Labeler] = None, state: Optional[StateSource] = None,
                  applied: Optional[AppliedSource] = None, self_npub: str = "",
                  verdicts: Optional[VerdictPublisherFn] = None,
+                 resolver: Optional[ResolveFn] = None,
                  roles: Sequence[Role] = (),
                  now: Callable[[], float] = time.time):
         self.store = store
@@ -2593,6 +2636,11 @@ class Sync:
                 log.warning("ngit: owns: %r is not a pubkey; this instance does not speak for"
                             " it", str(candidate)[:24])
         self.verdicts = verdicts
+        #: The one thing this pass may *write* about a merge it did not make: the record that
+        #: resolves the issue a card came from. `None` means this deployment has no
+        #: maintainer key to publish it with, and an off-box merge then leaves the issue to
+        #: `hng ngit resolved` -- the record it would have written is never guessed at.
+        self.resolver = resolver
         self._now = now
 
     # -- entry point -----------------------------------------------------
@@ -3008,6 +3056,95 @@ class Sync:
             self.store.ngit_note_comment(key, ref.hex, comment.hex, task_id)
             report.issues["comments"] += 1
 
+    def _resolve_off_box_merges(self, merges: Sequence[Merge], report: Report, *,
+                                dry_run: bool) -> list[Merge]:
+        """Publish the issue record for a merge nobody on this box made, and hand it on.
+
+        A maintainer can merge from anywhere -- GitWorkshop's merge button is the case this
+        exists for -- and that tool publishes the proposal's applied status and nothing about
+        the issue the work answered: the issue->card link is this store's, and it had no board
+        to consult. The status still names the commit, and every mergeable commit carries
+        `Card: t_xxxxxxxx`, so the record `scripts/merge_pr.sh` would have written is
+        recoverable rather than guessed at.
+
+        What this will not do is the point of it:
+
+        * it runs only on a status `_authorised_feed` kept, so a stranger's is still ignored;
+        * only for a PR root this board links (the pass narrates what it watched);
+        * never without a commit the status names, and never when the checkout cannot read
+          that commit -- the error says what was tried, and the next pass can heal it;
+        * never twice: a record already on the issue (this pass's feed, the link's own state,
+          or the relay read the publisher makes) is adopted instead of published again, so
+          `merge_pr.sh`'s record and this one converge on one event.
+
+        The rows it returns are the resolutions it published, as `Merge` objects rooted at the
+        issue, so `_resolve_issues` moves the links, posts the one channel line and finishes a
+        card that is still open in this same pass instead of the next one.
+        """
+        if self.resolver is None:
+            for merge in merges:
+                if merge.commit and self.store.ngit_link(self.target.key, KIND_PR, merge.pr_id):
+                    report.notes.append(
+                        "a merge status names a commit this board could resolve an issue from,"
+                        " but no maintainer key is configured to publish the record with:"
+                        " run `hng ngit resolved --card <card> --commit <sha>`")
+                    break
+            return []
+        out: list[Merge] = []
+        seen: set[str] = set()
+        already = {merge.pr_id for merge in merges}
+        for merge in sorted(merges, key=lambda item: (item.created_at, item.pr_id)):
+            pr_id = str(merge.pr_id or "")
+            if not pr_id or self.store.ngit_link(self.target.key, KIND_PR, pr_id) is None:
+                continue
+            if not merge.commit:
+                # A status that names no commit is not evidence (the pass's own rule for the
+                # PR's card), so there is nothing to read a card from. Silence here matches
+                # the rest of the pass: the card's refusal is where an operator learns why.
+                continue
+            landed = ngit_resolve.read(self.target.repo, commit=merge.commit,
+                                       listed=merge.commits)
+            for note in landed.notes:
+                report.notes.append(f"PR {pr_id[:8]}: {note}")
+            if not landed.ok:
+                report.errors.append(f"resolved record for PR {pr_id[:8]}: {landed.error}")
+                continue
+            for card in landed.cards:
+                link = self.store.ngit_link_for_task(card, kind=KIND_ISSUE)
+                if link is None or str(link.get("repo") or "") != self.target.key:
+                    continue        # a card with no issue link here: the ordinary no-op
+                issue_id = event_hex(str(link.get("source_id") or ""))
+                if not issue_id or issue_id in seen:
+                    continue
+                if str(link.get("state") or "") == "resolved":
+                    continue        # the link is final; nothing to publish
+                if issue_id in already:
+                    continue        # this pass already has a record for it; the walk applies it
+                seen.add(issue_id)
+                detail = _detail(link)
+                authors = [key for key in (as_hex(str(detail.get("author") or "")),
+                                           as_hex(self.self_npub)) if key]
+                if dry_run:
+                    report.issues["would_publish"] += 1
+                    out.append(Merge(pr_id=issue_id, commit=merge.commit,
+                                     created_at=merge.created_at))
+                    continue
+                answer = self.resolver(issue_id, commit=merge.commit, pr_id=pr_id,
+                                       authors=authors)
+                if answer.error or not answer.ok:
+                    report.errors.append(
+                        f"resolved record for issue {issue_id[:8]} (card {card}):"
+                        f" {answer.line()}")
+                    continue
+                if answer.existing:
+                    report.notes.append(f"issue {issue_id[:8]}: {answer.line()}")
+                else:
+                    report.issues["published"] += 1
+                out.append(Merge(pr_id=issue_id, commit=merge.commit,
+                                 created_at=merge.created_at, event_id=answer.event_id,
+                                 author=as_hex(self.self_npub)))
+        return out
+
     def _resolve_issues(self, merges: Sequence[Merge], report: Report, *,
                         dry_run: bool) -> None:
         """Finish the work of an issue a maintainer resolved with a kind-1631.
@@ -3254,8 +3391,11 @@ class Sync:
         feed, refused = self._authorised_feed(feed, report)
         # An issue's resolution is the same read as a PR's applied record: a maintainer's
         # kind-1631 naming the issue root. It finishes the work card and tells the channel
-        # once; a root this board does not link is ignored, exactly as for a PR.
-        self._resolve_issues(feed.merges, report, dry_run=dry_run)
+        # once; a root this board does not link is ignored, exactly as for a PR. A merge made
+        # off-box published only the PR's half, so the issue's record is written here first
+        # and the same walk applies it.
+        published = self._resolve_off_box_merges(feed.merges, report, dry_run=dry_run)
+        self._resolve_issues([*feed.merges, *published], report, dry_run=dry_run)
         merges = feed.merges
         applied = {merge.pr_id: merge for merge in merges}
         closed = {stopped.pr_id: stopped for stopped in feed.closed}

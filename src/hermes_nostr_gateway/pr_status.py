@@ -41,6 +41,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import nostr_sdk as sdk
 
+from . import ngit
 from .crypto import parse_secret, sign_event
 from .ngit import NgitError, run_ngit
 from .publisher import publish as publish_events
@@ -225,6 +226,59 @@ def resolved_event(*, issue_id: str, address: str, merge_commit: str, root_commi
     }
 
 
+def resolved_by(relays: Sequence[str], address: str, issue_id: str, secret: str,
+                maintainers: Sequence[str] = ()) -> str:
+    """The id of the status event that already resolves this issue, or "".
+
+    Read from where the bridge reads it: the two status kinds that name the issue by `e`.
+    Only a maintainer's record counts -- an empty allowlist counts none -- so a stranger's
+    `resolved` cannot stop the record a caller exists to publish.
+
+    This is the idempotency half of the whole route: `scripts/merge_pr.sh` publishes its
+    record before the pass ever sees the merge, so the pass finds it here and adopts it, and
+    a retry of the merge route finds the pass's record the same way. Two writers, one event.
+    """
+    if not relays or not address:
+        return ""
+    try:
+        # Through the module, not a bound name: a caller (a test, a probe) that replaces
+        # `RelayPrs` is replacing the reader this question is asked of.
+        feed = ngit.RelayPrs(list(relays), address, secret=secret,
+                             maintainers=maintainers).statuses([issue_id])
+    except NgitError:
+        return ""
+    seen = [*feed.merges, *feed.closed]
+    if not seen:
+        return ""
+    newest = max(seen, key=lambda event: (event.created_at, event.event_id))
+    return str(newest.event_id)
+
+
+def publish_resolved(*, issue_id: str, address: str, merge_commit: str,
+                     relays: Sequence[str], secret: str,
+                     maintainers: Sequence[str] = (), pr_id: str = "",
+                     authors: Sequence[str] = (), relay_hint: str = "", root: str = "",
+                     publish: Callable[..., Mapping[str, tuple[bool, Optional[str]]]]
+                     = publish_events) -> Published:
+    """One issue's resolved record -- published once, however often this is called.
+
+    The builder, the signer, the relay set and the idempotency check in one place, because
+    two routes write this event: `hng ngit resolved` (which `scripts/merge_pr.sh` runs) and
+    the bridge's own pass when a merge was made off-box. Both have to produce the *same*
+    record, and the second has to find the first instead of adding a second opinion. The
+    issue's own status is therefore read before anything is signed.
+    """
+    targets = tuple(dict.fromkeys(str(relay).strip() for relay in relays
+                                   if str(relay or "").strip()))
+    existing = resolved_by(targets, address, issue_id, secret, maintainers)
+    if existing:
+        return Published(event_id=existing, relays=targets, delivered=targets, existing=True)
+    event = resolved_event(issue_id=issue_id, address=address, merge_commit=merge_commit,
+                           root_commit=root, pr_id=pr_id, authors=authors,
+                           relay_hint=relay_hint)
+    return publish_status(event, targets, secret, publish=publish)
+
+
 def closed_event(*, pr_id: str, address: str, reason: str = "",
                  authors: Sequence[str] = (), relay_hint: str = "",
                  created_at: Optional[int] = None) -> dict[str, Any]:
@@ -281,6 +335,9 @@ class Published:
     delivered: tuple[str, ...] = ()
     refused: tuple[tuple[str, str], ...] = ()
     error: str = ""
+    #: True when nothing was sent because the issue already carries a resolved record: the
+    #: id is that record's, and the caller's job is done either way.
+    existing: bool = False
 
     @property
     def ok(self) -> bool:
